@@ -2,6 +2,9 @@
 
 End-to-end guide for building the engine image, packaging a per-flow image,
 running the container, and verifying the environment with `conduit doctor`.
+For running the result safely in production — service user, rootless runtime,
+read-only mounts, secrets, egress — see
+[`deployment-hardening.md`](deployment-hardening.md).
 
 ---
 

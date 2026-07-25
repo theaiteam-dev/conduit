@@ -48,7 +48,8 @@ hold it together:
   run halt kills the group, not a lone pid, so a harness that has spawned its own
   subprocesses (a shell, a browser, a language server) doesn't leave zombies behind.
   Deployment guidance additionally recommends running the container as a dedicated non-root
-  user for agentic/harness flows.
+  user for agentic/harness flows — [`deployment-hardening.md`](deployment-hardening.md) is
+  that guidance in full.
 - **The ADR-0003 container wall.** [ADR-0003](../adr/0003-packaging-and-distribution.md)'s
   Docker packaging is the outer containment boundary for what a harness does inside its
   loop — the container, not the kernel, bounds the blast radius. Network-policy
