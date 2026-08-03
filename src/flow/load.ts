@@ -200,6 +200,12 @@ interface RawStation {
   /** Output write scope ('project_root' | 'owned_dir'). Validated in collectErrors. */
   output_scope?: unknown;
   /**
+   * Card-scoped input declaration (issue #112). Typed as `unknown` so
+   * collectErrors can validate the block shape and the owned_dir list before
+   * buildStationConfig casts it onto StationConfig.input_scope.
+   */
+  input_scope?: unknown;
+  /**
    * YAML image_inputs list (WI-414). Typed as `unknown[]` so collectErrors can
    * validate each entry's shape before buildStationConfig casts them safely.
    */
@@ -410,6 +416,9 @@ function buildStationConfig(
   if (raw.child_stagger_seconds !== undefined) config.child_stagger_seconds = raw.child_stagger_seconds as number;
   // v10: output write scope (collectErrors has validated the enum + transform-only rule).
   if (raw.output_scope !== undefined) config.output_scope = raw.output_scope as 'project_root' | 'owned_dir';
+  // issue #112: card-scoped input names (collectErrors has validated the block
+  // shape, the string list, the ⊆ inputs rule, and the eligible worker kinds).
+  if (raw.input_scope !== undefined) config.input_scope = raw.input_scope as { owned_dir: string[] };
 
   // WI-414: image inputs (optional — ABSENT when not declared, never an empty array).
   // collectErrors has already validated each entry is a non-null object with a string
@@ -750,6 +759,61 @@ function collectErrors(
             `Station '${station.id}' sets output_scope but declares no outputs — ` +
             `the scope only governs where declared outputs are written`,
         });
+      }
+    }
+    // issue #112: input_scope — which declared inputs are READ from the card's
+    // owned dir instead of projectRoot. Validated fail-closed at LOAD so a typo
+    // surfaces here rather than as a card-scoped read that silently falls back
+    // to a project-root file (or an opaque render throw mid-run).
+    //
+    // Deliberately NOT transform-only, unlike output_scope: that one is scoped
+    // to transforms because the engine writes declared outputs only for
+    // transforms, but a HARNESS station reads (and mounts) its declared inputs
+    // the same way a transform does, so both kinds may scope them.
+    if (station.input_scope !== undefined) {
+      const rawScope = station.input_scope;
+      const ownedDir =
+        rawScope !== null && typeof rawScope === 'object'
+          ? (rawScope as { owned_dir?: unknown }).owned_dir
+          : undefined;
+      const declaredInputs = Array.isArray(station.inputs) ? station.inputs : [];
+      const workerKind = station.worker?.kind;
+      // The reserved synthetic input name (see render.ts FEEDBACK_INPUT / WI-379).
+      const FEEDBACK_RESERVED = 'feedback';
+
+      if (!Array.isArray(ownedDir) || !ownedDir.every((n) => typeof n === 'string')) {
+        errors.push({
+          code: 'INVALID_INPUT_SCOPE',
+          message:
+            `Station '${station.id}' has invalid input_scope — ` +
+            `'owned_dir' must be a list of declared input names`,
+        });
+      } else if (workerKind !== 'transform' && workerKind !== 'harness') {
+        errors.push({
+          code: 'INVALID_INPUT_SCOPE',
+          message:
+            `Station '${station.id}' sets input_scope but its worker kind is ` +
+            `'${String(workerKind)}' — input_scope applies only to transform and harness ` +
+            `stations (the kinds that resolve declared inputs into a prompt)`,
+        });
+      } else {
+        for (const name of ownedDir as string[]) {
+          if (name === FEEDBACK_RESERVED) {
+            errors.push({
+              code: 'INVALID_INPUT_SCOPE',
+              message:
+                `Station '${station.id}' lists '${FEEDBACK_RESERVED}' in input_scope.owned_dir — ` +
+                `'${FEEDBACK_RESERVED}' is a synthetic input threaded at runtime and never read from disk`,
+            });
+          } else if (!declaredInputs.includes(name)) {
+            errors.push({
+              code: 'INVALID_INPUT_SCOPE',
+              message:
+                `Station '${station.id}' lists '${name}' in input_scope.owned_dir but does not ` +
+                `declare it in inputs — only a declared input can be card-scoped`,
+            });
+          }
+        }
       }
     }
     const reworkCap = station.check?.rework_cap;

@@ -52,6 +52,7 @@ import { harnessRetryDelayMs } from '../worker/harness-retry';
 import { loadImageInput, hashImageInputs, assertImagePayloadWithinLimits } from '../worker/image-input';
 import type { ImageInput } from '../worker/image-input';
 import { renderPrompt } from '../flow/render';
+import { resolveInputPath } from '../flow/resolve-input';
 import { buildOutputSchema } from '../flow/schema';
 import { runGateRework } from './gate-rework';
 import {
@@ -2280,7 +2281,12 @@ interface GateCheckOrAdvanceArgs {
   stationConfig: StationConfig;
   stationId: string;
   cardId: string;
-  card: { lane: string; attempt: number; rework_count?: number };
+  /**
+   * `owned_paths` is carried (issue #112) so the gate critic resolves the same
+   * card-scoped inputs the maker did — a gate on a child_entry station judges
+   * THAT child's shard, not the shared project-root artifact of the same name.
+   */
+  card: { lane: string; attempt: number; rework_count?: number; owned_paths: string[] };
   /** Only consulted by a 'pass' verdict (or the no-gate path) when this station is a fan-out station. */
   stationOutput: { payload: unknown };
   trackingAdapter: ModelAdapter;
@@ -2761,6 +2767,10 @@ async function runGateCheckOrAdvance(args: GateCheckOrAdvanceArgs): Promise<bool
         adapter: trackingAdapter,
         harnessRegistry,
         projectRoot,
+        // The critic judges THIS child's work, so it resolves the same
+        // card-scoped inputs the maker did (issue #112).
+        ownedPaths: card.owned_paths,
+        ownedDirInputs: stationConfig.input_scope?.owned_dir ?? [],
         validBackEdges: flow.back_edges ?? [],
         // Pass the flow-level cap policy so gate-rework can signal 'rework' for
         // proceed_with_findings (rather than 'scrap') when the rework cap trips.
@@ -3098,12 +3108,14 @@ async function executeTransformStation(args: TransformArgs): Promise<boolean> {
   // (FR-6: hash order is irrelevant; computeBindingStamp sorts inputArtifactHashes.)
   const inputHashes = stationConfig.inputs.map((inputName) => {
     try {
-      // seed.json is card-scoped (child's owned dir), not at projectRoot.
-      // Hash from the same location as renderPrompt reads — otherwise sibling
-      // children with different seeds would get identical stamps.
-      const inputPath = inputName === 'seed.json' && card.owned_paths[0]
-        ? join(card.owned_paths[0], 'seed.json')
-        : join(projectRoot, inputName);
+      // Card-scoped inputs (the reserved seed.json, plus anything the station
+      // listed in input_scope.owned_dir) live in the child's owned dir, not at
+      // projectRoot. Hash from the SAME location renderPrompt reads — the shared
+      // resolver guarantees it — otherwise sibling children holding different
+      // per-child files would get identical stamps (WI-468 BUG-1, issue #112).
+      const inputPath = resolveInputPath(
+        inputName, projectRoot, card.owned_paths, stationConfig.input_scope?.owned_dir,
+      );
       const content = readFileSync(inputPath);
       return createHash('sha256').update(content).digest('hex');
     } catch {
@@ -3241,7 +3253,7 @@ async function executeTransformStation(args: TransformArgs): Promise<boolean> {
     // the local prompt) is preferred over the raw prompt_file (WI-555, D1
     // carrier option A) — the one allowed touch to this render path.
     const promptTemplate = stationConfig.prompt_content ?? readFileSync(stationConfig.prompt_file!, 'utf-8');
-    const prompt = renderPrompt(promptTemplate, stationConfig.inputs, projectRoot, feedbackString, (stationConfig.image_inputs ?? []).map((d) => d.path), card.owned_paths);
+    const prompt = renderPrompt(promptTemplate, stationConfig.inputs, projectRoot, feedbackString, (stationConfig.image_inputs ?? []).map((d) => d.path), card.owned_paths, stationConfig.input_scope?.owned_dir);
 
     // ── Build output schema ─────────────────────────────────────────────────
     const schema = buildOutputSchema(stationConfig.output_schema?.fields ?? []);
@@ -3585,9 +3597,11 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
   // identity-relevant input.
   const inputHashes = stationConfig.inputs.map((inputName) => {
     try {
-      const inputPath = inputName === 'seed.json' && card.owned_paths[0]
-        ? join(card.owned_paths[0], 'seed.json')
-        : join(projectRoot, inputName);
+      // Card-scoped inputs resolve from the child's owned dir — same shared
+      // resolver the transform stamp and renderPrompt use (issue #112).
+      const inputPath = resolveInputPath(
+        inputName, projectRoot, card.owned_paths, stationConfig.input_scope?.owned_dir,
+      );
       const content = readFileSync(inputPath);
       return createHash('sha256').update(content).digest('hex');
     } catch {
@@ -3688,14 +3702,23 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
     const promptTemplate = stationConfig.prompt_content ?? readFileSync(stationConfig.prompt_file!, 'utf-8');
     const prompt = renderPrompt(
       promptTemplate, stationConfig.inputs, projectRoot, feedbackString, [], card.owned_paths,
+      stationConfig.input_scope?.owned_dir,
     );
 
     // Declared inputs are MOUNTED (name + path), not inlined bytes — the
     // reserved synthetic inputs ('feedback', 'seed.json') have no on-disk
     // artifact of their own and are threaded via the prompt only.
+    //
+    // A card-scoped input (issue #112) must mount from the card's owned dir:
+    // mounting join(projectRoot, name) would hand the agent the shared artifact
+    // while its prompt quotes the per-child one — two different files under one
+    // name, the worst version of this bug to debug.
     const mountedInputs: MountedInput[] = stationConfig.inputs
       .filter((name) => name !== 'feedback' && name !== 'seed.json')
-      .map((name) => ({ name, path: join(projectRoot, name) }));
+      .map((name) => ({
+        name,
+        path: resolveInputPath(name, projectRoot, card.owned_paths, stationConfig.input_scope?.owned_dir),
+      }));
 
     const timeoutMs =
       stationConfig.timeout_seconds !== undefined
@@ -5154,6 +5177,7 @@ async function executeRankStation(args: RankStationArgs): Promise<boolean> {
             undefined,
             (stationConfig.image_inputs ?? []).map((d) => d.path),
             card.owned_paths,
+            stationConfig.input_scope?.owned_dir,
           );
         } catch (renderError) {
           const detail = renderError instanceof Error ? renderError.message : 'unknown error';

@@ -130,6 +130,25 @@ export interface StationConfig {
    * directory is a config violation.
    */
   output_scope?: 'project_root' | 'owned_dir';
+  /**
+   * Which of this station's declared inputs are READ from the card's owned dir
+   * rather than from projectRoot (issue #112, fan-out children). The mirror of
+   * `output_scope`: that one governs where a child WRITES, this one where it
+   * READS. Names listed here resolve to `<owned_paths[0]>/<name>` — the same
+   * card-scoped location seed.json lives in — so N homogeneous children can each
+   * be handed their OWN shard of an input (a per-child patch, one reviewer's
+   * slice of a diff) through one shared template, instead of every sibling
+   * reading one project-root file. Every other declared input is unaffected.
+   *
+   * `seed.json` needs no declaration: the effective card-scoped set is this list
+   * UNION the reserved seed name (WI-468), so pre-existing flows are unchanged.
+   *
+   * Validated at load: a list of strings, each a member of the station's declared
+   * `inputs`, never the synthetic `feedback`, and — unlike output_scope, which is
+   * transform-only because the engine writes declared outputs only for transforms
+   * — allowed on harness stations too, which read inputs the same way.
+   */
+  input_scope?: { owned_dir: string[] };
   /** Optional id of the QC check station gating this station's output. */
   check?: string;
   /** Resolved gate check configuration (populated by the loader when a `check` block is present). */

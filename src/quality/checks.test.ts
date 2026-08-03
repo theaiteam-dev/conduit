@@ -336,6 +336,10 @@ describe('runHarnessGateCheck (agentic critic, a pre-public engine review @queso
       prompt: 'Critique the draft.',
       criticInputScope: [],
       projectRoot: dir,
+      // Unscoped card: every critic input mounts from projectRoot (issue #112,
+      // behavior-preserving — these cases predate card-scoped inputs).
+      ownedPaths: [],
+      ownedDirInputs: [],
       timeoutMs: 5000,
       onReject: 'draft',
       validBackEdges: BACK_EDGES,

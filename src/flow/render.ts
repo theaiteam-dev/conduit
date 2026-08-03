@@ -20,10 +20,17 @@
  *     and referenced, it is resolved from the runtime `feedback` argument —
  *     never from disk. Absent → substituted as empty string (first-entry path).
  *     Undeclared `{{feedback}}` still triggers the scope guard.
+ *   - CARD-SCOPED inputs (the reserved `seed.json` from WI-468, plus anything a
+ *     station lists in `input_scope.owned_dir` — issue #112) are read from the
+ *     CHILD's owned directory rather than from `projectRoot`, via the shared
+ *     ./resolve-input.ts the binding-stamp hasher also calls, so an input can
+ *     never be rendered from one location and hashed from another. Declared,
+ *     referenced, and unresolvable → clear error, never a silent fallback to the
+ *     project-root file of the same name.
  */
 
-import { join } from 'node:path';
 import { readFileSync } from 'node:fs';
+import { isCardScoped, resolveInputPath } from './resolve-input';
 
 /**
  * Regex matching `{{<name>}}` placeholders where `<name>` contains no
@@ -41,16 +48,6 @@ const PLACEHOLDER_RE = /\{\{([^{}\s]+)\}\}/g;
  * redefine.
  */
 const FEEDBACK_INPUT = 'feedback';
-
-/**
- * Reserved synthetic input name for per-child seeds (WI-468 / FR-2a).
- *
- * When a template declares and references `{{seed.json}}`, its content is
- * read from the CHILD's owned directory (`<firstOwnedDir>/seed.json`), NOT
- * from `projectRoot`. The owned dir is supplied via the optional `ownedPaths`
- * param. Absent or unresolvable → clear error, never silent empty.
- */
-const SEED_INPUT = 'seed.json';
 
 /**
  * Render a prompt template by substituting `{{<artifact>}}` placeholders with
@@ -81,11 +78,17 @@ const SEED_INPUT = 'seed.json';
  *                      Omitting this parameter (arity-4 callers) is identical to
  *                      passing an empty list — the existing behaviour is unchanged.
  * @param ownedPaths  - Optional card-scoped owned paths (WI-468). When supplied,
- *                      the reserved `{{seed.json}}` placeholder is resolved from
- *                      `<firstEntry>/seed.json` — the child's own seed materialized
- *                      by commitFanOut — NOT from `projectRoot`. Declared and
- *                      referenced but unresolvable (absent/empty ownedPaths, or no
- *                      seed.json on disk) → clear error, never silent empty.
+ *                      every CARD-SCOPED placeholder is resolved from
+ *                      `<firstEntry>/<name>` — the child's own copy — NOT from
+ *                      `projectRoot`. Declared and referenced but unresolvable
+ *                      (absent/empty ownedPaths, or no such file in the owned
+ *                      dir) → clear error, never silent empty.
+ * @param ownedDirInputs - Optional list of declared inputs that are card-scoped
+ *                      (the station's `input_scope.owned_dir`, issue #112). The
+ *                      effective set is this list UNION the reserved `seed.json`,
+ *                      so omitting the parameter is identical to the WI-468
+ *                      behaviour: seed card-scoped, every other input read from
+ *                      `projectRoot`.
  * @returns The fully-rendered prompt string with every placeholder substituted.
  * @throws  If any placeholder names a declared IMAGE input (image-specific error).
  * @throws  If any placeholder names an artifact not in `inputs` (scope guard).
@@ -98,6 +101,7 @@ export function renderPrompt(
   feedback?: string,
   imageInputs?: string[],
   ownedPaths?: string[],
+  ownedDirInputs?: string[],
 ): string {
   const declaredInputs = new Set(inputs);
   const declaredImageInputs = new Set(imageInputs ?? []);
@@ -167,27 +171,20 @@ export function renderPrompt(
       continue;
     }
 
-    if (name === SEED_INPUT) {
-      // Seed is card-scoped: read from <firstOwnedDir>/seed.json, NOT projectRoot.
-      // Declared+referenced but unresolvable (no scope, empty scope, or missing
-      // file) → clear error. Never silently render empty.
-      if (!ownedPaths || ownedPaths.length === 0) {
-        throw new Error(
-          `Artifact "seed.json" is declared and referenced in the template but could not be read: no owned_paths scope was supplied for this card`,
-        );
-      }
-      const seedPath = join(ownedPaths[0]!, SEED_INPUT);
-      try {
-        artifactContents.set(name, readFileSync(seedPath, 'utf-8'));
-      } catch {
-        throw new Error(
-          `Artifact "seed.json" is declared and referenced in the template but could not be read from "${seedPath}"`,
-        );
-      }
-      continue;
+    // A card-scoped input (the reserved seed.json, or a name the station listed
+    // in input_scope.owned_dir) with NO owned scope to resolve against is
+    // FAIL-CLOSED: resolveInputPath would fall back to projectRoot, and reading
+    // that file would hand this card the shared artifact its per-card copy was
+    // meant to replace — silently, with a plausible-looking prompt. The stamp
+    // path wants the opposite (a missing input hashes as ''), which is why this
+    // guard lives here rather than inside the shared resolver.
+    if (isCardScoped(name, ownedDirInputs) && (!ownedPaths || ownedPaths.length === 0)) {
+      throw new Error(
+        `Artifact "${name}" is declared and referenced in the template but could not be read: no owned_paths scope was supplied for this card`,
+      );
     }
 
-    const artifactPath = join(projectRoot, name);
+    const artifactPath = resolveInputPath(name, projectRoot, ownedPaths, ownedDirInputs);
     try {
       artifactContents.set(name, readFileSync(artifactPath, 'utf-8'));
     } catch {

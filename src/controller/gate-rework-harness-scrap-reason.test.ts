@@ -108,6 +108,9 @@ describe('runGateRework — propagates the gate check\'s own scrap reason (a pre
       adapter: UNUSED_MODEL_ADAPTER,
       harnessRegistry: createHarnessRegistry([critic]),
       projectRoot: dir,
+      // Unscoped card: no card-scoped critic inputs (issue #112, behavior-preserving).
+      ownedPaths: [],
+      ownedDirInputs: [],
       validBackEdges: [{ from: 'ideate', to: 'ideate' }],
     };
   }

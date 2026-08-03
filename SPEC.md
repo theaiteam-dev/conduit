@@ -112,6 +112,7 @@ message broker.
 | Rework loop | reject-to-an-earlier-station, bounded |
 | Scrap bin | the `scrap` terminal lane (A(i)-Team: `blocked`) |
 | Andon cord | the global run budget + liveness watchdog → halt + alert |
+| Kitting (parts staged per work order) | card-scoped artifacts — `input_scope` / `output_scope: owned_dir` (§4) |
 | Poka-yoke (mistake-proofing) | Hooks, schema validation, coercive parsing, path ownership |
 | Jidoka (stop-the-flow) | forward-only across waves + hard-pause on defect; escalate, don't guess |
 | Heijunka (load leveling) | global token bucket / rate limiting across lanes |
@@ -380,6 +381,11 @@ stations:
     effectful: true            # billed external call → intent log (§5)
     materialize: on_approval   # JIT: only after the prompt proxy passes
     fan_out: 2                 # variants are the product, not candidates
+    inputs:  [brief.json, seed.json]
+    outputs: [asset.png]
+    input_scope:
+      owned_dir: [brief.json]  # each child READS its own copy (§9 card scope)
+    output_scope: owned_dir    # …and WRITES into its own dir, not one shared name
 
   - id: review
     check:
@@ -403,6 +409,31 @@ security:                      # the Law (§7)
   bash: { allow: ["ffmpeg", "ffprobe"], deny_shell_metachars: true }
   network_egress: deny         # content-processing workers get no network by default
 ```
+
+**Card scope — `input_scope` / `output_scope` (fan-out children).** By default a
+station's declared `inputs` are read from `<project_root>/<name>` and its declared
+`outputs` written back there — a single static name per station. That is wrong for
+homogeneous fan-out: N children of one `child_entry` station would all read the same
+input and clobber the same output file, when §9 requires artifacts to be **disjoint
+across concurrent cards**. The two knobs move that resolution into the card's own
+directory (`owned_paths[0]`, where `seed.json` already lives):
+
+| Knob | Governs | Applies to |
+|---|---|---|
+| `input_scope: { owned_dir: [<name>, …] }` | which declared **inputs** are READ from the card's dir | `transform` + `harness` stations |
+| `output_scope: project_root \| owned_dir` | where declared **outputs** are WRITTEN | `transform` stations |
+
+Only the names listed in `input_scope.owned_dir` move; every other declared input
+still resolves from the project root, so a child can combine one shared artifact (a
+style guide) with its own shard (its slice of a diff) in a single prompt. `seed.json`
+is **reserved** and card-scoped with no declaration at all — the effective set is the
+declared list ∪ `{seed.json}`. Both knobs are validated at load (a name that is not a
+declared input, or the synthetic `feedback`, is rejected there, not at run time) and
+both are **fail-closed** at use: a card-scoped input that cannot be read from the card's
+dir throws rather than silently falling back to the project-root file of the same name,
+which is precisely the shared artifact the per-child copy was meant to replace. The
+binding stamp (§5) hashes card-scoped inputs from the card's dir too, so sibling
+children get distinct stamps and a changed per-child file re-executes on resume.
 
 Every knob here came from the three flows diverging or from a rev-1 finding. The seam
 is the whole product: *the flow is config; the kernel is the engine.*
