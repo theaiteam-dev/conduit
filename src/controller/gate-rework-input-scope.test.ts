@@ -244,4 +244,63 @@ describe('runGateRework — critic renders card-scoped inputs (issue #112)', () 
     expect(byName.get('patch.txt')).toBe(join(ownedDir, 'patch.txt'));
     expect(byName.get('style-guide.md')).toBe(join(projectRoot, 'style-guide.md'));
   });
+
+  it('FAILS CLOSED rather than mounting the project-root decoy for an unscoped card', async () => {
+    // PR #114 review finding, critic half. `ownedPaths: []` is a legitimate
+    // shape (an unscoped card), and this critic template quotes only the
+    // project-root artifact — so render's guard never fires and the mount was
+    // free to hand the critic DECOY_WHOLE_DIFF under the name of the shard.
+    // A critic judging the shared diff would pass or fail the child on bytes
+    // the child never produced, which is worse than not running at all.
+    seedCard(db!, 'card-a', []);
+    const { adapter: modelAdapter } = recordingCriticAdapter();
+    const { adapter: harness, mounts } = recordingHarnessCritic(projectRoot);
+
+    await expect(
+      runGateRework(
+        buildInput({
+          adapter: modelAdapter,
+          criticTemplate: 'Judge against: {{style-guide.md}}',
+          criticInputScope: ['style-guide.md', 'patch.txt'],
+          ownedPaths: [],
+          ownedDirInputs: ['patch.txt'],
+          criticHarness: 'fake-critic',
+          harnessRegistry: {
+            resolve: () => ({ ok: true, adapter: harness }),
+            list: () => ['fake-critic'],
+          },
+        }),
+      ),
+    ).rejects.toThrow(/Card-scoped input "patch\.txt" cannot be resolved/);
+
+    expect(mounts.length).toBe(0);
+  });
+
+  it('still mounts every input from projectRoot for an unscoped card at an unscoped station', async () => {
+    // The guard must not punish the common case: no input_scope declared means
+    // an unscoped card mounts exactly as it always did.
+    seedCard(db!, 'card-a', []);
+    const { adapter: modelAdapter } = recordingCriticAdapter();
+    const { adapter: harness, mounts } = recordingHarnessCritic(projectRoot);
+
+    const decision = await runGateRework(
+      buildInput({
+        adapter: modelAdapter,
+        criticTemplate: 'Judge against: {{style-guide.md}}',
+        criticInputScope: ['style-guide.md', 'patch.txt'],
+        ownedPaths: [],
+        ownedDirInputs: [],
+        criticHarness: 'fake-critic',
+        harnessRegistry: {
+          resolve: () => ({ ok: true, adapter: harness }),
+          list: () => ['fake-critic'],
+        },
+      }),
+    );
+
+    expect(decision.action).toBe('pass');
+    const byName = new Map(mounts[0]!.map((m) => [m.name, m.path]));
+    expect(byName.get('patch.txt')).toBe(join(projectRoot, 'patch.txt'));
+    expect(byName.get('style-guide.md')).toBe(join(projectRoot, 'style-guide.md'));
+  });
 });

@@ -60,11 +60,32 @@ describe('resolveInputPath — card scope wins over projectRoot (issue #112)', (
     );
   });
 
-  it('falls back to projectRoot when the card has no owned dir', () => {
-    // The stamp path relies on this fallback: an unscoped card hashes from
-    // projectRoot (typically ENOENT → '') rather than throwing. Render layers
-    // its own fail-closed guard on top; see render.ts.
-    expect(resolveInputPath('patch.txt', ROOT, [], ['patch.txt'])).toBe(join(ROOT, 'patch.txt'));
-    expect(resolveInputPath('seed.json', ROOT, undefined, undefined)).toBe(join(ROOT, 'seed.json'));
+  it('THROWS rather than falling back to projectRoot when the card has no owned dir', () => {
+    // PR #114 review: the fallback returned <projectRoot>/<name> — the SHARED
+    // artifact the per-child copy was meant to replace. Silently handing that
+    // back is the exact bug this module exists to prevent, and render's own
+    // guard did not cover the callers that MOUNT an input without referencing
+    // it in a template. Fail closed here, once, for every caller.
+    expect(() => resolveInputPath('patch.txt', ROOT, [], ['patch.txt'])).toThrow(
+      /Card-scoped input "patch\.txt" cannot be resolved/,
+    );
+    expect(() => resolveInputPath('patch.txt', ROOT, undefined, ['patch.txt'])).toThrow(
+      /no owned_paths scope/,
+    );
+    expect(() => resolveInputPath('seed.json', ROOT, undefined, undefined)).toThrow(
+      /Card-scoped input "seed\.json" cannot be resolved/,
+    );
+  });
+
+  it('still resolves an UNSCOPED name from projectRoot on a card with no owned dir', () => {
+    // The throw is scoped to card-scoped names only — a station that declares
+    // no input_scope keeps resolving every input from the project root, which is
+    // the overwhelmingly common (and unchanged) case.
+    expect(resolveInputPath('style-guide.md', ROOT, [], ['patch.txt'])).toBe(
+      join(ROOT, 'style-guide.md'),
+    );
+    expect(resolveInputPath('style-guide.md', ROOT, undefined, undefined)).toBe(
+      join(ROOT, 'style-guide.md'),
+    );
   });
 });

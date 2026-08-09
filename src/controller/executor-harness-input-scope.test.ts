@@ -74,9 +74,16 @@ function makeRecordingHarness(): { adapter: HarnessAdapter; calls: HarnessInvoca
  * A harness reviewer whose per-child shard (`patch.txt`) is card-scoped and
  * whose house style (`style-guide.md`) stays at project root.
  */
-function writeShardHarnessFlow(dir: string, registry: HarnessRegistry): FlowConfig {
+function writeShardHarnessFlow(
+  dir: string,
+  registry: HarnessRegistry,
+  opts: { promptBody?: string } = {},
+): FlowConfig {
   mkdirSync(join(dir, 'prompts'), { recursive: true });
-  writeFileSync(join(dir, 'prompts', 'review.md'), 'Review: {{patch.txt}}');
+  // Default template QUOTES the shard. A caller can pass a body that references
+  // no artifact — the mount-only shape a harness station is free to use, and the
+  // one render's fail-closed guard cannot see.
+  writeFileSync(join(dir, 'prompts', 'review.md'), opts.promptBody ?? 'Review: {{patch.txt}}');
   writeFileSync(join(dir, 'patch.txt'), 'DECOY_WHOLE_DIFF');
   writeFileSync(join(dir, 'style-guide.md'), 'HOUSE_STYLE');
   writeFileSync(
@@ -203,5 +210,74 @@ describe('harness maker — card-scoped input mounts (issue #112)', () => {
     const mounted = calls[0]!.inputs.find((m) => m.name === 'patch.txt')!.path;
     expect(mounted).toBe(join(ownedDir, 'patch.txt'));
     expect(mounted).not.toBe(join(projectDir, 'patch.txt'));
+  });
+
+  it('FAILS CLOSED on a card with no owned dir instead of mounting the project-root decoy', async () => {
+    // PR #114 review finding. renderPrompt's fail-closed guard only fires for
+    // names the TEMPLATE references — and a harness station does not have to
+    // reference what it mounts. This prompt names no artifact at all, so render
+    // passes cleanly and the mount was the only thing standing between an
+    // unscoped card and DECOY_WHOLE_DIFF being handed over under the name of a
+    // shard. resolveInputPath now throws for every caller, not just render.
+    const { adapter: harness, calls } = makeRecordingHarness();
+    const registry = createHarnessRegistry([harness]);
+    const flow = writeShardHarnessFlow(projectDir, registry, { promptBody: 'Review the mounted shard.' });
+
+    db!.insertCard({
+      run_id: DEFAULT_RUN_ID,
+      id: 'entry',
+      parent_id: null,
+      lane: 'review_shard',
+      status: 'ready',
+      attempt: 0,
+      wave: 0,
+      // No owned dir — the card has no per-child copy of patch.txt to read.
+      owned_paths: [],
+      rework_count: 0,
+    });
+
+    await expect(
+      runExecutor({
+        db: db!, flow, now: SECONDS(1000), adapter: makeThrowingModel(), io: makeIO().io,
+        harnessRegistry: registry,
+      } as RunEngineArgs),
+    ).rejects.toThrow(/Card-scoped input "patch\.txt" cannot be resolved/);
+
+    // The agent was never handed the shared artifact under the card-scoped
+    // name — the whole point of the fix.
+    expect(calls.length).toBe(0);
+    expect(db!.getCard(DEFAULT_RUN_ID, 'entry')?.lane).not.toBe('done');
+  });
+
+  it('fails the same way whether the unresolvable scope is caught by render or by the mount', async () => {
+    // Shape check: the mount's new throw is not a novel failure mode. The
+    // template-quoting variant of the very same flow already fail-closed out of
+    // runExecutor via render's guard, so both halves of the fix escalate
+    // identically — what changed is only that the mount-only shape stopped
+    // silently succeeding.
+    const { adapter: harness, calls } = makeRecordingHarness();
+    const registry = createHarnessRegistry([harness]);
+    const flow = writeShardHarnessFlow(projectDir, registry); // default: quotes {{patch.txt}}
+
+    db!.insertCard({
+      run_id: DEFAULT_RUN_ID,
+      id: 'entry',
+      parent_id: null,
+      lane: 'review_shard',
+      status: 'ready',
+      attempt: 0,
+      wave: 0,
+      owned_paths: [],
+      rework_count: 0,
+    });
+
+    await expect(
+      runExecutor({
+        db: db!, flow, now: SECONDS(1000), adapter: makeThrowingModel(), io: makeIO().io,
+        harnessRegistry: registry,
+      } as RunEngineArgs),
+    ).rejects.toThrow(/no owned_paths scope was supplied for this card/);
+
+    expect(calls.length).toBe(0);
   });
 });

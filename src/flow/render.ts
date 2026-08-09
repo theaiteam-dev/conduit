@@ -173,11 +173,11 @@ export function renderPrompt(
 
     // A card-scoped input (the reserved seed.json, or a name the station listed
     // in input_scope.owned_dir) with NO owned scope to resolve against is
-    // FAIL-CLOSED: resolveInputPath would fall back to projectRoot, and reading
-    // that file would hand this card the shared artifact its per-card copy was
-    // meant to replace — silently, with a plausible-looking prompt. The stamp
-    // path wants the opposite (a missing input hashes as ''), which is why this
-    // guard lives here rather than inside the shared resolver.
+    // FAIL-CLOSED: substituting the project-root file would hand this card the
+    // shared artifact its per-card copy was meant to replace — silently, with a
+    // plausible-looking prompt. resolveInputPath now throws on exactly this
+    // condition too; this guard runs first only to name the template context in
+    // the message, matching every other unreadable-artifact error below.
     if (isCardScoped(name, ownedDirInputs) && (!ownedPaths || ownedPaths.length === 0)) {
       throw new Error(
         `Artifact "${name}" is declared and referenced in the template but could not be read: no owned_paths scope was supplied for this card`,

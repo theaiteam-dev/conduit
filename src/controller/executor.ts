@@ -3113,6 +3113,14 @@ async function executeTransformStation(args: TransformArgs): Promise<boolean> {
       // projectRoot. Hash from the SAME location renderPrompt reads — the shared
       // resolver guarantees it — otherwise sibling children holding different
       // per-child files would get identical stamps (WI-468 BUG-1, issue #112).
+      //
+      // A card-scoped input on a card with no owned dir makes resolveInputPath
+      // THROW rather than name the project-root file; the catch below turns that
+      // into '' — the same stamp an absent file yields. Deliberate: hashing the
+      // shared artifact instead would make every unscoped sibling stamp
+      // identically, which is the collision this resolver exists to prevent.
+      // The card still cannot execute — render and the mounts let that throw
+      // propagate — so '' is never a stamp anything skip-replays against.
       const inputPath = resolveInputPath(
         inputName, projectRoot, card.owned_paths, stationConfig.input_scope?.owned_dir,
       );
@@ -3598,7 +3606,9 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
   const inputHashes = stationConfig.inputs.map((inputName) => {
     try {
       // Card-scoped inputs resolve from the child's owned dir — same shared
-      // resolver the transform stamp and renderPrompt use (issue #112).
+      // resolver the transform stamp and renderPrompt use (issue #112). As
+      // there, an unresolvable card scope throws and the catch hashes '' rather
+      // than folding in the shared project-root artifact.
       const inputPath = resolveInputPath(
         inputName, projectRoot, card.owned_paths, stationConfig.input_scope?.owned_dir,
       );

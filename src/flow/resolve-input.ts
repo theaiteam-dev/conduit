@@ -60,20 +60,31 @@ export function isCardScoped(name: string, ownedDirInputs?: readonly string[]): 
  * Card-scoped names resolve to `<ownedPaths[0]>/<name>`; everything else to
  * `<projectRoot>/<name>`.
  *
- * A card-scoped name on a card with NO owned dir falls back to projectRoot
- * rather than throwing, because the two callers want different failure shapes
- * from the same unresolvable input (both preserved from the seed behavior this
- * generalizes):
- *   - the binding stamp hashes a missing file as '' — a card that cannot supply
- *     the input still gets a stamp, and the difference still invalidates;
- *   - `renderPrompt` FAILS CLOSED, throwing before it would substitute a
- *     project-root file for the per-child one the template asked for.
- * The fail-closed guard therefore lives in render.ts, ahead of this call.
+ * FAIL-CLOSED. A card-scoped name on a card with NO owned dir THROWS; it does
+ * not fall back to `<projectRoot>/<name>`. That fallback is precisely the bug
+ * this module exists to prevent: the project-root file of the same name is the
+ * SHARED artifact the per-child copy was meant to replace, so returning it hands
+ * a caller plausible-looking wrong bytes instead of an error. Concretely, it
+ * would let a harness station mount the whole diff under the name of a shard —
+ * and, worse, let every sibling hash that same shared file into its binding
+ * stamp, so N cards stamp identically and skip-replay serves one card's output
+ * to another (WI-468 BUG-1, generalized; PR #114 review).
+ *
+ * Callers still choose their own failure SHAPE around this throw, which is why
+ * it is raised here rather than at each use site:
+ *   - the binding-stamp hashers catch it and hash '' — the same value an absent
+ *     file already produces, so a card that cannot supply the input still gets a
+ *     stamp and the difference still invalidates;
+ *   - `renderPrompt` and the harness input MOUNTS let it propagate, so the card
+ *     escalates rather than executing against the wrong artifact.
+ * `renderPrompt` additionally pre-checks the same condition to raise a
+ * template-specific message; this throw is the backstop for every other caller.
  *
  * @param name           - Declared input artifact name.
  * @param projectRoot    - Absolute project root (the default scope).
  * @param ownedPaths     - The card's owned paths; `[0]` is the child dir.
  * @param ownedDirInputs - The station's `input_scope.owned_dir` list.
+ * @throws If `name` is card-scoped but `ownedPaths` is empty/absent.
  */
 export function resolveInputPath(
   name: string,
@@ -81,8 +92,14 @@ export function resolveInputPath(
   ownedPaths?: readonly string[],
   ownedDirInputs?: readonly string[],
 ): string {
-  const ownedDir = ownedPaths?.[0];
-  if (ownedDir !== undefined && isCardScoped(name, ownedDirInputs)) {
+  if (isCardScoped(name, ownedDirInputs)) {
+    const ownedDir = ownedPaths?.[0];
+    if (ownedDir === undefined) {
+      throw new Error(
+        `Card-scoped input "${name}" cannot be resolved: no owned_paths scope was supplied for this card. ` +
+          `Refusing to fall back to the project-root artifact of the same name.`,
+      );
+    }
     return join(ownedDir, name);
   }
   return join(projectRoot, name);
