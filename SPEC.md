@@ -431,7 +431,10 @@ declared list ∪ `{seed.json}`. Both knobs are validated at load (a name that i
 declared input, or the synthetic `feedback`, is rejected there, not at run time) and
 both are **fail-closed** at use: a card-scoped input that cannot be read from the card's
 dir throws rather than silently falling back to the project-root file of the same name,
-which is precisely the shared artifact the per-child copy was meant to replace. The
+which is precisely the shared artifact the per-child copy was meant to replace. Both are
+also **confined**: a declared name that resolves outside the directory it is scoped to —
+lexically via `..`, or through a symlink — is rejected on the read side exactly as it
+already was on the write side, so reads and writes obey one rule. The
 binding stamp (§5) hashes card-scoped inputs from the card's dir too, so sibling
 children get distinct stamps and a changed per-child file re-executes on resume.
 

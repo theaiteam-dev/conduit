@@ -29,7 +29,8 @@
  * and seed all live in one predictable directory.
  */
 
-import { join } from 'node:path';
+import { join, resolve, sep } from 'node:path';
+import { realpathSync } from 'node:fs';
 
 /**
  * Reserved synthetic input name for per-child seeds (WI-468 / FR-2a).
@@ -100,7 +101,88 @@ export function resolveInputPath(
           `Refusing to fall back to the project-root artifact of the same name.`,
       );
     }
-    return join(ownedDir, name);
+    return confineToBase(ownedDir, name, 'owned directory');
   }
-  return join(projectRoot, name);
+  return confineToBase(projectRoot, name, 'project root');
+}
+
+/**
+ * Assert that `<base>/<name>` stays inside `base`, and return the joined path.
+ *
+ * The READ-side counterpart of the output escape guard in `executor.ts` (Issue
+ * C), using the same two-root technique for the same reasons. Inputs never had
+ * one: every declared input has been read via a bare `join(projectRoot, name)`
+ * since long before card scope existed, so a station declaring
+ * `inputs: ['../../../etc/passwd']` was read verbatim (PR #114 review).
+ *
+ * This is defense in depth, not a privilege boundary. `name` comes from the
+ * flow's own `inputs:` list, and a flow author already chooses the commands
+ * their stations run — anyone who can add a traversing input name can more
+ * directly add a command that cats the same file. What the guard buys is that
+ * reads and writes now obey ONE rule, so neither side has to be re-audited on
+ * the assumption the other is looser, and a malformed name fails loudly at the
+ * chokepoint instead of quietly reading something outside the tree.
+ *
+ * Three tiers, most canonical first:
+ *   - TARGET exists  → realpath the target ITSELF. This is where the read side
+ *     must go further than the write side: an output is being created, so only
+ *     its parent can be canonicalized, but an input is being READ, so the leaf
+ *     is resolvable — and a symlink AT the leaf (`<owned>/patch.txt` →
+ *     `/etc/passwd`) is exactly the read-side attack. Parent-only resolution
+ *     accepts it, since the parent is honest and the filename is appended
+ *     verbatim.
+ *   - parent EXISTS  → realpath the parent and reattach the name, so an ancestor
+ *     symlink cannot launder an escape into a false allow;
+ *   - parent ENOENT  → compare lexically. A path that cannot be resolved cannot
+ *     be symlink-checked, and comparing lexical-to-lexical avoids false rejects
+ *     when the base itself is reached through a symlink (e.g. macOS `/tmp`).
+ *     A missing input is legal here — the binding stamp hashes it as '' — so
+ *     this branch is ordinary, not exceptional.
+ * The first two tiers compare against the realpath'd base, the third against the
+ * lexical one; mixing canonical against lexical is what produces false rejects.
+ *
+ * Returns the plain `join(base, name)`, NOT the realpath'd form: the resolved
+ * path is used for the confinement test only. Callers (and their error
+ * messages) keep seeing the path the flow declared, and a legitimate symlink
+ * INSIDE the scope is still read through the name the flow chose.
+ */
+function confineToBase(base: string, name: string, label: string): string {
+  const lexicalBase = resolve(base);
+  const lexicalTarget = resolve(join(base, name));
+
+  let resolvedTarget = lexicalTarget;
+  let canonical = false;
+  try {
+    resolvedTarget = realpathSync(lexicalTarget);
+    canonical = true;
+  } catch {
+    const parentDir = join(lexicalTarget, '..');
+    try {
+      const resolvedParent = realpathSync(parentDir);
+      const fileName = lexicalTarget.slice(parentDir.length).replace(/^[\\/]+/, '');
+      resolvedTarget = join(resolvedParent, fileName);
+      canonical = true;
+    } catch {
+      // Neither the target nor its parent exists — fall through to the lexical check.
+    }
+  }
+
+  const rootForCheck = canonical
+    ? (() => {
+        try {
+          return realpathSync(base);
+        } catch {
+          return lexicalBase;
+        }
+      })()
+    : lexicalBase;
+
+  if (resolvedTarget !== rootForCheck && !resolvedTarget.startsWith(rootForCheck + sep)) {
+    throw new Error(
+      `Input "${name}" resolves outside the ${label} '${rootForCheck}'. ` +
+        `Declared input names must not traverse above the directory they are scoped to.`,
+    );
+  }
+
+  return join(base, name);
 }

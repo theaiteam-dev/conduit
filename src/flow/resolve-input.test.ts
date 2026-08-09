@@ -12,8 +12,10 @@
  * HASHED from another — the divergence that produced the WI-468 BUG-1 stamp
  * collision.
  */
-import { describe, it, expect } from 'bun:test';
+import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import { join } from 'node:path';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync, realpathSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { isCardScoped, resolveInputPath } from './resolve-input';
 
 const ROOT = '/proj';
@@ -86,6 +88,109 @@ describe('resolveInputPath — card scope wins over projectRoot (issue #112)', (
     );
     expect(resolveInputPath('style-guide.md', ROOT, undefined, undefined)).toBe(
       join(ROOT, 'style-guide.md'),
+    );
+  });
+});
+
+/**
+ * Traversal confinement (PR #114 review, second pass).
+ *
+ * The READ side never had the escape guard the WRITE side has had since the
+ * output_scope work — every declared input was read via a bare
+ * `join(projectRoot, name)`. These use REAL directories because the guard's
+ * symlink branch only engages when the target's parent actually exists.
+ */
+describe('resolveInputPath — traversal confinement (issue #112 / PR #114 review)', () => {
+  let root: string;
+  let owned: string;
+  let outside: string;
+
+  beforeEach(() => {
+    // realpathSync so the fixture root is already canonical — otherwise on
+    // platforms where the temp dir is itself a symlink (macOS /tmp) the
+    // assertions below would be testing the harness, not the guard.
+    root = realpathSync(mkdtempSync(join(tmpdir(), 'conduit-resolve-confine-')));
+    owned = join(root, 'child-a');
+    mkdirSync(owned, { recursive: true });
+    outside = realpathSync(mkdtempSync(join(tmpdir(), 'conduit-resolve-outside-')));
+    writeFileSync(join(outside, 'secret.txt'), 'SECRET', 'utf-8');
+  });
+
+  afterEach(() => {
+    rmSync(root, { recursive: true, force: true });
+    rmSync(outside, { recursive: true, force: true });
+  });
+
+  it('rejects a card-scoped name that traverses above the owned dir', () => {
+    expect(() => resolveInputPath('../../etc/passwd', root, [owned], ['../../etc/passwd'])).toThrow(
+      /resolves outside the owned directory/,
+    );
+  });
+
+  it('rejects an unscoped name that traverses above the project root', () => {
+    // The pre-existing hole: this path predates card scope entirely.
+    expect(() => resolveInputPath('../secret.txt', root, [owned], [])).toThrow(
+      /resolves outside the project root/,
+    );
+  });
+
+  it('rejects a symlink inside the owned dir that points outside it', () => {
+    // The reason the guard realpaths rather than only normalizing lexically:
+    // '<owned>/leak.txt' is lexically confined and still reads SECRET.
+    symlinkSync(join(outside, 'secret.txt'), join(owned, 'leak.txt'));
+    expect(() => resolveInputPath('leak.txt', root, [owned], ['leak.txt'])).toThrow(
+      /resolves outside the owned directory/,
+    );
+  });
+
+  it('allows a symlink that stays INSIDE the scope, returning the declared name', () => {
+    // Canonicalizing the leaf must not outlaw symlinks outright — only ones that
+    // leave the scope. The returned path is still the declared name, so the
+    // caller reads through the link exactly as the flow wrote it.
+    writeFileSync(join(owned, 'real.txt'), 'MY_SHARD', 'utf-8');
+    symlinkSync(join(owned, 'real.txt'), join(owned, 'alias.txt'));
+    expect(resolveInputPath('alias.txt', root, [owned], ['alias.txt'])).toBe(
+      join(owned, 'alias.txt'),
+    );
+  });
+
+  it('allows a name in a subdirectory of the scope', () => {
+    mkdirSync(join(owned, 'shards'), { recursive: true });
+    writeFileSync(join(owned, 'shards', 'a.diff'), 'SHARD', 'utf-8');
+    expect(resolveInputPath('shards/a.diff', root, [owned], ['shards/a.diff'])).toBe(
+      join(owned, 'shards/a.diff'),
+    );
+  });
+
+  it('neutralizes an absolute-looking name into a confined path rather than escaping', () => {
+    // join() already treats a leading '/' as a segment, so this lands INSIDE the
+    // scope. Pinned so the guard is never "fixed" into rejecting it, and so the
+    // neutralization itself is not silently lost.
+    expect(resolveInputPath('/etc/passwd', root, [owned], ['/etc/passwd'])).toBe(
+      join(owned, 'etc/passwd'),
+    );
+  });
+
+  it('still resolves a MISSING file inside the scope (the stamp path depends on it)', () => {
+    // The lexical branch — no parent to realpath. A missing input is legal: the
+    // binding stamp hashes it as ''. The guard must not turn absence into an error.
+    expect(resolveInputPath('not-yet-written.json', root, [owned], ['not-yet-written.json'])).toBe(
+      join(owned, 'not-yet-written.json'),
+    );
+    expect(resolveInputPath('deep/nested/missing.json', root, [owned], ['deep/nested/missing.json'])).toBe(
+      join(owned, 'deep/nested/missing.json'),
+    );
+  });
+
+  it('allows a scope reached THROUGH a symlink (no false reject)', () => {
+    // A symlinked project root is a normal deployment shape; confinement must
+    // compare canonical-to-canonical, not canonical-to-lexical.
+    const linkedRoot = join(outside, 'link-to-root');
+    symlinkSync(root, linkedRoot);
+    writeFileSync(join(owned, 'patch.txt'), 'MY_SHARD', 'utf-8');
+    const viaLink = join(linkedRoot, 'child-a');
+    expect(resolveInputPath('patch.txt', linkedRoot, [viaLink], ['patch.txt'])).toBe(
+      join(viaLink, 'patch.txt'),
     );
   });
 });
