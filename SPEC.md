@@ -606,7 +606,12 @@ The back-edge makes the flow cyclic, not a DAG — DAG engines structurally cann
 express it (this is why Conduit is a state machine, not Airflow). It is bounded by
 **four** independent mechanisms (rev-1 added #2 and #4 over the original three):
 
-1. **Per-card rework cap → scrap** (or `proceed_with_findings`). Graceful, per-card.
+1. **Per-card, per-gate rework cap → scrap** (or `proceed_with_findings`). Graceful.
+   `rework_cap` is declared on each station's `check:` block, so the counter it bounds
+   is scoped to the **(card, gate)** pair — a gate declaring `rework_cap: 3` grants that
+   card three cycles *at that gate*, independent of what any other gate in the flow has
+   already spent. (`cards.rework_count` remains the card's lifetime total across all
+   gates; it is history and prompt-threading, not a budget.)
    *(A(i)-Team: `rejection_count ≥ cap → blocked`, enforced in the planner, not just
    the API.)*
 2. **Per-execution-attempt cap.** Integrity-fail / parse-fail retries are bounded

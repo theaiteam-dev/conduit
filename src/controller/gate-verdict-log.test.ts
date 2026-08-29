@@ -230,7 +230,7 @@ describe('runGateRework — widened decision carries verdict/findings/returnTo/a
       workerStationId: 'ideate',
       attempt: opts.attempt,
       maxExecutionAttempts: 4,
-      reworkCount: opts.reworkCount,
+      gateReworkCount: opts.reworkCount,
       gateConfig: gateConfigFor(dir),
       adapter: criticAdapter(opts.verdict, opts.findings, opts.returnTo),
       projectRoot: dir,

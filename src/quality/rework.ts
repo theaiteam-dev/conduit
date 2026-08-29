@@ -6,7 +6,9 @@
  * decision via the WI-293 FSM.
  *
  * Four independent guards, each on its own counter:
- *   1. Per-card rework cap (reworkCount) + no_progress detection on findings_hash.
+ *   1. Per-card-PER-GATE rework cap (reworkCount) + no_progress detection on
+ *      findings_hash. The counter is scoped to the (card, gate) pair, not the
+ *      card alone — see `countGateReworks` below for why.
  *   2. Per-execution-attempt cap (executionAttempt) — completely independent of
  *      the rework counter by construction.
  *   3. Progress-monotonicity: identical consecutive findings_hash → immediate
@@ -25,6 +27,62 @@ import type { Lane, StationOutput } from '../types/kernel';
 // ---------------------------------------------------------------------------
 
 /**
+ * The minimum shape `countGateReworks` reads off a `card_log` row. Kept
+ * structural (rather than importing `StoredCardLogEntry`) so this module stays
+ * DB-agnostic — every guard here is a pure function over data the caller
+ * fetched.
+ */
+export interface GateReworkLogEntry {
+  kind: string;
+  station: string;
+  reasonClass?: string | undefined;
+}
+
+/**
+ * Guard 1's counter: how many rework cycles this card has already spent AT ONE
+ * GATE, derived from the card_log.
+ *
+ * WHY THIS IS NOT `cards.rework_count` (issue #1): `rework_count` is a single
+ * lifetime counter that is incremented on every rework anywhere in the flow and
+ * never reset. But `rework_cap` is declared PER GATE
+ * (`stations.<id>.check.rework_cap`), and SPEC §4's own example gives one flow's
+ * two gates different caps. Comparing the lifetime counter against a per-gate
+ * cap let reworks spent at an early gate silently consume every later gate's
+ * budget: a gate declaring `rework_cap: 3` behaved as 2, 1, or 0 depending on
+ * unrelated upstream history, and under the default `cap_policy: scrap` a gate
+ * whose cap was already exhausted upstream scrapped the card on its FIRST
+ * reject — destroying work that never got a single one of its advertised
+ * chances.
+ *
+ * The journal already records exactly this fact, so no extra durable state is
+ * introduced: `advanceCard` writes an `entered_lane` row stamped with the GATE's
+ * station and `reasonClass: 'rework'` every time a gate sends a card back, and
+ * the attempt bump that rides along guarantees each of those rows lands at a
+ * distinct `(station, attempt)` — so they never collide under the card_log's
+ * `UNIQUE(run_id, card_id, station, attempt, kind)` idempotency key and are
+ * never double-counted on replay. Counting them is therefore precisely "reworks
+ * this gate has spent". Guard 3 (`findImmediatelyPriorVerdict`) already derives
+ * itself from the same log.
+ *
+ * `cards.rework_count` is deliberately left alone as the card's LIFETIME total —
+ * `CONDUIT_REWORK_COUNT` and the `{{feedback}}` threading gates both want "has
+ * this card ever been reworked", which is a different question.
+ */
+export function countGateReworks(
+  log: ReadonlyArray<GateReworkLogEntry>,
+  gateStation: string,
+): number {
+  let spent = 0;
+  for (const entry of log) {
+    if (entry.kind !== 'entered_lane') continue;
+    if (entry.station !== gateStation) continue;
+    if (entry.reasonClass !== 'rework') continue;
+    spent += 1;
+  }
+  return spent;
+}
+
+/**
  * Input to the QC reject decision.  Consumes the WI-289 StationOutput verdict
  * directly — findings_hash and return_to are the authoritative fields.
  */
@@ -36,7 +94,14 @@ export interface QcRejectInput {
    * the first rejection for this card.  Null → no no-progress check.
    */
   previousFindingsHash: string | null;
+  /**
+   * Rework cycles ALREADY SPENT AT THE GATE whose `reworkCap` is being applied
+   * below — NOT the card's lifetime rework total. `reworkCap` is declared
+   * per-gate (`stations.<id>.check.rework_cap`), so the counter it is compared
+   * against must be scoped the same way. Derive it with `countGateReworks`.
+   */
   reworkCount: number;
+  /** This gate's declared `check.rework_cap`. */
   reworkCap: number;
   capPolicy: 'scrap' | 'proceed_with_findings';
 }
@@ -69,7 +134,7 @@ export function decideQcReject(input: QcRejectInput): QcRejectDecision {
     previousFindingsHash !== null &&
     verdict.findings_hash === previousFindingsHash;
 
-  // Guard 1 — per-card rework cap.
+  // Guard 1 — per-card-per-gate rework cap (see QcRejectInput.reworkCount).
   const atCap = reworkCount >= reworkCap;
 
   if (noProgress || atCap) {

@@ -106,7 +106,7 @@ describe('runGateRework — criticTimeoutMs threads into the harness invocation'
       workerStationId: 'ideate',
       attempt: 0,
       maxExecutionAttempts: 4,
-      reworkCount: 0,
+      gateReworkCount: 0,
       gateConfig: {
         criticModel: 'unused',
         criticPromptFile: join(dir, 'critic.md'),

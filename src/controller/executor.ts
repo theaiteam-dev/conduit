@@ -73,7 +73,7 @@ import type { FsmState, TransitionContext } from '../statemachine/transitions';
 import { commitFanOut, evaluateFanIn } from '../dag/expand';
 import type { ArchitectProposal, FanInPolicy, FanInState } from '../dag/expand';
 import { runRankCheck, decideFromCandidates, parseCandidatesArtifact, type RankDecision } from '../quality/rank';
-import { aggregateByWave, checkWaveBudget, decideExecutionRetry } from '../quality/rework';
+import { aggregateByWave, checkWaveBudget, countGateReworks, decideExecutionRetry } from '../quality/rework';
 import type { CardUsage, BudgetCaps } from '../quality/rework';
 import {
   egressSend,
@@ -409,7 +409,7 @@ export async function runExecutor(args: RunEngineArgs): Promise<void> {
           const ctx = buildTransitionContext(
             msg.station, flow, happyPathNext, terminalLanes, maxExecutionAttempts,
           );
-          const fsmState = syntheticDonePendingAck(card);
+          const fsmState = syntheticDonePendingAck(card, REWORK_COUNT_UNREAD);
           const fsmResult = transition(fsmState, { type: 'INTEGRITY_PASS' }, ctx);
 
           if (!fsmResult.ok) {
@@ -472,7 +472,13 @@ export async function runExecutor(args: RunEngineArgs): Promise<void> {
             const ctx = buildTransitionContext(
               msg.station, flow, happyPathNext, terminalLanes, maxExecutionAttempts,
             );
-            const fsmState = syntheticDonePendingAck(card);
+            // Per-gate rework budget (issue #1): count only the reworks this
+            // station's own gate has already spent, so the pooled path caps
+            // identically to the synchronous gate path below rather than
+            // inheriting an upstream gate's exhausted lifetime counter.
+            const fsmState = syntheticDonePendingAck(
+              card, gateReworksSpent(db, runId, msg.cardId, msg.station),
+            );
             const rejectResult = transition(fsmState, { type: 'QC_REJECT', returnTo: card.lane }, ctx);
             if (!rejectResult.ok) {
               escalateToHold(stateDb, db, msg.cardId, msg.station, card,
@@ -2532,6 +2538,11 @@ async function runGateCheckOrAdvance(args: GateCheckOrAdvanceArgs): Promise<bool
 
   // ── Run gate check (if configured) ───────────────────────────────────────
   if (stationConfig.gateCheck) {
+    // Guard #1's counter, scoped to THIS station's gate (issue #1). Derived
+    // ONCE and used for BOTH the gate's cap check and the FSM's own cap check
+    // below, so the two can never disagree about how much budget is left.
+    const gateReworkCount = gateReworksSpent(db, runId, cardId, stationId);
+
     // WI-570 rework: an unresolvable check.critic.harness name (config error,
     // not caught at load time — WI-563's UNKNOWN_HARNESS_ADAPTER only covers a
     // kind:harness MAKER's worker.harness, not a gate's critic.harness) throws
@@ -2551,7 +2562,7 @@ async function runGateCheckOrAdvance(args: GateCheckOrAdvanceArgs): Promise<bool
         workerStationId: stationId,
         attempt: card.attempt,
         maxExecutionAttempts,
-        reworkCount: card.rework_count ?? 0,
+        gateReworkCount,
         gateConfig: stationConfig.gateCheck,
         adapter: trackingAdapter,
         harnessRegistry,
@@ -2604,7 +2615,7 @@ async function runGateCheckOrAdvance(args: GateCheckOrAdvanceArgs): Promise<bool
     // done_pending_ack is never persisted (the executor transitions atomically
     // from 'working' to whatever the FSM resolves).
     const ctx = buildTransitionContext(stationId, flow, happyPathNext, terminalLanes, maxExecutionAttempts);
-    const fsmState = syntheticDonePendingAck(card);
+    const fsmState = syntheticDonePendingAck(card, gateReworkCount);
 
     switch (gateDecision.action) {
       case 'pass': {
@@ -2741,7 +2752,7 @@ async function runGateCheckOrAdvance(args: GateCheckOrAdvanceArgs): Promise<bool
   if (!noGateDelivery.ok) return false;
 
   const noGateCtx = buildTransitionContext(stationId, flow, happyPathNext, terminalLanes, maxExecutionAttempts);
-  const noGateFsmState = syntheticDonePendingAck(card);
+  const noGateFsmState = syntheticDonePendingAck(card, REWORK_COUNT_UNREAD);
   const noGateResult = transition(noGateFsmState, { type: 'INTEGRITY_PASS' }, noGateCtx);
 
   if (!noGateResult.ok) {
@@ -4047,14 +4058,52 @@ function buildTransitionContext(
  * 'working' to whatever the FSM says comes after done_pending_ack).
  */
 function syntheticDonePendingAck(
-  card: { lane: string; attempt: number; rework_count?: number },
+  card: { lane: string; attempt: number },
+  /**
+   * Reworks already spent AT THE GATE this transition is being evaluated
+   * against — `gateReworksSpent(...)`, never `card.rework_count` (issue #1).
+   * The FSM compares this against `ctx.reworkCap`, which is that same gate's
+   * declared `check.rework_cap`, so a lifetime counter here let an upstream
+   * gate's reworks exhaust this gate's budget.
+   *
+   * REQUIRED even at the INTEGRITY_PASS / FAN_OUT call sites, where the FSM
+   * ignores it: an optional parameter defaulting to the lifetime scalar is
+   * exactly the footgun this rename exists to remove.
+   */
+  gateReworkCount: number,
 ): FsmState {
   return {
     lane: card.lane,
     status: 'done_pending_ack',
     executionAttempt: card.attempt,
-    reworkCount: card.rework_count ?? 0,
+    reworkCount: gateReworkCount,
   };
+}
+
+/**
+ * `gateReworkCount` for `syntheticDonePendingAck` call sites whose event is NOT
+ * QC_REJECT. Only QC_REJECT reads `state.reworkCount` (transitions.ts ~186);
+ * INTEGRITY_PASS and FAN_OUT ignore it entirely, so those sites would otherwise
+ * pay a card_log read on a hot path purely to fill a parameter.
+ *
+ * A named constant rather than a default value: the parameter stays REQUIRED,
+ * so a QC_REJECT site still cannot silently inherit the lifetime scalar
+ * (issue #1), while the sites that provably never read it don't query for it.
+ */
+const REWORK_COUNT_UNREAD = 0;
+
+/**
+ * Reworks this card has already spent at `stationId`'s gate, read from the
+ * card_log (see `countGateReworks`). Guard #1's counter — deliberately NOT
+ * `cards.rework_count`, which is the card's lifetime total across every gate.
+ */
+function gateReworksSpent(
+  db: ConduitDB,
+  runId: string,
+  cardId: string,
+  stationId: string,
+): number {
+  return countGateReworks(db.getCardLogForRun(runId, cardId), stationId);
 }
 
 /**
@@ -4946,7 +4995,7 @@ function handleFanOutComplete(args: FanOutCompleteArgs): boolean {
   // INTEGRITY_PASS would advance the parent to happyPathNext['plan'] = 'merge',
   // which is incorrect — the parent must wait for its children (AC6).
   const ctx = buildTransitionContext(stationId, flow, happyPathNext, terminalLanes, maxExecutionAttempts);
-  const fsmState = syntheticDonePendingAck(card);
+  const fsmState = syntheticDonePendingAck(card, REWORK_COUNT_UNREAD);
   const fanOutResult = transition(fsmState, { type: 'FAN_OUT' }, ctx);
 
   if (!fanOutResult.ok) {

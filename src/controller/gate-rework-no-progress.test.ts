@@ -101,7 +101,7 @@ function buildInput(opts: {
     workerStationId: 'ideate',
     attempt: opts.attempt,
     maxExecutionAttempts: 4,
-    reworkCount: opts.reworkCount,
+    gateReworkCount: opts.reworkCount,
     gateConfig: {
       criticModel: CRITIC_MODEL,
       criticPromptFile: join(opts.dir, 'critic.md'),

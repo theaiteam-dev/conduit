@@ -6,8 +6,9 @@
  * and applies the durable rework guards to produce a concrete next action
  * for the caller: advance forward, rework to the back-edge, or scrap.
  *
- * This module has NO DB access; the caller reads the current rework_count from
- * the DB and passes it in, then applies the returned decision to the DB.
+ * The caller supplies the per-gate rework count (see `gateReworkCount` below)
+ * and applies the returned decision to the DB; the only read this module makes
+ * for itself is the card_log lookup guard #3 needs.
  */
 
 import { readFileSync } from 'node:fs';
@@ -40,8 +41,18 @@ export interface GateReworkInput {
   workerStationId: string;
   attempt: number;
   maxExecutionAttempts: number;
-  /** Current durable rework count for this card (from cards.rework_count). */
-  reworkCount: number;
+  /**
+   * Rework cycles ALREADY SPENT AT THIS STATION'S GATE — NOT the card's lifetime
+   * `cards.rework_count` (issue #1). `gateConfig.reworkCap` is declared per-gate,
+   * so the counter compared against it must be scoped per-gate too; passing the
+   * lifetime scalar let upstream reworks consume this gate's budget. Callers
+   * derive this with `countGateReworks(db.getCardLogForRun(runId, cardId),
+   * workerStationId)`.
+   *
+   * Named distinctly from `rework_count` on purpose: the rename turns the old
+   * (buggy) call into a compile error rather than a silent mis-scoping.
+   */
+  gateReworkCount: number;
   gateConfig: StationGateConfig;
   adapter: ModelAdapter;
   /**
@@ -147,6 +158,7 @@ function findImmediatelyPriorVerdict(
  * Returns a GateReworkDecision the caller applies to the DB:
  *   - pass:   advance the card along the happy path
  *   - rework: route the card to `returnTo` (back-edge) and increment rework_count
+ *             (which also records this gate's spent cycle in the card_log)
  *   - scrap:  route the card to the scrap terminal
  *
  * The caller is responsible for:
@@ -155,7 +167,7 @@ function findImmediatelyPriorVerdict(
  *   2. Persisting the decision (card lane/status/rework_count update + slot release).
  */
 export async function runGateRework(input: GateReworkInput): Promise<GateReworkDecision> {
-  const { db, runId, cardId, workerStationId, attempt, maxExecutionAttempts, reworkCount, gateConfig, adapter, harnessRegistry, projectRoot, validBackEdges, capPolicy = 'scrap' } = input;
+  const { db, runId, cardId, workerStationId, attempt, maxExecutionAttempts, gateReworkCount, gateConfig, adapter, harnessRegistry, projectRoot, validBackEdges, capPolicy = 'scrap' } = input;
 
   // ── Render critic prompt ──────────────────────────────────────────────────
   const criticTemplate = readFileSync(gateConfig.criticPromptFile, 'utf-8');
@@ -245,7 +257,7 @@ export async function runGateRework(input: GateReworkInput): Promise<GateReworkD
 
       // ── Guard #3: progress-monotonicity on findings hash (SPEC §6) ──────────
       // If the critic returned the same findings as the immediately-prior attempt,
-      // no progress was made — scrap immediately regardless of reworkCount.
+      // no progress was made — scrap immediately regardless of gateReworkCount.
       // "Immediately-prior" = the gate_verdict entry for this station with the
       // highest attempt number strictly less than the current attempt.
       const currentHash = computeFindingsHash(findings);
@@ -258,8 +270,10 @@ export async function runGateRework(input: GateReworkInput): Promise<GateReworkD
         return { action: 'scrap', reason: 'no_progress', verdict: 'reject', findings, returnTo: null, attempt };
       }
 
-      // ── Guard #1: durable rework cap (SPEC §6 four-guard system) ────────────
-      if (reworkCount >= gateConfig.reworkCap) {
+      // ── Guard #1: durable per-gate rework cap (SPEC §6 four-guard system) ───
+      // gateReworkCount counts reworks spent AT THIS GATE only (issue #1); a
+      // sibling gate's exhausted budget must never scrap a card here.
+      if (gateReworkCount >= gateConfig.reworkCap) {
         if (capPolicy === 'proceed_with_findings') {
           // proceed_with_findings: return 'rework' so the executor can fire
           // QC_REJECT at the FSM, which advances the card forward instead of

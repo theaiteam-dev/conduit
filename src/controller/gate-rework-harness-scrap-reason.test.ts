@@ -94,7 +94,7 @@ describe('runGateRework — propagates the gate check\'s own scrap reason (a pre
       workerStationId: 'ideate',
       attempt: 0,
       maxExecutionAttempts: 4,
-      reworkCount: 0,
+      gateReworkCount: 0,
       gateConfig: {
         criticModel: 'unused',
         criticPromptFile: join(dir, 'critic.md'),

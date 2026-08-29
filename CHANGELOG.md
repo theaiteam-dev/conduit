@@ -11,6 +11,21 @@ historical context, not public releases or public repository history.
 
 ## [Unreleased]
 
+### Fixed
+
+- Scoped the bounded-rework cap to each gate instead of the whole card
+  ([#1](https://github.com/theaiteam-dev/conduit/issues/1)). `rework_cap` is
+  declared per gate, but it was compared against `cards.rework_count` — a single
+  lifetime counter incremented on every rework anywhere in the flow — so reworks
+  spent at an early gate silently consumed every later gate's budget. A gate
+  declaring `rework_cap: 3` could behave as 2, 1, or 0 depending on unrelated
+  upstream history, and under the default `cap_policy: scrap` a gate whose budget
+  was already spent upstream scrapped the card on its first rejection, destroying
+  work that never received the rework cycles the flow promised it. Each gate now
+  gets its full declared budget, on both the synchronous and the pooled
+  (`--concurrency` greater than 1) paths. `cards.rework_count` is unchanged and
+  remains the card's lifetime total.
+
 ## [1.0.0] - 2026-08-27
 
 ### Added
