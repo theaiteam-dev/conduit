@@ -59,7 +59,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { openConduitDB, type ConduitDB } from '../persistence/db';
-import type { SpawnSeam, SpawnInvocation } from './spawn';
+import type { SpawnSeam, SpawnInvocation, SpawnFailedAlert } from './spawn';
 import type { RespawnSeam } from './recovery';
 import type { LoadFlowResult } from '../flow/load';
 import type { FlowConfig, FlowChannels, FlowEgressChannel } from '../types/kernel';
@@ -1088,5 +1088,117 @@ describe('runGatedHitlResume (the original listener-backpressure work × HITL wo
     ).rejects.toThrow('resume exploded');
 
     expect(slots.inFlightCount()).toBe(0);
+  });
+});
+
+// ===========================================================================
+// Issue #8 — the listener must hand its alert seam (and the per-flow channel
+// resolution) to BOTH re-drive paths. Before this, only the hot spawn path
+// alerted; a re-driven run that died was silent on every channel.
+// ===========================================================================
+
+describe('re-drive failure alerting is wired into both sweeps (#8)', () => {
+  const settle = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
+
+  /** A respawn seam that launches, then lets the test kill the child. */
+  function launchingRespawn() {
+    const ends = new Map<string, (exit: { code: number }) => void>();
+    const respawn: RespawnSeam = async (event) => ({
+      result: 'spawned' as const,
+      exited: new Promise<{ code: number }>((resolve) => ends.set(event.event_id, resolve)),
+    });
+    return { respawn, exit: (eventId: string, code: number) => ends.get(eventId)!({ code }) };
+  }
+
+  function seedFailedFor(eventId: string, flowId: string, flowPath: string): void {
+    db.acceptIngressEvent(eventId, 500, {
+      flowId,
+      flowPath,
+      runId: `run-${eventId}`,
+      substrateJson: '{}',
+    });
+    db.incrementSpawnAttempts(eventId);
+    db.markIngressFailed(eventId);
+  }
+
+  it("alerts on the flow's own egress channel when a boot-re-driven child dies", async () => {
+    seedFailedFor('boot-dies', 'flowA', '/flows/a.yaml');
+    const alerts: SpawnFailedAlert[] = [];
+    const { respawn, exit } = launchingRespawn();
+
+    const flows = { '/flows/a.yaml': makeFlow(webhookIngress('/hooks/a'), '#flow-a-alerts') };
+    const deps = makeDeps({
+      loadFlow: loadFlowFrom(flows),
+      respawn,
+      alert: async (a) => { alerts.push(a); },
+    });
+    expectStarted(await startListener(deps, baseConfig({ allowlist: { flowA: '/flows/a.yaml' } })));
+
+    exit('boot-dies', 7);
+    await settle();
+
+    expect(alerts).toEqual([
+      {
+        flowId: 'flowA',
+        channel: '#flow-a-alerts',
+        eventId: 'boot-dies',
+        reason: 're-driven run exited with code 7',
+      },
+    ]);
+  });
+
+  it('falls back to the global alert channel for a flow with no egress', async () => {
+    seedFailedFor('boot-perm', 'flowA', '/flows/a.yaml');
+    const alerts: SpawnFailedAlert[] = [];
+
+    const flows = { '/flows/a.yaml': makeFlow(webhookIngress('/hooks/a')) }; // no egress
+    const deps = makeDeps({
+      loadFlow: loadFlowFrom(flows),
+      respawn: async () => 'permanent_failure',
+      alert: async (a) => { alerts.push(a); },
+    });
+    expectStarted(
+      await startListener(
+        deps,
+        baseConfig({ allowlist: { flowA: '/flows/a.yaml' }, globalAlertChannel: 'slack:ops' }),
+      ),
+    );
+
+    expect(alerts).toHaveLength(1);
+    expect(alerts[0]).toMatchObject({ flowId: 'flowA', channel: 'slack:ops', eventId: 'boot-perm' });
+  });
+
+  it('alerts from the periodic sweep too, not only from boot recovery', async () => {
+    const alerts: SpawnFailedAlert[] = [];
+    let tick: (() => void) | null = null;
+    const { respawn, exit } = launchingRespawn();
+
+    const flows = { '/flows/a.yaml': makeFlow(webhookIngress('/hooks/a'), '#flow-a-alerts') };
+    const deps = makeDeps({
+      loadFlow: loadFlowFrom(flows),
+      respawn,
+      alert: async (a) => { alerts.push(a); },
+      redriveSchedule: (fn) => { tick = fn; return { cancel: () => {} }; },
+    });
+    const listener = expectStarted(
+      await startListener(deps, baseConfig({ allowlist: { flowA: '/flows/a.yaml' } })),
+    );
+
+    listener.redrive.start();
+    seedFailedFor('sweep-dies', 'flowA', '/flows/a.yaml'); // fails AFTER boot
+    tick!();
+    await settle();
+    exit('sweep-dies', 2);
+    await settle();
+    listener.redrive.stop();
+
+    expect(alerts).toEqual([
+      {
+        flowId: 'flowA',
+        channel: '#flow-a-alerts',
+        eventId: 'sweep-dies',
+        reason: 're-driven run exited with code 2',
+      },
+    ]);
   });
 });

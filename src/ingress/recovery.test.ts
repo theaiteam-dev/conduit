@@ -58,10 +58,12 @@ import { openConduitDB, type ConduitDB, type IngressEventRecord } from '../persi
 import {
   redriveOnBoot,
   startPeriodicRedrive,
+  type RedriveAlerting,
   type RedriveResult,
   type RespawnSeam,
   type RedriveReport,
 } from './recovery';
+import type { AlertSeam, SpawnFailedAlert } from './spawn';
 import { createRunSlots } from './run-slots';
 
 const CAP = 3;
@@ -687,5 +689,271 @@ describe('launch-vs-exit re-drive (the original acknowledgement-on-accept work)'
     expect(report.spawned).toEqual(['e-legacy']);
     // No exit to wait for — the slot frees when the seam resolves, as before.
     expect(slots.inFlightCount()).toBe(0);
+  });
+});
+
+// ===========================================================================
+// Issue #8 — every re-drive failure fires the alert seam, exactly like the hot
+// spawn path. Before this, a re-driven run that died only wrote a 'spawn_failed'
+// row to ingress_log and NEVER alerted, so a halted run stayed silent.
+// ===========================================================================
+
+describe('re-drive failure alerting (#8)', () => {
+  const settle = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
+
+  /** Captures every alert the re-drive fires. */
+  function recordingAlert(behaviour: 'ok' | 'throw' = 'ok') {
+    const calls: SpawnFailedAlert[] = [];
+    const alert: AlertSeam = async (a) => {
+      calls.push(a);
+      if (behaviour === 'throw') throw new Error('alert transport down');
+    };
+    return { alert, calls };
+  }
+
+  /** The listener-shaped alerting deps: per-flow channels + the global fallback. */
+  function alerting(alert: AlertSeam): RedriveAlerting {
+    return {
+      alert,
+      channels: { flowA: '#flow-a-alerts' },
+      globalAlertChannel: '#listener-global',
+    };
+  }
+
+  /** Seed a 'failed' row that carries v9 flow attribution. */
+  function seedAttributedFailure(eventId: string, flowId: string, receivedAt = 1000): void {
+    db.acceptIngressEvent(eventId, receivedAt, {
+      flowId,
+      flowPath: `/flows/${flowId}.yaml`,
+      runId: `run-${eventId}`,
+      substrateJson: '{}',
+    });
+    db.incrementSpawnAttempts(eventId);
+    db.markIngressFailed(eventId);
+  }
+
+  /** A respawn seam that launches immediately and hands the exit back later. */
+  function launchingRespawn(): {
+    seam: RespawnSeam;
+    exit(eventId: string, code: number): void;
+    fail(eventId: string, err: Error): void;
+  } {
+    const resolvers = new Map<string, (exit: { code: number }) => void>();
+    const rejecters = new Map<string, (err: Error) => void>();
+    const seam: RespawnSeam = async (event) => ({
+      result: 'spawned',
+      exited: new Promise<{ code: number }>((resolve, reject) => {
+        resolvers.set(event.event_id, resolve);
+        rejecters.set(event.event_id, reject);
+      }),
+    });
+    return {
+      seam,
+      exit: (eventId, code) => resolvers.get(eventId)!({ code }),
+      fail: (eventId, err) => rejecters.get(eventId)!(err),
+    };
+  }
+
+  it('alerts when a re-driven child exits non-zero, on the flow\'s own channel', async () => {
+    seedAttributedFailure('e-dies', 'flowA');
+    const slots = createRunSlots({ capacity: 1 });
+    const respawn = launchingRespawn();
+    const alerts = recordingAlert();
+
+    await redriveOnBoot({
+      db, respawn: respawn.seam, cap: CAP, slots, alerts: alerting(alerts.alert),
+    });
+    expect(alerts.calls).toHaveLength(0); // launch succeeded — nothing to alert yet
+
+    respawn.exit('e-dies', 9);
+    await settle();
+
+    expect(alerts.calls).toEqual([
+      {
+        flowId: 'flowA',
+        channel: '#flow-a-alerts',
+        eventId: 'e-dies',
+        reason: 're-driven run exited with code 9',
+      },
+    ]);
+    expect(db.getIngressEvent('e-dies')!.spawn_state).toBe('failed');
+  });
+
+  it('alerts when the exit promise rejects, using the rejection message', async () => {
+    seedAttributedFailure('e-lost', 'flowA');
+    const respawn = launchingRespawn();
+    const alerts = recordingAlert();
+
+    await redriveOnBoot({
+      db, respawn: respawn.seam, cap: CAP, alerts: alerting(alerts.alert),
+    });
+    respawn.fail('e-lost', new Error('child handle vanished'));
+    await settle();
+
+    expect(alerts.calls).toHaveLength(1);
+    expect(alerts.calls[0]).toMatchObject({
+      eventId: 'e-lost',
+      flowId: 'flowA',
+      reason: 'child handle vanished',
+    });
+  });
+
+  it('fires no alert when the re-driven child exits cleanly', async () => {
+    seedAttributedFailure('e-ok', 'flowA');
+    const respawn = launchingRespawn();
+    const alerts = recordingAlert();
+
+    await redriveOnBoot({
+      db, respawn: respawn.seam, cap: CAP, alerts: alerting(alerts.alert),
+    });
+    respawn.exit('e-ok', 0);
+    await settle();
+
+    expect(alerts.calls).toEqual([]);
+    expect(db.getIngressEvent('e-ok')!.spawn_state).toBe('spawned');
+  });
+
+  it('alerts on a permanent respawn failure — the row will never be retried', async () => {
+    seedAttributedFailure('e-perm', 'flowA');
+    const alerts = recordingAlert();
+
+    await redriveOnBoot({
+      db,
+      respawn: async () => 'permanent_failure',
+      cap: CAP,
+      alerts: alerting(alerts.alert),
+    });
+
+    expect(alerts.calls).toHaveLength(1);
+    expect(alerts.calls[0]).toMatchObject({
+      flowId: 'flowA',
+      channel: '#flow-a-alerts',
+      eventId: 'e-perm',
+    });
+    expect(alerts.calls[0]!.reason).toContain('permanent');
+    // And the row really is out of the re-drive set — nothing else will surface it.
+    expect(db.listRedrivable(CAP).map((r) => r.event_id)).toEqual([]);
+  });
+
+  it('alerts on a transient respawn failure, mirroring the hot path', async () => {
+    seedAttributedFailure('e-transient', 'flowA');
+    const alerts = recordingAlert();
+
+    await redriveOnBoot({
+      db,
+      respawn: async () => 'transient_failure',
+      cap: CAP,
+      alerts: alerting(alerts.alert),
+    });
+
+    expect(alerts.calls).toHaveLength(1);
+    expect(alerts.calls[0]).toMatchObject({ flowId: 'flowA', eventId: 'e-transient' });
+  });
+
+  it('falls back to the global channel for a pre-v9 row with no flow attribution', async () => {
+    seedFailed('e-legacy-row', 1); // no attribution — flow_id is null
+    const alerts = recordingAlert();
+
+    await redriveOnBoot({
+      db,
+      respawn: async () => 'permanent_failure',
+      cap: CAP,
+      alerts: alerting(alerts.alert),
+    });
+
+    expect(alerts.calls).toHaveLength(1);
+    expect(alerts.calls[0]).toMatchObject({
+      channel: '#listener-global',
+      eventId: 'e-legacy-row',
+      flowId: 'unknown',
+    });
+  });
+
+  it('falls back to the global channel when the flow declares no egress target', async () => {
+    seedAttributedFailure('e-no-egress', 'flowNoEgress');
+    const alerts = recordingAlert();
+
+    await redriveOnBoot({
+      db,
+      respawn: async () => 'permanent_failure',
+      cap: CAP,
+      alerts: alerting(alerts.alert),
+    });
+
+    expect(alerts.calls[0]).toMatchObject({
+      flowId: 'flowNoEgress',
+      channel: '#listener-global',
+    });
+  });
+
+  it('alerts from a periodic sweep, not just from boot recovery', async () => {
+    const alerts = recordingAlert();
+    let tick: (() => void) | null = null;
+    const handle = startPeriodicRedrive({
+      db,
+      respawn: async () => 'permanent_failure',
+      cap: CAP,
+      intervalMs: 60_000,
+      schedule: (fn) => {
+        tick = fn;
+        return { cancel: () => {} };
+      },
+      alerts: alerting(alerts.alert),
+    });
+
+    seedAttributedFailure('e-swept', 'flowA', 900);
+    tick!();
+    await settle();
+    handle.stop();
+
+    expect(alerts.calls).toHaveLength(1);
+    expect(alerts.calls[0]).toMatchObject({ eventId: 'e-swept', channel: '#flow-a-alerts' });
+  });
+
+  it('a throwing alert still marks the row failed, logs spawn_failed, and frees the slot', async () => {
+    seedAttributedFailure('e-alert-throws', 'flowA');
+    const slots = createRunSlots({ capacity: 1 });
+    const respawn = launchingRespawn();
+    const alerts = recordingAlert('throw');
+
+    await redriveOnBoot({
+      db, respawn: respawn.seam, cap: CAP, slots, alerts: alerting(alerts.alert),
+    });
+    respawn.exit('e-alert-throws', 3);
+    await settle();
+
+    expect(alerts.calls).toHaveLength(1); // it was attempted…
+    expect(db.getIngressEvent('e-alert-throws')!.spawn_state).toBe('failed');
+    expect(db.getIngressLog().map((e) => e.outcome)).toEqual(['redriven', 'spawn_failed']);
+    expect(slots.inFlightCount()).toBe(0);
+  });
+
+  it('a throwing alert does not abort the sweep or lose the redriven log entry', async () => {
+    seedAttributedFailure('e-one', 'flowA', 1000);
+    seedAttributedFailure('e-two', 'flowA', 2000);
+    const alerts = recordingAlert('throw');
+
+    const report = await redriveOnBoot({
+      db,
+      respawn: async () => 'permanent_failure',
+      cap: CAP,
+      alerts: alerting(alerts.alert),
+    });
+
+    expect(report.permanentlyFailed).toEqual(['e-one', 'e-two']);
+    expect(alerts.calls.map((a) => a.eventId)).toEqual(['e-one', 'e-two']);
+    expect(db.getIngressLog({ outcome: 'redriven' })).toHaveLength(2);
+  });
+
+  it('stays silent when no alerting deps are wired (ungated callers)', async () => {
+    seedAttributedFailure('e-unwired', 'flowA');
+    const respawn = launchingRespawn();
+
+    await redriveOnBoot({ db, respawn: respawn.seam, cap: CAP });
+    respawn.exit('e-unwired', 4);
+    await settle();
+
+    // No alert seam to call — the durable log is still the record of the failure.
+    expect(db.getIngressLog().map((e) => e.outcome)).toEqual(['redriven', 'spawn_failed']);
   });
 });

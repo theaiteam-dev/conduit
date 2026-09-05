@@ -15,6 +15,9 @@
  *      resolve app tokens for socket-transport slack flows (the original Slack Socket Mode work) — an
  *      unset app token or a missing socket seam is a boot error.
  *   5. Run redriveOnBoot (WI-407) — completes BEFORE the listener is returned.
+ *      Both re-drive paths (boot + periodic sweep) get the alert seam and the
+ *      per-flow channels resolved in step 3, so a re-driven failure alerts the
+ *      way a hot-path failure does (#8).
  *   6. Return the wired Listener (socket clients created but not started —
  *      the caller starts them when it begins serving).
  *
@@ -30,6 +33,7 @@ import {
   redriveOnBoot,
   startPeriodicRedrive,
   type PeriodicRedrive,
+  type RedriveAlerting,
   type RedriveReport,
   type RespawnSeam,
 } from './recovery';
@@ -527,10 +531,27 @@ export async function startListener(
     }
   }
 
+  // Failure alerting for BOTH re-drive paths (#8), built from the per-flow
+  // channels resolved in phase 3 — so a re-driven run that dies is as loud as
+  // one that failed on the hot spawn path. Passing this is not optional in
+  // production: without it a halted re-driven run reaches ingress_log and
+  // nothing else (listener.test.ts pins the wiring).
+  const redriveAlerts: RedriveAlerting = {
+    alert: deps.alert,
+    channels: alertChannels,
+    globalAlertChannel: config.globalAlertChannel ?? '',
+  };
+
   // ── Phase 5: Boot re-drive (WI-407) — must complete before serving ────────
   // Slot-gated (the original listener-backpressure work): a backlog of recoverable events re-drives at most
   // maxConcurrentRuns at a time instead of stampeding the model endpoint.
-  await redriveOnBoot({ db: deps.db, respawn: deps.respawn, cap: deps.redriveCap, slots: runSlots });
+  await redriveOnBoot({
+    db: deps.db,
+    respawn: deps.respawn,
+    cap: deps.redriveCap,
+    slots: runSlots,
+    alerts: redriveAlerts,
+  });
 
   // ── Phase 6: Build and return the wired listener ─────────────────────────
   const webhookAdapterDeps: WebhookAdapterDeps = {
@@ -607,6 +628,7 @@ export async function startListener(
           respawn: deps.respawn,
           cap: deps.redriveCap,
           slots: runSlots,
+          alerts: redriveAlerts,
           intervalMs: deps.redriveIntervalMs ?? 60_000,
           ...(deps.redriveSchedule !== undefined && { schedule: deps.redriveSchedule }),
           ...(deps.onRedriveSweep !== undefined && { onSweep: deps.onRedriveSweep }),

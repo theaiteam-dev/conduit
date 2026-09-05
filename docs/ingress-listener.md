@@ -339,9 +339,20 @@ On listener startup, `redriveOnBoot`:
    - Increment `spawn_attempts` (before the spawn)
    - Re-invoke the core spawn path
    - Mark `'spawned'` on success, or `'failed'` on failure
+   - On failure, fire the alert seam — same payload and channel resolution as
+     the hot path (the flow's first egress target, else the listener-global
+     channel); a pre-v9 row with no flow attribution alerts on the global
+     channel as `flow=unknown`
    - Log outcome as `'redriven'` to ingress_log
 
-3. Rows at-cap or with permanent failures are **not** re-driven and are surfaced for manual intervention
+   A re-driven child that later exits non-zero gets the same treatment from its
+   exit watcher: `'failed'` + alert (`re-driven run exited with code N`) +
+   a `'spawn_failed'` log entry. Alerting is best effort — a throwing alert
+   seam never blocks the mark, the log entry, or the run-slot release.
+
+3. Rows at-cap or with permanent failures are **not** re-driven. A permanent
+   failure is the loudest case: the row is excluded from every future sweep, so
+   its alert is the only thing that will surface the event again.
 
 ### Attempt cap semantics
 

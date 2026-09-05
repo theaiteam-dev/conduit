@@ -17,7 +17,14 @@
  *      a row at N-1 is re-driven exactly once, incrementing it to N.
  *   4. A 'permanent_failure' result exhausts the row's spawn_attempts to >= cap
  *      so that listRedrivable skips it on the next boot (no unbounded auto-retry).
- *   5. The seam resolves on LAUNCH, not on exit (the original acknowledgement-on-accept work). A sweep therefore
+ *   5. Every FAILURE outcome fires the alert seam, exactly as the hot spawn path
+ *      does (#8) — a launch that fails permanently or transiently, and a launched
+ *      child that dies. Alerting is bookkeeping, so it lives here rather than in
+ *      the launch-only seam (invariant 1), and it is BEST EFFORT: a throwing
+ *      alert never blocks markIngressFailed, the ingress_log entry, or the slot
+ *      release. Before this, a re-driven failure only reached ingress_log, so a
+ *      halted run stayed silent on every operator channel.
+ *   6. The seam resolves on LAUNCH, not on exit (the original acknowledgement-on-accept work). A sweep therefore
  *      finishes in milliseconds instead of running as long as the runs it
  *      recovered, and boot no longer waits out a recovered render before the
  *      listener serves. The launched child keeps its run slot until it exits and
@@ -30,7 +37,7 @@
 
 import type { ConduitDB, IngressEventRecord } from '../persistence/db';
 import type { RunSlots } from './run-slots';
-import type { SpawnExit } from './spawn';
+import type { AlertSeam, SpawnExit } from './spawn';
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -62,9 +69,40 @@ export interface RedriveLaunch {
  */
 export type RespawnSeam = (event: IngressEventRecord) => Promise<RedriveResult | RedriveLaunch>;
 
+/**
+ * Failure-alerting deps for the re-drive paths (#8), mirroring the hot spawn
+ * path's `alert` + `globalAlertChannel` pair in SpawnPathDeps.
+ *
+ * Channel resolution matches the hot path: `channels` is the listener's
+ * already-resolved per-flow map (each flow's first egress target, falling back
+ * to the listener-global channel), and `globalAlertChannel` catches a row whose
+ * owning flow is unknown here — a pre-v9 row with a null flow_id, or a flow
+ * that was quarantined after the row was accepted.
+ */
+export interface RedriveAlerting {
+  alert: AlertSeam;
+  /** flowId → resolved alert channel (flow egress[0].target ?? globalAlertChannel). */
+  channels: Record<string, string>;
+  /** Listener-global fallback target. */
+  globalAlertChannel: string;
+}
+
+/**
+ * flow_id on a pre-v9 ingress_events row is null — the attribution columns did
+ * not exist when it was accepted. Alert anyway (silence is the bug being fixed
+ * here) with an explicit placeholder rather than guessing an owning flow.
+ */
+const UNATTRIBUTED_FLOW_ID = 'unknown';
+
 export interface RedriveDeps {
   db: ConduitDB;
   respawn: RespawnSeam;
+  /**
+   * Failure-alert seam + channel resolution (#8). Optional: a caller that does
+   * not alert (unit-level drivers) simply leaves re-drive failures to
+   * ingress_log. The listener ALWAYS wires it — see listener.test.ts.
+   */
+  alerts?: RedriveAlerting;
   /** Total-attempt cap (first spawn + all re-drives). Rows at spawn_attempts === cap are excluded. */
   cap: number;
   /** Label written to the 'redriven' ingress_log entries. Defaults to 'boot-recovery'. */
@@ -109,7 +147,7 @@ export interface RedriveReport {
  * Returns a summary report of all outcomes.
  */
 export async function redriveOnBoot(deps: RedriveDeps): Promise<RedriveReport> {
-  const { db, respawn, cap, source = 'boot-recovery', slots } = deps;
+  const { db, respawn, cap, source = 'boot-recovery', slots, alerts } = deps;
 
   const report: RedriveReport = { spawned: [], failed: [], permanentlyFailed: [], deferred: [] };
 
@@ -156,12 +194,21 @@ export async function redriveOnBoot(deps: RedriveDeps): Promise<RedriveReport> {
         report.spawned.push(event.event_id);
       } else if (launch.result === 'transient_failure') {
         db.markIngressFailed(event.event_id);
+        // Alert on a transient launch failure too (#8). The hot path alerts on
+        // EVERY launch failure without grading it, and an operator cannot tell
+        // a "will retry" from a "gave up" by the silence — the run is stalled
+        // either way until a later sweep succeeds. Mirroring it keeps one
+        // failure story across both paths; the reason text carries the nuance.
+        await fireRedriveAlert(alerts, event, 're-drive launch failed — will retry while under the attempt cap');
         report.failed.push(event.event_id);
       } else {
         // permanent_failure: mark failed and exhaust the remaining cap headroom so
         // listRedrivable skips this row on future boots (spawn_attempts reaches >= cap).
         db.markIngressFailed(event.event_id);
         exhaustCapForPermanentFailure(db, event.event_id, event.spawn_attempts, cap);
+        // The loudest case (#8): the row is now excluded from listRedrivable, so
+        // this alert is the ONLY thing that will ever surface the event again.
+        await fireRedriveAlert(alerts, event, 're-drive launch failed permanently — the event will not be retried');
         report.permanentlyFailed.push(event.event_id);
       }
 
@@ -171,11 +218,9 @@ export async function redriveOnBoot(deps: RedriveDeps): Promise<RedriveReport> {
       if (launch.result === 'spawned' && launch.exited !== undefined) {
         slotHandedOff = true;
         void watchRedrivenChildExit(
-          db,
-          source,
-          event.event_id,
+          { db, source, ...(alerts !== undefined && { alerts }), ...(slots !== undefined && { slots }) },
+          event,
           launch.exited,
-          slots,
         );
       }
     } finally {
@@ -205,28 +250,64 @@ function normalizeRedriveLaunch(value: RedriveResult | RedriveLaunch): RedriveLa
  * detached); always frees the slot.
  */
 async function watchRedrivenChildExit(
-  db: ConduitDB,
-  source: string,
-  eventId: string,
+  deps: { db: ConduitDB; source: string; alerts?: RedriveAlerting; slots?: RunSlots },
+  event: IngressEventRecord,
   exited: Promise<SpawnExit>,
-  slots?: RunSlots,
 ): Promise<void> {
+  const { db, source, alerts, slots } = deps;
+  const eventId = event.event_id;
   try {
     let reason: string | null = null;
     try {
       const exit = await exited;
       if (exit.code !== 0) reason = `re-driven run exited with code ${exit.code}`;
     } catch (err) {
+      // The seam could not observe the child's exit at all — treat the run as
+      // failed rather than leaving the row permanently 'spawned'.
       reason = err instanceof Error ? err.message : String(err);
     }
     if (reason === null) return; // clean exit — the row stays 'spawned'
 
+    // Mark → alert → log, the same order the hot path's watchChildExit uses, so
+    // the durable ingress_log entry is written even when alerting throws.
     db.markIngressFailed(eventId);
+    await fireRedriveAlert(alerts, event, reason);
     db.appendIngressLog({ source, eventId, outcome: 'spawn_failed', reason });
   } catch {
     // Persistence failure in a detached watcher — nothing left to report to.
   } finally {
     slots?.release(eventId);
+  }
+}
+
+/**
+ * Fire the failure alert for one re-driven event (#8) — best effort.
+ *
+ * Never throws: a dead alert transport must not abort a sweep, skip the
+ * ingress_log entry, or strand a run slot, exactly as in watchChildExit. The
+ * channel resolves the way the hot path resolves it (the flow's first egress
+ * target, else the listener-global channel); a row with no flow attribution
+ * (pre-v9) alerts on the global channel under an explicit placeholder id.
+ */
+async function fireRedriveAlert(
+  alerts: RedriveAlerting | undefined,
+  event: IngressEventRecord,
+  reason: string,
+): Promise<void> {
+  if (alerts === undefined) return;
+  const flowId = event.flow_id;
+  const channel =
+    (flowId !== null ? alerts.channels[flowId] : undefined) ?? alerts.globalAlertChannel;
+  try {
+    await alerts.alert({
+      flowId: flowId ?? UNATTRIBUTED_FLOW_ID,
+      channel,
+      eventId: event.event_id,
+      reason,
+    });
+  } catch {
+    // Best effort — the ingress_log entry written by the caller is the durable
+    // record of this failure.
   }
 }
 
@@ -272,7 +353,7 @@ export interface PeriodicRedriveDeps extends Omit<RedriveDeps, 'source'> {
  * skipped — attempts stay bounded even when a sweep outlives the interval.
  */
 export function startPeriodicRedrive(deps: PeriodicRedriveDeps): PeriodicRedrive {
-  const { db, respawn, cap, intervalMs, onSweep, slots } = deps;
+  const { db, respawn, cap, intervalMs, onSweep, slots, alerts } = deps;
   const schedule =
     deps.schedule ??
     ((tick: () => void, ms: number) => {
@@ -287,7 +368,14 @@ export function startPeriodicRedrive(deps: PeriodicRedriveDeps): PeriodicRedrive
   const runSweep = () => {
     if (sweepInFlight || stopped) return;
     sweepInFlight = true;
-    void redriveOnBoot({ db, respawn, cap, source: 'periodic-recovery', ...(slots !== undefined && { slots }) })
+    void redriveOnBoot({
+      db,
+      respawn,
+      cap,
+      source: 'periodic-recovery',
+      ...(slots !== undefined && { slots }),
+      ...(alerts !== undefined && { alerts }),
+    })
       .then((report) => {
         if (!stopped) onSweep?.(report);
       })
