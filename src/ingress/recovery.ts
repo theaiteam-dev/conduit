@@ -20,10 +20,11 @@
  *   5. Every FAILURE outcome fires the alert seam, exactly as the hot spawn path
  *      does (#8) — a launch that fails permanently or transiently, and a launched
  *      child that dies. Alerting is bookkeeping, so it lives here rather than in
- *      the launch-only seam (invariant 1), and it is BEST EFFORT: a throwing
- *      alert never blocks markIngressFailed, the ingress_log entry, or the slot
- *      release. Before this, a re-driven failure only reached ingress_log, so a
- *      halted run stayed silent on every operator channel.
+ *      the launch-only seam (invariant 1), and it is BEST EFFORT: fireRedriveAlert
+ *      is started but never awaited, so neither a throwing alert nor one that
+ *      never settles can block markIngressFailed, the ingress_log entry, or the
+ *      slot release. Before this, a re-driven failure only reached ingress_log,
+ *      so a halted run stayed silent on every operator channel.
  *   6. The seam resolves on LAUNCH, not on exit (the original acknowledgement-on-accept work). A sweep therefore
  *      finishes in milliseconds instead of running as long as the runs it
  *      recovered, and boot no longer waits out a recovered render before the
@@ -199,7 +200,7 @@ export async function redriveOnBoot(deps: RedriveDeps): Promise<RedriveReport> {
         // a "will retry" from a "gave up" by the silence — the run is stalled
         // either way until a later sweep succeeds. Mirroring it keeps one
         // failure story across both paths; the reason text carries the nuance.
-        await fireRedriveAlert(alerts, event, 're-drive launch failed — will retry while under the attempt cap');
+        void fireRedriveAlert(alerts, event, 're-drive launch failed — will retry while under the attempt cap');
         report.failed.push(event.event_id);
       } else {
         // permanent_failure: mark failed and exhaust the remaining cap headroom so
@@ -208,7 +209,7 @@ export async function redriveOnBoot(deps: RedriveDeps): Promise<RedriveReport> {
         exhaustCapForPermanentFailure(db, event.event_id, event.spawn_attempts, cap);
         // The loudest case (#8): the row is now excluded from listRedrivable, so
         // this alert is the ONLY thing that will ever surface the event again.
-        await fireRedriveAlert(alerts, event, 're-drive launch failed permanently — the event will not be retried');
+        void fireRedriveAlert(alerts, event, 're-drive launch failed permanently — the event will not be retried');
         report.permanentlyFailed.push(event.event_id);
       }
 
@@ -268,10 +269,14 @@ async function watchRedrivenChildExit(
     }
     if (reason === null) return; // clean exit — the row stays 'spawned'
 
-    // Mark → alert → log, the same order the hot path's watchChildExit uses, so
-    // the durable ingress_log entry is written even when alerting throws.
+    // Mark → start alert → log. The alert is NOT awaited: a stalled transport
+    // (a promise that never settles, not just one that throws) must never block
+    // the durable ingress_log entry or the slot release in the finally below —
+    // fireRedriveAlert already swallows rejection internally, so firing it
+    // without awaiting loses nothing but the send-order guarantee, which this
+    // path never needed.
     db.markIngressFailed(eventId);
-    await fireRedriveAlert(alerts, event, reason);
+    void fireRedriveAlert(alerts, event, reason);
     db.appendIngressLog({ source, eventId, outcome: 'spawn_failed', reason });
   } catch {
     // Persistence failure in a detached watcher — nothing left to report to.

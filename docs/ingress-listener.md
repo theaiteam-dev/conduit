@@ -347,8 +347,10 @@ On listener startup, `redriveOnBoot`:
 
    A re-driven child that later exits non-zero gets the same treatment from its
    exit watcher: `'failed'` + alert (`re-driven run exited with code N`) +
-   a `'spawn_failed'` log entry. Alerting is best effort — a throwing alert
-   seam never blocks the mark, the log entry, or the run-slot release.
+   a `'spawn_failed'` log entry. Alerting is best effort and fire-and-forget —
+   the alert is started but never awaited, so neither a throwing alert seam nor
+   one whose promise never settles blocks the mark, the log entry, or the
+   run-slot release.
 
 3. Rows at-cap or with permanent failures are **not** re-driven. A permanent
    failure is the loudest case: the row is excluded from every future sweep, so

@@ -956,4 +956,59 @@ describe('re-drive failure alerting (#8)', () => {
     // No alert seam to call — the durable log is still the record of the failure.
     expect(db.getIngressLog().map((e) => e.outcome)).toEqual(['redriven', 'spawn_failed']);
   });
+
+  it('does not block the boot sweep on an alert that never settles', async () => {
+    seedAttributedFailure('e-hang-1', 'flowA', 1000);
+    seedAttributedFailure('e-hang-2', 'flowA', 2000);
+    let alertCalls = 0;
+    const neverSettlingAlert: AlertSeam = async () => {
+      alertCalls++;
+      return new Promise<void>(() => {
+        /* never settles — simulates a stalled alert transport */
+      });
+    };
+
+    const report = await Promise.race([
+      redriveOnBoot({
+        db,
+        respawn: async () => 'permanent_failure',
+        cap: CAP,
+        alerts: alerting(neverSettlingAlert),
+      }),
+      new Promise<RedriveReport>((_, reject) =>
+        setTimeout(() => reject(new Error('redriveOnBoot hung on a pending alert')), 250),
+      ),
+    ]);
+
+    expect(report.permanentlyFailed).toEqual(['e-hang-1', 'e-hang-2']);
+    expect(db.getIngressLog({ outcome: 'redriven' }).map((e) => e.eventId).sort()).toEqual([
+      'e-hang-1',
+      'e-hang-2',
+    ]);
+    expect(alertCalls).toBe(2); // the alert was started for both rows, just never settled
+  });
+
+  it('does not block the exit watcher on an alert that never settles', async () => {
+    seedAttributedFailure('e-exit-hang', 'flowA');
+    const slots = createRunSlots({ capacity: 1 });
+    const respawn = launchingRespawn();
+    const neverSettlingAlert: AlertSeam = async () =>
+      new Promise<void>(() => {
+        /* never settles — simulates a stalled alert transport */
+      });
+
+    await redriveOnBoot({
+      db, respawn: respawn.seam, cap: CAP, slots, alerts: alerting(neverSettlingAlert),
+    });
+    respawn.exit('e-exit-hang', 7);
+
+    await Promise.race([
+      settle(),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('exit watcher hung on a pending alert')), 250)),
+    ]);
+
+    expect(db.getIngressEvent('e-exit-hang')!.spawn_state).toBe('failed');
+    expect(db.getIngressLog().map((e) => e.outcome)).toEqual(['redriven', 'spawn_failed']);
+    expect(slots.inFlightCount()).toBe(0);
+  });
 });
