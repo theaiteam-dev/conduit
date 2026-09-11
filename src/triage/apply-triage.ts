@@ -73,10 +73,31 @@ export type Decision = {
   apply: string[];
   /** Labels named in the comment for a human to apply. */
   propose: string[];
-  /** Why apply is empty when it is. */
-  suppressed: 'injection' | 'no-valid-type' | null;
+  /**
+   * Why apply is empty when it is.
+   *
+   * `injection` and `no-scan-verdict` both suppress every write, but they are
+   * NOT the same event and must not be collapsed: the first is the scan doing
+   * its job, the second is the scan failing to report at all. Only the first
+   * justifies telling a submitter their text looked like an injection.
+   */
+  suppressed: 'injection' | 'no-scan-verdict' | 'no-valid-type' | null;
+  /** True only when the scan actually REPORTED an injection. */
   flagged: boolean;
 };
+
+/**
+ * True iff `value` could be a real GitHub issue or PR number.
+ *
+ * One predicate for both the decision and the rendered comment, because the
+ * two drifting apart is the bug: a looser render check prints `#-1` or
+ * `#Infinity` next to a `duplicate` label the decision already refused.
+ * `Number.isInteger` alone admits 0, negatives, and values past the safe
+ * range, none of which name anything.
+ */
+export function isIssueNumber(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0;
+}
 
 /** True iff `label` is in LABEL_TIERS at the given tier. */
 function tierOf(label: string): Tier | null {
@@ -86,16 +107,27 @@ function tierOf(label: string): Tier | null {
 /**
  * Map validated model output onto real labels.
  *
- * Fail-closed at every branch: an unrecognised `type`, a non-string `type`, or
- * a tripped scan verdict all yield an empty `apply`. The scan check comes
- * first so a flagged issue cannot be labelled even if its classification is
- * well-formed — a successful injection producing clean-looking JSON is the
- * expected case, not the surprising one.
+ * Fail-closed at every branch: an unrecognised `type`, a non-string `type`, a
+ * tripped scan verdict, and a scan verdict that is missing or not a boolean all
+ * yield an empty `apply`. The scan checks come first so a flagged issue cannot
+ * be labelled even if its classification is well-formed: a successful injection
+ * producing clean-looking JSON is the expected case, not the surprising one.
  */
 export function decide(cls: Classification, scan: ScanVerdict): Decision {
   const flagged = scan.injection_detected === true;
   if (flagged) {
     return { apply: [], propose: [], suppressed: 'injection', flagged: true };
+  }
+
+  // Require the clean verdict to be EXPLICIT. readArtifact returns {} for a
+  // missing, unreadable, or malformed scan.json, so anything short of a
+  // literal false is indistinguishable from the scan never having run. Reading
+  // that as "clean" would let a crashed or garbage-emitting scan station
+  // silently remove the flow's second independent signal while labels kept
+  // being applied, which is the one failure the reader of a triage comment has
+  // no way to notice.
+  if (scan.injection_detected !== false) {
+    return { apply: [], propose: [], suppressed: 'no-scan-verdict', flagged: false };
   }
 
   const type = typeof cls.type === 'string' ? cls.type : '';
@@ -109,7 +141,7 @@ export function decide(cls: Classification, scan: ScanVerdict): Decision {
     const label = `priority: ${priority}`;
     if (tierOf(label) === 'PROPOSE') propose.push(label);
   }
-  if (typeof cls.possible_duplicate === 'number' && Number.isInteger(cls.possible_duplicate)) {
+  if (isIssueNumber(cls.possible_duplicate)) {
     if (tierOf('duplicate') === 'PROPOSE') propose.push('duplicate');
   }
 
@@ -153,6 +185,16 @@ export function renderComment(cls: Classification, d: Decision, scan: ScanVerdic
       `Scan evidence: ${fence(scan.evidence, 300)}`,
       '',
     );
+  } else if (d.suppressed === 'no-scan-verdict') {
+    // Says what actually happened. Accusing the submitter of an injection the
+    // scan never reported is both wrong and, on a real bug report, insulting.
+    lines.push(
+      '⚠️ The injection scan returned no usable verdict, so its check could not',
+      'be completed. **No labels were applied.** This is a fault in the triage',
+      'flow, not a finding about this submission. A maintainer should label it',
+      'by hand.',
+      '',
+    );
   }
 
   lines.push(
@@ -165,7 +207,7 @@ export function renderComment(cls: Classification, d: Decision, scan: ScanVerdic
   if (typeof cls.area === 'string' && cls.area) {
     lines.push(`Area (no label exists for this; informational): \`${fence(cls.area, 40)}\``);
   }
-  if (typeof cls.possible_duplicate === 'number') {
+  if (isIssueNumber(cls.possible_duplicate)) {
     lines.push(`Possible duplicate of #${cls.possible_duplicate} (unverified).`);
   }
 

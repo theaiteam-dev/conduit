@@ -69,12 +69,51 @@ describe('injection verdict suppresses all writes', () => {
     expect(d.flagged).toBe(true);
   });
 
-  test('only a literal true trips it — a truthy string does not, and does not suppress', () => {
-    // Guards against a model emitting "false" as a string and being believed,
-    // and against a non-boolean silently reading as flagged.
-    const d = decide({ type: 'bug' }, { injection_detected: 'true' });
-    expect(d.flagged).toBe(false);
-    expect(d.apply).toEqual(['bug']);
+  test('a non-boolean verdict is not read as an injection REPORT', () => {
+    // `flagged` means the scan actually reported an injection. A string is not
+    // a report, so the comment must not accuse the submitter of one.
+    expect(decide({ type: 'bug' }, { injection_detected: 'true' }).flagged).toBe(false);
+  });
+});
+
+describe('a missing or malformed scan verdict suppresses writes too', () => {
+  // readArtifact returns {} for a missing, unreadable, or malformed scan.json,
+  // so "no verdict" is indistinguishable from "clean verdict" unless the clean
+  // case is required to be explicit. Losing the second independent signal must
+  // not silently degrade to labelling anyway.
+  test.each([
+    ['absent key', {}],
+    ['string "true"', { injection_detected: 'true' }],
+    ['string "false"', { injection_detected: 'false' }],
+    ['null', { injection_detected: null }],
+    ['number 0', { injection_detected: 0 }],
+    ['undefined', { injection_detected: undefined }],
+  ])('%s applies nothing and is reported as a missing verdict', (_name, scan) => {
+    const d = decide({ type: 'bug', priority_suggestion: 'high' }, scan as Record<string, unknown>);
+    expect(d.apply).toEqual([]);
+    expect(d.propose).toEqual([]);
+    expect(d.suppressed).toBe('no-scan-verdict');
+  });
+
+  test('only an explicit false lets labels through', () => {
+    expect(decide({ type: 'bug' }, { injection_detected: false }).apply).toEqual(['bug']);
+  });
+
+  test('a missing verdict does not accuse the submitter of injection', () => {
+    const scan = {};
+    const out = renderComment({ type: 'bug', summary: 's' }, decide({ type: 'bug' }, scan), scan);
+    expect(out).not.toContain('flagged this issue body');
+    expect(out).toContain('No labels were applied');
+    expect(out.indexOf('No labels were applied')).toBeLessThan(out.indexOf('Model summary'));
+  });
+
+  test('the two suppression reasons stay distinguishable', () => {
+    const injected = decide({ type: 'bug' }, { injection_detected: true });
+    const missing = decide({ type: 'bug' }, {});
+    expect(injected.suppressed).toBe('injection');
+    expect(injected.flagged).toBe(true);
+    expect(missing.suppressed).toBe('no-scan-verdict');
+    expect(missing.flagged).toBe(false);
   });
 });
 
@@ -90,9 +129,28 @@ describe('malformed model output fails closed', () => {
     expect(decide(cls as Record<string, unknown>, CLEAN).apply).toEqual([]);
   });
 
-  test('a non-integer duplicate is not proposed', () => {
-    expect(decide({ type: 'bug', possible_duplicate: 1.5 }, CLEAN).propose).toEqual([]);
-    expect(decide({ type: 'bug', possible_duplicate: '12' }, CLEAN).propose).toEqual([]);
+  test.each([
+    ['fractional', 1.5],
+    ['string', '12'],
+    ['zero', 0],
+    ['negative', -1],
+    ['beyond safe integer range', Number.MAX_SAFE_INTEGER + 1],
+    ['NaN', Number.NaN],
+    ['Infinity', Number.POSITIVE_INFINITY],
+  ])('a %s duplicate is neither proposed nor rendered', (_name, value) => {
+    const cls = { type: 'bug', summary: 's', possible_duplicate: value };
+    const d = decide(cls, CLEAN);
+    expect(d.propose).toEqual([]);
+    // The decision and the comment must agree: a value too invalid to propose
+    // the label is too invalid to print as "#<n>" as well.
+    expect(renderComment(cls, d, CLEAN)).not.toContain('Possible duplicate of');
+  });
+
+  test('a real issue number is proposed and rendered', () => {
+    const cls = { type: 'bug', summary: 's', possible_duplicate: 12 };
+    const d = decide(cls, CLEAN);
+    expect(d.propose).toContain('duplicate');
+    expect(renderComment(cls, d, CLEAN)).toContain('Possible duplicate of #12');
   });
 });
 

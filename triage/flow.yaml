@@ -5,11 +5,19 @@
 #              ├─> apply (deterministic, effectful)  -> done
 #   scan     ──┘
 #
-# Both transforms read the SAME entry artifact (issue.json). That is deliberate:
-# `scan` must see the raw, attacker-authored text. If it only saw classify's
-# output there would be nothing left to detect. They are independent, so the
-# linear order below is a cost choice (scan first would skip the classify call
-# on a hit), not a safety one.
+# Both transforms declare the SAME entry artifact (issue.json) as an input, and
+# both reference it as `{{issue.json}}`. That is deliberate: `scan` must see the
+# raw, attacker-authored text. If it only saw classify's output there would be
+# nothing left to detect. They are independent, so the linear order below is a
+# cost choice (scan first would skip the classify call on a hit), not a safety
+# one.
+#
+# The declaration is load-bearing, not decorative. A transform has no
+# filesystem: its prompt is built by substituting `{{artifact}}` placeholders
+# against the station's DECLARED inputs, and `conduit run --input` seeds the
+# entry artifact at the entry station's FIRST declared input. With `inputs: []`
+# the submission reaches neither station and both models classify an empty
+# prompt, silently. src/triage/flow-config.test.ts pins both halves.
 #
 # `scan` is NOT a gate station. A gate's remedy is rework, and re-running
 # classify on identical input changes nothing. The verdict is a routing input
@@ -71,7 +79,7 @@ stations:
           - { name: priority_suggestion, type: string, required: false }
           - { name: possible_duplicate, type: number, required: false }
           - { name: summary, type: string, required: true }
-    inputs: []
+    inputs: [issue.json]
     outputs: [triage.json]
     next: scan
 
@@ -89,7 +97,7 @@ stations:
         fields:
           - { name: injection_detected, type: boolean, required: true }
           - { name: evidence, type: string, required: true }
-    inputs: []
+    inputs: [issue.json]
     outputs: [scan.json]
     next: apply
 

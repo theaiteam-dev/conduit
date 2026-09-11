@@ -30,8 +30,13 @@
 #      ARTIFACTS created today — i.e. runs that actually did work — and bail
 #      over TRIAGE_DAILY_CAP. Counting artifacts rather than workflow runs
 #      matters: a run gated out by the job `if` costs no cap slot, so PR events
-#      that triage ignores cannot starve the ones it handles. It fails OPEN to
-#      a skip (untriaged item) rather than a red job.
+#      that triage ignores cannot starve the ones it handles.
+#
+# BOTH GUARDS FAIL CLOSED. When either one cannot read what it needs to decide
+# (a GitHub API error, an unparseable response), the job SKIPS: the submission
+# is left untriaged for a human rather than triaged twice or past the cap. The
+# outcome is a skip, never a red job, so an API blip does not look like a
+# broken workflow.
 #
 # DRY RUN BY DEFAULT. The job applies nothing until repository variable
 # TRIAGE_APPLY is set to '1'. Burn in against real issues and read the job
@@ -107,11 +112,24 @@ jobs:
           set -euo pipefail
           skip() { echo "proceed=false" >> "$GITHUB_OUTPUT"; echo "reason=$1" >> "$GITHUB_OUTPUT"; echo "SKIP: $1"; exit 0; }
 
+          # BOTH GUARDS FAIL CLOSED. A guard that cannot read its own input has
+          # not passed, it has failed to run, and the two are only the same if
+          # you squint. Neither `gh api` failing nor `jq` failing may be read as
+          # "no marker found" or "zero runs today": during a GitHub API outage
+          # that reading turns every retry into another full triage, so the
+          # first thing to break would spend model budget posting duplicate
+          # comments on issues already triaged. Capturing each response into a
+          # variable, separately from the parse, is what makes the failure
+          # visible: inside `if <pipeline>` or with `|| echo 0`, set -e and
+          # pipefail are both suspended and every error reads as a clean miss.
+          #
           # Guard 1 — already triaged. Matches the marker apply-triage.ts writes
           # (TRIAGE_MARKER). In dry run no comment is posted, so no marker
           # exists and re-runs are free, which is what burn-in wants.
-          if gh api "repos/$REPO/issues/$ISSUE/comments" --paginate --jq '.[].body' 2>/dev/null \
-               | grep -qF '<!-- conduit-triage -->'; then
+          if ! comments=$(gh api "repos/$REPO/issues/$ISSUE/comments" --paginate --jq '.[].body'); then
+            skip "could not read comments on #$ISSUE (GitHub API error) — refusing to risk a duplicate triage"
+          fi
+          if printf '%s' "$comments" | grep -qF '<!-- conduit-triage -->'; then
             skip "issue #$ISSUE already has a triage comment"
           fi
 
@@ -125,11 +143,18 @@ jobs:
           # end), so the comparison is >= and the cap is exact. Soft in one
           # direction only: genuinely concurrent runs can race past it.
           today=$(date -u +%Y-%m-%d)
-          count=$(gh api --paginate --slurp \
-            "repos/$REPO/actions/artifacts?per_page=100" 2>/dev/null \
-            | jq "[.[].artifacts[]
+          if ! artifacts=$(gh api --paginate --slurp "repos/$REPO/actions/artifacts?per_page=100"); then
+            skip "could not list artifacts (GitHub API error) — cannot verify the daily cap"
+          fi
+          if ! count=$(printf '%s' "$artifacts" | jq "[.[].artifacts[]
                    | select(.name | startswith(\"triage-\"))
-                   | select(.created_at >= \"$today\")] | length" || echo 0)
+                   | select(.created_at >= \"$today\")] | length"); then
+            skip "could not parse the artifact list — cannot verify the daily cap"
+          fi
+          # A non-numeric count is a parse that succeeded on the wrong shape.
+          case "$count" in
+            ''|*[!0-9]*) skip "artifact count '$count' is not a number — cannot verify the daily cap" ;;
+          esac
           echo "triage runs today: $count / cap $DAILY_CAP"
           if [ "$count" -ge "$DAILY_CAP" ]; then
             skip "daily cap reached ($count >= $DAILY_CAP) — #$ISSUE left untriaged"
@@ -202,14 +227,27 @@ jobs:
       - name: Report
         if: always() && steps.guards.outputs.proceed == 'true'
         run: |
+          # Everything below the headings is model output derived from an
+          # anonymous submission, and $GITHUB_STEP_SUMMARY is rendered as
+          # GitHub-Flavored Markdown. A line of three backticks inside run.log
+          # (which carries apply-triage.ts's raw comment preview) would close
+          # the fence this step opened and let the rest render as markdown
+          # addressed to the maintainer reading the summary. Neutralise every
+          # backtick run on the way in, the same substitution and for the same
+          # reason as `fence()` in src/triage/apply-triage.ts.
+          defuse() { sed "s/\`\{3,\}/'''/g" "$1" 2>/dev/null || true; }
           {
             echo "## Triage — #${{ github.event.issue.number || github.event.pull_request.number }} (${{ github.event_name }})"
             echo "Mode: \`${{ vars.TRIAGE_APPLY == '1' && 'APPLY' || 'DRY RUN' }}\`"
             echo "Guards: \`${{ steps.guards.outputs.reason }}\`"
             for f in triage.json scan.json result.json; do
-              echo; echo "### $f"; echo '```json'; cat "$f" 2>/dev/null || echo '{}'; echo '```'
+              echo; echo "### $f"; echo '```json'
+              if [ -s "$f" ]; then defuse "$f"; else echo '{}'; fi
+              echo '```'
             done
-            echo; echo "### run log (includes the halted-run card summary)"; echo '```'; tail -200 run.log 2>/dev/null; echo '```'
+            echo; echo "### run log (includes the halted-run card summary)"; echo '```'
+            tail -200 run.log 2>/dev/null | sed "s/\`\{3,\}/'''/g" || true
+            echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload triage artifacts
