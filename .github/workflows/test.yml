@@ -37,3 +37,27 @@ jobs:
 
       - name: Test
         run: bun run test
+
+      # Mutation check on the harness usage FOLD SITES (scripts/mutation-check.ts).
+      #
+      # A step in THIS job, not an advisory job of its own, and deliberately so.
+      # blackbox.yml and docs.yml burn in advisory-first because they carry
+      # flakiness this repo does not control — an external `drift` binary whose
+      # AST fingerprints can go stale repo-wide on a version bump, and a
+      # long-running journey suite. This check has neither exposure: same
+      # runner, same lockfile, same `bun test` as the step above, fully
+      # deterministic, ~3s for all five mutants. There is nothing to burn in.
+      #
+      # It belongs in the REQUIRED gate because of what it catches. The five
+      # fold sites move real money into the run/wave budgets, and deleting one
+      # breaks no type and no schema — issue #26 shipped with a dropped
+      # HarnessResult past a green suite, and an early version of #26's own
+      # tests passed with one of these folds removed. Green output is exactly
+      # what this failure mode looks like, so a check that merely advises is a
+      # check nobody reads at the moment it matters.
+      #
+      # The script restores every file it edits (finally + SIGINT/SIGTERM) and
+      # verifies the restore byte-for-byte, so a failure here leaves no mutated
+      # source behind for later steps.
+      - name: Mutation check (harness usage fold sites)
+        run: bun run test:mutation

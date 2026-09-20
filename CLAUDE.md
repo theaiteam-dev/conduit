@@ -191,6 +191,35 @@ binding set is deliberately small — `adr/`, `docs/archive/`, `docs/history/`,
 **never** bound. An ADR is a dated record of a decision and is *supposed* to
 describe the world as it was; prompt templates are runtime inputs, not docs.
 
+## A green suite does not mean a budget is wired
+
+`foldHarnessUsage` is how a billed harness call reaches the run and wave
+budgets. There are five call sites, all in `src/controller/executor.ts`: the
+gate critic, the rate-limit park, the maker throw, the maker success, and the
+subflow roll-up. Deleting any one of them breaks no type, no schema and no
+journal row — the row is written by a different line — so the only thing that
+goes wrong is that `tokensSpent` is too low, on exactly the runs that cost the
+most. Issue #26 shipped that way, and an early version of #26's own tests
+passed with one of the folds removed, because the assertion read the journal
+instead of the accumulator.
+
+`bun run test:mutation` (`scripts/mutation-check.ts`) deletes each fold site in
+turn and requires a named test to fail. It runs in the required CI gate and
+takes about three seconds. Two obligations follow:
+
+- **Assert on the accumulator, not the journal.** A test that proves usage was
+  *recorded* does not prove it was *counted*. Reach for `tokensSpent`, or for a
+  budget that trips.
+- **If you move, rename or add a fold site, update the manifest in the same
+  change.** A `find` string that no longer matches fails the check rather than
+  skipping it, deliberately: a silently skipped mutant is the same failure mode
+  the script exists to catch. `--list` prints each site and what goes wrong
+  without it.
+
+The manifest is small on purpose — five lines that move money — and its guard
+lists were found by mutating and seeing what broke, not by guessing. Keep them
+that way.
+
 ## Design principles to apply consistently
 
 - **Deterministic flow, non-deterministic labor.** The kernel decides what's legal next; LLMs only produce and judge. No LLM in the steady-state dispatch loop.
