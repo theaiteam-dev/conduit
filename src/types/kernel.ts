@@ -341,10 +341,18 @@ export interface StationGateConfig {
   criticInputScope: string[];
   /**
    * Adapter name for an AGENTIC critic (WI-570, Phase 2) — a `kind: harness`
-   * station used as the critic gate instead of a model call. Mutually
-   * exclusive in practice with a meaningful `criticModel` (absent when a
-   * harness critic is configured). Resolved against the same engine-config
-   * harness registry a `kind: harness` maker uses (WI-560).
+   * station used as the critic gate instead of a model call. Resolved against
+   * the same engine-config harness registry a `kind: harness` maker uses
+   * (WI-560).
+   *
+   * NOT mutually exclusive with `criticModel`, despite what this comment used
+   * to claim. Issue #26 AC4 made a harness critic's model meaningful:
+   * `check.critic.model` now reaches `HarnessInvocation.model` with
+   * station-over-adapter precedence (FR-10), so declaring both is the
+   * SUPPORTED way to pin a critic to a specific model while the adapter
+   * supplies the deployment default elsewhere. Note that an absent critic
+   * model is the EMPTY STRING, not undefined (flow/load.ts), so any
+   * precedence check must treat `''` as absent.
    */
   criticHarness?: string;
   /**
