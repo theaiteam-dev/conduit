@@ -47,6 +47,7 @@ import { runTransformStation, coerciveParse, computeFindingsHash } from '../work
 import type {
   HarnessRegistry, MountedInput, HarnessResult, KnownUsage, RateLimitSnapshot,
 } from '../worker/harness-adapter';
+import { usageFromThrow } from '../worker/harness-adapter';
 import { harnessRetryDelayMs } from '../worker/harness-retry';
 import { loadImageInput, hashImageInputs, assertImagePayloadWithinLimits } from '../worker/image-input';
 import type { ImageInput } from '../worker/image-input';
@@ -1593,6 +1594,11 @@ async function executeStation(args: ExecuteStationArgs): Promise<boolean> {
       harnessRegistry,
       // the pre-public deterministic failure-reporting review: fresh liveness stamp for slow-failing commands mid-retry.
       stampActivity: stampHarnessActivity,
+      // issue #26 AC3: a gate critic's billed spend must reach the SAME
+      // run/wave accumulators the harness/subflow maker paths already fold
+      // into — a deterministic maker itself never calls foldHarnessUsage, but
+      // its `check.critic.harness` critic can.
+      foldHarnessUsage,
       err,
     });
   }
@@ -1620,6 +1626,8 @@ async function executeStation(args: ExecuteStationArgs): Promise<boolean> {
       // Review #1: a transform maker may declare an AGENTIC critic
       // (check.critic.harness) — the registry must reach runGateCheckOrAdvance.
       harnessRegistry,
+      // issue #26 AC3: same reasoning as the deterministic branch above.
+      foldHarnessUsage,
       err,
     });
   }
@@ -1738,6 +1746,13 @@ interface DeterministicArgs {
    * wall-clock counts as progress during count-and-retry (the pre-public deterministic failure-reporting review).
    */
   stampActivity?: () => void;
+  /**
+   * issue #26 AC3: threaded through so a `check.critic.harness` (AGENTIC)
+   * critic gating this deterministic maker can fold its OWN billed spend into
+   * the same run/wave accumulators the maker path feeds — a deterministic
+   * command never calls a harness/model itself, but its gate critic can.
+   */
+  foldHarnessUsage: (tokens: number) => void;
   /** Error-surfacing channel threaded through from runExecutor's io.err. */
   err: (msg: string) => void;
 }
@@ -2043,7 +2058,7 @@ async function executeDeterministicStation(args: DeterministicArgs): Promise<boo
   const {
     db, stateDb, runId, stationConfig, stationId, cardId, commandAllowlist, happyPathNext, terminalLanes,
     projectRoot, flow, maxExecutionAttempts, trackingAdapter, currentNow, runStartedAt, wallClockSeconds,
-    maxTokens, getTokensSpent, onAndonTrip, harnessRegistry, stampActivity, err,
+    maxTokens, getTokensSpent, onAndonTrip, harnessRegistry, stampActivity, foldHarnessUsage, err,
   } = args;
 
   // Punch-list #8 — per-station wall-clock timeout for the spawned command.
@@ -2104,7 +2119,7 @@ async function executeDeterministicStation(args: DeterministicArgs): Promise<boo
         db, stateDb, runId, stationConfig, stationId, cardId, card,
         stationOutput: readDeterministicStationOutput(stationConfig, projectRoot),
         trackingAdapter, projectRoot, flow, happyPathNext, terminalLanes, maxExecutionAttempts,
-        currentNow, runStartedAt, wallClockSeconds, maxTokens, getTokensSpent, onAndonTrip, harnessRegistry, err,
+        currentNow, runStartedAt, wallClockSeconds, maxTokens, getTokensSpent, onAndonTrip, harnessRegistry, foldHarnessUsage, err,
       });
     }
 
@@ -2161,7 +2176,7 @@ async function executeDeterministicStation(args: DeterministicArgs): Promise<boo
         db, stateDb, runId, stationConfig, stationId, cardId, card,
         stationOutput: readDeterministicStationOutput(stationConfig, projectRoot),
         trackingAdapter, projectRoot, flow, happyPathNext, terminalLanes, maxExecutionAttempts,
-        currentNow, runStartedAt, wallClockSeconds, maxTokens, getTokensSpent, onAndonTrip, harnessRegistry, err,
+        currentNow, runStartedAt, wallClockSeconds, maxTokens, getTokensSpent, onAndonTrip, harnessRegistry, foldHarnessUsage, err,
       });
     } else {
       // Command failed with the intent still PENDING. A nonzero exit does NOT
@@ -2222,7 +2237,7 @@ async function executeDeterministicStation(args: DeterministicArgs): Promise<boo
       db, stateDb, runId, stationConfig, stationId, cardId, card,
       stationOutput: readDeterministicStationOutput(stationConfig, projectRoot),
       trackingAdapter, projectRoot, flow, happyPathNext, terminalLanes, maxExecutionAttempts,
-      currentNow, runStartedAt, wallClockSeconds, maxTokens, getTokensSpent, onAndonTrip, harnessRegistry, err,
+      currentNow, runStartedAt, wallClockSeconds, maxTokens, getTokensSpent, onAndonTrip, harnessRegistry, foldHarnessUsage, err,
     });
   } else {
     // Command failed → count it toward the attempt cap: retry below the cap,
@@ -2286,6 +2301,15 @@ interface GateCheckOrAdvanceArgs {
    * Optional — undefined for flows with no harness makers or critics.
    */
   harnessRegistry?: HarnessRegistry;
+  /**
+   * issue #26 AC3: folds a harness CRITIC's own billed spend into the SAME
+   * run/wave budget accumulators trackingAdapter/foldHarnessUsage already feed
+   * for the maker path — a gate critic never calls trackingAdapter (the maker
+   * kinds that host `check:` may not even touch a ModelAdapter at all, e.g. a
+   * deterministic maker), so without this the critic's own spend is invisible
+   * to the consumption andon and the wave budget.
+   */
+  foldHarnessUsage: (tokens: number) => void;
   err: (msg: string) => void;
 }
 
@@ -2703,7 +2727,7 @@ async function runGateCheckOrAdvance(args: GateCheckOrAdvanceArgs): Promise<bool
   const {
     db, stateDb, runId, stationConfig, stationId, cardId, card, stationOutput, trackingAdapter, projectRoot,
     flow, happyPathNext, terminalLanes, maxExecutionAttempts, currentNow, runStartedAt, wallClockSeconds,
-    maxTokens, getTokensSpent, onAndonTrip, harnessRegistry, err,
+    maxTokens, getTokensSpent, onAndonTrip, harnessRegistry, foldHarnessUsage, err,
   } = args;
 
   // ── Run gate check (if configured) ───────────────────────────────────────
@@ -2749,6 +2773,44 @@ async function runGateCheckOrAdvance(args: GateCheckOrAdvanceArgs): Promise<bool
         err, runId, true,
       );
       return false;
+    }
+
+    // ── issue #26 AC3/AC5: fold + journal the critic's OWN billed spend ──────
+    // Only an AGENTIC (harness) critic populates `criticUsage` — a transform
+    // critic's spend is already folded via trackingAdapter inside
+    // runTransformStation, and double-folding it here would double-count
+    // (see CriticUsage's doc comment in quality/gate.ts).
+    //
+    // PLACEMENT: this runs BEFORE the andon check below on purpose. A critic
+    // that itself blows the run budget must trip the andon on its own spend,
+    // not a tick later — folding first is what makes that true; checking the
+    // andon first would let one over-budget critic call slip through free.
+    if (gateDecision.criticUsage !== undefined) {
+      const { adapterName, model, durationMs, usage } = gateDecision.criticUsage;
+      const usageKnown = !('unknown' in usage);
+      if (usageKnown) {
+        // Budgets fold the TOTAL, mirroring the maker path's foldHarnessUsage
+        // call — never the pieces of a breakdown.
+        foldHarnessUsage(usage.tokens);
+      }
+      // SPAN NAME: '<station>.harness-critic', deliberately NOT '<station>.harness'.
+      // countConsecutiveRateLimitParks (~line 4469) walks journal spans
+      // backwards by the EXACT name '<station>.harness' to bound
+      // MAX_CONSECUTIVE_RATE_LIMIT_PARKS; a critic span sharing that name
+      // would silently corrupt that streak (either hard-pausing a maker that
+      // never actually parked, or masking one that did).
+      db.appendJournalSpan({
+        runId,
+        cardId,
+        station: stationId,
+        attempt: card.attempt,
+        name: `${stationId}.harness-critic`,
+        adapter: adapterName,
+        durationMs,
+        usageUnknown: !usageKnown,
+        usage: usageKnown ? harnessJournalUsage(usage, model) : undefined,
+        attributes: usageKnown ? rateLimitAttributes(usage.rateLimit) : {},
+      });
     }
 
     // Andon check after gate model call.
@@ -2968,6 +3030,13 @@ interface TransformArgs {
    * every maker kind must supply the registry, not just a harness maker.
    */
   harnessRegistry?: HarnessRegistry;
+  /**
+   * issue #26 AC3: threaded through so a `check.critic.harness` (AGENTIC)
+   * critic gating this transform maker can fold its OWN billed spend into the
+   * same run/wave accumulators the maker path feeds — a transform maker's own
+   * model call already folds via trackingAdapter, but a harness critic does not.
+   */
+  foldHarnessUsage: (tokens: number) => void;
   /** Error-surfacing channel threaded through from runExecutor's io.err. */
   err: (msg: string) => void;
 }
@@ -2993,6 +3062,7 @@ async function executeTransformStation(args: TransformArgs): Promise<boolean> {
     getTokensSpent,
     onAndonTrip,
     harnessRegistry,
+    foldHarnessUsage,
     err,
   } = args;
 
@@ -3378,7 +3448,7 @@ async function executeTransformStation(args: TransformArgs): Promise<boolean> {
     db, stateDb, runId, stationConfig, stationId, cardId, card,
     stationOutput,
     trackingAdapter, projectRoot, flow, happyPathNext, terminalLanes, maxExecutionAttempts,
-    currentNow, runStartedAt, wallClockSeconds, maxTokens, getTokensSpent, onAndonTrip, harnessRegistry, err,
+    currentNow, runStartedAt, wallClockSeconds, maxTokens, getTokensSpent, onAndonTrip, harnessRegistry, foldHarnessUsage, err,
   });
 }
 
@@ -3696,9 +3766,26 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
         if ((invokeErr as { code?: string }).code === 'harness-rate-limited') {
           const resetAtMs = (invokeErr as { resetAtMs?: number }).resetAtMs;
           const releaseAt = releaseAtForRateLimit(currentNow, resetAtMs, Date.now());
+          // issue #26 AC5: a rate limit does not refund tokens already spent —
+          // a call that ran for minutes before hitting the cap was still
+          // billed. Recovered the SAME way as the general-throw catch below
+          // (usageFromThrow), and folded/journaled BEFORE the park so the
+          // run/wave budget sees it even though this attempt spends no
+          // execution attempt. Safe to fold here: `attributes.outcome` stays
+          // 'harness-rate-limited' regardless, so countConsecutiveRateLimitParks
+          // (which keys on that attribute, not usageUnknown) is unaffected.
+          const parkedUsage = usageFromThrow(invokeErr);
+          let parkedUsageKnown = false;
+          let parkedJournalUsage: JournalSpanInput['usage'];
+          if (parkedUsage !== undefined && !('unknown' in parkedUsage)) {
+            parkedUsageKnown = true;
+            foldHarnessUsage(parkedUsage.tokens);
+            parkedJournalUsage = harnessJournalUsage(parkedUsage, effectiveModel);
+          }
           db.appendJournalSpan({
             runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.harness`,
-            adapter: harnessAdapter.name, durationMs: Date.now() - invokeStartedAt, usageUnknown: true,
+            adapter: harnessAdapter.name, durationMs: Date.now() - invokeStartedAt,
+            usageUnknown: !parkedUsageKnown, usage: parkedJournalUsage,
             attributes: {
               // Issue #5 ask (4): a usage_unknown row that names WHY. This is
               // what separates "capped, cost nothing" from "ran for minutes and
@@ -3767,12 +3854,29 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
             : code === 'harness-nonzero-exit'
               ? 'harness-nonzero-exit'
               : `harness-invocation-failed: ${(invokeErr as Error).message}`;
-        // WI-567 AC2: on the books even when the invocation itself throws — no
-        // usage was ever returned, so this is explicitly unknown (never a
-        // fabricated zero) and does NOT fold into the run/wave budget.
+        // issue #26 AC5: a thrown invocation was still BILLED for whatever it
+        // did before it died (a timeout or nonzero exit does not refund
+        // tokens already consumed). usageFromThrow is the ONE reader for
+        // usage attached to a harness throw — never cast and reach for
+        // `.usage` directly. When the adapter recovered a real figure, fold
+        // it into the run/wave budget and journal it instead of a fabricated
+        // usageUnknown row; when it returns undefined (the adapter genuinely
+        // could not recover one — e.g. a claude wall-clock timeout, which
+        // never emits a terminal result event to read usage from), this is
+        // WI-567 AC2's original behaviour, unchanged: explicitly unknown,
+        // never a fabricated zero, and nothing folds into the budget.
+        const thrownUsage = usageFromThrow(invokeErr);
+        let thrownUsageKnown = false;
+        let thrownJournalUsage: JournalSpanInput['usage'];
+        if (thrownUsage !== undefined && !('unknown' in thrownUsage)) {
+          thrownUsageKnown = true;
+          foldHarnessUsage(thrownUsage.tokens);
+          thrownJournalUsage = harnessJournalUsage(thrownUsage, effectiveModel);
+        }
         db.appendJournalSpan({
           runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.harness`,
-          adapter: harnessAdapter.name, durationMs: Date.now() - invokeStartedAt, usageUnknown: true,
+          adapter: harnessAdapter.name, durationMs: Date.now() - invokeStartedAt,
+          usageUnknown: !thrownUsageKnown, usage: thrownJournalUsage,
           attributes: { outcome: scrapReason },
         });
         // Issue #3: back off before the next attempt. Without this,
@@ -4013,7 +4117,7 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
     stationOutput,
     trackingAdapter, projectRoot, flow, happyPathNext, terminalLanes, maxExecutionAttempts,
     currentNow, runStartedAt, wallClockSeconds, maxTokens, getTokensSpent, onAndonTrip,
-    harnessRegistry, err,
+    harnessRegistry, foldHarnessUsage, err,
   });
 }
 
@@ -4273,7 +4377,7 @@ async function executeSubflowStation(args: SubflowArgs): Promise<boolean> {
     stationOutput,
     trackingAdapter, projectRoot, flow, happyPathNext, terminalLanes, maxExecutionAttempts,
     currentNow, runStartedAt, wallClockSeconds, maxTokens, getTokensSpent, onAndonTrip,
-    harnessRegistry, err,
+    harnessRegistry, foldHarnessUsage, err,
   });
 }
 

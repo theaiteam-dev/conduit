@@ -494,11 +494,28 @@ export interface StationOutput<TPayload> {
    * Consumed by the gate (WI-300) to route the card.
    */
   return_to: Lane | null;
-  /** Per-call token and cost attribution for budget tracking. */
-  usage: {
-    tokens: number;
-    cost: number;
-  };
+  /**
+   * Per-call token and cost attribution for budget tracking.
+   *
+   * A UNION, not a bare `{tokens, cost}`, because a MISSING measurement and a
+   * MEASURED zero are different facts and must stay distinguishable (issue
+   * #26 AC2). An adapter that cannot report usage for a call returns
+   * `{ unknown: true }` (HarnessResult.usage, worker/harness-adapter.ts) and
+   * that unknown must survive into the StationOutput rather than being
+   * flattened to a fabricated `{ tokens: 0, cost: 0 }` — a fabricated zero is
+   * indistinguishable from a free call and silently under-counts every budget
+   * that folds this number.
+   *
+   * Structurally compatible with `UsageReport` from worker/harness-adapter.ts,
+   * deliberately restated here rather than imported: types/kernel.ts is the
+   * kernel's dependency-free type root and must not take an edge into worker/.
+   */
+  usage:
+    | {
+        tokens: number;
+        cost: number;
+      }
+    | { unknown: true };
 }
 
 // ---------------------------------------------------------------------------

@@ -45,6 +45,7 @@ import type {
   HarnessRunnerConfig,
   HarnessSpawnResult,
 } from './harness-runner';
+import { usageFromThrow } from './harness-adapter';
 import type { HarnessAdapter, HarnessInvocation, BinaryProbe } from './harness-adapter';
 
 // ---------------------------------------------------------------------------
@@ -747,5 +748,113 @@ describe('dominantModel', () => {
   it('is undefined when nothing was reported', () => {
     expect(dominantModel(undefined)).toBeUndefined();
     expect(dominantModel({})).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Issue #26 AC5 — a throw that was still BILLED carries the real usage figure,
+// when the adapter genuinely has one in hand at the moment it fails.
+// ---------------------------------------------------------------------------
+
+describe('claude-headless adapter: usage carried through a billed throw (issue #26 AC5)', () => {
+  it('a non-zero exit whose stdout carried a complete result event carries the real usage', async () => {
+    // A non-429 crash (terminal_reason: refusal) that still reported a full
+    // result payload with structured usage before dying nonzero.
+    const stdout = JSON.stringify({
+      type: 'result',
+      subtype: 'error_during_execution',
+      is_error: true,
+      terminal_reason: 'refusal',
+      result: 'the agent refused the task',
+      total_cost_usd: 0.0087,
+      usage: {
+        input_tokens: 500,
+        output_tokens: 200,
+        cache_creation_input_tokens: 50,
+        cache_read_input_tokens: 25,
+      },
+    });
+    const adapter = makeAdapter({ run: makeRun({ stdout, exitCode: 2, stderr: '' }).run });
+
+    const err = await adapter.invoke(invocation()).catch((e: unknown) => e);
+
+    expect((err as { code?: string }).code).toBe('harness-nonzero-exit');
+    // The provider charged for this call before it died — the executor must
+    // fold the real total, not record a failed-and-therefore-free attempt.
+    expect(usageFromThrow(err)).toEqual({
+      tokens: 775,
+      cost: 0.0087,
+      breakdown: {
+        inputTokens: 500, outputTokens: 200,
+        cacheReadInputTokens: 25, cacheCreationInputTokens: 50,
+      },
+    });
+  });
+
+  it('a rate-limited exit keeps its resetAtMs/rateLimit detail AND carries usage', async () => {
+    const rateLimited = JSON.stringify({
+      type: 'result',
+      subtype: 'success',
+      is_error: true,
+      api_error_status: 429,
+      terminal_reason: 'api_error',
+      result: "You've hit your session limit · resets 3pm (UTC)",
+      total_cost_usd: 0.0041,
+      usage: {
+        input_tokens: 300,
+        output_tokens: 100,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+      },
+    });
+    const stdout = [RECORDED_RATE_LIMIT_EVENT, rateLimited].join('\n');
+    const adapter = makeAdapter({ run: makeRun({ stdout, exitCode: 1 }).run });
+
+    const err = await adapter.invoke(invocation()).catch((e: unknown) => e);
+
+    expect((err as { code?: string }).code).toBe('harness-rate-limited');
+    // Existing rate-limit detail must stay intact alongside the new usage field.
+    expect((err as { resetAtMs?: number }).resetAtMs).toBe(1788328800 * 1000);
+    expect((err as { rateLimit?: unknown }).rateLimit).toBeDefined();
+    // KnownUsage carries its own optional rateLimit field (same as the success
+    // path's usage object), alongside the throw's separate top-level rateLimit
+    // detail used for the park calculation.
+    expect(usageFromThrow(err)).toEqual({
+      tokens: 400,
+      cost: 0.0041,
+      breakdown: {
+        inputTokens: 300, outputTokens: 100,
+        cacheReadInputTokens: 0, cacheCreationInputTokens: 0,
+      },
+      rateLimit: {
+        status: 'allowed_warning',
+        usingOverage: false,
+        windows: [{ name: 'seven_day', utilization: 0.77, resetsAtMs: 1788328800 * 1000 }],
+      },
+    });
+  });
+
+  it('a non-zero exit whose stdout carried NO result event has no usage to recover — absent, not zero', async () => {
+    const adapter = makeAdapter({
+      run: makeRun({ stdout: '', exitCode: 3, stderr: 'segfault' }).run,
+    });
+
+    const err = await adapter.invoke(invocation()).catch((e: unknown) => e);
+
+    expect((err as { code?: string }).code).toBe('harness-nonzero-exit');
+    // AC2's "unknown is not zero" rule on the THROW path: nothing to recover
+    // means the field is absent, never a fabricated { tokens: 0, cost: 0 }.
+    expect(usageFromThrow(err)).toBeUndefined();
+  });
+
+  it('a wall-clock timeout carries no usage (claude reports usage only in a terminal result event a kill never emits)', async () => {
+    const adapter = makeAdapter({
+      run: makeRun({ stdout: '', timedOut: true, exitCode: 137 }).run,
+    });
+
+    const err = await adapter.invoke(invocation()).catch((e: unknown) => e);
+
+    expect((err as { code?: string }).code).toBe('harness-timeout');
+    expect(usageFromThrow(err)).toBeUndefined();
   });
 });
