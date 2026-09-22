@@ -177,6 +177,15 @@ fi
 # container a path into your object store. This one has no remotes you push to,
 # no hooks, and nothing in it you have ever committed.
 # ---------------------------------------------------------------------------
+# `git -C` does not override the environment: GIT_DIR, GIT_WORK_TREE and the
+# rest still win over it. This script runs `git init` and `git fetch` into the
+# quarantine path, so an inherited GIT_DIR would point that quarantine at the
+# caller's repository instead — and being invoked from a hook or a git wrapper
+# is exactly the situation this script exists to survive. Clear them before the
+# first git command below.
+unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_INDEX_FILE \
+      GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_PREFIX
+
 origin_url="$(git -C "$(dirname "$0")/.." remote get-url origin)"
 
 # quarantine <dir> <sha> — a shallow, hookless checkout of exactly that commit.
@@ -268,25 +277,62 @@ sandbox none "$work" bun run test:blackbox || warn "blackbox failed — advisory
 # reviewer who learns to wave those through is worse off than one who never
 # ran it.
 # ---------------------------------------------------------------------------
-fails_in() { grep -oP '^\(fail\) \K.*?(?= \[[0-9.]+m?s\]$|$)' "$1" 2>/dev/null | sort -u; }
+# Total by construction: grep exits 1 on no match and `set -o pipefail` would
+# make that the pipeline's status, which `set -e` turns into an abort the
+# moment this is used in a command substitution rather than a <(...).
+fails_in() { grep -oP '^\(fail\) \K.*?(?= \[[0-9.]+m?s\]$|$)' "$1" 2>/dev/null | sort -u || true; }
 
 if [[ " ${failed[*]} " == *" tests "* ]]; then
   note "tests failed — running base $base_sha through the same sandbox to attribute them"
-  if [[ ! -d "$base_work/node_modules" ]]; then
+  # A bare node_modules is not evidence of a usable baseline. An interrupted
+  # install leaves a partial one behind, and this tree is deliberately
+  # persistent — it is also where the previous baseline run's tests wrote. Both
+  # make the baseline fail MORE than the base commit really does, and a
+  # baseline that over-fails cancels real failures in the subtraction below.
+  # So: reuse only a tree whose install ran to completion, and put it back to
+  # the checked-out commit before reusing it.
+  base_stamp="$ROOT_DIR/base-$base_sha.installed"
+  if [[ ! -f "$base_stamp" || ! -d "$base_work/.git" ]]; then
+    rm -f "$base_stamp"
     quarantine "$base_work" "$base_sha"
     sandbox bridge "$base_work" bun install --frozen-lockfile --ignore-scripts >/dev/null \
       || die "baseline install failed; cannot attribute the failures" 1
+    # Written only after a clean install, and kept outside the tree so that
+    # the reset below cannot remove the very marker that vouches for it.
+    : >"$base_stamp"
+  else
+    note "reusing the installed baseline at $base_work (resetting it first)"
+    git -C "$base_work" reset -q --hard
+    git -C "$base_work" clean -qfd -e node_modules
   fi
-  sandbox none "$base_work" bun run test >"$logs/base-$base_sha.test.log" 2>&1 || true
 
-  new_fails="$(comm -23 <(fails_in "$logs/pr-$pr.test.log") <(fails_in "$logs/base-$base_sha.test.log"))"
-  if [[ -z "$new_fails" ]]; then
-    warn "every failure also fails on the base commit in this sandbox — none are attributable to PR #$pr"
+  base_rc=0
+  sandbox none "$base_work" bun run test >"$logs/base-$base_sha.test.log" 2>&1 || base_rc=$?
+
+  pr_fails="$(fails_in "$logs/pr-$pr.test.log")"
+  base_fails="$(fails_in "$logs/base-$base_sha.test.log")"
+  new_fails="$(comm -23 <(printf '%s\n' "$pr_fails") <(printf '%s\n' "$base_fails"))"
+
+  # Dropping `tests` from `failed` asserts that the sandbox caused all of it,
+  # and that assertion needs evidence on BOTH sides: the base must actually
+  # have failed, each log must carry parsed `(fail)` lines to subtract, and
+  # nothing may survive the subtraction. Demanding all three is what stops a
+  # suite that died WITHOUT printing a single `(fail)` line — a crash, an OOM,
+  # a broken `test` script — from yielding an empty set on both sides,
+  # subtracting to empty, and reporting the pull request clean. A false green
+  # from the tool that exists to prevent one is the worst thing this script
+  # could do, so ambiguity keeps the failure rather than explaining it away.
+  if (( base_rc != 0 )) && [[ -n "$pr_fails" && -n "$base_fails" && -z "$new_fails" ]]; then
+    warn "every parsed failure also fails on the base commit in this sandbox — none are attributable to PR #$pr"
     warn "logs: $logs/pr-$pr.test.log vs $logs/base-$base_sha.test.log"
     failed=("${failed[@]/tests/}")
-  else
+  elif [[ -n "$new_fails" ]]; then
     printf '\n\033[31mfailures introduced by PR #%s:\033[0m\n' "$pr" >&2
     printf '  %s\n' "$new_fails" >&2
+  else
+    warn "the suite failed, but the logs do not show the base failing the same way"
+    warn "keeping it against PR #$pr — check the logs yourself rather than trusting this"
+    warn "logs: $logs/pr-$pr.test.log vs $logs/base-$base_sha.test.log"
   fi
 fi
 

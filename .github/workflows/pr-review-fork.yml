@@ -134,13 +134,35 @@ jobs:
           skip() { echo "proceed=false" >>"$GITHUB_OUTPUT"; echo "SKIP: $1"; exit 0; }
 
           since="$(date -u +%Y-%m-%d)"
-          # Count runs that actually did work. A run gated out by the job `if`
-          # above ends as 'skipped' and must not consume a slot: every
-          # pull_request_target event reaches this workflow, so counting raw
-          # runs would let ordinary traffic starve the reviews this file is for.
+          # Count runs that actually did work, PLUS runs still in flight.
+          #
+          # A run gated out by the job `if` above ends as 'skipped' and must
+          # not consume a slot: every pull_request_target event reaches this
+          # workflow, so counting raw runs would let ordinary traffic starve
+          # the reviews this file is for.
+          #
+          # In-flight runs count because a conclusion is only written when a
+          # run ENDS. Counting concluded runs alone makes this a read-then-act
+          # race across pull requests: label several at once and every guard
+          # reads the same total, every one admits, and the cap is overshot by
+          # however many are running concurrently. That burst is not a
+          # hypothetical edge — it is precisely the shape of the slip of the
+          # hand or the compromised maintainer account this cap exists to
+          # bound. This run excludes itself, being in flight by the time this
+          # step executes.
+          #
+          # Serializing the workflow on one repository-wide concurrency group
+          # would close the same race, but GitHub holds at most one run pending
+          # per group: a third label would cancel the queued review outright,
+          # and a cancelled run still consumes a slot below. Counting drops
+          # nothing, and leaves the per-PR supersede above intact.
           runs="$(gh api --paginate \
             "repos/$REPO/actions/workflows/pr-review-fork.yml/runs?created=>=$since&per_page=100" \
-            --jq '[.workflow_runs[] | select(.conclusion=="success" or .conclusion=="failure" or .conclusion=="cancelled")] | length' \
+            --jq '[.workflow_runs[]
+                   | select((.id|tostring) != env.GITHUB_RUN_ID)
+                   | select(.conclusion=="success" or .conclusion=="failure" or .conclusion=="cancelled"
+                            or .status=="queued" or .status=="in_progress" or .status=="waiting"
+                            or .status=="pending" or .status=="requested")] | length' \
             2>/dev/null | paste -sd+ | bc 2>/dev/null)" || skip "cannot read run history — failing closed"
           [ -n "$runs" ] || skip "cannot read run history — failing closed"
 

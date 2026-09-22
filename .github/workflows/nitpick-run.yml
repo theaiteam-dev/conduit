@@ -141,8 +141,24 @@ jobs:
           MAX_DIFF_BYTES: ${{ inputs.max_diff_bytes }}
         run: |
           set -euo pipefail
-          gh api "repos/$REPO/pulls/$PR_NUMBER" \
-            -H "Accept: application/vnd.github.diff" > diff.patch
+          # GitHub refuses the diff media type with 406 once a pull request
+          # passes 300 changed files or 20,000 diff lines. Nothing was
+          # reviewable, which is the same outcome as the byte cap below, so it
+          # is reported the same way. Letting `set -e` kill the step instead
+          # would turn this check red on exactly the largest pull requests —
+          # the ones the cap exists for — and the caller would never reach its
+          # "diff too large" comment. The fork caller's `advisory` flag is no
+          # help here either: `continue-on-error` sits on `Post review` only.
+          if ! gh api "repos/$REPO/pulls/$PR_NUMBER" \
+               -H "Accept: application/vnd.github.diff" > diff.patch 2>api.err; then
+            if grep -q 'HTTP 406' api.err; then
+              echo "GitHub refused the diff as too large: $(tr '\n' ' ' < api.err)"
+              echo "too_large=true" >>"$GITHUB_OUTPUT"
+              exit 0
+            fi
+            cat api.err >&2
+            exit 1
+          fi
 
           size=$(wc -c < diff.patch)
           if [ "$MAX_DIFF_BYTES" -gt 0 ] && [ "$size" -gt "$MAX_DIFF_BYTES" ]; then
