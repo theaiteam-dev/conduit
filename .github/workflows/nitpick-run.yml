@@ -74,8 +74,12 @@ on:
 
 env:
   FLOW_IMAGE: ghcr.io/queso/nitpick-flow:main
-  REVIEWER_MODEL: accounts/fireworks/models/gpt-oss-120b
-  COORDINATOR_MODEL: accounts/fireworks/models/qwen3p7-plus
+  # Both seats on glm-5p3-flash (nitpick-flow docs/model-refresh-2026-09.md):
+  # gpt-oss-120b had ~zero recall at production prompt size (~23k tokens),
+  # and qwen3p7-plus is being sunset. Keep in sync with nitpick-flow's own
+  # nitpick.yml defaults.
+  REVIEWER_MODEL: accounts/fireworks/models/glm-5p3-flash
+  COORDINATOR_MODEL: accounts/fireworks/models/glm-5p3-flash
   CONDUIT_BASE_URL: https://api.fireworks.ai/inference/v1
 
 jobs:
