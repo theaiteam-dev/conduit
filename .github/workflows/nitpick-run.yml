@@ -85,15 +85,54 @@ jobs:
     outputs:
       too_large: ${{ steps.inputs.outputs.too_large }}
     steps:
+      # ── Preflight ─────────────────────────────────────────────────────────
+      # This reviewer needs two credentials that are listed as one-time
+      # prerequisites in pr-review.yml's header and, at the time of writing,
+      # had never been created. The result was `Error response from daemon:
+      # denied` on the image pull and a RED `nitpick` check on every pull
+      # request going back months — a check nobody could act on, which is how a
+      # check stops being read at all.
+      #
+      # A missing credential is a configuration state, not a review failure, so
+      # it reports as one: the job skips and goes green with a WARNING
+      # annotation on every run. It is deliberately not `continue-on-error`,
+      # which would also swallow a genuine reviewer failure, and deliberately
+      # not silent, because a reviewer that quietly stops reviewing is worse
+      # than one that is visibly off.
+      #
+      # This needs no reverting. The moment both secrets exist the check runs
+      # for real.
+      - name: Preflight — reviewer credentials
+        id: preflight
+        env:
+          # Comparing a secret to '' does not expose it.
+          HAS_KEY: ${{ secrets.conduit_api_key != '' }}
+          HAS_PAT: ${{ secrets.ghcr_read_pat != '' }}
+        run: |
+          set -euo pipefail
+          missing=""
+          [ "$HAS_KEY" = "true" ] || missing="$missing FIREWORKS_AI_API_KEY"
+          [ "$HAS_PAT" = "true" ] || missing="$missing GHCR_READ_PAT"
+          if [ -n "$missing" ]; then
+            echo "::warning title=Nitpick not configured::Skipping review. Missing repository secret(s):$missing. The reviewer cannot pull its image or reach the gateway without them."
+            echo "configured=false" >>"$GITHUB_OUTPUT"
+          else
+            echo "configured=true" >>"$GITHUB_OUTPUT"
+          fi
+
       # persist-credentials: false — nothing after this step uses git, and a
       # token left in .git/config is one the container steps could read.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        if: steps.preflight.outputs.configured == 'true'
         with:
           ref: ${{ inputs.checkout_ref }}
           persist-credentials: false
 
+      # Every later step already gates on steps.inputs.outputs.ok, which this
+      # step is the only writer of — so gating here gates the whole job.
       - name: Fetch PR diff + context
         id: inputs
+        if: steps.preflight.outputs.configured == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
