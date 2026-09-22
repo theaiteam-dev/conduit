@@ -15,10 +15,21 @@
 # wrong label. The scan is a second, independent signal on top of that.
 #
 # BLAST RADIUS OF A LABEL WRITE = the union of every workflow triggered by
-# `labeled`. At time of writing that union is EMPTY (release.yml:109 and
-# docker.yml:65 mention only Docker OCI image labels). Anyone adding a
-# label-triggered workflow is handing this model a new capability — check here
-# first.
+# `labeled`. That union is NO LONGER EMPTY: pr-review-fork.yml runs the Nitpick
+# reviewer when the `nitpick` label is applied. Anyone adding a label-triggered
+# workflow is handing this model a new capability — check here first, and add
+# it to the list below.
+#
+#   pr-review-fork.yml — label `nitpick`. NOT reachable from this model, twice
+#     over: `nitpick` is outside TYPE_VALUES (apply-triage.ts:57), which is
+#     what bounds `apply`; and that workflow independently requires the
+#     labeller's login to appear in its LABELLERS allowlist, which
+#     github-actions[bot] does not and cannot add itself to. Adding `nitpick`
+#     to TYPE_VALUES would break the first of those; the second would still
+#     hold, which is why it exists.
+#
+# (release.yml and docker.yml mention only Docker OCI image labels, which are
+# unrelated to GitHub issue labels.)
 #
 # TWO RATE GUARDS, both checked BEFORE the image pull and the model calls:
 #   1. Once per issue. `opened` already fires once, but a maintainer can re-run
@@ -252,7 +263,7 @@ jobs:
 
       - name: Upload triage artifacts
         if: always() && steps.guards.outputs.proceed == 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: triage-${{ github.event.issue.number || github.event.pull_request.number }}
           path: |
