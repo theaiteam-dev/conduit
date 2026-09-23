@@ -66,13 +66,10 @@ on:
       conduit_api_key:
         description: OpenAI-compatible gateway key (Fireworks).
         required: true
-      ghcr_read_pat:
-        description: >-
-          Classic PAT with read:packages, for the cross-org private image.
-          GITHUB_TOKEN cannot read another owner's package.
-        required: false
 
 env:
+  # Public package, so the pull needs no registry login. If it is ever made
+  # private again, the pull fails with `denied` and the check goes red.
   FLOW_IMAGE: ghcr.io/queso/nitpick-flow:main
   # Both seats on glm-5p3-flash (nitpick-flow docs/model-refresh-2026-09.md):
   # gpt-oss-120b had ~zero recall at production prompt size (~23k tokens),
@@ -90,12 +87,11 @@ jobs:
       too_large: ${{ steps.inputs.outputs.too_large }}
     steps:
       # ── Preflight ─────────────────────────────────────────────────────────
-      # This reviewer needs two credentials that are listed as one-time
-      # prerequisites in pr-review.yml's header and, at the time of writing,
-      # had never been created. The result was `Error response from daemon:
-      # denied` on the image pull and a RED `nitpick` check on every pull
-      # request going back months — a check nobody could act on, which is how a
-      # check stops being read at all.
+      # This reviewer needs one credential, the gateway key listed as a one-time
+      # prerequisite in pr-review.yml's header. Its secrets once went uncreated
+      # for months, and the result was a RED `nitpick` check on every pull
+      # request — a check nobody could act on, which is how a check stops being
+      # read at all.
       #
       # A missing credential is a configuration state, not a review failure, so
       # it reports as one: the job skips and goes green with a WARNING
@@ -104,21 +100,17 @@ jobs:
       # not silent, because a reviewer that quietly stops reviewing is worse
       # than one that is visibly off.
       #
-      # This needs no reverting. The moment both secrets exist the check runs
+      # This needs no reverting. The moment the secret exists the check runs
       # for real.
       - name: Preflight — reviewer credentials
         id: preflight
         env:
           # Comparing a secret to '' does not expose it.
           HAS_KEY: ${{ secrets.conduit_api_key != '' }}
-          HAS_PAT: ${{ secrets.ghcr_read_pat != '' }}
         run: |
           set -euo pipefail
-          missing=""
-          [ "$HAS_KEY" = "true" ] || missing="$missing FIREWORKS_AI_API_KEY"
-          [ "$HAS_PAT" = "true" ] || missing="$missing GHCR_READ_PAT"
-          if [ -n "$missing" ]; then
-            echo "::warning title=Nitpick not configured::Skipping review. Missing repository secret(s):$missing. The reviewer cannot pull its image or reach the gateway without them."
+          if [ "$HAS_KEY" != "true" ]; then
+            echo "::warning title=Nitpick not configured::Skipping review. Missing repository secret FIREWORKS_AI_API_KEY. The reviewer cannot reach the gateway without it."
             echo "configured=false" >>"$GITHUB_OUTPUT"
           else
             echo "configured=true" >>"$GITHUB_OUTPUT"
@@ -178,18 +170,6 @@ jobs:
             > context.txt 2>/dev/null || true
           node -e 'const fs=require("fs");fs.writeFileSync("context.json",JSON.stringify({context:fs.existsSync("context.txt")?fs.readFileSync("context.txt","utf8"):""}))'
           echo "ok=true" >>"$GITHUB_OUTPUT"
-
-      - name: Log in to GHCR
-        if: steps.inputs.outputs.ok == 'true'
-        # Cross-org private image: GITHUB_TOKEN can't see queso's package, so a
-        # read:packages PAT is required. repository_owner rather than
-        # github.actor — under pull_request_target the actor is the fork's
-        # author, who has no standing at this registry.
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.repository_owner }}
-          password: ${{ secrets.ghcr_read_pat || secrets.GITHUB_TOKEN }}
 
       - name: Run Nitpick flow
         if: steps.inputs.outputs.ok == 'true'

@@ -181,7 +181,6 @@ jobs:
       # what a poisoned diff can achieve: one wrong review comment.
       contents: read
       pull-requests: write
-      packages: read
     uses: ./.github/workflows/nitpick-run.yml
     with:
       pr_number: ${{ github.event.pull_request.number }}
@@ -197,7 +196,6 @@ jobs:
       max_diff_bytes: 400000
     secrets:
       conduit_api_key: ${{ secrets.FIREWORKS_AI_API_KEY }}
-      ghcr_read_pat: ${{ secrets.GHCR_READ_PAT }}
 
   # ── Tell the contributor why nothing happened. ────────────────────────────
   too-large:

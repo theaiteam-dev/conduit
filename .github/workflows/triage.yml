@@ -197,8 +197,7 @@ jobs:
       - name: Pull triage image
         if: steps.guards.outputs.proceed == 'true'
         # Published by docker.yml on every push to main. Public image, so no
-        # registry login and no PAT — the cross-org read:packages PAT that
-        # pr-review.yml needs has no equivalent here.
+        # registry login and no PAT.
         run: docker pull "$TRIAGE_IMAGE"
 
       - name: Run triage flow

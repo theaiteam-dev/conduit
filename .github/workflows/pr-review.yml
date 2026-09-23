@@ -1,8 +1,8 @@
 # Maintainer-only Nitpick PR review for Conduit — INTERNAL branches.
 #
 # The workflow definition is public, but the job runs only for branches in this
-# repository. Pull requests from forks never receive maintainer secrets and
-# never pull the private reviewer image; they are handled by pr-review-fork.yml,
+# repository. Pull requests from forks never receive maintainer secrets through
+# this file; they are handled by pr-review-fork.yml,
 # which is label-triggered, advisory, and checks out no fork code.
 #
 # The reviewer itself lives in nitpick-run.yml, called by both. Everything that
@@ -14,13 +14,10 @@
 # This repository is in a different owner (org) than queso/nitpick-flow, so it
 # cannot consume nitpick-flow's private reusable workflow. nitpick-run.yml pulls
 # the prebuilt per-flow image (Conduit engine + the nitpick flow baked at /flow)
-# directly from GHCR instead.
+# directly from GHCR instead. That package is public, so no registry login.
 #
-# Prerequisites (one-time, done outside this file):
+# Prerequisite (one-time, done outside this file):
 #   - repo secret FIREWORKS_AI_API_KEY — the OpenAI-compatible gateway key.
-#   - repo secret GHCR_READ_PAT — a classic PAT with read:packages, able to pull
-#     the private ghcr.io/queso/nitpick-flow image cross-org. (GITHUB_TOKEN
-#     can't read another owner's package.)
 name: Nitpick PR Review
 
 on:
@@ -39,7 +36,6 @@ jobs:
     permissions:
       contents: read
       pull-requests: write
-      packages: read
     uses: ./.github/workflows/nitpick-run.yml
     with:
       pr_number: ${{ github.event.pull_request.number }}
@@ -54,4 +50,3 @@ jobs:
       advisory: false
     secrets:
       conduit_api_key: ${{ secrets.FIREWORKS_AI_API_KEY }}
-      ghcr_read_pat: ${{ secrets.GHCR_READ_PAT }}
