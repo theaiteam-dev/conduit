@@ -68,6 +68,7 @@ import type {
 } from './harness-runner';
 import { createHarnessRegistry, usageFromThrow } from './harness-adapter';
 import type { HarnessAdapter, HarnessInvocation, BinaryProbe } from './harness-adapter';
+import { describeHarnessContainmentConformance } from './harness-containment.conformance';
 
 // ---------------------------------------------------------------------------
 // Recorded `codex exec --json` event streams (JSONL, no live network).
@@ -596,3 +597,11 @@ describe('codex-exec adapter: config-only provider swap seam', () => {
     expect([...registry.list()].sort()).toEqual(['claude-headless', 'codex-exec']);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Containment conformance (issue #27): the real runner, a real `sh` fixture as
+// the binary, and a grandchild that must die when the invocation times out.
+// ---------------------------------------------------------------------------
+
+describeHarnessContainmentConformance('codex-exec', (opts) =>
+  createCodexHarnessAdapter({ ...opts, envAllowlist: [] }));

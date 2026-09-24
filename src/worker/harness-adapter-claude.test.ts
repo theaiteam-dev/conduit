@@ -47,6 +47,7 @@ import type {
 } from './harness-runner';
 import { usageFromThrow } from './harness-adapter';
 import type { HarnessAdapter, HarnessInvocation, BinaryProbe } from './harness-adapter';
+import { describeHarnessContainmentConformance } from './harness-containment.conformance';
 
 // ---------------------------------------------------------------------------
 // Recorded `claude -p --output-format stream-json --verbose` payloads (no live
@@ -858,3 +859,11 @@ describe('claude-headless adapter: usage carried through a billed throw (issue #
     expect(usageFromThrow(err)).toBeUndefined();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Containment conformance (issue #27): the real runner, a real `sh` fixture as
+// the binary, and a grandchild that must die when the invocation times out.
+// ---------------------------------------------------------------------------
+
+describeHarnessContainmentConformance('claude-headless', (opts) =>
+  createClaudeHarnessAdapter({ ...opts, envAllowlist: [] }));

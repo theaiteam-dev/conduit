@@ -322,6 +322,14 @@ const SHIPPED_HARNESS_FACTORIES: Record<string, (config: ShippedAdapterFactoryCo
   'codex-exec': createCodexHarnessAdapter,
 };
 
+/**
+ * The names in the shipped factory map. The containment registry test reads
+ * this to require a conformance call for every adapter (issue #27).
+ */
+export function shippedHarnessAdapterNames(): readonly string[] {
+  return Object.keys(SHIPPED_HARNESS_FACTORIES);
+}
+
 /** Test/production seam forwarded into every adapter this registry builds. */
 export interface HarnessRegistryDeps {
   run?: (cmd: HarnessCommand, config: HarnessRunnerConfig) => Promise<HarnessSpawnResult>;

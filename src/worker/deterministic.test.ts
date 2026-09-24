@@ -34,6 +34,7 @@ import {
   type DeterministicCommand,
   type LawLiteConfig,
 } from './deterministic';
+import { describeContainmentConformance } from './harness-containment.conformance';
 
 const ALLOW: LawLiteConfig = { allowlist: ['bun'] };
 
@@ -288,3 +289,24 @@ describe('runDeterministic — env injection', () => {
     expect(result.stdout).toBe(process.env.PATH ?? '');
   });
 });
+
+// ---------------------------------------------------------------------------
+// Containment conformance (issue #27). runDeterministic is the other spawn
+// path, and it does not reap descendants yet: Bun.spawn's native timeout kills
+// only the immediate child, so the fixture's grandchild survives (#10 for the
+// timeout, #17 for a normal exit). The reaping test is registered with
+// `test.failing` until that is fixed. It goes red once the grandchild dies,
+// and the fix should then drop `knownLeak`.
+// ---------------------------------------------------------------------------
+
+describeContainmentConformance(
+  'deterministic',
+  async ({ projectRoot, fixture, timeoutMs }) => {
+    const result = await runDeterministic(
+      { command: fixture, args: [] },
+      { allowlist: [fixture], cwd: projectRoot, timeoutMs },
+    );
+    return result.timedOut === true ? 'timedOut' : undefined;
+  },
+  { timeoutClass: 'timedOut', knownLeak: '#10 and #17' },
+);

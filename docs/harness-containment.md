@@ -47,6 +47,16 @@ hold it together:
 - **Process-group termination.** The harness runs as its own process group; a timeout or
   run halt kills the group, not a lone pid, so a harness that has spawned its own
   subprocesses (a shell, a browser, a language server) doesn't leave zombies behind.
+  The evidence is the containment conformance suite,
+  [`src/worker/harness-containment.conformance.ts`](../src/worker/harness-containment.conformance.ts).
+  Each shipped adapter runs it through its own spawn path with a stand-in binary that
+  backgrounds a grandchild, and must show that the grandchild's pid is gone and its
+  sentinel file stops changing after the timeout.
+  `src/worker/harness-containment-registry.test.ts` fails if an adapter ships without a
+  conformance call. The deterministic station runner is registered against the same suite
+  but does not pass it yet ([#10](https://github.com/theaiteam-dev/conduit/issues/10),
+  [#17](https://github.com/theaiteam-dev/conduit/issues/17)); that is a separate path from
+  harness stations, and its test is marked as a known failure until those are fixed.
   Deployment guidance additionally recommends running the container as a dedicated non-root
   user for agentic/harness flows.
 - **The ADR-0003 container wall.** [ADR-0003](../adr/0003-packaging-and-distribution.md)'s
