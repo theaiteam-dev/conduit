@@ -246,6 +246,43 @@ export interface HarnessContainmentFactoryOptions {
 }
 
 /**
+ * The classification a harness adapter spawn path must report for a
+ * timed-out invocation. Shared by `harnessAdapterSpawnPath` and the
+ * `timeoutClass` passed to `describeContainmentConformance` so the two
+ * cannot drift apart.
+ */
+export const HARNESS_TIMEOUT_CLASS = 'harness-timeout';
+
+/**
+ * Build the `ContainmentSpawnPath` for one shipped harness adapter: construct
+ * it through the factory, invoke it, and report the timeout classification.
+ *
+ * Only a throw whose `code` is exactly `HARNESS_TIMEOUT_CLASS` is the timeout
+ * report this suite is checking for. Anything else, including a throw with no
+ * `code` at all, is a different failure (a binary-probe error, a bad config,
+ * a bug in the factory or the invocation) and is rethrown unchanged: folding
+ * it into `undefined` would report it as "no timeout happened" and swallow
+ * the original error and its stack.
+ */
+export function harnessAdapterSpawnPath(
+  name: string,
+  factory: (opts: HarnessContainmentFactoryOptions) => HarnessAdapter,
+): ContainmentSpawnPath {
+  return async ({ projectRoot, fixture, timeoutMs }) => {
+    const adapter = factory({ projectRoot, command: fixture });
+    expect(adapter.name).toBe(name);
+    try {
+      await adapter.invoke({ prompt: 'containment conformance', inputs: [], tools: [], timeoutMs });
+    } catch (err) {
+      const code = (err as { code?: string }).code;
+      if (code === HARNESS_TIMEOUT_CLASS) return code;
+      throw err;
+    }
+    return undefined;
+  };
+}
+
+/**
  * Register the containment conformance tests for one shipped harness adapter.
  *
  * The factory must build the adapter through its production spawn path with
@@ -258,18 +295,7 @@ export function describeHarnessContainmentConformance(
   name: string,
   factory: (opts: HarnessContainmentFactoryOptions) => HarnessAdapter,
 ): void {
-  describeContainmentConformance(
-    name,
-    async ({ projectRoot, fixture, timeoutMs }) => {
-      const adapter = factory({ projectRoot, command: fixture });
-      expect(adapter.name).toBe(name);
-      try {
-        await adapter.invoke({ prompt: 'containment conformance', inputs: [], tools: [], timeoutMs });
-      } catch (err) {
-        return (err as { code?: string }).code;
-      }
-      return undefined;
-    },
-    { timeoutClass: 'harness-timeout' },
-  );
+  describeContainmentConformance(name, harnessAdapterSpawnPath(name, factory), {
+    timeoutClass: HARNESS_TIMEOUT_CLASS,
+  });
 }
