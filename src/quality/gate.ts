@@ -260,7 +260,7 @@ export interface HarnessGateConfig {
   projectRoot: string;
   /**
    * The judged card's owned paths — `[0]` is the child dir card-scoped critic
-   * inputs are MOUNTED from (issue #112). REQUIRED, mirroring the `runId` idiom
+   * inputs are MOUNTED from (issue #51). REQUIRED, mirroring the `runId` idiom
    * above: mounting the project-root artifact for a card-scoped name would hand
    * the critic the shared file while its prompt quotes the child's shard. A
    * compile error beats a critic judging the wrong bytes. `[]` for an unscoped card.
@@ -268,7 +268,7 @@ export interface HarnessGateConfig {
   ownedPaths: string[];
   /**
    * The judged station's `input_scope.owned_dir` — which critic inputs mount
-   * from the owned dir (issue #112). REQUIRED for the same reason; `[]` when the
+   * from the owned dir (issue #51). REQUIRED for the same reason; `[]` when the
    * station declares no input_scope (the reserved `seed.json` is never mounted).
    */
   ownedDirInputs: string[];
@@ -316,7 +316,7 @@ export async function runHarnessGateCheck(config: HarnessGateConfig): Promise<Ga
   // Mount declared inputs the same way a harness maker does — the reserved
   // synthetic 'feedback'/'seed.json' names have no on-disk artifact of their
   // own (WI-565) — and, like the maker, resolve card-scoped names from the
-  // card's owned dir rather than projectRoot (issue #112).
+  // card's owned dir rather than projectRoot (issue #51).
   const mountedInputs: MountedInput[] = config.criticInputScope
     .filter((name) => name !== 'feedback' && name !== 'seed.json')
     .map((name) => ({

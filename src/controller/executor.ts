@@ -2282,7 +2282,7 @@ interface GateCheckOrAdvanceArgs {
   stationId: string;
   cardId: string;
   /**
-   * `owned_paths` is carried (issue #112) so the gate critic resolves the same
+   * `owned_paths` is carried (issue #51) so the gate critic resolves the same
    * card-scoped inputs the maker did — a gate on a child_entry station judges
    * THAT child's shard, not the shared project-root artifact of the same name.
    */
@@ -2768,7 +2768,7 @@ async function runGateCheckOrAdvance(args: GateCheckOrAdvanceArgs): Promise<bool
         harnessRegistry,
         projectRoot,
         // The critic judges THIS child's work, so it resolves the same
-        // card-scoped inputs the maker did (issue #112).
+        // card-scoped inputs the maker did (issue #51).
         ownedPaths: card.owned_paths,
         ownedDirInputs: stationConfig.input_scope?.owned_dir ?? [],
         validBackEdges: flow.back_edges ?? [],
@@ -3112,7 +3112,7 @@ async function executeTransformStation(args: TransformArgs): Promise<boolean> {
       // listed in input_scope.owned_dir) live in the child's owned dir, not at
       // projectRoot. Hash from the SAME location renderPrompt reads — the shared
       // resolver guarantees it — otherwise sibling children holding different
-      // per-child files would get identical stamps (WI-468 BUG-1, issue #112).
+      // per-child files would get identical stamps (WI-468 BUG-1, issue #51).
       //
       // A card-scoped input on a card with no owned dir makes resolveInputPath
       // THROW rather than name the project-root file; the catch below turns that
@@ -3606,7 +3606,7 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
   const inputHashes = stationConfig.inputs.map((inputName) => {
     try {
       // Card-scoped inputs resolve from the child's owned dir — same shared
-      // resolver the transform stamp and renderPrompt use (issue #112). As
+      // resolver the transform stamp and renderPrompt use (issue #51). As
       // there, an unresolvable card scope throws and the catch hashes '' rather
       // than folding in the shared project-root artifact.
       const inputPath = resolveInputPath(
@@ -3719,7 +3719,7 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
     // reserved synthetic inputs ('feedback', 'seed.json') have no on-disk
     // artifact of their own and are threaded via the prompt only.
     //
-    // A card-scoped input (issue #112) must mount from the card's owned dir:
+    // A card-scoped input (issue #51) must mount from the card's owned dir:
     // mounting join(projectRoot, name) would hand the agent the shared artifact
     // while its prompt quotes the per-child one — two different files under one
     // name, the worst version of this bug to debug.

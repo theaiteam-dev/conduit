@@ -1323,12 +1323,12 @@ describe('loadFlow — output_scope validation (v10 owned-dir outputs)', () => {
 });
 
 // ---------------------------------------------------------------------------
-// issue #112 — input_scope: which declared inputs are READ from the card's
+// issue #51 — input_scope: which declared inputs are READ from the card's
 //        owned dir. A list ⊆ inputs, never 'feedback', transform OR harness
 //        (unlike output_scope, harness stations read inputs too).
 // ---------------------------------------------------------------------------
 
-describe('loadFlow — input_scope validation (issue #112 owned-dir inputs)', () => {
+describe('loadFlow — input_scope validation (issue #51 owned-dir inputs)', () => {
   function scopedInputs(
     ownedDir: string,
     opts: { kind?: string; inputs?: string } = {},

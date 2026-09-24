@@ -1,5 +1,5 @@
 /**
- * Executor binding-stamp wiring for declared card-scoped inputs (issue #112).
+ * Executor binding-stamp wiring for declared card-scoped inputs (issue #51).
  *
  * `input_scope.owned_dir` lets a fan-out child READ its own copy of a declared
  * input from `<owned_paths[0]>/<name>`. The binding stamp (SPEC §5 skip-on-resume)
@@ -153,7 +153,7 @@ afterEach(() => {
   rmSync(projectDir, { recursive: true, force: true });
 });
 
-describe('binding stamp — declared card-scoped inputs (issue #112)', () => {
+describe('binding stamp — declared card-scoped inputs (issue #51)', () => {
   it('re-executes (does NOT skip-replay) when the child card-scoped input changes between runs', async () => {
     // A correct stamp hashes patch.txt from the card's owned dir. When the shard
     // changes, the recomputed stamp differs from the checkpointed one, so the

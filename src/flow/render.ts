@@ -21,7 +21,7 @@
  *     never from disk. Absent → substituted as empty string (first-entry path).
  *     Undeclared `{{feedback}}` still triggers the scope guard.
  *   - CARD-SCOPED inputs (the reserved `seed.json` from WI-468, plus anything a
- *     station lists in `input_scope.owned_dir` — issue #112) are read from the
+ *     station lists in `input_scope.owned_dir` — issue #51) are read from the
  *     CHILD's owned directory rather than from `projectRoot`, via the shared
  *     ./resolve-input.ts the binding-stamp hasher also calls, so an input can
  *     never be rendered from one location and hashed from another. Declared,
@@ -84,7 +84,7 @@ const FEEDBACK_INPUT = 'feedback';
  *                      (absent/empty ownedPaths, or no such file in the owned
  *                      dir) → clear error, never silent empty.
  * @param ownedDirInputs - Optional list of declared inputs that are card-scoped
- *                      (the station's `input_scope.owned_dir`, issue #112). The
+ *                      (the station's `input_scope.owned_dir`, issue #51). The
  *                      effective set is this list UNION the reserved `seed.json`,
  *                      so omitting the parameter is identical to the WI-468
  *                      behaviour: seed card-scoped, every other input read from

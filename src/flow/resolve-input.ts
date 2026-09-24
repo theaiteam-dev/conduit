@@ -1,6 +1,6 @@
 /**
  * Card-scoped input resolution — the ONE place that decides where a declared
- * input is read from (issue #112).
+ * input is read from (issue #51).
  *
  * A station's declared inputs resolve from `projectRoot` by default. A fan-out
  * CHILD, however, may need a per-child copy of an input: the shard of a diff it
@@ -69,7 +69,7 @@ export function isCardScoped(name: string, ownedDirInputs?: readonly string[]): 
  * would let a harness station mount the whole diff under the name of a shard —
  * and, worse, let every sibling hash that same shared file into its binding
  * stamp, so N cards stamp identically and skip-replay serves one card's output
- * to another (WI-468 BUG-1, generalized; PR #114 review).
+ * to another (WI-468 BUG-1, generalized).
  *
  * Callers still choose their own failure SHAPE around this throw, which is why
  * it is raised here rather than at each use site:
@@ -113,7 +113,7 @@ export function resolveInputPath(
  * C), using the same two-root technique for the same reasons. Inputs never had
  * one: every declared input has been read via a bare `join(projectRoot, name)`
  * since long before card scope existed, so a station declaring
- * `inputs: ['../../../etc/passwd']` was read verbatim (PR #114 review).
+ * `inputs: ['../../../etc/passwd']` was read verbatim.
  *
  * This is defense in depth, not a privilege boundary. `name` comes from the
  * flow's own `inputs:` list, and a flow author already chooses the commands

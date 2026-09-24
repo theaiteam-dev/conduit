@@ -132,7 +132,7 @@ export interface StationConfig {
   output_scope?: 'project_root' | 'owned_dir';
   /**
    * Which of this station's declared inputs are READ from the card's owned dir
-   * rather than from projectRoot (issue #112, fan-out children). The mirror of
+   * rather than from projectRoot (issue #51, fan-out children). The mirror of
    * `output_scope`: that one governs where a child WRITES, this one where it
    * READS. Names listed here resolve to `<owned_paths[0]>/<name>` — the same
    * card-scoped location seed.json lives in — so N homogeneous children can each

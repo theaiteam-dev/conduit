@@ -1,5 +1,5 @@
 /**
- * Card-scoped declared inputs in prompt rendering (issue #112).
+ * Card-scoped declared inputs in prompt rendering (issue #51).
  *
  * WI-468 made the reserved `{{seed.json}}` resolve from the child's owned dir.
  * This item completes the symmetry: a station may declare a LIST of its inputs
@@ -18,7 +18,7 @@
  *     feedback?: string,
  *     imageInputs?: string[],
  *     ownedPaths?: string[],
- *     ownedDirInputs?: string[],   // NEW (#112) — names read from the owned dir
+ *     ownedDirInputs?: string[],   // NEW (#51) — names read from the owned dir
  *   ): string
  *
  * Invariants pinned here:
@@ -72,7 +72,7 @@ function thrownMessage(fn: () => unknown): string {
 //        card's owned dir, not projectRoot.
 // ===========================================================================
 
-describe('renderPrompt — declared card-scoped inputs (issue #112 AC1)', () => {
+describe('renderPrompt — declared card-scoped inputs (issue #51 AC1)', () => {
   it('substitutes a listed input with the bytes of <ownedPaths[0]>/<name>', () => {
     const root = makeDir();
     const ownedDir = makeDir({ 'patch.txt': 'SHARD-A-DIFF' });
@@ -145,7 +145,7 @@ describe('renderPrompt — declared card-scoped inputs (issue #112 AC1)', () => 
 // AC2 — inputs NOT listed stay project-root scoped, in the same render.
 // ===========================================================================
 
-describe('renderPrompt — unlisted inputs stay project-root scoped (issue #112 AC2)', () => {
+describe('renderPrompt — unlisted inputs stay project-root scoped (issue #51 AC2)', () => {
   it('mixes a project-root input and a card-scoped input in one prompt', () => {
     const root = makeDir({ 'style-guide.md': 'HOUSE_STYLE' });
     const ownedDir = makeDir({ 'patch.txt': 'MY_SHARD' });
@@ -187,7 +187,7 @@ describe('renderPrompt — unlisted inputs stay project-root scoped (issue #112 
 //        does. It must never silently fall back to the project-root file.
 // ===========================================================================
 
-describe('renderPrompt — fail-closed card-scoped reads (issue #112 AC3)', () => {
+describe('renderPrompt — fail-closed card-scoped reads (issue #51 AC3)', () => {
   it('throws when the card-scoped input is missing from the owned dir', () => {
     const root = makeDir();
     const ownedDirEmpty = makeDir();
@@ -244,7 +244,7 @@ describe('renderPrompt — fail-closed card-scoped reads (issue #112 AC3)', () =
 //        input_scope, and the new parameter is additive for existing callers.
 // ===========================================================================
 
-describe('renderPrompt — backward compatibility (issue #112 AC4)', () => {
+describe('renderPrompt — backward compatibility (issue #51 AC4)', () => {
   it('resolves seed.json from the owned dir with NO input_scope declared', () => {
     const root = makeDir({ 'seed.json': 'DECOY_FROM_PROJECT_ROOT' });
     const ownedDir = makeDir({ 'seed.json': '{"sku":"WIDGET-A"}' });

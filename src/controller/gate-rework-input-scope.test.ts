@@ -1,5 +1,5 @@
 /**
- * Gate critic sees the child's card-scoped inputs (issue #112).
+ * Gate critic sees the child's card-scoped inputs (issue #51).
  *
  * A QC gate on a child_entry station judges THAT child's work — so its critic
  * needs the same shard the maker read. Before this item, runGateRework called
@@ -10,7 +10,7 @@
  * with: the maker path works, the critic path fails on the same flow.
  *
  * `ownedPaths` + `ownedDirInputs` are REQUIRED on GateReworkInput /
- * HarnessGateConfig rather than optional-with-default, mirroring the issue #110
+ * HarnessGateConfig rather than optional-with-default, mirroring the
  * `runId` seam: a critic that silently renders the project-root artifact instead
  * of the child's shard is exactly the mis-attribution the required field
  * prevents, so an omitted scope is a compile error, not a wrong judgment.
@@ -135,7 +135,7 @@ function buildInput(opts: {
     workerStationId: 'review_shard',
     attempt: 0,
     maxExecutionAttempts: 4,
-    reworkCount: 0,
+    gateReworkCount: 0,
     gateConfig: {
       criticModel: CRITIC_MODEL,
       criticPromptFile: join(projectRoot, 'critic.md'),
@@ -156,7 +156,7 @@ function buildInput(opts: {
   };
 }
 
-describe('runGateRework — critic renders card-scoped inputs (issue #112)', () => {
+describe('runGateRework — critic renders card-scoped inputs (issue #51)', () => {
   it('RENDERS a critic that references a card-scoped input (the naive-implementation regression)', async () => {
     seedCard(db!, 'card-a', [ownedDir]);
     const { adapter, calls } = recordingCriticAdapter();
@@ -181,7 +181,7 @@ describe('runGateRework — critic renders card-scoped inputs (issue #112)', () 
 
   it('renders the reserved seed.json for a critic on a child-entry station', async () => {
     // seed.json has been card-scoped since WI-468, yet the critic path passed no
-    // ownedPaths at all — so a seed-referencing critic threw even before #112.
+    // ownedPaths at all — so a seed-referencing critic threw even before #51.
     seedCard(db!, 'card-a', [ownedDir]);
     const { adapter, calls } = recordingCriticAdapter();
 
@@ -246,7 +246,7 @@ describe('runGateRework — critic renders card-scoped inputs (issue #112)', () 
   });
 
   it('FAILS CLOSED rather than mounting the project-root decoy for an unscoped card', async () => {
-    // PR #114 review finding, critic half. `ownedPaths: []` is a legitimate
+    // Review finding, critic half. `ownedPaths: []` is a legitimate
     // shape (an unscoped card), and this critic template quotes only the
     // project-root artifact — so render's guard never fires and the mount was
     // free to hand the critic DECOY_WHOLE_DIFF under the name of the shard.

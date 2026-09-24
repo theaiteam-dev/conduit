@@ -112,7 +112,7 @@ function buildInput(opts: {
     },
     adapter: opts.adapter,
     projectRoot: opts.dir,
-    // Unscoped card: no card-scoped critic inputs (issue #112, behavior-preserving).
+    // Unscoped card: no card-scoped critic inputs (issue #51, behavior-preserving).
     ownedPaths: [],
     ownedDirInputs: [],
     validBackEdges: [{ from: 'ideate', to: 'ideate' }],

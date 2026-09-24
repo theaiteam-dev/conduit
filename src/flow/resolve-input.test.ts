@@ -1,5 +1,5 @@
 /**
- * Shared card-scoped input resolution (issue #112).
+ * Shared card-scoped input resolution (issue #51).
  *
  * The rule this file pins: an input name is CARD-SCOPED when it appears in the
  * station's `input_scope.owned_dir` list, UNION the reserved `seed.json` (which
@@ -21,7 +21,7 @@ import { isCardScoped, resolveInputPath } from './resolve-input';
 const ROOT = '/proj';
 const OWNED = '/proj/child-a';
 
-describe('isCardScoped — declared list ∪ {seed.json} (issue #112)', () => {
+describe('isCardScoped — declared list ∪ {seed.json} (issue #51)', () => {
   it('treats a name in the owned-dir list as card-scoped', () => {
     expect(isCardScoped('patch.txt', ['patch.txt'])).toBe(true);
   });
@@ -41,7 +41,7 @@ describe('isCardScoped — declared list ∪ {seed.json} (issue #112)', () => {
   });
 });
 
-describe('resolveInputPath — card scope wins over projectRoot (issue #112)', () => {
+describe('resolveInputPath — card scope wins over projectRoot (issue #51)', () => {
   it('resolves a card-scoped input under the first owned path', () => {
     expect(resolveInputPath('patch.txt', ROOT, [OWNED], ['patch.txt'])).toBe(join(OWNED, 'patch.txt'));
   });
@@ -63,7 +63,7 @@ describe('resolveInputPath — card scope wins over projectRoot (issue #112)', (
   });
 
   it('THROWS rather than falling back to projectRoot when the card has no owned dir', () => {
-    // PR #114 review: the fallback returned <projectRoot>/<name> — the SHARED
+    // Review finding: the fallback returned <projectRoot>/<name> — the SHARED
     // artifact the per-child copy was meant to replace. Silently handing that
     // back is the exact bug this module exists to prevent, and render's own
     // guard did not cover the callers that MOUNT an input without referencing
@@ -93,14 +93,14 @@ describe('resolveInputPath — card scope wins over projectRoot (issue #112)', (
 });
 
 /**
- * Traversal confinement (PR #114 review, second pass).
+ * Traversal confinement (review finding).
  *
  * The READ side never had the escape guard the WRITE side has had since the
  * output_scope work — every declared input was read via a bare
  * `join(projectRoot, name)`. These use REAL directories because the guard's
  * symlink branch only engages when the target's parent actually exists.
  */
-describe('resolveInputPath — traversal confinement (issue #112 / PR #114 review)', () => {
+describe('resolveInputPath — traversal confinement (issue #51)', () => {
   let root: string;
   let owned: string;
   let outside: string;

@@ -200,7 +200,7 @@ interface RawStation {
   /** Output write scope ('project_root' | 'owned_dir'). Validated in collectErrors. */
   output_scope?: unknown;
   /**
-   * Card-scoped input declaration (issue #112). Typed as `unknown` so
+   * Card-scoped input declaration (issue #51). Typed as `unknown` so
    * collectErrors can validate the block shape and the owned_dir list before
    * buildStationConfig casts it onto StationConfig.input_scope.
    */
@@ -416,7 +416,7 @@ function buildStationConfig(
   if (raw.child_stagger_seconds !== undefined) config.child_stagger_seconds = raw.child_stagger_seconds as number;
   // v10: output write scope (collectErrors has validated the enum + transform-only rule).
   if (raw.output_scope !== undefined) config.output_scope = raw.output_scope as 'project_root' | 'owned_dir';
-  // issue #112: card-scoped input names (collectErrors has validated the block
+  // issue #51: card-scoped input names (collectErrors has validated the block
   // shape, the string list, the ⊆ inputs rule, and the eligible worker kinds).
   if (raw.input_scope !== undefined) config.input_scope = raw.input_scope as { owned_dir: string[] };
 
@@ -761,7 +761,7 @@ function collectErrors(
         });
       }
     }
-    // issue #112: input_scope — which declared inputs are READ from the card's
+    // issue #51: input_scope — which declared inputs are READ from the card's
     // owned dir instead of projectRoot. Validated fail-closed at LOAD so a typo
     // surfaces here rather than as a card-scoped read that silently falls back
     // to a project-root file (or an opaque render throw mid-run).

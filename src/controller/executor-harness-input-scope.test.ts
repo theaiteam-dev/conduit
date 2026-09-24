@@ -1,5 +1,5 @@
 /**
- * Harness maker mounts card-scoped inputs from the owned dir (issue #112).
+ * Harness maker mounts card-scoped inputs from the owned dir (issue #51).
  *
  * A harness station does not inline its declared inputs into the prompt — it
  * MOUNTS them (name + path) so the agent CLI can open them itself. Those mount
@@ -139,7 +139,7 @@ afterEach(() => {
   rmSync(projectDir, { recursive: true, force: true });
 });
 
-describe('harness maker — card-scoped input mounts (issue #112)', () => {
+describe('harness maker — card-scoped input mounts (issue #51)', () => {
   it('mounts a card-scoped input from the owned dir and an unlisted one from projectRoot', async () => {
     const { adapter: harness, calls } = makeRecordingHarness();
     const registry = createHarnessRegistry([harness]);
@@ -213,7 +213,7 @@ describe('harness maker — card-scoped input mounts (issue #112)', () => {
   });
 
   it('FAILS CLOSED on a card with no owned dir instead of mounting the project-root decoy', async () => {
-    // PR #114 review finding. renderPrompt's fail-closed guard only fires for
+    // Review finding. renderPrompt's fail-closed guard only fires for
     // names the TEMPLATE references — and a harness station does not have to
     // reference what it mounts. This prompt names no artifact at all, so render
     // passes cleanly and the mount was the only thing standing between an

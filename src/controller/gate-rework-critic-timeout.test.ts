@@ -121,7 +121,7 @@ describe('runGateRework — criticTimeoutMs threads into the harness invocation'
       adapter: UNUSED_MODEL_ADAPTER,
       harnessRegistry: createHarnessRegistry([critic]),
       projectRoot: dir,
-      // Unscoped card: no card-scoped critic inputs (issue #112, behavior-preserving).
+      // Unscoped card: no card-scoped critic inputs (issue #51, behavior-preserving).
       ownedPaths: [],
       ownedDirInputs: [],
       validBackEdges: [{ from: 'ideate', to: 'ideate' }],

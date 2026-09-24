@@ -65,9 +65,9 @@ export interface GateReworkInput {
   projectRoot: string;
   /**
    * The judged card's owned paths — `[0]` is the child dir card-scoped critic
-   * inputs resolve from (issue #112). REQUIRED, mirroring the issue #110 `runId`
+   * inputs resolve from (issue #51). REQUIRED, mirroring the `runId`
    * idiom: a gate on a child_entry station judges THAT child's work, so a
-   * forgotten scope would either throw at render (the pre-#112 behavior) or,
+   * forgotten scope would either throw at render (the pre-#51 behavior) or,
    * worse, quietly judge the shared project-root artifact instead of the
    * child's shard. A compile error beats a wrong verdict. Pass `[]` for a card
    * that owns no paths.
@@ -75,7 +75,7 @@ export interface GateReworkInput {
   ownedPaths: string[];
   /**
    * The judged station's `input_scope.owned_dir` — which of its inputs are
-   * card-scoped (issue #112). REQUIRED for the same reason as `ownedPaths`.
+   * card-scoped (issue #51). REQUIRED for the same reason as `ownedPaths`.
    * Pass `[]` when the station declares no input_scope; the reserved
    * `seed.json` stays card-scoped either way.
    *
@@ -202,7 +202,7 @@ export async function runGateRework(input: GateReworkInput): Promise<GateReworkD
   // ── Render critic prompt ──────────────────────────────────────────────────
   // The card's scope is threaded so a critic on a child_entry station reads the
   // CHILD's card-scoped inputs — its shard, its seed — exactly as the maker did
-  // (issue #112). Without it a critic referencing either throws at render.
+  // (issue #51). Without it a critic referencing either throws at render.
   const criticTemplate = readFileSync(gateConfig.criticPromptFile, 'utf-8');
   const criticPrompt = renderPrompt(
     criticTemplate, gateConfig.criticInputScope, projectRoot, undefined, [], ownedPaths, ownedDirInputs,
