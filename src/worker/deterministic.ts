@@ -17,7 +17,7 @@
  * so nothing the station started outlives it, whatever the exit reason.
  */
 
-import { killProcessGroup } from './process-group';
+import { killProcessGroup, trackProcessGroup, untrackProcessGroup } from './process-group';
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -207,6 +207,9 @@ export async function runDeterministic(
     ...(config.cwd ? { cwd: config.cwd } : {}),
     ...(hasEnv ? { env: { ...process.env, ...config.env } } : {}),
   });
+  // The detached group no longer receives the terminal's Ctrl-C, so register
+  // it for the kernel's signal and exit handlers until the final kill below.
+  trackProcessGroup(proc.pid);
 
   // Our own timer instead of Bun.spawn's native `timeout`, which kills only the
   // immediate child (#10). Killing the group also closes the pipes any
@@ -224,16 +227,20 @@ export async function runDeterministic(
   const stdoutText = new Response(proc.stdout).text();
   const stderrText = new Response(proc.stderr as ReadableStream).text();
 
-  const exitCode = await proc.exited;
-  clearTimeout(timer);
-
-  // #17: the command has exited, but a descendant it backgrounded may still be
-  // running and holding the pipes. Kill the group BEFORE awaiting the drains so
-  // they settle. Bytes already written stay readable, so no output is lost.
-  // The leader has already exited, so this does not change its exit status.
-  // While any member is alive the group id cannot be reused, so the signal
-  // reaches only this command's descendants; an empty group is ESRCH.
-  killProcessGroup(proc.pid);
+  let exitCode: number;
+  try {
+    exitCode = await proc.exited;
+  } finally {
+    clearTimeout(timer);
+    // #17: the command has exited, but a descendant it backgrounded may still
+    // be running and holding the pipes. Kill the group BEFORE awaiting the
+    // drains so they settle. Bytes already written stay readable, so no output
+    // is lost. The leader has already exited, so this does not change its exit
+    // status. While any member is alive the group id cannot be reused, so the
+    // signal reaches only this command's descendants; an empty group is ESRCH.
+    killProcessGroup(proc.pid);
+    untrackProcessGroup(proc.pid);
+  }
 
   const [stdout, stderr] = await Promise.all([stdoutText, stderrText]);
 

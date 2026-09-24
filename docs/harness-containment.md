@@ -59,7 +59,9 @@ hold it together:
   process group before it returns, so a grandchild does not outlive a station that finished
   on its own ([#10](https://github.com/theaiteam-dev/conduit/issues/10),
   [#17](https://github.com/theaiteam-dev/conduit/issues/17)). A harness adapter kills the
-  group on timeout only.
+  group on timeout only. Both runners also kill every live station process group when the
+  kernel receives SIGINT, SIGTERM or SIGHUP, or exits; a SIGKILLed kernel cannot do this,
+  which is why the container boundary below still matters.
   Deployment guidance additionally recommends running the container as a dedicated non-root
   user for agentic/harness flows.
 - **The ADR-0003 container wall.** [ADR-0003](../adr/0003-packaging-and-distribution.md)'s

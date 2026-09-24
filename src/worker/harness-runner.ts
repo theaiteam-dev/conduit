@@ -22,7 +22,7 @@
 
 import { resolve, sep } from 'node:path';
 import { existsSync, statSync } from 'node:fs';
-import { killProcessGroup } from './process-group';
+import { killProcessGroup, trackProcessGroup, untrackProcessGroup } from './process-group';
 
 /** The command + argv to spawn (no shell — array form, per the Law-lite pattern). */
 export interface HarnessCommand {
@@ -176,19 +176,29 @@ export async function runHarnessProcess(
     // Never inherit the parent env wholesale — only the allowlisted names.
     env: childEnv,
   });
+  // The detached group no longer receives the terminal's Ctrl-C, so register
+  // it for the kernel's signal and exit handlers (./process-group.ts).
+  trackProcessGroup(proc.pid);
 
   const timer = setTimeout(() => {
     killProcessGroup(proc.pid);
   }, config.timeoutMs);
 
-  const [exitCode, stdout, stderr] = await Promise.all([
-    proc.exited,
-    config.stdoutLineFilter !== undefined
-      ? readKeptLines(proc.stdout as ReadableStream<Uint8Array>, config.stdoutLineFilter)
-      : new Response(proc.stdout).text(),
-    new Response(proc.stderr as ReadableStream).text(),
-  ]);
-  clearTimeout(timer);
+  let exitCode: number;
+  let stdout: string;
+  let stderr: string;
+  try {
+    [exitCode, stdout, stderr] = await Promise.all([
+      proc.exited,
+      config.stdoutLineFilter !== undefined
+        ? readKeptLines(proc.stdout as ReadableStream<Uint8Array>, config.stdoutLineFilter)
+        : new Response(proc.stdout).text(),
+      new Response(proc.stderr as ReadableStream).text(),
+    ]);
+  } finally {
+    clearTimeout(timer);
+    untrackProcessGroup(proc.pid);
+  }
 
   const durationMs = Date.now() - startedAt;
 
