@@ -81,6 +81,19 @@ Either way, a compromised run cannot rewrite its own `flow.yaml`, prompts, or sc
 persist across the per-event fresh process. The **only writable path is the state volume**
 (`/data`) — one named volume, nothing else.
 
+Two constraints in the current engine affect this rule:
+
+- With `defaults.workspace: per_run`, each run's workspace is created at
+  `<project_root>/.conduit/runs/<run-id>/`, inside the flow directory. A `:ro` checkout
+  therefore needs a writable volume mounted over `.conduit/runs` for each served flow, plus
+  one for any other path the flow writes. Station `command`/`args` resolve relative to that
+  workspace, so the runs root cannot simply be moved elsewhere
+  ([#56](https://github.com/theaiteam-dev/conduit/issues/56),
+  [#54](https://github.com/theaiteam-dev/conduit/issues/54)).
+- Do not mount a flow checkout at `/app`. The engine image keeps the kernel source there,
+  and a mount over it fails at startup with `Module not found "src/cli/main.ts"`. Use a
+  path such as `/flows` ([#55](https://github.com/theaiteam-dev/conduit/issues/55)).
+
 ### 4. Pin images by immutable reference
 
 Deploy `<image>:git-<sha>` (or a digest), never `:latest`, and never enable auto-update on
@@ -96,6 +109,11 @@ Socket-Mode deployment should publish none (`PublishPort=`/`-p` absent entirely)
 the engine binds on `0.0.0.0` then stays inside the container network, unreachable from
 the LAN. If you do run webhook ingress, publish exactly that one port and terminate it
 behind a reverse proxy you already trust — nothing else.
+
+`conduit listen` currently starts its HTTP ingress server on `0.0.0.0:3000` even when
+every binding uses Socket Mode ([#44](https://github.com/theaiteam-dev/conduit/issues/44)).
+In a container that port is harmless as long as it is not published. On a bare-metal
+install it is reachable from the host's network, so block it with the host firewall.
 
 ### 6. Secrets are a runtime seam, not a file in the repo
 

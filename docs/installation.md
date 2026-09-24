@@ -572,7 +572,7 @@ available inside the container.
 
 Setting `HTTPS_PROXY` routes both the engine's HTTP calls and the Socket Mode
 websocket through the proxy, so a deployment can run a default-deny egress
-policy with a domain allowlist (deployment-hardening rule 9) without the
+policy with a domain allowlist ([deployment-hardening rule 9](deployment-hardening.md#9-default-deny-egress)) without the
 listener needing a direct hole punched for it.
 
 `wss:`/`https:` targets prefer `HTTPS_PROXY` and fall back to `HTTP_PROXY`;
