@@ -2,6 +2,9 @@
 
 End-to-end guide for building the engine image, packaging a per-flow image,
 running the container, and verifying the environment with `conduit doctor`.
+For running the result safely in production — service user, rootless runtime,
+read-only mounts, secrets, egress — see
+[`deployment-hardening.md`](deployment-hardening.md).
 
 ---
 
@@ -569,7 +572,7 @@ available inside the container.
 
 Setting `HTTPS_PROXY` routes both the engine's HTTP calls and the Socket Mode
 websocket through the proxy, so a deployment can run a default-deny egress
-policy with a domain allowlist (deployment-hardening rule 9) without the
+policy with a domain allowlist ([deployment-hardening rule 9](deployment-hardening.md#9-default-deny-egress)) without the
 listener needing a direct hole punched for it.
 
 `wss:`/`https:` targets prefer `HTTPS_PROXY` and fall back to `HTTP_PROXY`;
