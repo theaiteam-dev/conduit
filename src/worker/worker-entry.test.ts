@@ -15,6 +15,12 @@ import { tmpdir } from 'node:os';
 import { runWorkerProcess, type WorkerProcessIO } from './worker-entry';
 import { serializeWorkerMessage, parseWorkerMessage } from './ipc-protocol';
 import type { WorkerMessage } from './ipc-protocol';
+import {
+  CONTAINMENT_FIXTURE,
+  containmentFixtureExitArgs,
+  expectGrandchildReaped,
+  killRecordedGrandchild,
+} from './harness-containment.conformance';
 
 // ---------------------------------------------------------------------------
 // Harness: a controllable IO seam capturing sends/exits and feeding raw input.
@@ -226,6 +232,54 @@ stations:
     expect(seen.rework).toBe('0');
     expect(seen.attempt).toBe('0');
   });
+});
+
+describe('worker-entry #17: a pooled deterministic station reaps its descendants on exit 0', () => {
+  afterEach(() => {
+    killRecordedGrandchild(dir);
+  });
+
+  it('reports success and leaves no backgrounded grandchild running', async () => {
+    // The containment fixture backgrounds a grandchild that touches a sentinel,
+    // waits for its first touch, then exits 0. It writes into its cwd, which
+    // the worker sets to the project root.
+    const args = [CONTAINMENT_FIXTURE, ...containmentFixtureExitArgs(0)].map((a) => JSON.stringify(a));
+    const reapFlow = join(dir, 'reap-flow.yaml');
+    writeFileSync(
+      reapFlow,
+      `
+flow: worker-entry-reap-test
+project_root: .
+flow_version: 1
+budgets:
+  run: { wall_clock_minutes: 10, max_tokens: 1000 }
+  per_card: { max_execution_attempts: 1 }
+  liveness: { no_progress_minutes: 3 }
+defaults: { cap_policy: scrap, on_dep_scrap: hold }
+terminal_lanes: [done, scrap, hold]
+security:
+  bash:
+    allow: ["sh"]
+stations:
+  - id: spawner
+    worker: { kind: deterministic, command: "sh", args: [${args.join(', ')}] }
+    next: done
+`,
+    );
+    const h = makeIO();
+    runWorkerProcess({ flowPath: reapFlow, projectRoot: dir }, h.io);
+    h.deliver(start('c1', 'spawner'));
+
+    const deadline = Date.now() + 10_000;
+    while (h.sent.length === 0 && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 25));
+    }
+
+    const done = h.sent[0];
+    if (done?.type !== 'MARK_DONE') throw new Error('expected a MARK_DONE');
+    expect(done.outcome).toBe('success');
+    await expectGrandchildReaped(dir);
+  }, 20_000);
 });
 
 describe('worker-entry — NFR-3: the worker module does no state-DB I/O', () => {

@@ -23,6 +23,10 @@
  * build TERMINATE (the no-progress watchdog halts it, leaving the card
  * un-scrapped) instead of hanging — so this test fails fast (red) pre-fix rather
  * than wedging the suite. The fixed build scraps well before the watchdog.
+ *
+ * The second describe covers containment on the same path (#17): a station
+ * whose command backgrounds a grandchild and exits 0 must not leave that
+ * grandchild running once the card has advanced.
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
@@ -36,6 +40,12 @@ import type { FlowConfig } from '../types/kernel';
 import { runExecutor } from './executor';
 import type { RunEngineArgs } from '../cli/main';
 import type { ModelAdapter } from '../worker/adapter';
+import {
+  CONTAINMENT_FIXTURE,
+  containmentFixtureExitArgs,
+  expectGrandchildReaped,
+  killRecordedGrandchild,
+} from '../worker/harness-containment.conformance';
 
 const io = { out: (_l: string) => {}, err: (_l: string) => {} };
 
@@ -120,6 +130,7 @@ afterEach(() => {
     db.close();
     db = null;
   }
+  killRecordedGrandchild(projectDir);
   process.chdir(originalCwd);
   rmSync(projectDir, { recursive: true, force: true });
 });
@@ -169,4 +180,52 @@ describe('WI-686 — synchronous-path deterministic failure routes to scrap', ()
     expect(runs).toBeGreaterThanOrEqual(1);
     expect(runs).toBeLessThanOrEqual(MAX_ATTEMPTS);
   });
+});
+
+describe('#17: synchronous-path deterministic station reaps its descendants on exit 0', () => {
+  it('advances the card to done and leaves no backgrounded grandchild running', async () => {
+    db = openDb();
+    // The containment fixture backgrounds a grandchild that touches a sentinel,
+    // waits for its first touch, then exits 0. It writes into its cwd, which
+    // the executor sets to the project root.
+    const args = [CONTAINMENT_FIXTURE, ...containmentFixtureExitArgs(0)].map((a) => JSON.stringify(a));
+    writeFileSync(
+      join(projectDir, 'flow.yaml'),
+      `
+flow: sync-deterministic-reap
+project_root: .
+flow_version: 1
+terminal_lanes: [done, scrap, hold]
+defaults:
+  cap_policy: scrap
+budgets:
+  per_card: { max_execution_attempts: 1 }
+stations:
+  - id: boom
+    next: done
+    worker:
+      kind: deterministic
+      role: spawner
+      command: sh
+      args: [${args.join(', ')}]
+    wip: 1
+    inputs: []
+    outputs: []
+`,
+    );
+    const loaded = loadFlow(join(projectDir, 'flow.yaml'));
+    if (!loaded.ok) throw new Error(`fixture flow invalid: ${JSON.stringify(loaded.errors)}`);
+    seedBoomCard(db);
+
+    await runExecutor({
+      db,
+      flow: loaded.flow,
+      now: () => Math.floor(Date.now() / 1000),
+      adapter: throwingModel,
+      io,
+    } as RunEngineArgs);
+
+    expect(db.getCard(DEFAULT_RUN_ID, 'entry')?.lane).toBe('done');
+    await expectGrandchildReaped(projectDir);
+  }, 20_000);
 });

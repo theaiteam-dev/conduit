@@ -7,12 +7,12 @@
  * (not a lone pid) on expiry, and confines the child's cwd to inside the
  * project root.
  *
- * Bun.spawn's native `timeout`/`killSignal` (used by runDeterministic in
- * ./deterministic.ts) kills only the immediate child — a grandchild the
- * harness backgrounds (a common agent-CLI pattern) reparents to init and
- * survives. This runner instead spawns the child DETACHED (`setsid()`, so
- * the child's pid becomes its own process-group id) and, on timeout, sends
- * SIGKILL to the negative pid — the whole group, grandchildren included.
+ * Bun.spawn's native `timeout`/`killSignal` kills only the immediate child: a
+ * grandchild the harness backgrounds (a common agent-CLI pattern) reparents to
+ * init and survives. This runner instead spawns the child DETACHED (`setsid()`,
+ * so the child's pid becomes its own process-group id) and, on timeout, sends
+ * SIGKILL to the negative pid, which is the whole group, grandchildren included
+ * (`killProcessGroup` in ./process-group.ts, shared with runDeterministic).
  *
  * Do NOT apply a command allowlist here — the harness binary comes from
  * trusted engine config (WI-560); the `tools` allowlist is enforced
@@ -22,6 +22,7 @@
 
 import { resolve, sep } from 'node:path';
 import { existsSync, statSync } from 'node:fs';
+import { killProcessGroup } from './process-group';
 
 /** The command + argv to spawn (no shell — array form, per the Law-lite pattern). */
 export interface HarnessCommand {
@@ -177,12 +178,7 @@ export async function runHarnessProcess(
   });
 
   const timer = setTimeout(() => {
-    try {
-      // Negative pid == the process GROUP, not just the immediate child.
-      process.kill(-proc.pid, 'SIGKILL');
-    } catch {
-      /* group already exited — nothing to kill */
-    }
+    killProcessGroup(proc.pid);
   }, config.timeoutMs);
 
   const [exitCode, stdout, stderr] = await Promise.all([
@@ -196,8 +192,7 @@ export async function runHarnessProcess(
 
   const durationMs = Date.now() - startedAt;
 
-  // Distinguish OUR timeout-kill from a normal exit (mirrors runDeterministic's
-  // discrimination in ./deterministic.ts). A shared flag set independently
+  // Distinguish OUR timeout-kill from a normal exit. A shared flag set independently
   // inside the setTimeout callback would race: when the child exits naturally
   // right around the deadline, the timer can still fire and attempt a kill —
   // harmless (it fails silently on an already-exited pid) but a flag set there

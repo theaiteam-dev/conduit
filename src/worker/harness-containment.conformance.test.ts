@@ -36,7 +36,7 @@ describe('harnessAdapterSpawnPath', () => {
       throw Object.assign(new Error('timed out'), { code: HARNESS_TIMEOUT_CLASS });
     });
     const spawnPath = harnessAdapterSpawnPath('fake-adapter', () => adapter);
-    const code = await spawnPath({ projectRoot: '/tmp/unused', fixture: '/bin/true', timeoutMs: 1000 });
+    const code = await spawnPath({ projectRoot: '/tmp/unused', fixture: '/bin/true', timeoutMs: 1000, fixtureArgs: [] });
     expect(code).toBe(HARNESS_TIMEOUT_CLASS);
   });
 
@@ -47,7 +47,7 @@ describe('harnessAdapterSpawnPath', () => {
     });
     const spawnPath = harnessAdapterSpawnPath('fake-adapter', () => adapter);
     await expect(
-      spawnPath({ projectRoot: '/tmp/unused', fixture: '/bin/true', timeoutMs: 1000 }),
+      spawnPath({ projectRoot: '/tmp/unused', fixture: '/bin/true', timeoutMs: 1000, fixtureArgs: [] }),
     ).rejects.toBe(boom);
   });
 
@@ -57,14 +57,14 @@ describe('harnessAdapterSpawnPath', () => {
     });
     const spawnPath = harnessAdapterSpawnPath('fake-adapter', () => adapter);
     await expect(
-      spawnPath({ projectRoot: '/tmp/unused', fixture: '/bin/true', timeoutMs: 1000 }),
+      spawnPath({ projectRoot: '/tmp/unused', fixture: '/bin/true', timeoutMs: 1000, fixtureArgs: [] }),
     ).rejects.toMatchObject({ code: 'harness-exit-nonzero' });
   });
 
   it('returns undefined when the invocation resolves', async () => {
     const adapter = makeFake('fake-adapter', async () => RESULT);
     const spawnPath = harnessAdapterSpawnPath('fake-adapter', () => adapter);
-    const code = await spawnPath({ projectRoot: '/tmp/unused', fixture: '/bin/true', timeoutMs: 1000 });
+    const code = await spawnPath({ projectRoot: '/tmp/unused', fixture: '/bin/true', timeoutMs: 1000, fixtureArgs: [] });
     expect(code).toBeUndefined();
   });
 });

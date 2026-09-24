@@ -3,7 +3,9 @@
  *
  * Every spawn path that runs a worker process must kill that worker's whole
  * process tree on timeout, so a grandchild the worker backgrounded (a shell, a
- * browser, a language server) does not outlive the invocation. The guarantee
+ * browser, a language server) does not outlive the invocation. A spawn path
+ * that opts in with `reapsOnExit` must also kill it when the worker exits on
+ * its own, with status 0 or nonzero (issue #17). The guarantee
  * is implemented in `runHarnessProcess` (./harness-runner.ts) and proved there
  * by the runner's own AC3 test. That test calls the runner directly, so an
  * adapter that spawns some other way would drop the guarantee without anything
@@ -22,7 +24,8 @@
  *
  * The fixture (./containment-fixture.sh) stands in for the binary. It
  * backgrounds a grandchild that records its pid and touches a sentinel file
- * every 100ms, then blocks. The suite proves the grandchild died two ways: the
+ * every 100ms, then blocks, or exits with a given code when run with
+ * `--exit <code>`. The suite proves the grandchild died two ways: the
  * pid is gone, and the sentinel mtime stops advancing. The second check does
  * not depend on the pid, so a recycled pid cannot make a surviving grandchild
  * look dead.
@@ -62,6 +65,12 @@ export interface ContainmentRun {
   fixture: string;
   /** Wall-clock bound to pass to the spawn path's own timeout mechanism. */
   timeoutMs: number;
+  /**
+   * Arguments for the fixture. Empty for the timeout scenario. The exit
+   * scenarios, registered only with `reapsOnExit`, pass `--exit <code>`, so a
+   * spawn path that opts in must hand these to the fixture unchanged.
+   */
+  fixtureArgs: string[];
 }
 
 /**
@@ -77,14 +86,31 @@ export interface ContainmentConformanceOptions {
   timeoutClass: string;
   /**
    * Set when the path is known not to reap descendants yet, naming the open
-   * issue(s). The reaping test is then registered with `test.failing`: it
-   * reports as passing while the bug stands, and turns red the moment the
-   * path is fixed, so the marker has to be removed rather than left behind.
-   * A separate normal test still pins the timeout class and the fixture, so a
-   * broken fixture cannot hide behind the inverted test.
+   * issue(s). The reaping tests are then registered with `test.failing`: they
+   * report as passing while the bug stands, and turn red the moment the path
+   * is fixed, so the marker has to be removed rather than left behind. A
+   * separate normal test still pins the timeout class and the fixture, so a
+   * broken fixture cannot hide behind the inverted test. No shipped path sets
+   * it today; it is kept so a new spawn path can be registered before its fix.
    */
   knownLeak?: string;
+  /**
+   * Also register the exit scenarios: the fixture backgrounds its grandchild
+   * and exits 0, or exits nonzero, well before the timeout. The spawn path
+   * must return without reporting a timeout and the grandchild must be gone.
+   * Opt-in because it requires the path to pass `fixtureArgs` through, and a
+   * harness adapter builds its own argv and treats a nonzero exit as an error.
+   */
+  reapsOnExit?: boolean;
 }
+
+/**
+ * The wall-clock bound for the exit scenarios. The fixture exits on its own
+ * long before this, so a path that returns near it waited on something the
+ * exit should have ended.
+ */
+const EXIT_SCENARIO_TIMEOUT_MS = 10_000;
+const EXIT_SCENARIO_PROMPT_MS = 5_000;
 
 /** True while `pid` exists (signal 0 checks for existence without delivering a signal). */
 function isAlive(pid: number): boolean {
@@ -118,7 +144,8 @@ function sentinelMtime(projectRoot: string): number | undefined {
   }
 }
 
-function recordedPid(projectRoot: string): number | undefined {
+/** The grandchild pid the fixture recorded in `projectRoot`, if it got that far. */
+export function recordedPid(projectRoot: string): number | undefined {
   const path = join(projectRoot, PID_FILE);
   if (!existsSync(path)) return undefined;
   const pid = Number(readFileSync(path, 'utf-8').trim());
@@ -143,6 +170,45 @@ async function watchSentinelAdvance(projectRoot: string, settled: () => boolean)
   return false;
 }
 
+/** The fixture arguments that make it exit with `code` once its grandchild is running. */
+export function containmentFixtureExitArgs(code: number): string[] {
+  return ['--exit', String(code)];
+}
+
+/**
+ * SIGKILL the grandchild recorded in `projectRoot`, for an afterEach, so a
+ * failing test does not leave the fixture's loop running in the developer's
+ * session. Only the recorded pid: when the path did not detach the worker,
+ * the grandchild shares the test runner's process group, so a group kill here
+ * would take the runner down with it.
+ */
+export function killRecordedGrandchild(projectRoot: string): void {
+  const pid = recordedPid(projectRoot);
+  if (pid === undefined) return;
+  try {
+    process.kill(pid, 'SIGKILL');
+  } catch {
+    /* already gone: the expected case */
+  }
+}
+
+/**
+ * Assert that the fixture's grandchild in `projectRoot` is dead, two ways:
+ * the recorded pid disappears, and the sentinel stops advancing. A live
+ * grandchild touches the sentinel every 100ms, so an unchanged mtime across
+ * the window means nothing is left running the loop, whatever the pid now
+ * refers to.
+ */
+export async function expectGrandchildReaped(projectRoot: string): Promise<void> {
+  const pid = recordedPid(projectRoot);
+  expect(pid).toBeDefined();
+  expect(await waitForPidGone(pid!, REAP_BUDGET_MS)).toBe(true);
+
+  const before = sentinelMtime(projectRoot);
+  await sleep(STALL_WINDOW_MS);
+  expect(sentinelMtime(projectRoot)).toBe(before);
+}
+
 interface ObservedRun {
   timeoutClass: string | undefined;
   /** The sentinel advanced while the invocation was running. */
@@ -152,7 +218,12 @@ interface ObservedRun {
 
 async function runAndObserve(spawnPath: ContainmentSpawnPath, projectRoot: string): Promise<ObservedRun> {
   let done = false;
-  const invocation = spawnPath({ projectRoot, fixture: CONTAINMENT_FIXTURE, timeoutMs: TIMEOUT_MS }).finally(
+  const invocation = spawnPath({
+    projectRoot,
+    fixture: CONTAINMENT_FIXTURE,
+    timeoutMs: TIMEOUT_MS,
+    fixtureArgs: [],
+  }).finally(
     () => {
       done = true;
     },
@@ -181,19 +252,7 @@ export function describeContainmentConformance(
     });
 
     afterEach(() => {
-      // Kill a grandchild the spawn path failed to reap, so a failing test
-      // does not leave the fixture's loop running in the developer's session.
-      // Only the recorded pid: when the path did not detach the worker, the
-      // grandchild shares the test runner's process group, so a group kill
-      // here would take the runner down with it.
-      const pid = recordedPid(projectRoot);
-      if (pid !== undefined) {
-        try {
-          process.kill(pid, 'SIGKILL');
-        } catch {
-          /* already gone: the expected case */
-        }
-      }
+      killRecordedGrandchild(projectRoot);
       rmSync(projectRoot, { recursive: true, force: true });
     });
 
@@ -223,18 +282,40 @@ export function describeContainmentConformance(
         expect(run.sawGrandchildLive).toBe(true);
         expect(run.grandchildPid).toBeDefined();
 
-        // Proof one: the recorded pid disappears.
-        expect(await waitForPidGone(run.grandchildPid!, REAP_BUDGET_MS)).toBe(true);
-
-        // Proof two: the sentinel stops advancing. A live grandchild touches
-        // it every 100ms, so an unchanged mtime across the window means
-        // nothing is left running the loop, whatever the pid now refers to.
-        const before = sentinelMtime(projectRoot);
-        await sleep(STALL_WINDOW_MS);
-        expect(sentinelMtime(projectRoot)).toBe(before);
+        await expectGrandchildReaped(projectRoot);
       },
       TEST_TIMEOUT_MS,
     );
+
+    if (options.reapsOnExit === true) {
+      for (const [label, code] of [
+        ['exits 0', 0],
+        ['exits nonzero', 3],
+      ] as const) {
+        reaps(
+          `kills a backgrounded grandchild when the worker ${label} before its timeout`,
+          async () => {
+            const startedAt = Date.now();
+            const timeoutClass = await spawnPath({
+              projectRoot,
+              fixture: CONTAINMENT_FIXTURE,
+              timeoutMs: EXIT_SCENARIO_TIMEOUT_MS,
+              fixtureArgs: containmentFixtureExitArgs(code),
+            });
+
+            expect(Date.now() - startedAt).toBeLessThan(EXIT_SCENARIO_PROMPT_MS);
+            // A worker that exited on its own was not timed out, even though
+            // the path killed its process group afterwards.
+            expect(timeoutClass).toBeUndefined();
+            // The fixture exits only after the grandchild has touched the
+            // sentinel, so the grandchild was running when the worker exited.
+            expect(sentinelMtime(projectRoot)).toBeDefined();
+            await expectGrandchildReaped(projectRoot);
+          },
+          TEST_TIMEOUT_MS,
+        );
+      }
+    }
   });
 }
 

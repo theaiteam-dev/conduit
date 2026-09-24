@@ -53,10 +53,13 @@ hold it together:
   backgrounds a grandchild, and must show that the grandchild's pid is gone and its
   sentinel file stops changing after the timeout.
   `src/worker/harness-containment-registry.test.ts` fails if an adapter ships without a
-  conformance call. The deterministic station runner is registered against the same suite
-  but does not pass it yet ([#10](https://github.com/theaiteam-dev/conduit/issues/10),
-  [#17](https://github.com/theaiteam-dev/conduit/issues/17)); that is a separate path from
-  harness stations, and its test is marked as a known failure until those are fixed.
+  conformance call. The deterministic station runner, a separate path from harness
+  stations, passes the same suite. It also runs the suite's exit scenarios: when the
+  station's command exits 0 or nonzero before its timeout, the runner kills the command's
+  process group before it returns, so a grandchild does not outlive a station that finished
+  on its own ([#10](https://github.com/theaiteam-dev/conduit/issues/10),
+  [#17](https://github.com/theaiteam-dev/conduit/issues/17)). A harness adapter kills the
+  group on timeout only.
   Deployment guidance additionally recommends running the container as a dedicated non-root
   user for agentic/harness flows.
 - **The ADR-0003 container wall.** [ADR-0003](../adr/0003-packaging-and-distribution.md)'s
