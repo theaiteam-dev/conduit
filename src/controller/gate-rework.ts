@@ -63,6 +63,28 @@ export interface GateReworkInput {
   harnessRegistry?: HarnessRegistry;
   /** Absolute project root for resolving artifact inputs of the critic prompt. */
   projectRoot: string;
+  /**
+   * The judged card's owned paths — `[0]` is the child dir card-scoped critic
+   * inputs resolve from (issue #51). REQUIRED, mirroring the `runId`
+   * idiom: a gate on a child_entry station judges THAT child's work, so a
+   * forgotten scope would either throw at render (the pre-#51 behavior) or,
+   * worse, quietly judge the shared project-root artifact instead of the
+   * child's shard. A compile error beats a wrong verdict. Pass `[]` for a card
+   * that owns no paths.
+   */
+  ownedPaths: string[];
+  /**
+   * The judged station's `input_scope.owned_dir` — which of its inputs are
+   * card-scoped (issue #51). REQUIRED for the same reason as `ownedPaths`.
+   * Pass `[]` when the station declares no input_scope; the reserved
+   * `seed.json` stays card-scoped either way.
+   *
+   * This is the WORKER station's list, not a critic-specific one: the critic
+   * judges the child's work and must read the same shard the maker did, so a
+   * critic input that names a card-scoped artifact resolves the same way on
+   * both sides of the gate.
+   */
+  ownedDirInputs: string[];
   /** Validated back-edges from the flow config. */
   validBackEdges: ReadonlyArray<{ from: string; to: string }>;
   /**
@@ -175,11 +197,16 @@ function findImmediatelyPriorVerdict(
  *   2. Persisting the decision (card lane/status/rework_count update + slot release).
  */
 export async function runGateRework(input: GateReworkInput): Promise<GateReworkDecision> {
-  const { db, runId, cardId, workerStationId, attempt, maxExecutionAttempts, gateReworkCount, gateConfig, adapter, harnessRegistry, projectRoot, validBackEdges, capPolicy = 'scrap' } = input;
+  const { db, runId, cardId, workerStationId, attempt, maxExecutionAttempts, gateReworkCount, gateConfig, adapter, harnessRegistry, projectRoot, ownedPaths, ownedDirInputs, validBackEdges, capPolicy = 'scrap' } = input;
 
   // ── Render critic prompt ──────────────────────────────────────────────────
+  // The card's scope is threaded so a critic on a child_entry station reads the
+  // CHILD's card-scoped inputs — its shard, its seed — exactly as the maker did
+  // (issue #51). Without it a critic referencing either throws at render.
   const criticTemplate = readFileSync(gateConfig.criticPromptFile, 'utf-8');
-  const criticPrompt = renderPrompt(criticTemplate, gateConfig.criticInputScope, projectRoot);
+  const criticPrompt = renderPrompt(
+    criticTemplate, gateConfig.criticInputScope, projectRoot, undefined, [], ownedPaths, ownedDirInputs,
+  );
 
   // ── Run gate check ────────────────────────────────────────────────────────
   // Use the worker station id (not a ':gate' suffix) so the back-edge check
@@ -219,6 +246,8 @@ export async function runGateRework(input: GateReworkInput): Promise<GateReworkD
           prompt: criticPrompt,
           criticInputScope: gateConfig.criticInputScope,
           projectRoot,
+          ownedPaths,
+          ownedDirInputs,
           timeoutMs: gateConfig.criticTimeoutMs ?? DEFAULT_HARNESS_CRITIC_TIMEOUT_MS,
           model: criticModel,
           onReject: gateConfig.onReject,

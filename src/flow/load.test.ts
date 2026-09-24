@@ -1323,6 +1323,116 @@ describe('loadFlow — output_scope validation (v10 owned-dir outputs)', () => {
 });
 
 // ---------------------------------------------------------------------------
+// issue #51 — input_scope: which declared inputs are READ from the card's
+//        owned dir. A list ⊆ inputs, never 'feedback', transform OR harness
+//        (unlike output_scope, harness stations read inputs too).
+// ---------------------------------------------------------------------------
+
+describe('loadFlow — input_scope validation (issue #51 owned-dir inputs)', () => {
+  function scopedInputs(
+    ownedDir: string,
+    opts: { kind?: string; inputs?: string } = {},
+  ): string {
+    const kind = opts.kind ?? 'transform';
+    const workerExtra =
+      kind === 'transform'
+        ? [
+            '      model: gpt-4o-mini',
+            '      prompt_file: prompts/w.md',
+            '      prompt_version: "1"',
+            '      output_schema: { fields: [{ name: ok, type: string, required: true }] }',
+          ].join('\n')
+        : kind === 'harness'
+          ? [
+              '      harness: claude-code',
+              '      prompt_file: prompts/w.md',
+              '      prompt_version: "1"',
+            ].join('\n')
+          : '';
+    return (
+      [
+        'flow: scope',
+        'flow_version: 1',
+        'terminal_lanes: [done, scrap, hold]',
+        'stations:',
+        '  - id: w',
+        '    worker:',
+        `      kind: ${kind}`,
+        ...(workerExtra ? [workerExtra] : []),
+        `    inputs: ${opts.inputs ?? '[patch.txt, style-guide.md]'}`,
+        '    outputs: [out.json]',
+        '    input_scope:',
+        `      owned_dir: ${ownedDir}`,
+      ].join('\n') + '\n'
+    );
+  }
+  const FILES = { 'prompts/w.md': 'w' };
+
+  it('accepts a valid list, parsed onto the config', () => {
+    const station = expectOk(loadInline(scopedInputs('[patch.txt]'), FILES)).stations.w!;
+    expect(station.input_scope).toEqual({ owned_dir: ['patch.txt'] });
+  });
+
+  it('accepts several declared inputs at once', () => {
+    const station = expectOk(
+      loadInline(scopedInputs('[patch.txt, style-guide.md]'), FILES),
+    ).stations.w!;
+    expect(station.input_scope).toEqual({ owned_dir: ['patch.txt', 'style-guide.md'] });
+  });
+
+  it('leaves input_scope ABSENT when not declared', () => {
+    const noScope =
+      [
+        'flow: scope',
+        'flow_version: 1',
+        'terminal_lanes: [done, scrap, hold]',
+        'stations:',
+        '  - id: w',
+        '    worker:',
+        '      kind: transform',
+        '      model: gpt-4o-mini',
+        '      prompt_file: prompts/w.md',
+        '      prompt_version: "1"',
+        '      output_schema: { fields: [{ name: ok, type: string, required: true }] }',
+        '    inputs: [patch.txt]',
+        '    outputs: [out.json]',
+      ].join('\n') + '\n';
+    expect(expectOk(loadInline(noScope, FILES)).stations.w!.input_scope).toBeUndefined();
+  });
+
+  it('rejects a non-list owned_dir', () => {
+    expect(errorCodes(loadInline(scopedInputs('patch.txt'), FILES))).toContain('INVALID_INPUT_SCOPE');
+  });
+
+  it('rejects a list holding a non-string entry', () => {
+    expect(errorCodes(loadInline(scopedInputs('[7]'), FILES))).toContain('INVALID_INPUT_SCOPE');
+  });
+
+  it('rejects a name that is not among the declared inputs', () => {
+    expect(errorCodes(loadInline(scopedInputs('[nope.txt]'), FILES))).toContain('INVALID_INPUT_SCOPE');
+  });
+
+  it('rejects the synthetic feedback input (never on disk)', () => {
+    expect(
+      errorCodes(loadInline(scopedInputs('[feedback]', { inputs: '[patch.txt, feedback]' }), FILES)),
+    ).toContain('INVALID_INPUT_SCOPE');
+  });
+
+  it('accepts input_scope on a HARNESS station (unlike output_scope)', () => {
+    const station = expectOk(
+      loadInline(scopedInputs('[patch.txt]', { kind: 'harness' }), FILES),
+    ).stations.w!;
+    expect(station.input_scope).toEqual({ owned_dir: ['patch.txt'] });
+  });
+
+  it('rejects input_scope on a station kind that reads no prompt inputs', () => {
+    expect(
+      errorCodes(loadInline(scopedInputs('[patch.txt]', { kind: 'deterministic' }), FILES)),
+    ).toContain('INVALID_INPUT_SCOPE');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // AC1 — a valid fan-out station loads and exposes the parsed topology on the
 //        station config. resume_at may name a station OR a terminal lane.
 // ---------------------------------------------------------------------------

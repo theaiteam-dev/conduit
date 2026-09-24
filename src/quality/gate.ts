@@ -17,6 +17,7 @@ import { join } from 'node:path';
 import type { Lane, StationOutput } from '../types/kernel';
 import { DEFAULT_RUN_ID, type ConduitDB } from '../persistence/db';
 import type { ModelAdapter } from '../worker/adapter';
+import { resolveInputPath } from '../flow/resolve-input';
 import { runTransformStation, coerciveParse, type OutputSchema } from '../worker/transform';
 import type { HarnessAdapter, HarnessResult, MountedInput, UsageReport } from '../worker/harness-adapter';
 import { usageFromThrow } from '../worker/harness-adapter';
@@ -257,6 +258,20 @@ export interface HarnessGateConfig {
   /** Artifacts in scope for the critic — mounted the same way a harness maker mounts its inputs. */
   criticInputScope: string[];
   projectRoot: string;
+  /**
+   * The judged card's owned paths — `[0]` is the child dir card-scoped critic
+   * inputs are MOUNTED from (issue #51). REQUIRED, mirroring the `runId` idiom
+   * above: mounting the project-root artifact for a card-scoped name would hand
+   * the critic the shared file while its prompt quotes the child's shard. A
+   * compile error beats a critic judging the wrong bytes. `[]` for an unscoped card.
+   */
+  ownedPaths: string[];
+  /**
+   * The judged station's `input_scope.owned_dir` — which critic inputs mount
+   * from the owned dir (issue #51). REQUIRED for the same reason; `[]` when the
+   * station declares no input_scope (the reserved `seed.json` is never mounted).
+   */
+  ownedDirInputs: string[];
   timeoutMs: number;
   /**
    * Resolved EFFECTIVE model for this invocation (station override or
@@ -300,10 +315,14 @@ export interface HarnessGateConfig {
 export async function runHarnessGateCheck(config: HarnessGateConfig): Promise<GateDecision> {
   // Mount declared inputs the same way a harness maker does — the reserved
   // synthetic 'feedback'/'seed.json' names have no on-disk artifact of their
-  // own (WI-565).
+  // own (WI-565) — and, like the maker, resolve card-scoped names from the
+  // card's owned dir rather than projectRoot (issue #51).
   const mountedInputs: MountedInput[] = config.criticInputScope
     .filter((name) => name !== 'feedback' && name !== 'seed.json')
-    .map((name) => ({ name, path: join(config.projectRoot, name) }));
+    .map((name) => ({
+      name,
+      path: resolveInputPath(name, config.projectRoot, config.ownedPaths, config.ownedDirInputs),
+    }));
 
   // WI-570 rework: clear any STALE verdict.json BEFORE this attempt's invoke()
   // — mirrors WI-568's fresh-per-attempt-baseline precedent in executor.ts

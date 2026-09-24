@@ -234,6 +234,9 @@ describe('runGateRework — widened decision carries verdict/findings/returnTo/a
       gateConfig: gateConfigFor(dir),
       adapter: criticAdapter(opts.verdict, opts.findings, opts.returnTo),
       projectRoot: dir,
+      // Unscoped card: no card-scoped critic inputs (issue #51, behavior-preserving).
+      ownedPaths: [],
+      ownedDirInputs: [],
       validBackEdges: [{ from: 'ideate', to: 'ideate' }],
     });
     return decision as unknown as WidenedGateDecision;
