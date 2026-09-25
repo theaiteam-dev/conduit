@@ -53,15 +53,17 @@ hold it together:
   backgrounds a grandchild, and must show that the grandchild's pid is gone and its
   sentinel file stops changing after the timeout.
   `src/worker/harness-containment-registry.test.ts` fails if an adapter ships without a
-  conformance call. The deterministic station runner, a separate path from harness
-  stations, passes the same suite. It also runs the suite's exit scenarios: when the
-  station's command exits 0 or nonzero before its timeout, the runner kills the command's
-  process group before it returns, so a grandchild does not outlive a station that finished
-  on its own ([#10](https://github.com/theaiteam-dev/conduit/issues/10),
-  [#17](https://github.com/theaiteam-dev/conduit/issues/17)). A harness adapter kills the
-  group on timeout only. Both runners also kill every live station process group when the
-  kernel receives SIGINT, SIGTERM or SIGHUP, or exits; a SIGKILLed kernel cannot do this,
-  which is why the container boundary below still matters.
+  conformance call. The deterministic station runner and the harness runner, two separate
+  spawn paths, both pass the same suite, and both also run its exit scenarios: when the
+  command exits 0 or nonzero before its timeout, the runner kills the command's process
+  group before it returns, so a grandchild does not outlive a station or a harness
+  invocation that finished on its own
+  ([#10](https://github.com/theaiteam-dev/conduit/issues/10),
+  [#17](https://github.com/theaiteam-dev/conduit/issues/17)). For the harness runner this
+  also keeps a grandchild that inherited the stdout/stderr pipes from stalling the output
+  drains past its actual finish. Both runners also kill every live station process group
+  when the kernel receives SIGINT, SIGTERM or SIGHUP, or exits; a SIGKILLed kernel cannot do
+  this, which is why the container boundary below still matters.
   Deployment guidance additionally recommends running the container as a dedicated non-root
   user for agentic/harness flows.
 - **The ADR-0003 container wall.** [ADR-0003](../adr/0003-packaging-and-distribution.md)'s

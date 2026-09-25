@@ -15,15 +15,20 @@
  *   3. a child that spawns a grandchild is FULLY reaped on timeout — the recorded
  *      grandchild pid is dead afterward (process-GROUP kill, not child.kill).
  *   4. cwd is set inside the project root; a cwd resolving OUTSIDE it is rejected.
+ *   5. (#17) a grandchild backgrounded by a harness that exits on its own (0 or
+ *      nonzero, well before the timeout) is reaped too, and does not stall the
+ *      output drains: the runner returns promptly with the output written
+ *      before the exit, not at timeoutMs.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
-import { mkdtempSync, mkdirSync, rmSync, readFileSync, realpathSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync, realpathSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   runHarnessProcess,
   type HarnessRunnerConfig,
 } from './harness-runner';
+import { describeContainmentConformance } from './harness-containment.conformance';
 
 // ---------------------------------------------------------------------------
 // Fixtures: an isolated project root per test + tracked pids for cleanup so a
@@ -333,4 +338,93 @@ describe('harness runner: stdout line filter', () => {
 
     expect(result.stdout).toBe('a\nb\n');
   });
+});
+
+// ---------------------------------------------------------------------------
+// Containment conformance (issue #17, mirroring runDeterministic). The runner
+// spawns the harness as its own process group and must SIGKILL the group after
+// the leader exits, not only on timeout, so the fixture's grandchild dies on
+// every exit path.
+// ---------------------------------------------------------------------------
+
+/** Test-local label for `result.timedOut === true`. HarnessSpawnResult carries a boolean. */
+const HARNESS_RUNNER_TIMEOUT_LABEL = 'timedOut';
+
+describeContainmentConformance(
+  'harness-runner',
+  async ({ projectRoot, fixture, timeoutMs, fixtureArgs }) => {
+    const result = await runHarnessProcess(
+      { command: fixture, args: fixtureArgs },
+      { projectRoot, timeoutMs },
+    );
+    return result.timedOut === true ? HARNESS_RUNNER_TIMEOUT_LABEL : undefined;
+  },
+  { timeoutClass: HARNESS_RUNNER_TIMEOUT_LABEL, reapsOnExit: true },
+);
+
+// ---------------------------------------------------------------------------
+// #17: a descendant that keeps the inherited stdout/stderr pipes open. The
+// conformance fixture above sends its grandchild's stdio to /dev/null, so it
+// proves reaping but not the drain stall; this script does not redirect, so a
+// surviving grandchild would keep `Promise.all`'s drains pending until
+// timeoutMs. The post-exit group kill must close the pipes so the runner
+// returns promptly, and output written before the exit must still be captured.
+// ---------------------------------------------------------------------------
+
+describe('runHarnessProcess: descendants holding the output pipes (#17)', () => {
+  /** Grandchild pids a test recorded; afterEach SIGKILLs any that survived. */
+  const recorded: number[] = [];
+
+  afterEach(() => {
+    // Single pids only, never a group: a leaked grandchild of an undetached
+    // spawn shares the test runner's process group.
+    for (const pid of recorded.splice(0)) {
+      try {
+        process.kill(pid, 'SIGKILL');
+      } catch {
+        /* already gone: the expected case */
+      }
+    }
+  });
+
+  /**
+   * A script that writes to stdout and stderr, backgrounds a `sleep 30` that
+   * inherits both pipes, records its pid, then exits with `tail`.
+   */
+  function pipeHoldingScript(tail: string): string {
+    const script = join(projectRoot, 'hold.sh');
+    writeFileSync(
+      script,
+      ['echo before-out', 'echo before-err >&2', 'sleep 30 &', 'echo "$!" > grandchild.pid', tail, ''].join('\n'),
+    );
+    return script;
+  }
+
+  function grandchildPid(): number {
+    const pid = Number(readFileSync(join(projectRoot, 'grandchild.pid'), 'utf-8').trim());
+    expect(Number.isInteger(pid) && pid > 1).toBe(true);
+    recorded.push(pid);
+    return pid;
+  }
+
+  for (const [label, code] of [
+    ['exits 0', 0],
+    ['exits nonzero', 4],
+  ] as const) {
+    it(`returns promptly with the output written before it ${label}, and the grandchild is gone`, async () => {
+      const script = pipeHoldingScript(`exit ${code}`);
+      const start = Date.now();
+      // A generous timeout the fix must beat by a wide margin: without the
+      // post-exit group kill, the drains wait out the full 30s sleep instead.
+      const result = await runHarnessProcess({ command: 'sh', args: [script] }, config({ timeoutMs: 60_000 }));
+      const elapsed = Date.now() - start;
+
+      expect(elapsed).toBeLessThan(10_000);
+      expect(result.exitCode).toBe(code);
+      expect(result.timedOut).toBe(false);
+      expect(result.stdout).toBe('before-out\n');
+      expect(result.stderr).toBe('before-err\n');
+      expect(await waitForPidGone(grandchildPid(), 3_000)).toBe(true);
+    }, 40_000);
+  }
 });
