@@ -414,7 +414,12 @@ A gate critic takes the same field as `check.critic.agent`, next to
   file's SHA-256 into the station's `prompt_template_version`. Editing the
   agent body invalidates the checkpoint and cascades downstream, the same as
   editing a `worker.uses` skill. Other plugin files (skills, hooks, commands)
-  are not hashed.
+  are not hashed. Every `<station>.harness` journal row records the agent
+  name and that SHA-256 in its `agent` and `agent_sha256` columns, next to
+  the `binding_stamp` and folded `prompt_template_version`, so a result stays
+  attributable to the agent version that produced it after the checkpoint is
+  gone. A harness critic's `<station>.harness-critic` row records its agent
+  the same way, with no stamp, since a critic writes no checkpoint.
 - **It fails closed.** An agent with no definition file in the plugin dirs, a
   name without a `<plugin>:` part, or more than one matching file is rejected
   at flow load (`UNRESOLVED_HARNESS_AGENT`) when a registry is configured, and

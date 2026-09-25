@@ -38,7 +38,7 @@ import { deriveSubflowRunId } from '../run/run-id';
 import type { StartWorkMessage } from '../worker/ipc-protocol';
 import { sanitizeStderrTail } from '../worker/ipc-protocol';
 import type { ModelAdapter } from '../worker/adapter';
-import { DEFAULT_RUN_ID, type ConduitDB, type JournalSpanInput } from '../persistence/db';
+import { DEFAULT_RUN_ID, type ConduitDB, type JournalSpanInput, type JournalProvenance } from '../persistence/db';
 import type { FlowConfig, StationConfig, FanInPolicyConfig, StationOutput, Card } from '../types/kernel';
 import { planTick } from './tick';
 import { attemptClaim, beginWork, renewLease, reconcile } from '../dispatch/claim';
@@ -2806,6 +2806,11 @@ async function runGateCheckOrAdvance(args: GateCheckOrAdvanceArgs): Promise<bool
         station: stationId,
         attempt: card.attempt,
         name: `${stationId}.harness-critic`,
+        // Provenance: the critic's agent and its definition hash. The critic
+        // writes no checkpoint, so it has no binding stamp to record.
+        ...(gateDecision.criticUsage.agent !== undefined
+          ? { agent: gateDecision.criticUsage.agent, agentSha256: gateDecision.criticUsage.agentSha256 }
+          : {}),
         adapter: adapterName,
         durationMs,
         usageUnknown: !usageKnown,
@@ -3274,6 +3279,8 @@ async function executeTransformStation(args: TransformArgs): Promise<boolean> {
       // engine-default timeout (not truly unbounded — the original transform-timeout work).
       timeoutMs:
         stationConfig.timeout_seconds !== undefined ? stationConfig.timeout_seconds * 1000 : undefined,
+      // Journal provenance: the stamp and the effective prompt version it folded.
+      provenance: { bindingStamp, promptTemplateVersion },
     });
 
     // ── Andon check after model call ──────────────────────────────────────────
@@ -3574,6 +3581,7 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
   // from a stale checkpoint.
   const effectiveAgent = stationConfig.agent ?? harnessAdapter.agent;
   let promptTemplateVersion = stationConfig.prompt_version ?? '';
+  let agentSha256: string | undefined;
   if (effectiveAgent !== undefined) {
     const definition = resolveHarnessAgent(harnessAdapter, effectiveAgent);
     if (!definition.ok) {
@@ -3584,6 +3592,7 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
       );
       return false;
     }
+    agentSha256 = definition.sha256;
     promptTemplateVersion = computeAgentAwarePromptTemplateVersion(
       promptTemplateVersion, effectiveAgent, definition.sha256,
     );
@@ -3637,6 +3646,14 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
     // modelId stays semantically the model id.
     adapterName: harnessAdapter.name,
   });
+
+  // Journal provenance, written on every `<station>.harness` span below so each
+  // result is attributable to the exact config that produced it across runs.
+  const provenance: JournalProvenance = {
+    bindingStamp,
+    promptTemplateVersion,
+    ...(effectiveAgent !== undefined ? { agent: effectiveAgent, agentSha256 } : {}),
+  };
 
   // ── WI-571: effectful-station outbox discipline (Phase 3, FR-11) ────────
   // Mirrors the transform effectful path exactly (SPEC §5 exactly-once): for
@@ -3810,7 +3827,7 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
             parkedJournalUsage = harnessJournalUsage(parkedUsage, effectiveModel);
           }
           db.appendJournalSpan({
-            runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.harness`,
+            runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.harness`, ...provenance,
             adapter: harnessAdapter.name, durationMs: Date.now() - invokeStartedAt,
             usageUnknown: !parkedUsageKnown, usage: parkedJournalUsage,
             attributes: {
@@ -3901,7 +3918,7 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
           thrownJournalUsage = harnessJournalUsage(thrownUsage, effectiveModel);
         }
         db.appendJournalSpan({
-          runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.harness`,
+          runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.harness`, ...provenance,
           adapter: harnessAdapter.name, durationMs: Date.now() - invokeStartedAt,
           usageUnknown: !thrownUsageKnown, usage: thrownJournalUsage,
           attributes: { outcome: scrapReason },
@@ -3983,7 +4000,7 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
           : runOwnedPathsIntegrity(projectRoot, ownedPaths, touchedPaths);
       if (integrityViolation && !integrityViolation.ok) {
         db.appendJournalSpan({
-          runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.harness`,
+          runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.harness`, ...provenance,
           adapter: harnessAdapter.name, durationMs, usageUnknown: !usageKnown, usage: journalUsage,
           attributes: { outcome: `integrity_violation: ${describeIntegrity(integrityViolation)}` },
         });
@@ -4003,7 +4020,7 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
         callsMade++;
         scrapReason = `harness-output-missing: ${missingOutputs.join(', ')}`;
         db.appendJournalSpan({
-          runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.harness`,
+          runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.harness`, ...provenance,
           adapter: harnessAdapter.name, durationMs, usageUnknown: !usageKnown, usage: journalUsage,
           attributes: { outcome: scrapReason },
         });
@@ -4025,7 +4042,7 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
         callsMade++;
         scrapReason = `harness-output-unparseable: station '${stationId}' output '${outputFile ?? '(none declared)'}' is not valid JSON`;
         db.appendJournalSpan({
-          runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.harness`,
+          runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.harness`, ...provenance,
           adapter: harnessAdapter.name, durationMs, usageUnknown: !usageKnown, usage: journalUsage,
           attributes: { outcome: scrapReason },
         });
@@ -4036,7 +4053,7 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
         callsMade++;
         scrapReason = `harness-output-invalid: station '${stationId}': ${validated.error}`;
         db.appendJournalSpan({
-          runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.harness`,
+          runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.harness`, ...provenance,
           adapter: harnessAdapter.name, durationMs, usageUnknown: !usageKnown, usage: journalUsage,
           attributes: { outcome: scrapReason },
         });
@@ -4073,7 +4090,7 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
         }
       }
       db.appendJournalSpan({
-        runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.harness`,
+        runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.harness`, ...provenance,
         adapter: harnessAdapter.name, durationMs, usageUnknown: !usageKnown, usage: journalUsage,
         // Issue #5: the capacity snapshot rides along on the priced row, so
         // "what did this run draw against the plan" is a query rather than an
@@ -4333,7 +4350,7 @@ async function executeSubflowStation(args: SubflowArgs): Promise<boolean> {
         callsMade++;
         scrapReason = `subflow-${result.outcome}: ${result.reason}`;
         db.appendJournalSpan({
-          runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.subflow`,
+          runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.subflow`, bindingStamp,
           adapter: `subflow:${childFlowPath}`, durationMs, usageUnknown: !usageKnown, usage: journalUsage,
           attributes: { child_run_id: childRunId, outcome: scrapReason },
         });
@@ -4348,7 +4365,7 @@ async function executeSubflowStation(args: SubflowArgs): Promise<boolean> {
         callsMade++;
         scrapReason = `subflow-output-missing: ${missingOutputs.join(', ')}`;
         db.appendJournalSpan({
-          runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.subflow`,
+          runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.subflow`, bindingStamp,
           adapter: `subflow:${childFlowPath}`, durationMs, usageUnknown: !usageKnown, usage: journalUsage,
           attributes: { child_run_id: childRunId, outcome: scrapReason },
         });
@@ -4366,7 +4383,7 @@ async function executeSubflowStation(args: SubflowArgs): Promise<boolean> {
       stationOutput = output;
 
       db.appendJournalSpan({
-        runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.subflow`,
+        runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.subflow`, bindingStamp,
         adapter: `subflow:${childFlowPath}`, durationMs, usageUnknown: !usageKnown, usage: journalUsage,
         attributes: { child_run_id: childRunId, outcome: 'success' },
       });

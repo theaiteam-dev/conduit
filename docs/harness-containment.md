@@ -181,7 +181,8 @@ Everything upstream and downstream of the tool loop is the same kernel machinery
 `transform` station gets: the atomic claim, declared inputs and typed `output_schema`
 validation with coercive parsing, `check:` gates in both directions with journaled
 `gate_verdict` rows and all four rework guards, per-attempt journaling (harness identity,
-model, duration, artifact hashes, usage), wall-clock timeout and execution-attempt caps,
+model, duration, artifact hashes, usage, and the binding stamp, effective
+`prompt_template_version`, agent and agent definition hash that produced the attempt), wall-clock timeout and execution-attempt caps,
 liveness-watchdog integration so an in-flight attempt counts as progress, and the outbox +
 idempotency discipline for effectful stations. The tool loop is the only new freedom; the
 contract around it is unchanged.

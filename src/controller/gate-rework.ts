@@ -217,11 +217,15 @@ export async function runGateRework(input: GateReworkInput): Promise<GateReworkD
         // definition file throws, which the executor turns into a hold, rather
         // than running a critic the kernel cannot identify.
         const criticAgent = gateConfig.criticAgent ?? resolved.adapter.agent;
+        // The definition hash rides to the journal's critic span on
+        // CriticUsage, so this is the only resolution.
+        let criticAgentSha256: string | undefined;
         if (criticAgent !== undefined) {
           const definition = resolveHarnessAgent(resolved.adapter, criticAgent);
           if (!definition.ok) {
             throw new Error(`harness critic agent unresolved for station '${workerStationId}': ${definition.error}`);
           }
+          criticAgentSha256 = definition.sha256;
         }
         return runHarnessGateCheck({
           cardId,
@@ -233,7 +237,7 @@ export async function runGateRework(input: GateReworkInput): Promise<GateReworkD
           projectRoot,
           timeoutMs: gateConfig.criticTimeoutMs ?? DEFAULT_HARNESS_CRITIC_TIMEOUT_MS,
           model: criticModel,
-          ...(criticAgent !== undefined ? { agent: criticAgent } : {}),
+          ...(criticAgent !== undefined ? { agent: criticAgent, agentSha256: criticAgentSha256 } : {}),
           onReject: gateConfig.onReject,
           validBackEdges,
           tools: gateConfig.criticTools,

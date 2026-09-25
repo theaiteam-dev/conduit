@@ -947,6 +947,45 @@ describe('issue #28 AC2: check.critic.agent reaches the harness critic\'s Harnes
     expect(critic.calls[0]!.agent).toBeUndefined();
   });
 
+  it('journals the critic agent and its definition sha256 on the <station>.harness-critic span, with no stamp', async () => {
+    db = openDb();
+    const maker = makeZeroUsageHarnessMaker();
+    const critic = makeConfigurableHarnessCritic({
+      verdict: 'pass', adapterAgent: 'team:default', knownAgents: ['team:default', 'team:reviewer'],
+    });
+    const registry = createHarnessRegistry([maker.adapter, critic.adapter]);
+    const flow = writeGatedFlow(dir, registry, {
+      harnessCritic: 'claude-critic', criticTools: ['Read', 'Write'], criticAgent: 'team:reviewer',
+    });
+    seedCard(db);
+
+    await run(flow, registry, neverModel);
+
+    const spans = db.getJournalSpansForRun(DEFAULT_RUN_ID, 'entry').filter((s) => s.name === 'coder.harness-critic');
+    expect(spans).toHaveLength(1);
+    expect(spans[0]!.agent).toBe('team:reviewer');
+    expect(spans[0]!.agentSha256).toBe('b'.repeat(64));
+    // The critic writes no checkpoint, so there is no stamp to record.
+    expect(spans[0]!.bindingStamp).toBeNull();
+    expect(spans[0]!.promptTemplateVersion).toBeNull();
+  });
+
+  it('journals NULL agent columns on the critic span when the critic runs no agent', async () => {
+    db = openDb();
+    const maker = makeZeroUsageHarnessMaker();
+    const critic = makeConfigurableHarnessCritic({ verdict: 'pass' });
+    const registry = createHarnessRegistry([maker.adapter, critic.adapter]);
+    const flow = writeGatedFlow(dir, registry, { harnessCritic: 'claude-critic', criticTools: ['Read', 'Write'] });
+    seedCard(db);
+
+    await run(flow, registry, neverModel);
+
+    const spans = db.getJournalSpansForRun(DEFAULT_RUN_ID, 'entry').filter((s) => s.name === 'coder.harness-critic');
+    expect(spans).toHaveLength(1);
+    expect(spans[0]!.agent).toBeNull();
+    expect(spans[0]!.agentSha256).toBeNull();
+  });
+
   it('holds the card without invoking the critic when its adapter-default agent cannot be resolved', async () => {
     db = openDb();
     const maker = makeZeroUsageHarnessMaker();

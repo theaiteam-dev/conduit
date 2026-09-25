@@ -292,6 +292,19 @@ CREATE TABLE IF NOT EXISTS journal (
   -- fraction (~55-70% of real traffic).
   cache_read_input_tokens      INTEGER,
   cache_creation_input_tokens  INTEGER,
+  -- Provenance: which config produced this span, for a station execution that
+  -- computes a binding stamp (SPEC §5). binding_stamp is the stamp the
+  -- checkpoint was (or would be) written under; prompt_template_version is the
+  -- effective value folded into it (prompt_version with skills or the agent
+  -- folded in); agent and agent_sha256 name the effective harness agent and
+  -- the SHA-256 of its definition file. The checkpoints table cannot answer
+  -- this across runs: it is per-run, deleted on invalidation, and holds only
+  -- the one-way stamp. All nullable: a span outside a stamped execution, and
+  -- every row written before these columns existed, reads back NULL.
+  binding_stamp            TEXT,
+  prompt_template_version  TEXT,
+  agent                    TEXT,
+  agent_sha256             TEXT,
   created_at       INTEGER NOT NULL DEFAULT (unixepoch())
 );
 
@@ -489,7 +502,28 @@ export interface JournalSpanInput {
    * is never confused with a fabricated zero.
    */
   usageUnknown?: boolean;
+  /**
+   * Provenance of a stamped station execution. Written on the spans of a
+   * station execution that computes a binding stamp; omitted elsewhere, which
+   * stores NULL.
+   */
+  bindingStamp?: string;
+  /** The effective prompt_template_version folded into bindingStamp. */
+  promptTemplateVersion?: string;
+  /** The effective harness agent name, when the execution ran one. */
+  agent?: string;
+  /** SHA-256 of that agent's definition file. */
+  agentSha256?: string;
 }
+
+/**
+ * The provenance fields of a JournalSpanInput, so a call site can compute them
+ * once per station execution and spread them onto every span it writes.
+ */
+export type JournalProvenance = Pick<
+  JournalSpanInput,
+  'bindingStamp' | 'promptTemplateVersion' | 'agent' | 'agentSha256'
+>;
 
 /** A journal span as returned by getJournalSpans — attributes are pre-filtered. */
 export interface StoredJournalSpan {
@@ -505,6 +539,14 @@ export interface StoredJournalSpan {
   durationMs?: number | null;
   /** True iff this attempt's usage was explicitly reported unknown (WI-567). */
   usageUnknown?: boolean;
+  /** Binding stamp of the execution that wrote this span; null when none was recorded. */
+  bindingStamp?: string | null;
+  /** Effective prompt_template_version folded into that stamp; null when none was recorded. */
+  promptTemplateVersion?: string | null;
+  /** Effective harness agent name; null when the execution ran none. */
+  agent?: string | null;
+  /** SHA-256 of the agent's definition file; null when the execution ran none. */
+  agentSha256?: string | null;
 }
 
 /** The typed DB handle every caller interacts with. */
@@ -1086,12 +1128,14 @@ class ConduitDBImpl implements ConduitDB {
            (run_id, card_id, station, attempt, name, attributes_json,
             model, input_tokens, output_tokens, cost_usd,
             adapter, duration_ms, usage_unknown,
-            cache_read_input_tokens, cache_creation_input_tokens)
+            cache_read_input_tokens, cache_creation_input_tokens,
+            binding_stamp, prompt_template_version, agent, agent_sha256)
          VALUES
            ($run_id, $card_id, $station, $attempt, $name, $attributes_json,
             $model, $input_tokens, $output_tokens, $cost_usd,
             $adapter, $duration_ms, $usage_unknown,
-            $cache_read_input_tokens, $cache_creation_input_tokens)`,
+            $cache_read_input_tokens, $cache_creation_input_tokens,
+            $binding_stamp, $prompt_template_version, $agent, $agent_sha256)`,
       )
       .run({
         $run_id: span.runId,
@@ -1109,6 +1153,10 @@ class ConduitDBImpl implements ConduitDB {
         $usage_unknown: span.usageUnknown === true ? 1 : 0,
         $cache_read_input_tokens: span.usage?.cacheReadInputTokens ?? null,
         $cache_creation_input_tokens: span.usage?.cacheCreationInputTokens ?? null,
+        $binding_stamp: span.bindingStamp ?? null,
+        $prompt_template_version: span.promptTemplateVersion ?? null,
+        $agent: span.agent ?? null,
+        $agent_sha256: span.agentSha256 ?? null,
       });
   }
 
@@ -1171,7 +1219,8 @@ class ConduitDBImpl implements ConduitDB {
     const rows = this.journalDb
       .prepare(
         `SELECT card_id, station, attempt, name, attributes_json,
-                adapter, duration_ms, usage_unknown
+                adapter, duration_ms, usage_unknown,
+                binding_stamp, prompt_template_version, agent, agent_sha256
          FROM journal
          WHERE card_id = $card_id
          ORDER BY id ASC`,
@@ -1185,6 +1234,10 @@ class ConduitDBImpl implements ConduitDB {
         adapter: string | null;
         duration_ms: number | null;
         usage_unknown: number;
+        binding_stamp: string | null;
+        prompt_template_version: string | null;
+        agent: string | null;
+        agent_sha256: string | null;
       }[];
 
     return rows.map((row) => ({
@@ -1200,6 +1253,10 @@ class ConduitDBImpl implements ConduitDB {
       adapter: row.adapter,
       durationMs: row.duration_ms,
       usageUnknown: row.usage_unknown === 1,
+      bindingStamp: row.binding_stamp,
+      promptTemplateVersion: row.prompt_template_version,
+      agent: row.agent,
+      agentSha256: row.agent_sha256,
     }));
   }
 
@@ -1229,7 +1286,8 @@ class ConduitDBImpl implements ConduitDB {
     const rows = this.journalDb
       .prepare(
         `SELECT card_id, station, attempt, name, attributes_json,
-                adapter, duration_ms, usage_unknown
+                adapter, duration_ms, usage_unknown,
+                binding_stamp, prompt_template_version, agent, agent_sha256
          FROM journal
          WHERE run_id = $run_id AND card_id = $card_id
          ORDER BY id ASC`,
@@ -1243,6 +1301,10 @@ class ConduitDBImpl implements ConduitDB {
         adapter: string | null;
         duration_ms: number | null;
         usage_unknown: number;
+        binding_stamp: string | null;
+        prompt_template_version: string | null;
+        agent: string | null;
+        agent_sha256: string | null;
       }[];
 
     return rows.map((row) => ({
@@ -1258,6 +1320,10 @@ class ConduitDBImpl implements ConduitDB {
       adapter: row.adapter,
       durationMs: row.duration_ms,
       usageUnknown: row.usage_unknown === 1,
+      bindingStamp: row.binding_stamp,
+      promptTemplateVersion: row.prompt_template_version,
+      agent: row.agent,
+      agentSha256: row.agent_sha256,
     }));
   }
 
@@ -2247,6 +2313,24 @@ export function openConduitDB({
   for (const column of [
     'ALTER TABLE journal ADD COLUMN cache_read_input_tokens INTEGER',
     'ALTER TABLE journal ADD COLUMN cache_creation_input_tokens INTEGER',
+  ]) {
+    try {
+      journalDb.exec(column);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (!msg.includes('duplicate column name') && !msg.includes('no such table')) throw err;
+    }
+  }
+
+  // (a'''') journal — provenance ADDITIVE ALTERs: binding stamp, effective
+  // prompt_template_version, and the effective agent with its definition hash.
+  // Nullable with no backfill: a row written before these columns existed has
+  // no recorded provenance, and NULL says exactly that.
+  for (const column of [
+    'ALTER TABLE journal ADD COLUMN binding_stamp TEXT',
+    'ALTER TABLE journal ADD COLUMN prompt_template_version TEXT',
+    'ALTER TABLE journal ADD COLUMN agent TEXT',
+    'ALTER TABLE journal ADD COLUMN agent_sha256 TEXT',
   ]) {
     try {
       journalDb.exec(column);
