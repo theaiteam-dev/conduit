@@ -37,4 +37,7 @@ if (runner === 'deterministic') {
 } else {
   await runHarnessProcess({ command: fixture, args: [] }, { projectRoot, timeoutMs });
 }
+// A fixture that never recorded its pid leaves the poll running, which would
+// keep this process alive after the station returned.
+clearInterval(poll);
 console.log('station returned');
