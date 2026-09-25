@@ -428,3 +428,50 @@ describe('runHarnessProcess: descendants holding the output pipes (#17)', () => 
     }, 40_000);
   }
 });
+
+// ---------------------------------------------------------------------------
+// A `stdoutLineFilter` that throws before `proc.exited` resolves. The filter
+// runs inside `readKeptLines`'s `for await` loop as lines arrive, so a filter
+// that throws on an early line rejects the stdout drain promise while the
+// child is still running (the `sleep` below keeps `proc.exited` pending).
+// Before the fix, that promise had no handler attached until after the
+// process-group kill, so the rejection could go unhandled in the gap; bun:test
+// treats an unhandled rejection as a failure independent of what this function
+// returns.
+// ---------------------------------------------------------------------------
+
+describe('runHarnessProcess: a throwing stdoutLineFilter does not produce an unhandled rejection', () => {
+  it('rejects with the filter error, and the drain rejection is never unhandled', async () => {
+    const filterError = new Error('stdoutLineFilter boom');
+    const throwingFilter = (): boolean => {
+      throw filterError;
+    };
+
+    let unhandled: unknown;
+    const onUnhandledRejection = (reason: unknown) => {
+      unhandled = reason;
+    };
+    process.on('unhandledRejection', onUnhandledRejection);
+
+    try {
+      await expect(
+        runHarnessProcess(
+          // Prints a line immediately (the filter throws on it), then keeps the
+          // process alive briefly so proc.exited has not resolved yet when the
+          // filter throws.
+          { command: 'sh', args: ['-c', 'echo x; sleep 1'] },
+          config({ timeoutMs: 5_000, stdoutLineFilter: throwingFilter }),
+        ),
+      ).rejects.toBe(filterError);
+
+      // Let the event loop settle so a rejection that only becomes unhandled
+      // after this test's assertions (e.g. once the group kill finally runs)
+      // has had a chance to fire the listener above.
+      await new Promise((resolve) => setTimeout(resolve, 200));
+
+      expect(unhandled).toBeUndefined();
+    } finally {
+      process.off('unhandledRejection', onUnhandledRejection);
+    }
+  });
+});

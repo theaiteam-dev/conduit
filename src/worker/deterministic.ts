@@ -226,6 +226,10 @@ export async function runDeterministic(
   // blocked on a full pipe while we wait for it to exit.
   const stdoutText = new Response(proc.stdout).text();
   const stderrText = new Response(proc.stderr as ReadableStream).text();
+  // Attach a handler now: a drain that rejects while we await proc.exited
+  // would otherwise be an unhandled rejection. `await drains` below rethrows it.
+  const drains = Promise.all([stdoutText, stderrText]);
+  drains.catch(() => {});
 
   let exitCode: number;
   try {
@@ -242,7 +246,7 @@ export async function runDeterministic(
     untrackProcessGroup(proc.pid);
   }
 
-  const [stdout, stderr] = await Promise.all([stdoutText, stderrText]);
+  const [stdout, stderr] = await drains;
 
   // Distinguish OUR timeout-kill from a normal exit or an unrelated SIGKILL
   // (OOM-killer, a child that self-kills). Both must hold: our timer fired, and

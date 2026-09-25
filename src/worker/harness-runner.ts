@@ -198,6 +198,11 @@ export async function runHarnessProcess(
       ? readKeptLines(proc.stdout as ReadableStream<Uint8Array>, config.stdoutLineFilter)
       : new Response(proc.stdout).text();
   const stderrText = new Response(proc.stderr as ReadableStream).text();
+  // Attach a handler now: a throwing `stdoutLineFilter` rejects its drain while
+  // proc.exited is still pending, which would otherwise be an unhandled
+  // rejection. `await drains` below rethrows it after the group kill.
+  const drains = Promise.all([stdoutText, stderrText]);
+  drains.catch(() => {});
 
   let exitCode: number;
   try {
@@ -215,7 +220,7 @@ export async function runHarnessProcess(
     untrackProcessGroup(proc.pid);
   }
 
-  const [stdout, stderr] = await Promise.all([stdoutText, stderrText]);
+  const [stdout, stderr] = await drains;
 
   const durationMs = Date.now() - startedAt;
 
