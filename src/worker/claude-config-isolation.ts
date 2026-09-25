@@ -28,6 +28,13 @@ const CREDENTIALS_FILE = '.credentials.json';
  * Variables that authenticate the CLI without a credentials file. Any one of
  * them allowlisted and set in the kernel env means the constructed dir needs
  * no credentials link at all.
+ *
+ * The token/key variables (ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN,
+ * CLAUDE_CODE_OAUTH_TOKEN) count on any non-empty value. The three USE_*
+ * variables are feature flags, not credentials, so they count only when
+ * env-truthy: '1', 'true', 'yes' or 'on', case-insensitive and trimmed,
+ * matching the claude CLI's own reading of them. CLAUDE_CODE_USE_BEDROCK=0
+ * or =false does not authenticate the child.
  */
 export const CLAUDE_AUTH_ENV_VARS: readonly string[] = [
   'ANTHROPIC_API_KEY',
@@ -37,6 +44,18 @@ export const CLAUDE_AUTH_ENV_VARS: readonly string[] = [
   'CLAUDE_CODE_USE_VERTEX',
   'CLAUDE_CODE_USE_FOUNDRY',
 ];
+
+/** The USE_* flags count as authenticating only when set to one of these, matching the CLI's own env-truthy rule. */
+const TRUTHY_VALUES = new Set(['1', 'true', 'yes', 'on']);
+
+const USE_FLAG_VARS = new Set(['CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_VERTEX', 'CLAUDE_CODE_USE_FOUNDRY']);
+
+/** Whether `name`'s value counts as authenticating the child: non-empty for token vars, env-truthy for the USE_* flags. */
+function authenticatingValue(name: string, value: string | undefined): boolean {
+  const trimmed = (value ?? '').trim();
+  if (trimmed.length === 0) return false;
+  return USE_FLAG_VARS.has(name) ? TRUTHY_VALUES.has(trimmed.toLowerCase()) : true;
+}
 
 /** The operator's own config dir as the kernel sees it: CLAUDE_CONFIG_DIR, else $HOME/.claude. */
 export function operatorClaudeConfigDir(sourceEnv: Record<string, string | undefined>): string | undefined {
@@ -58,7 +77,7 @@ export function createRunScopedClaudeConfigDir(
   envAllowlist: readonly string[],
 ): string {
   const authVar = CLAUDE_AUTH_ENV_VARS.find(
-    (name) => envAllowlist.includes(name) && (sourceEnv[name] ?? '').length > 0,
+    (name) => envAllowlist.includes(name) && authenticatingValue(name, sourceEnv[name]),
   );
   const operatorDir = operatorClaudeConfigDir(sourceEnv);
   const credentials = operatorDir !== undefined ? join(operatorDir, CREDENTIALS_FILE) : undefined;

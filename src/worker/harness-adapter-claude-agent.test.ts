@@ -304,6 +304,48 @@ describe('claude-headless isolateConfig: a constructed config dir per invocation
     expect(calls[0]!.configDirEntries).toEqual([]);
   });
 
+  it('treats a falsy CLAUDE_CODE_USE_BEDROCK="0" as not authenticating: still fails closed with no credentials file', async () => {
+    const empty = join(root, 'empty-config');
+    mkdirSync(empty);
+    const { run, calls } = makeRun();
+    await expect(
+      adapter({
+        isolateConfig: true,
+        envAllowlist: ['PATH', 'CLAUDE_CODE_USE_BEDROCK'],
+        sourceEnv: { CLAUDE_CONFIG_DIR: empty, CLAUDE_CODE_USE_BEDROCK: '0' },
+        run,
+      }).invoke(invocation()),
+    ).rejects.toThrow('.credentials.json');
+    expect(calls).toHaveLength(0);
+  });
+
+  it('treats a falsy CLAUDE_CODE_USE_BEDROCK="false" as not authenticating: still links the credentials file', async () => {
+    const ambient = writeAmbient();
+    const { run, calls } = makeRun();
+    await adapter({
+      isolateConfig: true,
+      envAllowlist: ['PATH', 'CLAUDE_CODE_USE_BEDROCK'],
+      sourceEnv: { CLAUDE_CONFIG_DIR: ambient, CLAUDE_CODE_USE_BEDROCK: 'false' },
+      run,
+    }).invoke(invocation());
+
+    expect(calls[0]!.configDirEntries).toEqual(['.credentials.json']);
+  });
+
+  it('treats a truthy CLAUDE_CODE_USE_BEDROCK="1" as authenticating: runs with an empty config dir and no credentials file', async () => {
+    const empty = join(root, 'empty-config');
+    mkdirSync(empty);
+    const { run, calls } = makeRun();
+    await adapter({
+      isolateConfig: true,
+      envAllowlist: ['PATH', 'CLAUDE_CODE_USE_BEDROCK'],
+      sourceEnv: { CLAUDE_CONFIG_DIR: empty, CLAUDE_CODE_USE_BEDROCK: '1' },
+      run,
+    }).invoke(invocation());
+
+    expect(calls[0]!.configDirEntries).toEqual([]);
+  });
+
   it('issue #29 AC1: with an identically named agent in ambient config, the child gets the --plugin-dir agent and cannot see the ambient one', async () => {
     // Ambient: the operator's config carries a plugin named `team` with an
     // agent `coder` (the CLI loads ~/.claude/skills/<plugin> as a plugin).

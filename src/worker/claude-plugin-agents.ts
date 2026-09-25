@@ -11,7 +11,7 @@
  *     plugin; any other entry is a folder of plugins, and each child holding
  *     that manifest is a plugin (a child without one is not loaded);
  *   - the plugin's namespace is the manifest's `name`, falling back to the
- *     directory name;
+ *     directory name only when the manifest parses but omits `name`;
  *   - agents are the `.md` files in `agents/` plus any the manifest's `agents`
  *     field lists, and each is addressed by its frontmatter `name:`, not its
  *     filename.
@@ -19,7 +19,11 @@
  * The file is hashed, not interpreted: only the frontmatter `name:` line is
  * read, to match the address. Every miss fails closed; the caller never falls
  * back to hashing the name alone, which would let an edited agent replay from
- * a stale checkpoint.
+ * a stale checkpoint. A manifest that cannot be read or parsed is not a valid
+ * plugin root at all: the kernel cannot know which namespace the CLI would
+ * use for it, so it is neither loaded as a plugin (no directory-name
+ * fallback) nor scanned as a folder of plugins, and looking it up returns
+ * `{ ok: false }` naming the manifest path rather than guessing.
  */
 
 import { createHash } from 'node:crypto';
@@ -36,6 +40,14 @@ interface PluginRoot {
   declaredAgents: string[];
 }
 
+/**
+ * The result of looking at one directory for `.claude-plugin/plugin.json`:
+ * no manifest at all (not a plugin root — a folder-of-plugins candidate),
+ * a manifest present but unreadable/unparseable (a plugin root the kernel
+ * fails closed on, never a folder-of-plugins candidate), or a valid root.
+ */
+type PluginLookup = { kind: 'none' } | { kind: 'invalid'; dir: string; manifestPath: string } | { kind: 'root'; root: PluginRoot };
+
 function isDirectory(path: string): boolean {
   try {
     return statSync(path).isDirectory();
@@ -44,35 +56,54 @@ function isDirectory(path: string): boolean {
   }
 }
 
-function readPluginRoot(dir: string): PluginRoot | undefined {
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+function readPluginRoot(dir: string): PluginLookup {
   const manifestPath = join(dir, MANIFEST);
-  if (!existsSync(manifestPath)) return undefined;
-  let manifest: { name?: unknown; agents?: unknown } = {};
+  if (!existsSync(manifestPath)) return { kind: 'none' };
+  let raw: string;
   try {
-    manifest = JSON.parse(readFileSync(manifestPath, 'utf-8')) as typeof manifest;
+    raw = readFileSync(manifestPath, 'utf-8');
   } catch {
-    // An unreadable manifest still marks a plugin root; its agents dir is scanned.
+    return { kind: 'invalid', dir, manifestPath };
+  }
+  let manifest: { name?: unknown; agents?: unknown };
+  try {
+    manifest = JSON.parse(raw) as typeof manifest;
+  } catch {
+    return { kind: 'invalid', dir, manifestPath };
   }
   const declared = manifest.agents;
   const declaredAgents =
     typeof declared === 'string' ? [declared] : Array.isArray(declared) ? declared.filter((a) => typeof a === 'string') : [];
   return {
-    dir,
-    name: typeof manifest.name === 'string' && manifest.name.length > 0 ? manifest.name : basename(dir),
-    declaredAgents,
+    kind: 'root',
+    root: {
+      dir,
+      name: typeof manifest.name === 'string' && manifest.name.length > 0 ? manifest.name : basename(dir),
+      declaredAgents,
+    },
   };
 }
 
-/** The plugins one `--plugin-dir` entry loads: itself, or each child plugin. */
-function pluginsIn(pluginDir: string): PluginRoot[] {
+/**
+ * The plugins one `--plugin-dir` entry loads: itself (if it is a plugin
+ * root, valid or invalid), or each child plugin. An invalid manifest at the
+ * entry itself is reported, not silently skipped, and never triggers a
+ * folder-of-plugins scan.
+ */
+function pluginsIn(pluginDir: string): Exclude<PluginLookup, { kind: 'none' }>[] {
   const self = readPluginRoot(pluginDir);
-  if (self !== undefined) return [self];
+  if (self.kind !== 'none') return [self];
   if (!isDirectory(pluginDir)) return [];
   return readdirSync(pluginDir)
     .sort()
     .map((child) => join(pluginDir, child))
     .filter(isDirectory)
-    .flatMap((child) => readPluginRoot(child) ?? []);
+    .map((child) => readPluginRoot(child))
+    .filter((lookup): lookup is Exclude<PluginLookup, { kind: 'none' }> => lookup.kind !== 'none');
 }
 
 function markdownFilesIn(dir: string): string[] {
@@ -134,16 +165,38 @@ export function resolveClaudePluginAgent(pluginDirs: readonly string[], agent: s
   const agentName = agent.slice(separator + 1);
 
   const matches: string[] = [];
+  // The manifest path of an invalid plugin.json whose directory name matches
+  // `pluginName` — reported when no match is found, since a directory-name
+  // guess is the only identifier available for a manifest that failed to
+  // parse, and the operator needs to know why nothing resolved.
+  let invalidManifest: string | undefined;
   for (const pluginDir of pluginDirs) {
-    for (const plugin of pluginsIn(pluginDir)) {
+    for (const lookup of pluginsIn(pluginDir)) {
+      if (lookup.kind === 'invalid') {
+        if (invalidManifest === undefined && basename(lookup.dir) === pluginName) invalidManifest = lookup.manifestPath;
+        continue;
+      }
+      const plugin = lookup.root;
       if (plugin.name !== pluginName) continue;
       for (const file of agentFilesOf(plugin)) {
-        if (frontmatterName(readFileSync(file, 'utf-8')) === agentName) matches.push(file);
+        let text: string;
+        try {
+          text = readFileSync(file, 'utf-8');
+        } catch (err) {
+          return { ok: false, error: `agent '${agent}' definition file '${file}' could not be read: ${errorMessage(err)}` };
+        }
+        if (frontmatterName(text) === agentName) matches.push(file);
       }
     }
   }
 
   if (matches.length === 0) {
+    if (invalidManifest !== undefined) {
+      return {
+        ok: false,
+        error: `agent '${agent}' cannot be resolved: plugin manifest '${invalidManifest}' is not valid JSON, so its namespace is unknown`,
+      };
+    }
     return {
       ok: false,
       error: `agent '${agent}' has no definition file in the configured plugin dirs: ${pluginDirs.join(', ')}`,
@@ -158,5 +211,11 @@ export function resolveClaudePluginAgent(pluginDirs: readonly string[], agent: s
     };
   }
   const path = matches[0]!;
-  return { ok: true, path, sha256: createHash('sha256').update(readFileSync(path)).digest('hex') };
+  let bytes: Buffer;
+  try {
+    bytes = readFileSync(path);
+  } catch (err) {
+    return { ok: false, error: `agent '${agent}' definition file '${path}' could not be read: ${errorMessage(err)}` };
+  }
+  return { ok: true, path, sha256: createHash('sha256').update(bytes).digest('hex') };
 }

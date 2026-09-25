@@ -355,6 +355,23 @@ describe('parseHarnessConfig: _AGENT, _PLUGIN_DIRS, _ISOLATE_CONFIG (issues #28,
     expect(def!.agent).toBe('ai-team:murdock');
   });
 
+  it('trims _AGENT before storing it', () => {
+    const [def] = expectOk(parseHarnessConfig(claudeEnv({ CONDUIT_HARNESS_CLAUDE_HEADLESS_AGENT: ' plug:agent ' })));
+    expect(def!.agent).toBe('plug:agent');
+  });
+
+  it('rejects an empty _AGENT, naming the variable, rather than storing "" and silently holding every station', () => {
+    const error = expectErr(parseHarnessConfig(claudeEnv({ CONDUIT_HARNESS_CLAUDE_HEADLESS_AGENT: '' })));
+    expect(error).toContain('CONDUIT_HARNESS_CLAUDE_HEADLESS_AGENT');
+    expect(error).toContain('empty');
+  });
+
+  it('rejects a whitespace-only _AGENT the same way', () => {
+    const error = expectErr(parseHarnessConfig(claudeEnv({ CONDUIT_HARNESS_CLAUDE_HEADLESS_AGENT: '   ' })));
+    expect(error).toContain('CONDUIT_HARNESS_CLAUDE_HEADLESS_AGENT');
+    expect(error).toContain('empty');
+  });
+
   it('splits _PLUGIN_DIRS as CSV into one entry per path, trimming whitespace and dropping empty tokens', () => {
     const [def] = expectOk(
       parseHarnessConfig(claudeEnv({ CONDUIT_HARNESS_CLAUDE_HEADLESS_PLUGIN_DIRS: ' /opt/plugins/a ,,/opt/plugins/b ' })),

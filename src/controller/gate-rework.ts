@@ -218,7 +218,10 @@ export async function runGateRework(input: GateReworkInput): Promise<GateReworkD
         // than running a critic the kernel cannot identify.
         const criticAgent = gateConfig.criticAgent ?? resolved.adapter.agent;
         // The definition hash rides to the journal's critic span on
-        // CriticUsage, so this is the only resolution.
+        // CriticUsage, so this is the only resolution. It is not folded into
+        // a binding stamp because a gate critic writes no checkpoint and is
+        // never skipped on resume: every attempt re-runs the critic against
+        // the current definition file.
         let criticAgentSha256: string | undefined;
         if (criticAgent !== undefined) {
           const definition = resolveHarnessAgent(resolved.adapter, criticAgent);

@@ -98,8 +98,16 @@ export function parseHarnessConfig(env: Record<string, string | undefined>): Har
       def.model = model;
     }
 
-    const agent = env[`${prefix}AGENT`];
-    if (agent !== undefined) {
+    const agentVar = `${prefix}AGENT`;
+    const agentRaw = env[agentVar];
+    if (agentRaw !== undefined) {
+      const agent = agentRaw.trim();
+      if (agent.length === 0) {
+        return {
+          ok: false,
+          error: `harness config: ${agentVar} is set but empty`,
+        };
+      }
       def.agent = agent;
     }
 

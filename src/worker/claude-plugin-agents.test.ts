@@ -18,11 +18,16 @@
  */
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import { createHash } from 'node:crypto';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { resolveClaudePluginAgent } from './claude-plugin-agents';
+
+// chmod 0o000 is ineffective as root (root bypasses file permission checks),
+// so a test relying on it is skipped when the test runner itself is root —
+// there the read would succeed and the assertions would not exercise the guard.
+const isRoot = typeof process.getuid === 'function' && process.getuid() === 0;
 
 let root: string;
 
@@ -46,6 +51,11 @@ function writeAgent(file: string, frontmatterName: string, body = 'Do the task.'
 
 function sha256(file: string): string {
   return createHash('sha256').update(readFileSync(file)).digest('hex');
+}
+
+function writeMalformedManifest(dir: string): void {
+  mkdirSync(join(dir, '.claude-plugin'), { recursive: true });
+  writeFileSync(join(dir, '.claude-plugin', 'plugin.json'), '{ not valid json');
 }
 
 describe('resolveClaudePluginAgent', () => {
@@ -172,5 +182,77 @@ describe('resolveClaudePluginAgent', () => {
 
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.error).toContain('ambiguous');
+  });
+
+  it.skipIf(isRoot)('fails closed, naming the file, when an agent file in the match loop is unreadable', () => {
+    const plugin = join(root, 'p');
+    writePlugin(plugin, { name: 'p' });
+    const readable = join(plugin, 'agents', 'a.md');
+    writeAgent(readable, 'a');
+    const unreadable = join(plugin, 'agents', 'b.md');
+    writeAgent(unreadable, 'b');
+    chmodSync(unreadable, 0o000);
+
+    const result = resolveClaudePluginAgent([plugin], 'p:b');
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).toContain(unreadable);
+  });
+
+  it('fails closed, naming the path, instead of throwing when agents/ contains a directory named *.md', () => {
+    const plugin = join(root, 'p');
+    writePlugin(plugin, { name: 'p' });
+    const trap = join(plugin, 'agents', 'x.md');
+    mkdirSync(trap, { recursive: true });
+
+    const result = resolveClaudePluginAgent([plugin], 'p:x');
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).toContain(trap);
+  });
+
+  it('fails closed, naming the manifest, when a direct --plugin-dir entry has an unparseable plugin.json', () => {
+    const plugin = join(root, 'p');
+    writeMalformedManifest(plugin);
+    writeAgent(join(plugin, 'agents', 'a.md'), 'a');
+
+    const result = resolveClaudePluginAgent([plugin], 'p:a');
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).toContain(join(plugin, '.claude-plugin', 'plugin.json'));
+  });
+
+  it('does not scan an entry with an unparseable plugin.json as a folder of plugins', () => {
+    const plugin = join(root, 'p');
+    writeMalformedManifest(plugin);
+    // If the invalid-manifest root were treated as "not a plugin root" and
+    // scanned as a folder of plugins, this nested child would resolve.
+    writePlugin(join(plugin, 'nested'), { name: 'nested' });
+    writeAgent(join(plugin, 'nested', 'agents', 'a.md'), 'a');
+
+    const result = resolveClaudePluginAgent([plugin], 'nested:a');
+
+    expect(result.ok).toBe(false);
+  });
+
+  it('fails closed, naming the manifest, when a child of a folder-of-plugins has an unparseable plugin.json', () => {
+    writeMalformedManifest(join(root, 'broken'));
+    writeAgent(join(root, 'broken', 'agents', 'a.md'), 'a');
+
+    const result = resolveClaudePluginAgent([root], 'broken:a');
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).toContain(join(root, 'broken', '.claude-plugin', 'plugin.json'));
+  });
+
+  it('still resolves a valid sibling plugin when another child of the folder has an unparseable manifest', () => {
+    writeMalformedManifest(join(root, 'broken'));
+    writePlugin(join(root, 'ok'), { name: 'ok' });
+    const file = join(root, 'ok', 'agents', 'a.md');
+    writeAgent(file, 'a');
+
+    const result = resolveClaudePluginAgent([root], 'ok:a');
+
+    expect(result).toEqual({ ok: true, path: file, sha256: sha256(file) });
   });
 });
