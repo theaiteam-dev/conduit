@@ -48,7 +48,7 @@ import { findCycleNodes } from './dag-utils';
 import { resolveSkill, type ResolveSkillResult } from '../skills/resolve';
 import type { ParsedSkill } from '../skills/parse';
 import { detectExecutionSurface, type ExecutionSurfaceWarning } from '../skills/detect-surface';
-import { adapterCanExpressTools, type HarnessRegistry } from '../worker/harness-adapter';
+import { adapterCanExpressTools, resolveHarnessAgent, type HarnessRegistry } from '../worker/harness-adapter';
 
 // ---------------------------------------------------------------------------
 // Public contract
@@ -109,6 +109,11 @@ interface RawWorker {
   uses?: string[];
   /** Adapter name for a `kind: harness` station (WI-559/563). */
   harness?: string;
+  /**
+   * Named agent for a `kind: harness` station (issue #28). Untrusted: validated
+   * to a non-empty string on a harness station in collectErrors.
+   */
+  agent?: unknown;
   /** Child flow.yaml path for a `kind: subflow` station (the original multi-flow engine work). */
   flow?: string;
   /** Tools allowlist for a harness station's underlying agent-CLI. */
@@ -137,6 +142,11 @@ interface RawCritic {
   harness?: string;
   /** Tools allowlist for an agentic (harness) critic's invocation (WI-595). */
   tools?: string[];
+  /**
+   * Named agent for an agentic (harness) critic (issue #28). Untrusted:
+   * validated in collectErrors.
+   */
+  agent?: unknown;
   /**
    * Wall-clock bound for an agentic (harness) critic's invocation, in seconds.
    * Absent -> the engine's DEFAULT_HARNESS_CRITIC_TIMEOUT_MS (5 minutes). A
@@ -370,6 +380,9 @@ function buildStationConfig(
   // WI-563: lift harness fields (adapter name, tools allowlist, waiver) onto the
   // flat StationConfig — mirrors the model/prompt fields above.
   if (w?.harness !== undefined) config.harness = w.harness;
+  // Issue #28: absent stays absent (no key), as for model; collectErrors has
+  // already rejected a non-string or empty value.
+  if (typeof w?.agent === 'string') config.agent = w.agent;
   // The original multi-flow engine work: lift the subflow child-flow reference, resolved to an absolute
   // path against the parent flow's directory (mirrors prompt_file resolution).
   if (w?.flow !== undefined) config.flow = isAbsolute(w.flow) ? w.flow : resolve(flowDir, w.flow);
@@ -503,6 +516,8 @@ function buildStationConfig(
     if (chk.critic.harness !== undefined) gateCheck.criticHarness = chk.critic.harness;
     // WI-595: the critic's tools allowlist, threaded to its harness invocation.
     if (chk.critic.tools !== undefined) gateCheck.criticTools = chk.critic.tools;
+    // Issue #28: the critic's named agent (omit when absent, never a false '').
+    if (typeof chk.critic.agent === 'string') gateCheck.criticAgent = chk.critic.agent;
     // Harness-critic wall-clock bound (validated positive integer in
     // collectErrors) — threaded to runHarnessGateCheck in ms; absent falls
     // back to the engine default there.
@@ -1455,6 +1470,69 @@ function collectErrors(
               `Station '${station.id}' declares a tools allowlist that adapter ` +
               `'${resolved.adapter.name}' cannot narrow/express — ` +
               `set unrestricted_tools: true to waive this check`,
+          });
+        }
+      }
+    }
+  }
+
+  // ── Issue #28: named-agent validation (worker.agent, check.critic.agent) ──
+  // An agent only means something to a harness adapter that passes it on
+  // (`--agent`), so it is rejected anywhere it would be dropped. With a
+  // registry injected, the adapter must also be able to locate the agent's
+  // definition file, which the executor hashes into the binding stamp; the
+  // executor repeats that resolution at dispatch, since plugin dirs are engine
+  // config and their files can change after load.
+  for (const station of stations) {
+    const agent = station.worker?.agent;
+    if (agent !== undefined) {
+      const kind = resolveStationKind(station);
+      if (typeof agent !== 'string' || agent.trim() === '') {
+        errors.push({
+          code: 'INVALID_HARNESS_AGENT',
+          message: `Station '${station.id}' has invalid worker.agent '${String(agent)}': must be a non-empty string`,
+        });
+      } else if (kind !== 'harness') {
+        errors.push({
+          code: 'INVALID_HARNESS_AGENT',
+          message:
+            `Station '${station.id}' sets worker.agent but is kind=${String(kind)}; only a kind: harness ` +
+            `station passes an agent to its adapter`,
+        });
+      } else if (harnessRegistry !== undefined && station.worker?.harness !== undefined) {
+        const resolved = harnessRegistry.resolve(station.worker.harness);
+        if (resolved.ok) {
+          const definition = resolveHarnessAgent(resolved.adapter, agent);
+          if (!definition.ok) {
+            errors.push({ code: 'UNRESOLVED_HARNESS_AGENT', message: `Station '${station.id}': ${definition.error}` });
+          }
+        }
+      }
+    }
+
+    const critic = station.check?.critic;
+    const criticAgent = critic?.agent;
+    if (criticAgent === undefined) continue;
+    if (typeof criticAgent !== 'string' || criticAgent.trim() === '') {
+      errors.push({
+        code: 'INVALID_HARNESS_AGENT',
+        message: `Station '${station.id}' has invalid check.critic.agent '${String(criticAgent)}': must be a non-empty string`,
+      });
+    } else if (critic?.harness === undefined || station.check?.kind === 'rank') {
+      errors.push({
+        code: 'INVALID_HARNESS_AGENT',
+        message:
+          `Station '${station.id}' sets check.critic.agent but its critic is not a harness gate critic; ` +
+          `only a check.critic.harness gate critic passes an agent to its adapter`,
+      });
+    } else if (harnessRegistry !== undefined) {
+      const resolved = harnessRegistry.resolve(critic.harness);
+      if (resolved.ok) {
+        const definition = resolveHarnessAgent(resolved.adapter, criticAgent);
+        if (!definition.ok) {
+          errors.push({
+            code: 'UNRESOLVED_HARNESS_AGENT',
+            message: `Station '${station.id}' gate critic: ${definition.error}`,
           });
         }
       }

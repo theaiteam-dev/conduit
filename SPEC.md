@@ -546,6 +546,13 @@ stamp**:
 binding = hash(model_id, prompt_template_version, resolved_input_artifact_hashes, flow_version)
 ```
 
+`prompt_template_version` covers everything that becomes part of the worker's prompt,
+not only the template file. A `worker.uses` station folds the content hash of each
+injected skill into it, in declared order. A `kind: harness` station that runs a named
+agent folds in the agent's name and the SHA-256 of its definition file, which the kernel
+locates in the adapter's configured plugin dirs. A station whose agent definition cannot be
+located holds rather than stamping on the name alone.
+
 On resume, a completed station is skipped **only if its binding stamp matches the
 current config.** On mismatch the checkpoint is **invalidated and the invalidation
 cascades downstream** (any station whose `resolved_input_artifact_hashes` changed is

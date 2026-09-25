@@ -43,7 +43,9 @@ hold it together:
 - **Secrets by explicit allowlist only.** The harness child process's environment contains
   only variables named in engine configuration (e.g. the harness's own auth token) — never
   the kernel's environment inherited wholesale. Allowlisted names live in engine config
-  (trusted), never in `flow.yaml` (validated, untrusted).
+  (trusted), never in `flow.yaml` (validated, untrusted). An allowlisted `HOME` is more
+  than a variable: it hands a CLI the operator's home directory, including its config. See
+  [The child's configuration surface](#the-childs-configuration-surface).
 - **Process-group termination.** The harness runs as its own process group; a timeout or
   run halt kills the group, not a lone pid, so a harness that has spawned its own
   subprocesses (a shell, a browser, a language server) doesn't leave zombies behind.
@@ -85,6 +87,61 @@ container (the operator's network/process boundary), and by the adversarial gate
 (corrupted output gets caught before it ships) — and that every attempt is legible in the
 journal (hashes and usage, never raw transcripts).
 
+## The child's configuration surface
+
+A harness CLI assembles its behaviour from configuration it finds, not only from the
+argv and env the kernel builds. For `claude -p`, allowlisting `HOME` (which subscription
+auth needs) hands the child the operator's `~/.claude`: installed and skills-dir plugins,
+user agents, `settings.json` and its hooks, the user `CLAUDE.md`, and the account's
+claude.ai MCP connectors. That surface differs between operators, is not in `flow.yaml`,
+and is not in the binding stamp, so two operators resuming the same flow at the same stamp
+can get different child behaviour.
+
+**Default: inherited.** With no extra configuration, a `claude-headless` station with
+`HOME` allowlisted runs with the operator's user-level Claude configuration. This is the
+behaviour before issue #29, kept so existing deployments do not change underneath their
+operators.
+
+**With `CONDUIT_HARNESS_CLAUDE_HEADLESS_ISOLATE_CONFIG=1`: constructed.** Each invocation
+gets a `CLAUDE_CONFIG_DIR` the adapter creates, holding only a symlink to the operator's
+`.credentials.json` (or nothing, when an auth variable such as `CLAUDE_CODE_OAUTH_TOKEN` is
+allowlisted), and `--strict-mcp-config`. The directory is deleted when the invocation ends.
+Verified against `claude` 2.1.282: subscription auth works, and the child loads no user
+plugin, user agent, user settings or hooks, user `CLAUDE.md`, or MCP server. Plugins and
+agents then come only from what engine config declares with
+`CONDUIT_HARNESS_CLAUDE_HEADLESS_PLUGIN_DIRS`. The opt-in E2E test
+`src/integration/harness-e2e-claude-agent.test.ts` shows an ambient agent answering when
+the child can see ambient config, and a same-named `--plugin-dir` agent answering, with the
+ambient one unreachable, under isolation.
+
+A named `agent:` is part of the binding stamp in both modes: the kernel locates its
+definition file in the configured plugin dirs and folds the name and the file's SHA-256
+into `prompt_template_version`, and a station whose agent it cannot locate holds rather
+than runs. A `--plugin-dir` plugin takes precedence over an installed plugin of the same
+name, so without isolation the declared agent is still the one that runs; the rest of the
+operator's configuration still loads alongside it.
+
+What isolation does **not** fence, stated so the claim stays narrow:
+
+- **The project root's own configuration.** `CLAUDE.md`, `.claude/settings.json` and
+  `.claude/agents/` inside the project root still load. They belong to the project the flow
+  operates on rather than to the operator, but they are not hashed into the stamp either.
+- **Account-level state.** The CLI fetches account state into the run-scoped dir as it
+  runs, including account-synced skills (observed: `anthropic-skills:*` appearing on a
+  second invocation against a reused dir). That content follows the logged-in account, not
+  the machine. A fresh dir per invocation keeps most of it from arriving, since it is
+  synced in the background; the kernel does not guarantee that.
+- **Built-in skills and agents** that ship with the CLI binary, and admin-managed (policy)
+  settings, which apply regardless of the config dir.
+- **Other plugin files.** Only the agent's definition file is hashed. A changed skill, hook
+  or command inside a plugin dir does not move the stamp.
+- **Token refresh.** The CLI replaces `.credentials.json` with an atomic rename that does
+  not follow the symlink, so a token refreshed inside the child is discarded with the
+  run-scoped dir and the operator's file keeps the old token. A long-lived
+  `CLAUDE_CODE_OAUTH_TOKEN` on the allowlist avoids this.
+- **`codex-exec`.** No equivalent fence exists for codex yet; its allowlisted `HOME`
+  still exposes the operator's codex configuration.
+
 ## Network posture: full egress in v1
 
 **Harness stations have full network egress in v1.** This is stated plainly, not implied
@@ -102,10 +159,14 @@ transcripts. An allowlisted egress proxy is a possible later tier — not a v1 p
 ## Operator-owned upgrades
 
 The checkpoint binding stamp for a harness station incorporates the **adapter name**, the
-**model id**, and the **prompt version** — a change to any of them invalidates the
-checkpoint and cascades downstream on resume, exactly like any other station.
+**model id**, and the **prompt version**, with a named **agent's name and definition-file
+hash** folded into the prompt version when the station runs one. A change to any of them
+invalidates the checkpoint and cascades downstream on resume, exactly like any other
+station.
 
-The harness **binary version is deliberately excluded** from the stamp. Upgrading the
+The harness **binary version is deliberately excluded** from the stamp, as are the
+adapter's engine config (`_COMMAND`, `_ENV`, `_PLUGIN_DIRS` beyond the agent file,
+`_ISOLATE_CONFIG`) and, without isolation, the operator's own CLI configuration. Upgrading the
 installed `claude`/`codex`/harness binary on the host or in the container does not
 invalidate existing checkpoints. This means **the operator owns harness upgrades and their
 behavioral consequences** — if a harness upgrade changes output format or behavior

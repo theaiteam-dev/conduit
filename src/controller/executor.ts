@@ -47,7 +47,7 @@ import { runTransformStation, coerciveParse, computeFindingsHash } from '../work
 import type {
   HarnessRegistry, MountedInput, HarnessResult, KnownUsage, RateLimitSnapshot,
 } from '../worker/harness-adapter';
-import { usageFromThrow } from '../worker/harness-adapter';
+import { usageFromThrow, resolveHarnessAgent } from '../worker/harness-adapter';
 import { harnessRetryDelayMs } from '../worker/harness-retry';
 import { loadImageInput, hashImageInputs, assertImagePayloadWithinLimits } from '../worker/image-input';
 import type { ImageInput } from '../worker/image-input';
@@ -57,6 +57,7 @@ import { runGateRework } from './gate-rework';
 import {
   computeBindingStamp,
   computeSkillAwarePromptTemplateVersion,
+  computeAgentAwarePromptTemplateVersion,
   writeCheckpoint,
   readCheckpoint,
   invalidateCheckpoint,
@@ -3564,6 +3565,30 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
   // let a changed adapter default wrongly skip on resume).
   const effectiveModel = stationConfig.model ?? harnessAdapter.model;
 
+  // ── Effective agent (issue #28): same precedence as the model, computed
+  // once so the stamp and the invocation agree. The definition file is
+  // resolved HERE, at dispatch, not only at load: plugin dirs are engine
+  // config, and the file may have changed since the flow loaded. An agent that
+  // cannot be resolved is a configuration failure, so the card holds rather
+  // than stamping on the name alone, which would let an edited agent replay
+  // from a stale checkpoint.
+  const effectiveAgent = stationConfig.agent ?? harnessAdapter.agent;
+  let promptTemplateVersion = stationConfig.prompt_version ?? '';
+  if (effectiveAgent !== undefined) {
+    const definition = resolveHarnessAgent(harnessAdapter, effectiveAgent);
+    if (!definition.ok) {
+      escalateToHold(
+        stateDb, db, cardId, stationId, card,
+        `harness agent unresolved for station '${stationId}': ${definition.error}`,
+        err, runId, true,
+      );
+      return false;
+    }
+    promptTemplateVersion = computeAgentAwarePromptTemplateVersion(
+      promptTemplateVersion, effectiveAgent, definition.sha256,
+    );
+  }
+
   // ── Accumulate prior gate rejection findings for feedback (FR-5) ──────────
   // Identical to the transform path: {{feedback}} is prompt-threaded, zero new
   // machinery (WI-565 AC2).
@@ -3601,7 +3626,8 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
 
   const bindingStamp = computeBindingStamp({
     modelId: effectiveModel ?? '',
-    promptTemplateVersion: stationConfig.prompt_version ?? '',
+    // prompt_version, with the effective agent folded in when there is one.
+    promptTemplateVersion,
     inputArtifactHashes: inputHashes,
     flowVersion: flow.version,
     // WI-572 / review #7: the adapter's identity rides the dedicated
@@ -3744,6 +3770,7 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
           tools: stationConfig.tools ?? [],
           timeoutMs,
           model: effectiveModel,
+          ...(effectiveAgent !== undefined ? { agent: effectiveAgent } : {}),
         });
       } catch (invokeErr) {
         // WI-567 FR-8 fix: stamp fresh liveness progress even on a thrown

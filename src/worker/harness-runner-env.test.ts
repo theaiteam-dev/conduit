@@ -159,3 +159,34 @@ describe('runHarnessProcess — the built child env reaches the process (AC1, AC
     expect(result.stdout).toBe('A=<unset>;D=<unset>');
   });
 });
+
+// ---------------------------------------------------------------------------
+// Issue #29: kernel-constructed variables. An adapter that builds part of the
+// child's surface itself (claude-headless's run-scoped CLAUDE_CONFIG_DIR) sets
+// them through `injectedEnv`, which is applied AFTER the allowlist and wins
+// over an allowlisted value of the same name.
+// ---------------------------------------------------------------------------
+
+describe('runHarnessProcess: injectedEnv (issue #29)', () => {
+  it('sets an injected var the allowlist does not name', async () => {
+    const result = await runHarnessProcess(
+      { command: 'sh', args: ['-c', PRINT_ENV] },
+      config({ envAllowlist: [], sourceEnv: {}, injectedEnv: { WI562_ALLOWED: 'constructed' } }),
+    );
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toBe('A=constructed;D=<unset>');
+  });
+
+  it('overrides an allowlisted value of the same name, so the kernel-constructed value is the one the child sees', async () => {
+    const result = await runHarnessProcess(
+      { command: 'sh', args: ['-c', PRINT_ENV] },
+      config({
+        envAllowlist: ['WI562_ALLOWED'],
+        sourceEnv: { WI562_ALLOWED: 'ambient' },
+        injectedEnv: { WI562_ALLOWED: 'constructed' },
+      }),
+    );
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toBe('A=constructed;D=<unset>');
+  });
+});

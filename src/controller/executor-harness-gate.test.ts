@@ -105,6 +105,10 @@ function makeConfigurableHarnessCritic(
     name?: string;
     adapterModel?: string;
     sameFindings?: boolean;
+    /** issue #28: the adapter's default agent. */
+    adapterAgent?: string;
+    /** issue #28: when set, the critic runs named agents and resolves exactly these. */
+    knownAgents?: string[];
   } = {},
 ): { adapter: HarnessAdapter; calls: HarnessInvocation[] } {
   const verdict = opts.verdict ?? 'reject';
@@ -116,6 +120,15 @@ function makeConfigurableHarnessCritic(
     reportsUsage: true,
     canRestrictTools: true,
     ...(opts.adapterModel !== undefined ? { model: opts.adapterModel } : {}),
+    ...(opts.adapterAgent !== undefined ? { agent: opts.adapterAgent } : {}),
+    ...(opts.knownAgents !== undefined
+      ? {
+          resolveAgentDefinition: (agent: string) =>
+            opts.knownAgents!.includes(agent)
+              ? { ok: true as const, path: `/plugins/${agent}.md`, sha256: 'b'.repeat(64) }
+              : { ok: false as const, error: `agent '${agent}' not found in plugin dirs` },
+        }
+      : {}),
     async probeBinary() {
       return { present: true };
     },
@@ -175,6 +188,8 @@ function writeGatedFlow(
     criticTools?: string[];
     /** issue #26 AC4: an explicit `check.critic.model` override for a harness critic. */
     criticModel?: string;
+    /** issue #28: an explicit `check.critic.agent` for a harness critic. */
+    criticAgent?: string;
     /** issue #26 AC3: the run's token budget, so a test can size it below/above a critic's known spend. */
     runMaxTokens?: number;
   } = {},
@@ -191,8 +206,9 @@ function writeGatedFlow(
   // critic's invocation (gate.ts) — only meaningful on the harness branch.
   const criticToolsPart = opts.criticTools !== undefined ? `tools: [${opts.criticTools.join(', ')}], ` : '';
   const criticModelPart = opts.criticModel !== undefined ? `model: ${opts.criticModel}, ` : '';
+  const criticAgentPart = opts.criticAgent !== undefined ? `agent: ${opts.criticAgent}, ` : '';
   const criticBlock = opts.harnessCritic !== undefined
-    ? `critic: { role: critic, harness: ${opts.harnessCritic}, ${criticModelPart}${criticToolsPart}prompt_file: prompts/verify.md, prompt_version: "1" }`
+    ? `critic: { role: critic, harness: ${opts.harnessCritic}, ${criticModelPart}${criticAgentPart}${criticToolsPart}prompt_file: prompts/verify.md, prompt_version: "1" }`
     : `critic: { role: critic, model: ${CRITIC_MODEL}, prompt_file: prompts/verify.md, prompt_version: "1" }`;
 
   const flowYaml = `
@@ -881,5 +897,67 @@ describe('issue #26 AC4 — check.critic.model reaches the harness critic\'s Har
 
     expect(critic.calls).toHaveLength(1);
     expect(critic.calls[0]!.model).toBe('adapter-default-model');
+  });
+});
+
+describe('issue #28 AC2: check.critic.agent reaches the harness critic\'s HarnessInvocation.agent', () => {
+  it('threads an explicit check.critic.agent into the invocation, winning over the adapter default', async () => {
+    db = openDb();
+    const maker = makeZeroUsageHarnessMaker();
+    const critic = makeConfigurableHarnessCritic({
+      verdict: 'pass', adapterAgent: 'team:default', knownAgents: ['team:default', 'team:reviewer'],
+    });
+    const registry = createHarnessRegistry([maker.adapter, critic.adapter]);
+    const flow = writeGatedFlow(dir, registry, {
+      harnessCritic: 'claude-critic', criticTools: ['Read', 'Write'], criticAgent: 'team:reviewer',
+    });
+    seedCard(db);
+
+    await run(flow, registry, neverModel);
+
+    expect(critic.calls).toHaveLength(1);
+    expect(critic.calls[0]!.agent).toBe('team:reviewer');
+  });
+
+  it('falls back to the adapter default agent when check.critic.agent is absent', async () => {
+    db = openDb();
+    const maker = makeZeroUsageHarnessMaker();
+    const critic = makeConfigurableHarnessCritic({ verdict: 'pass', adapterAgent: 'team:default', knownAgents: ['team:default'] });
+    const registry = createHarnessRegistry([maker.adapter, critic.adapter]);
+    const flow = writeGatedFlow(dir, registry, { harnessCritic: 'claude-critic', criticTools: ['Read', 'Write'] });
+    seedCard(db);
+
+    await run(flow, registry, neverModel);
+
+    expect(critic.calls).toHaveLength(1);
+    expect(critic.calls[0]!.agent).toBe('team:default');
+  });
+
+  it('passes no agent when neither the critic nor the adapter names one', async () => {
+    db = openDb();
+    const maker = makeZeroUsageHarnessMaker();
+    const critic = makeConfigurableHarnessCritic({ verdict: 'pass' });
+    const registry = createHarnessRegistry([maker.adapter, critic.adapter]);
+    const flow = writeGatedFlow(dir, registry, { harnessCritic: 'claude-critic', criticTools: ['Read', 'Write'] });
+    seedCard(db);
+
+    await run(flow, registry, neverModel);
+
+    expect(critic.calls).toHaveLength(1);
+    expect(critic.calls[0]!.agent).toBeUndefined();
+  });
+
+  it('holds the card without invoking the critic when its adapter-default agent cannot be resolved', async () => {
+    db = openDb();
+    const maker = makeZeroUsageHarnessMaker();
+    const critic = makeConfigurableHarnessCritic({ verdict: 'pass', adapterAgent: 'team:missing', knownAgents: [] });
+    const registry = createHarnessRegistry([maker.adapter, critic.adapter]);
+    const flow = writeGatedFlow(dir, registry, { harnessCritic: 'claude-critic', criticTools: ['Read', 'Write'] });
+    seedCard(db);
+
+    await run(flow, registry, neverModel);
+
+    expect(critic.calls).toHaveLength(0);
+    expect(getCard(db)?.lane).toBe('hold');
   });
 });

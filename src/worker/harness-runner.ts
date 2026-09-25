@@ -52,6 +52,13 @@ export interface HarnessRunnerConfig {
    */
   sourceEnv?: Record<string, string | undefined>;
   /**
+   * Variables the adapter constructs itself rather than forwards from the
+   * kernel env (issue #29: claude-headless's run-scoped CLAUDE_CONFIG_DIR).
+   * Applied after the allowlist, so a value here wins over an allowlisted one
+   * of the same name. Never sourced from flow.yaml.
+   */
+  injectedEnv?: Readonly<Record<string, string>>;
+  /**
    * Keep only the stdout lines this predicate accepts, discarding the rest AS
    * THEY ARRIVE rather than buffering the whole stream.
    *
@@ -170,7 +177,10 @@ export async function runHarnessProcess(
   config: HarnessRunnerConfig,
 ): Promise<HarnessSpawnResult> {
   const resolvedCwd = resolveConfinedCwd(config.projectRoot, config.cwd);
-  const childEnv = buildHarnessChildEnv(config.envAllowlist ?? [], config.sourceEnv ?? process.env);
+  const childEnv = {
+    ...buildHarnessChildEnv(config.envAllowlist ?? [], config.sourceEnv ?? process.env),
+    ...config.injectedEnv,
+  };
 
   const startedAt = Date.now();
   const proc = Bun.spawn([cmd.command, ...cmd.args], {
@@ -180,7 +190,8 @@ export async function runHarnessProcess(
     // setsid(): the child becomes its own session/process-group leader, so
     // `-proc.pid` addresses the whole group (grandchildren included) below.
     detached: true,
-    // Never inherit the parent env wholesale — only the allowlisted names.
+    // Never inherit the parent env wholesale: only the allowlisted names plus
+    // what the adapter constructed.
     env: childEnv,
   });
   // The detached group no longer receives the terminal's Ctrl-C, so register

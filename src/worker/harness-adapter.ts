@@ -44,7 +44,22 @@ export interface HarnessInvocation {
    * default, FR-10).
    */
   model?: string;
+  /**
+   * Named agent for this call (issue #28), e.g. `team:coder`. Per-station like
+   * `model`: the executor passes `station.agent ?? adapter.agent`, and an
+   * adapter that runs named agents pushes it as its own flag (`--agent`).
+   */
+  agent?: string;
 }
+
+/**
+ * Where an adapter found a named agent's definition file, and its SHA-256
+ * (issue #28). The executor folds the hash into the binding stamp's
+ * promptTemplateVersion, so an edited agent invalidates the checkpoint.
+ */
+export type AgentDefinitionResult =
+  | { ok: true; path: string; sha256: string }
+  | { ok: false; error: string };
 
 /** A reference to one output the harness produced (name + path, not bytes). */
 export interface ProducedOutput {
@@ -214,10 +229,38 @@ export interface HarnessAdapter {
    * the invocation and the resume binding stamp.
    */
   readonly model?: string;
+  /**
+   * The adapter's configured default agent (issue #28), from
+   * CONDUIT_HARNESS_<NAME>_AGENT. Read by the executor to compute the
+   * effective agent (`station.agent ?? adapter default`), as with `model`.
+   */
+  readonly agent?: string;
+  /**
+   * Locate and hash a named agent's definition file (issue #28). Only an
+   * adapter that can run named agents implements it; judge through
+   * `resolveHarnessAgent`, which fails closed on an adapter without it.
+   */
+  resolveAgentDefinition?(agent: string): AgentDefinitionResult;
   /** Probe binary presence/executability without a full invocation. */
   probeBinary(): Promise<BinaryProbe>;
   /** Bounded invocation of the underlying agent CLI. */
   invoke(call: HarnessInvocation): Promise<HarnessResult>;
+}
+
+/**
+ * The single judgment seam for a named agent (issue #28). Every load-time and
+ * dispatch site resolves through here, so an adapter that cannot run named
+ * agents fails closed the same way everywhere instead of receiving an agent it
+ * would drop.
+ */
+export function resolveHarnessAgent(
+  adapter: Pick<HarnessAdapter, 'name' | 'resolveAgentDefinition'>,
+  agent: string,
+): AgentDefinitionResult {
+  if (adapter.resolveAgentDefinition === undefined) {
+    return { ok: false, error: `harness adapter '${adapter.name}' cannot run a named agent ('${agent}')` };
+  }
+  return adapter.resolveAgentDefinition(agent);
 }
 
 /**
@@ -294,6 +337,11 @@ export interface HarnessAdapterDefinition {
   canExpressTools?(tools: readonly string[]): boolean;
   readonly envAllowlist: readonly string[];
   readonly command: string | undefined;
+  /**
+   * Named-agent lookup passthrough (issue #28). Root-independent: plugin dirs
+   * are absolute engine config, so load-time validation can call it.
+   */
+  resolveAgentDefinition?(agent: string): AgentDefinitionResult;
   probeBinary(): Promise<BinaryProbe>;
   bind(projectRoot: string): HarnessAdapter;
 }
@@ -312,9 +360,27 @@ interface ShippedAdapterFactoryConfig {
   envAllowlist: string[];
   command?: string;
   model?: string;
+  agent?: string;
+  pluginDirs?: string[];
+  isolateConfig?: boolean;
   run?: (cmd: HarnessCommand, config: HarnessRunnerConfig) => Promise<HarnessSpawnResult>;
   probe?: () => Promise<BinaryProbe>;
 }
+
+/**
+ * Engine-config options only some adapters act on, with the variable suffix
+ * that sets each. An adapter not listed for an option would drop it without a
+ * word, so the registry rejects the combination instead (issues #28, #29).
+ */
+const ADAPTER_SPECIFIC_OPTIONS: ReadonlyArray<{
+  field: 'agent' | 'pluginDirs' | 'isolateConfig';
+  suffix: string;
+  adapters: readonly string[];
+}> = [
+  { field: 'agent', suffix: 'AGENT', adapters: ['claude-headless'] },
+  { field: 'pluginDirs', suffix: 'PLUGIN_DIRS', adapters: ['claude-headless'] },
+  { field: 'isolateConfig', suffix: 'ISOLATE_CONFIG', adapters: ['claude-headless'] },
+];
 
 /** Every adapter the engine ships, keyed by the name a config def can name. */
 const SHIPPED_HARNESS_FACTORIES: Record<string, (config: ShippedAdapterFactoryConfig) => HarnessAdapter> = {
@@ -367,12 +433,24 @@ export function buildHarnessDefinitionRegistry(
       );
     }
 
+    for (const option of ADAPTER_SPECIFIC_OPTIONS) {
+      if (configDef[option.field] !== undefined && !option.adapters.includes(configDef.name)) {
+        throw new Error(
+          `harness registry: adapter "${configDef.name}" does not support _${option.suffix} ` +
+            `(supported by: ${option.adapters.join(', ')}); remove it from your CONDUIT_HARNESS_* config`,
+        );
+      }
+    }
+
     const buildAdapter = (projectRoot: string): HarnessAdapter =>
       factory({
         projectRoot,
         envAllowlist: [...configDef.envAllowlist],
         command: configDef.command,
         model: configDef.model,
+        ...(configDef.agent !== undefined ? { agent: configDef.agent } : {}),
+        ...(configDef.pluginDirs !== undefined ? { pluginDirs: [...configDef.pluginDirs] } : {}),
+        ...(configDef.isolateConfig !== undefined ? { isolateConfig: configDef.isolateConfig } : {}),
         run: deps.run,
         probe: deps.probe,
       });
@@ -395,6 +473,9 @@ export function buildHarnessDefinitionRegistry(
     // definition's absent-method shape matches the adapter's.
     if (identityAdapter.canExpressTools !== undefined) {
       definition.canExpressTools = (tools) => identityAdapter.canExpressTools!(tools);
+    }
+    if (identityAdapter.resolveAgentDefinition !== undefined) {
+      definition.resolveAgentDefinition = (agent) => identityAdapter.resolveAgentDefinition!(agent);
     }
     definitions.set(configDef.name, definition);
   }
@@ -468,6 +549,10 @@ export function bindHarnessDefinitionsForIntrospection(
         // silently demote a lattice adapter back to its conservative boolean.
         ...(def.canExpressTools !== undefined
           ? { canExpressTools: (tools: readonly string[]) => def.canExpressTools!(tools) }
+          : {}),
+        // Load-time validation resolves a station's named agent (issue #28).
+        ...(def.resolveAgentDefinition !== undefined
+          ? { resolveAgentDefinition: (agent: string) => def.resolveAgentDefinition!(agent) }
           : {}),
         probeBinary: (): Promise<BinaryProbe> => def.probeBinary(),
         invoke: async (): Promise<HarnessResult> => {

@@ -266,6 +266,11 @@ export interface HarnessGateConfig {
    * default," never coerced to a placeholder.
    */
   model?: string;
+  /**
+   * Resolved EFFECTIVE agent for this invocation (issue #28), resolved and
+   * checked by the CALLER like `model`. Omitted means no `--agent`.
+   */
+  agent?: string;
   onReject: Lane;
   validBackEdges: ReadonlyArray<{ from: string; to: string }>;
   /**
@@ -327,6 +332,7 @@ export async function runHarnessGateCheck(config: HarnessGateConfig): Promise<Ga
       tools: config.tools ?? [],
       timeoutMs: config.timeoutMs,
       ...(config.model !== undefined ? { model: config.model } : {}),
+      ...(config.agent !== undefined ? { agent: config.agent } : {}),
     });
   } catch (err) {
     // A thrown invocation (timeout/nonzero-exit/untagged) never yields a

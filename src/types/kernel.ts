@@ -220,6 +220,14 @@ export interface StationConfig {
    */
   harness?: string;
   /**
+   * Named agent for a `kind: harness` station (issue #28), e.g. `team:coder`,
+   * from `worker.agent`. Absent when undeclared: the executor uses
+   * `agent ?? adapter default`, threads it to HarnessInvocation.agent, and
+   * folds its name and definition-file hash into the binding stamp's
+   * promptTemplateVersion (computeAgentAwarePromptTemplateVersion).
+   */
+  agent?: string;
+  /**
    * Absolute path to the child flow.yaml for a `kind: subflow` station
    * (the original multi-flow engine work, flow-as-station composition) — required for subflow stations,
    * absent otherwise. Resolved at load time relative to the parent flow's
@@ -367,6 +375,12 @@ export interface StationGateConfig {
    * cannot host a critic at all).
    */
   criticTools?: string[];
+  /**
+   * Named agent for an agentic (harness) critic (issue #28), from
+   * `check.critic.agent`. Absent when undeclared, never `''` (unlike
+   * `criticModel`); the gate uses `criticAgent ?? adapter default`.
+   */
+  criticAgent?: string;
   /**
    * Wall-clock bound for an agentic (harness) critic's invocation, in ms
    * (check.critic.timeout_seconds * 1000). Absent -> the engine default

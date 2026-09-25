@@ -7,6 +7,11 @@
  * JSON usage/cost output (never scraped from free text), and translates the
  * station's declared `tools` allowlist into claude's `--allowed-tools` flag.
  *
+ * Issue #28: a station's named agent becomes `--agent`, and engine-config
+ * plugin dirs become one `--plugin-dir` each. Issue #29: with `isolateConfig`
+ * the child gets a run-scoped CLAUDE_CONFIG_DIR instead of the operator's
+ * ~/.claude (claude-config-isolation.ts).
+ *
  * `outputs` is always `[]` — the executor collects declared outputs from disk
  * (findMissingDeclaredOutputs in executor.ts); the claude JSON payload carries
  * no file manifest, so this adapter never fabricates output references.
@@ -14,11 +19,15 @@
  * Do NOT touch ./harness.ts (unrelated worker-pool subprocess harness).
  */
 
+import { isAbsolute } from 'node:path';
+import { statSync } from 'node:fs';
 import type {
   HarnessAdapter, HarnessInvocation, HarnessResult, BinaryProbe,
   RateLimitSnapshot, RateLimitWindow, KnownUsage,
 } from './harness-adapter';
 import { runHarnessProcess } from './harness-runner';
+import { resolveClaudePluginAgent } from './claude-plugin-agents';
+import { createRunScopedClaudeConfigDir, removeRunScopedClaudeConfigDir } from './claude-config-isolation';
 import type { HarnessCommand, HarnessRunnerConfig, HarnessSpawnResult } from './harness-runner';
 
 export interface ClaudeHarnessAdapterConfig {
@@ -30,6 +39,26 @@ export interface ClaudeHarnessAdapterConfig {
   command?: string;
   /** Optional --model override. */
   model?: string;
+  /** Default --agent (issue #28). A station's own agent wins. */
+  agent?: string;
+  /**
+   * Absolute plugin directories, one --plugin-dir each (issue #28). Each must
+   * be an existing directory: the CLI ignores a missing one without error, and
+   * the kernel must be able to read agent definitions out of it.
+   */
+  pluginDirs?: string[];
+  /**
+   * Point the child at a run-scoped CLAUDE_CONFIG_DIR holding only a link to
+   * the operator's credentials, and pass --strict-mcp-config (issue #29).
+   * Off by default, which keeps the child reading the operator's config.
+   */
+  isolateConfig?: boolean;
+  /**
+   * Kernel env used to find the operator's credentials under isolateConfig and
+   * to resolve the env allowlist. Injected for testability; defaults to
+   * process.env.
+   */
+  sourceEnv?: Record<string, string | undefined>;
   /** Injected process-runner seam, for testability. Defaults to runHarnessProcess. */
   run?: (cmd: HarnessCommand, config: HarnessRunnerConfig) => Promise<HarnessSpawnResult>;
   /** Injected binary-presence probe, for testability. Defaults to a real PATH check. */
@@ -411,6 +440,31 @@ function fail(reason: string, code?: string, detail?: Record<string, unknown>): 
   );
 }
 
+/**
+ * Reject a plugin dir the kernel cannot use, at construction (engine boot).
+ * `claude --plugin-dir` also accepts a .zip, but a zip cannot be scanned for
+ * agent definitions without unpacking it, so only directories are accepted.
+ */
+function assertUsablePluginDirs(pluginDirs: readonly string[]): void {
+  for (const dir of pluginDirs) {
+    if (!isAbsolute(dir)) {
+      throw new Error(`claude-headless: plugin dir '${dir}' is not an absolute path`);
+    }
+    let isDir = false;
+    try {
+      isDir = statSync(dir).isDirectory();
+    } catch {
+      throw new Error(`claude-headless: plugin dir '${dir}' does not exist`);
+    }
+    if (!isDir) {
+      throw new Error(
+        `claude-headless: plugin dir '${dir}' is not a directory (a .zip plugin must be unpacked so its ` +
+          `agent definitions can be hashed)`,
+      );
+    }
+  }
+}
+
 /** Is the harness CLI on PATH? The detail is the resolved path, or why not. */
 async function defaultProbe(command: string): Promise<BinaryProbe> {
   const resolved = Bun.which(command);
@@ -428,12 +482,20 @@ export function createClaudeHarnessAdapter(config: ClaudeHarnessAdapterConfig): 
   const command = config.command ?? 'claude';
   const run = config.run ?? runHarnessProcess;
   const probe = config.probe ?? (() => defaultProbe(command));
+  const pluginDirs = config.pluginDirs ?? [];
+  assertUsablePluginDirs(pluginDirs);
+  const sourceEnv = config.sourceEnv ?? process.env;
 
   return {
     name: 'claude-headless',
     reportsUsage: true,
     canRestrictTools: true,
     model: config.model,
+    agent: config.agent,
+
+    resolveAgentDefinition(agent: string) {
+      return resolveClaudePluginAgent(pluginDirs, agent);
+    },
 
     async probeBinary(): Promise<BinaryProbe> {
       return probe();
@@ -450,6 +512,24 @@ export function createClaudeHarnessAdapter(config: ClaudeHarnessAdapterConfig): 
       if (model !== undefined) {
         args.push('--model', model);
       }
+      // Station wins over the adapter's configured default, as for --model.
+      // An agent the CLI does not know exits 1 naming it (verified against
+      // claude 2.1.282), which the nonzero-exit path below reports.
+      const agent = call.agent ?? config.agent;
+      if (agent !== undefined) {
+        args.push('--agent', agent);
+      }
+      // A --plugin-dir plugin takes precedence over an installed plugin of the
+      // same name, so its agents are the ones --agent resolves to.
+      for (const dir of pluginDirs) {
+        args.push('--plugin-dir', dir);
+      }
+      // The run-scoped config dir fences user-level MCP config; this also drops
+      // the account's claude.ai connectors, which the CLI loads regardless of
+      // the config dir.
+      if (config.isolateConfig === true) {
+        args.push('--strict-mcp-config');
+      }
       // Comma-joined single value — claude accepts comma- or space-separated.
       // Empty tools (the executor's encoding of a waived unrestricted_tools:
       // true station) passes through with NO narrowing flag.
@@ -460,18 +540,29 @@ export function createClaudeHarnessAdapter(config: ClaudeHarnessAdapterConfig): 
       // swallow the prompt positional.
       args.push('--', call.prompt);
 
-      const spawnResult = await run(
-        { command, args },
-        {
-          projectRoot: config.projectRoot,
-          timeoutMs: call.timeoutMs,
-          envAllowlist: config.envAllowlist,
-          // stream-json carries the whole agent transcript; we need two events
-          // from it. Filtering as it arrives keeps a long station's memory
-          // proportional to what we actually read, not to how much it did.
-          stdoutLineFilter: (line) => CLAUDE_KEPT_EVENT.test(line),
-        },
-      );
+      // Throws before anything is spawned when the child could not authenticate.
+      const configDir =
+        config.isolateConfig === true ? createRunScopedClaudeConfigDir(sourceEnv, config.envAllowlist) : undefined;
+
+      let spawnResult: HarnessSpawnResult;
+      try {
+        spawnResult = await run(
+          { command, args },
+          {
+            projectRoot: config.projectRoot,
+            timeoutMs: call.timeoutMs,
+            envAllowlist: config.envAllowlist,
+            ...(config.sourceEnv !== undefined ? { sourceEnv: config.sourceEnv } : {}),
+            ...(configDir !== undefined ? { injectedEnv: { CLAUDE_CONFIG_DIR: configDir } } : {}),
+            // stream-json carries the whole agent transcript; we need two events
+            // from it. Filtering as it arrives keeps a long station's memory
+            // proportional to what we actually read, not to how much it did.
+            stdoutLineFilter: (line) => CLAUDE_KEPT_EVENT.test(line),
+          },
+        );
+      } finally {
+        if (configDir !== undefined) removeRunScopedClaudeConfigDir(configDir);
+      }
 
       if (spawnResult.timedOut) {
         // No usage to recover here (issue #26 AC5): claude-headless reports

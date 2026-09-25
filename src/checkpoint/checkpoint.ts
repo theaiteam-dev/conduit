@@ -173,6 +173,27 @@ export function computeSkillAwarePromptTemplateVersion(
   return createHash('sha256').update(canonical).digest('hex');
 }
 
+/**
+ * Combine a harness station's promptTemplateVersion with the named agent it
+ * runs (issue #28): the agent name and the SHA-256 of its definition file.
+ * The same combining discipline as computeSkillAwarePromptTemplateVersion: an
+ * agent carries a system prompt, a tool allowlist and a model preference, so
+ * it is part of the prompt, and editing its body invalidates the checkpoint
+ * and cascades exactly as editing a skill body does. The name is folded as
+ * well as the hash so that two agents with identical files still stamp apart.
+ *
+ * Only called for a station that runs an agent. A station without one keeps
+ * its bare promptTemplateVersion, so no existing stamp moves.
+ */
+export function computeAgentAwarePromptTemplateVersion(
+  promptTemplateVersion: string,
+  agentName: string,
+  definitionSha256: string,
+): string {
+  const canonical = JSON.stringify([promptTemplateVersion, 'agent', agentName, definitionSha256]);
+  return createHash('sha256').update(canonical).digest('hex');
+}
+
 // ---------------------------------------------------------------------------
 // ensureCheckpointSchema — idempotent DDL init.
 // ---------------------------------------------------------------------------
