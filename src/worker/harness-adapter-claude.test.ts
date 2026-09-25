@@ -204,6 +204,17 @@ describe('claude-headless adapter: invocation building (AC1)', () => {
     expect(config.envAllowlist).toEqual(ENV_ALLOWLIST);
   });
 
+  it('threads streamed stdout progress back to the invocation caller', async () => {
+    const { run, calls } = makeRun({ stdout: RECORDED_SUCCESS });
+    let progressEvents = 0;
+    const adapter = makeAdapter({ run });
+
+    await adapter.invoke(invocation({ onProgress: () => { progressEvents += 1; } }));
+
+    calls[0]!.config.onStdoutLine?.('{"type":"assistant"}');
+    expect(progressEvents).toBe(1);
+  });
+
   it('passes the configured binary command through to the runner', async () => {
     const { run, calls } = makeRun({ stdout: RECORDED_SUCCESS });
     const adapter = makeAdapter({ run, command: '/opt/claude/bin/claude' });

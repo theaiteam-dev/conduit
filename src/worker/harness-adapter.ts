@@ -44,6 +44,8 @@ export interface HarnessInvocation {
    * default, FR-10).
    */
   model?: string;
+  /** Called as the underlying harness emits stdout progress. */
+  onProgress?: () => void;
   /**
    * Named agent for this call (issue #28), e.g. `team:coder`. Per-station like
    * `model`: the executor passes `station.agent ?? adapter.agent`, and an

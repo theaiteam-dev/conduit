@@ -283,6 +283,24 @@ describe('harness runner: stdout line filter', () => {
     expect(result.stdout).toBe('{"type":"result","ok":1}');
   });
 
+  it('notifies progress for every line, including lines discarded by the filter', async () => {
+    const lines: string[] = [];
+    const result = await runHarnessProcess(
+      {
+        command: 'sh',
+        args: ['-c', 'printf \'{"type":"assistant"}\\n{"type":"result","ok":1}\\n{"type":"tool"}\\n\''],
+      },
+      config({
+        timeoutMs: 5_000,
+        stdoutLineFilter: keepResult,
+        onStdoutLine: (line) => lines.push(line),
+      }),
+    );
+
+    expect(lines).toEqual(['{"type":"assistant"}', '{"type":"result","ok":1}', '{"type":"tool"}']);
+    expect(result.stdout).toBe('{"type":"result","ok":1}');
+  });
+
   it('keeps a final line with no trailing newline — a crashed stream rarely has one', async () => {
     const result = await runHarnessProcess(
       { command: 'sh', args: ['-c', 'printf \'{"type":"noise"}\\n{"type":"result","ok":2}\''] },
@@ -290,6 +308,16 @@ describe('harness runner: stdout line filter', () => {
     );
 
     expect(result.stdout).toBe('{"type":"result","ok":2}');
+  });
+
+  it('notifies progress for a final line with no trailing newline', async () => {
+    const lines: string[] = [];
+    await runHarnessProcess(
+      { command: 'sh', args: ['-c', 'printf \'partial\''] },
+      config({ timeoutMs: 5_000, onStdoutLine: (line) => lines.push(line) }),
+    );
+
+    expect(lines).toEqual(['partial']);
   });
 
   it('does not hold the discarded bulk — the point of filtering at all', async () => {

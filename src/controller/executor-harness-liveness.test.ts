@@ -52,7 +52,7 @@ const throwingModel: ModelAdapter = {
 function makeSlowHarness(
   clock: { t: number },
   advanceBy: number,
-  opts: { throwTimeout?: boolean; usageTokens?: number } = {},
+  opts: { throwTimeout?: boolean; usageTokens?: number; emitProgress?: boolean } = {},
 ): { adapter: HarnessAdapter; calls: HarnessInvocation[] } {
   const calls: HarnessInvocation[] = [];
   const adapter: HarnessAdapter = {
@@ -64,7 +64,17 @@ function makeSlowHarness(
     },
     async invoke(call: HarnessInvocation) {
       calls.push(call);
-      clock.t += advanceBy; // the attempt consumed real wall-clock time
+      if (opts.emitProgress === true) {
+        // Simulate a chatty child: each callback represents a line arriving
+        // while the attempt is still in flight.
+        const step = advanceBy / 4;
+        for (let i = 0; i < 4; i += 1) {
+          clock.t += step;
+          call.onProgress?.();
+        }
+      } else {
+        clock.t += advanceBy; // the attempt consumed real wall-clock time
+      }
       if (opts.throwTimeout === true) {
         // The runner's wall-clock timeout killed the process group; the adapter
         // surfaces it as a distinct timed-out failure — EVEN THOUGH the attempt
@@ -201,6 +211,21 @@ describe('WI-567 / FR-8 — a long harness attempt does not false-trip the liven
     expect(getCard(db)?.lane).toBe('done');
     // …and the watchdog did NOT falsely report a stall for the long-but-progressing attempt.
     expect(err.join('\n')).not.toMatch(/liveness stall/i);
+  });
+
+  it('passes a progress callback to a chatty in-flight harness attempt', async () => {
+    db = openDb();
+    const clock = { t: 1000 };
+    const { adapter, calls } = makeSlowHarness(clock, ADVANCE_SECONDS, { emitProgress: true });
+    const registry = createHarnessRegistry([adapter]);
+    const flow = writeFlow(dir, registry, {});
+    seedCard(db);
+    const { io } = makeIO();
+
+    await runExecutor({ db, flow, now: () => clock.t, adapter: throwingModel, io, harnessRegistry: registry } as RunEngineArgs);
+
+    expect(typeof calls[0]?.onProgress).toBe('function');
+    expect(getCard(db)?.lane).toBe('done');
   });
 
   // -------------------------------------------------------------------------

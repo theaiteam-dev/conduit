@@ -558,6 +558,7 @@ export function createClaudeHarnessAdapter(config: ClaudeHarnessAdapterConfig): 
             // from it. Filtering as it arrives keeps a long station's memory
             // proportional to what we actually read, not to how much it did.
             stdoutLineFilter: (line) => CLAUDE_KEPT_EVENT.test(line),
+            onStdoutLine: () => call.onProgress?.(),
           },
         );
       } finally {

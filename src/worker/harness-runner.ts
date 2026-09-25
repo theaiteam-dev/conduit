@@ -71,6 +71,12 @@ export interface HarnessRunnerConfig {
    * in the carry buffer exactly as an unfiltered read would.
    */
   stdoutLineFilter?: (line: string) => boolean;
+  /**
+   * Observe every complete stdout line as it arrives, independently of the
+   * retention filter. This lets callers refresh liveness without retaining the
+   * harness transcript in memory.
+   */
+  onStdoutLine?: (line: string) => void;
 }
 
 /**
@@ -83,6 +89,7 @@ export interface HarnessRunnerConfig {
 async function readKeptLines(
   stream: ReadableStream<Uint8Array>,
   keep: (line: string) => boolean,
+  onLine?: (line: string) => void,
 ): Promise<string> {
   const decoder = new TextDecoder();
   const kept: string[] = [];
@@ -94,6 +101,7 @@ async function readKeptLines(
     while (newline !== -1) {
       const line = carry.slice(0, newline);
       carry = carry.slice(newline + 1);
+      onLine?.(line);
       if (keep(line)) kept.push(line);
       newline = carry.indexOf('\n');
     }
@@ -101,7 +109,10 @@ async function readKeptLines(
   // Flush the decoder, then the final unterminated line (a stream need not end
   // with a newline, and on a crash it very often does not).
   carry += decoder.decode();
-  if (carry.length > 0 && keep(carry)) kept.push(carry);
+  if (carry.length > 0) {
+    onLine?.(carry);
+    if (keep(carry)) kept.push(carry);
+  }
 
   return kept.join('\n');
 }
@@ -206,8 +217,10 @@ export async function runHarnessProcess(
   // blocked on a full pipe while we wait for it to exit.
   const stdoutText =
     config.stdoutLineFilter !== undefined
-      ? readKeptLines(proc.stdout as ReadableStream<Uint8Array>, config.stdoutLineFilter)
-      : new Response(proc.stdout).text();
+      ? readKeptLines(proc.stdout as ReadableStream<Uint8Array>, config.stdoutLineFilter, config.onStdoutLine)
+      : config.onStdoutLine !== undefined
+        ? readKeptLines(proc.stdout as ReadableStream<Uint8Array>, () => true, config.onStdoutLine)
+        : new Response(proc.stdout).text();
   const stderrText = new Response(proc.stderr as ReadableStream).text();
   // Attach a handler now: a throwing `stdoutLineFilter` rejects its drain while
   // proc.exited is still pending, which would otherwise be an unhandled

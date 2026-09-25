@@ -3787,6 +3787,7 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
           tools: stationConfig.tools ?? [],
           timeoutMs,
           model: effectiveModel,
+          onProgress: stampHarnessActivity,
           ...(effectiveAgent !== undefined ? { agent: effectiveAgent } : {}),
         });
       } catch (invokeErr) {
