@@ -395,10 +395,16 @@ describe('runDeterministic: descendants holding the output pipes (#10, #17)', ()
 
   it('does not report a timeout when the group is killed after a normal exit', async () => {
     const script = pipeHoldingScript('exit 0');
+    const start = Date.now();
     const result = await runDeterministic(
       { command: 'sh', args: [script] },
       { allowlist: ['sh'], cwd: dir, timeoutMs: 20_000 },
     );
+
+    // Without the post-exit group kill the drains wait for the 20s timer,
+    // which reaps the grandchild and reports no timeout, so only the elapsed
+    // time tells the two apart.
+    expect(Date.now() - start).toBeLessThan(10_000);
     expect(result.ok).toBe(true);
     expect(result.exitCode).toBe(0);
     expect(result.timedOut).toBeFalsy();
