@@ -101,6 +101,16 @@ describe('resolveClaudePluginAgent', () => {
     expect(resolveClaudePluginAgent([plugin], 'p:file-name').ok).toBe(false);
   });
 
+  it('does not close the frontmatter on an indented ---- or ---text line inside a YAML value', () => {
+    const plugin = join(root, 'p');
+    writePlugin(plugin, { name: 'p' });
+    const file = join(plugin, 'agents', 'd.md');
+    mkdirSync(join(file, '..'), { recursive: true });
+    writeFileSync(file, '---\ndescription: |\n  ----\n  ---rule\nname: dashed\n---\nDo the task.\n');
+
+    expect(resolveClaudePluginAgent([plugin], 'p:dashed')).toEqual({ ok: true, path: file, sha256: sha256(file) });
+  });
+
   it('accepts a quoted frontmatter name', () => {
     const plugin = join(root, 'p');
     writePlugin(plugin, { name: 'p' });

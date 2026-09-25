@@ -4346,6 +4346,9 @@ async function executeSubflowStation(args: SubflowArgs): Promise<boolean> {
         ? { model: '', inputTokens: result.tokens ?? 0, outputTokens: 0, costUsd: result.costUsd ?? 0 }
         : undefined;
 
+      // Subflow spans record only bindingStamp as provenance: a subflow
+      // station has no prompt, so its stamp is computed with an empty
+      // promptTemplateVersion and no agent, and there is nothing else to record.
       if (result.outcome !== 'done') {
         callsMade++;
         scrapReason = `subflow-${result.outcome}: ${result.reason}`;
