@@ -163,6 +163,20 @@ describe('resolveClaudePluginAgent', () => {
     if (!result.ok) expect(result.error).toContain('PLUGIN_DIRS');
   });
 
+  it('never reads a file outside the plugin dirs for a path-shaped agent name, since names are matched, not joined', () => {
+    const plugin = join(root, 'plugins', 'team');
+    writePlugin(plugin, { name: 'team' });
+    writeAgent(join(plugin, 'agents', 'coder.md'), 'coder');
+    const outside = join(root, 'outside', 'secret.md');
+    writeAgent(outside, 'secret');
+
+    for (const agent of ['team:../../outside/secret.md', 'team:../../outside/secret', `team:${outside}`, 'team:secret']) {
+      const result = resolveClaudePluginAgent([plugin], agent);
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.error).toContain('has no definition file');
+    }
+  });
+
   it('rejects an agent name without a plugin namespace, since only --plugin-dir agents can be hashed', () => {
     const result = resolveClaudePluginAgent([root], 'general-purpose');
 

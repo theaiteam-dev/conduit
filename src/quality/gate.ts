@@ -296,7 +296,13 @@ export interface HarnessGateConfig {
   tools?: string[];
 }
 
-/** The agent fields of a CriticUsage: both present when the critic ran an agent, else neither. */
+/**
+ * The agent fields of a CriticUsage: `agent` when the critic ran one, and
+ * `agentSha256` only when the caller passed the resolved definition hash.
+ * gate-rework.ts resolves the definition before invoking and always passes
+ * both, so a journal row with `agent` and no hash comes from a caller that
+ * skipped resolution.
+ */
 function criticAgentProvenance(config: HarnessGateConfig): Pick<CriticUsage, 'agent' | 'agentSha256'> {
   if (config.agent === undefined) return {};
   return { agent: config.agent, ...(config.agentSha256 !== undefined ? { agentSha256: config.agentSha256 } : {}) };
