@@ -47,7 +47,7 @@ const PLACEHOLDER_RE = /\{\{([^{}\s]+)\}\}/g;
  * it is part of the Conduit flow contract, not something a flow author may
  * redefine.
  */
-const FEEDBACK_INPUT = 'feedback';
+export const FEEDBACK_INPUT = 'feedback';
 
 /**
  * Render a prompt template by substituting `{{<artifact>}}` placeholders with

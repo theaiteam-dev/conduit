@@ -127,6 +127,11 @@ export function resolveInputPath(
  * the assumption the other is looser, and a malformed name fails loudly at the
  * chokepoint instead of quietly reading something outside the tree.
  *
+ * The check holds only at the moment this function runs. Callers read the
+ * returned path in a separate step, so a file swapped for an escaping symlink
+ * between the check and the read is followed. Do not treat the returned path
+ * as safe to open later without re-checking it.
+ *
  * Three tiers, most canonical first:
  *   - TARGET exists  → realpath the target ITSELF. This is where the read side
  *     must go further than the write side: an output is being created, so only

@@ -45,6 +45,7 @@ import type {
   StationDeliverConfig,
 } from '../types/kernel';
 import { findCycleNodes } from './dag-utils';
+import { FEEDBACK_INPUT } from './render';
 import { resolveSkill, type ResolveSkillResult } from '../skills/resolve';
 import type { ParsedSkill } from '../skills/parse';
 import { detectExecutionSurface, type ExecutionSurfaceWarning } from '../skills/detect-surface';
@@ -778,8 +779,6 @@ function collectErrors(
           : undefined;
       const declaredInputs = Array.isArray(station.inputs) ? station.inputs : [];
       const workerKind = station.worker?.kind;
-      // The reserved synthetic input name (see render.ts FEEDBACK_INPUT / WI-379).
-      const FEEDBACK_RESERVED = 'feedback';
 
       if (!Array.isArray(ownedDir) || !ownedDir.every((n) => typeof n === 'string')) {
         errors.push({
@@ -798,12 +797,12 @@ function collectErrors(
         });
       } else {
         for (const name of ownedDir as string[]) {
-          if (name === FEEDBACK_RESERVED) {
+          if (name === FEEDBACK_INPUT) {
             errors.push({
               code: 'INVALID_INPUT_SCOPE',
               message:
-                `Station '${station.id}' lists '${FEEDBACK_RESERVED}' in input_scope.owned_dir — ` +
-                `'${FEEDBACK_RESERVED}' is a synthetic input threaded at runtime and never read from disk`,
+                `Station '${station.id}' lists '${FEEDBACK_INPUT}' in input_scope.owned_dir — ` +
+                `'${FEEDBACK_INPUT}' is a synthetic input threaded at runtime and never read from disk`,
             });
           } else if (!declaredInputs.includes(name)) {
             errors.push({
@@ -1399,8 +1398,7 @@ function collectErrors(
           // 'feedback' is the reserved synthetic input name (see render.ts
           // FEEDBACK_INPUT / WI-379). Self-loops (on_reject: self → self) count
           // as a valid back-edge and are accepted (dogfood / ideate shape).
-          const FEEDBACK_RESERVED = 'feedback';
-          if (refs.has(FEEDBACK_RESERVED) && !backEdgeTargets.has(station.id)) {
+          if (refs.has(FEEDBACK_INPUT) && !backEdgeTargets.has(station.id)) {
             errors.push({
               code: 'FEEDBACK_WITHOUT_BACK_EDGE',
               message:
