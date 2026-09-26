@@ -329,6 +329,40 @@ export function readCheckpoint(db: Database, key: CheckpointKey): CheckpointReco
 }
 
 /**
+ * Return the checkpoint with the highest attempt for (run, flow, card,
+ * station), or null if the station has none. A `skip_when` predicate with
+ * `source: output` reads its value here (issue #32): the attempt that last ran
+ * the upstream transform is the one whose payload is current.
+ */
+export function readLatestCheckpoint(
+  db: Database,
+  key: Omit<CheckpointKey, 'attempt'>,
+): CheckpointRecord | null {
+  const runId = key.run ?? defaultRunId();
+  const row = db
+    .prepare(
+      `SELECT binding_stamp, output_json
+       FROM checkpoints
+       WHERE run_id = $run_id AND flow = $flow AND card = $card AND station = $station
+       ORDER BY attempt DESC
+       LIMIT 1`,
+    )
+    .get({
+      $run_id: runId,
+      $flow: key.flow,
+      $card: key.card,
+      $station: key.station,
+    }) as CheckpointRow | undefined;
+
+  if (!row) return null;
+
+  return {
+    stamp: row.binding_stamp,
+    output: JSON.parse(row.output_json) as StationOutput<unknown>,
+  };
+}
+
+/**
  * Remove a checkpoint, forcing re-execution on the next resume.
  *
  * Called by the kernel when a stamp mismatch is detected and after
