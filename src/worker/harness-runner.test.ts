@@ -28,7 +28,13 @@ import {
   runHarnessProcess,
   type HarnessRunnerConfig,
 } from './harness-runner';
-import { describeContainmentConformance } from './harness-containment.conformance';
+import {
+  describeContainmentConformance,
+  CONTAINMENT_FIXTURE,
+  recordedPid,
+  expectGrandchildReaped,
+  killRecordedGrandchild,
+} from './harness-containment.conformance';
 
 // ---------------------------------------------------------------------------
 // Fixtures: an isolated project root per test + tracked pids for cleanup so a
@@ -365,6 +371,166 @@ describe('harness runner: stdout line filter', () => {
     );
 
     expect(result.stdout).toBe('a\nb\n');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Idle timeout (issue #31). A second timer, independent of the wall-clock
+// one, resets on every stdout line and kills the process group when the
+// child goes silent. The executor cannot check liveness while a harness
+// station's `invoke()` is in flight, so this is the only bound on a hung call.
+// ---------------------------------------------------------------------------
+
+describe('harness runner: idle timeout (issue #31)', () => {
+  it('does not re-arm the idle timer for lines drained after the child exits', async () => {
+    // The leader exits at once while a backgrounded writer keeps the pipe
+    // full, so lines are still drained after proc.exited resolves and the
+    // group is reaped (#17). A timer re-armed by those lines would later
+    // SIGKILL a process group id the kernel may have reused. The writer is
+    // capped at 4MB to bound the drain on a loaded machine.
+    const kills: number[] = [];
+    const realKill = process.kill.bind(process);
+    const result = await (async () => {
+      process.kill = ((pid: number, signal?: string | number) => {
+        kills.push(pid);
+        return realKill(pid, signal);
+      }) as typeof process.kill;
+      try {
+        const r = await runHarnessProcess(
+          { command: 'sh', args: ['-c', 'yes | head -c 4000000 & exit 0'] },
+          config({ timeoutMs: 10_000, idleTimeoutMs: 100 }),
+        );
+        kills.length = 0;
+        await Bun.sleep(300);
+        return r;
+      } finally {
+        process.kill = realKill;
+      }
+    })();
+
+    expect(result.exitCode).toBe(0);
+    expect(result.idledOut).toBe(false);
+    expect(kills).toEqual([]);
+  }, 30_000);
+
+  it('completes normally when stdout lines keep arriving inside the idle bound', async () => {
+    const result = await runHarnessProcess(
+      {
+        command: 'sh',
+        args: [
+          '-c',
+          'i=0; while [ $i -lt 8 ]; do printf "line%s\\n" $i; sleep 0.05; i=$((i+1)); done; exit 0',
+        ],
+      },
+      config({ timeoutMs: 10_000, idleTimeoutMs: 300 }),
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.timedOut).toBe(false);
+    expect(result.idledOut).toBe(false);
+    // Byte-exact: the idle-observing drain path must retain exactly what an
+    // unobserved run would (trailing newline included), not a lossy
+    // reconstruction from split lines.
+    expect(result.stdout).toBe('line0\nline1\nline2\nline3\nline4\nline5\nline6\nline7\n');
+  });
+
+  it('kills a silent child well before the wall-clock timeout', async () => {
+    const start = Date.now();
+    const result = await runHarnessProcess(
+      { command: 'sh', args: ['-c', 'sleep 30'] },
+      config({ timeoutMs: 10_000, idleTimeoutMs: 250 }),
+    );
+    const elapsed = Date.now() - start;
+
+    expect(result.idledOut).toBe(true);
+    expect(result.timedOut).toBe(false);
+    // Killed by the idle timer, nowhere near the 10s wall-clock bound.
+    expect(result.durationMs).toBeGreaterThanOrEqual(200);
+    expect(result.durationMs).toBeLessThan(3_000);
+    expect(elapsed).toBeLessThan(3_000);
+  });
+
+  it('resets on every line, including lines a stdoutLineFilter discards', async () => {
+    // Noise lines (discarded by the filter) arrive faster than the idle
+    // bound, so the timer must reset on each one, not only on a kept line, or
+    // the process would be killed before it reaches the result line.
+    const result = await runHarnessProcess(
+      {
+        command: 'sh',
+        args: [
+          '-c',
+          'i=0; while [ $i -lt 6 ]; do printf "noise%s\\n" $i; sleep 0.05; i=$((i+1)); done; printf "RESULT\\n"; exit 0',
+        ],
+      },
+      config({
+        timeoutMs: 10_000,
+        idleTimeoutMs: 300,
+        stdoutLineFilter: (line) => line === 'RESULT',
+      }),
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.idledOut).toBe(false);
+    expect(result.stdout).toBe('RESULT');
+  });
+
+  it('reaps a grandchild backgrounded by a child the idle timer killed', async () => {
+    // The containment fixture (issue #27) never writes to stdout, so with no
+    // stdoutLineFilter or onStdoutLine configured, idleTimeoutMs alone must
+    // still observe the (silent) stream well enough to arm and fire the
+    // timer. This covers the no-filter path, not just the reset-on-line path
+    // exercised above.
+    const result = await runHarnessProcess(
+      { command: CONTAINMENT_FIXTURE, args: [] },
+      { projectRoot, timeoutMs: 10_000, idleTimeoutMs: 300 },
+    );
+
+    expect(result.idledOut).toBe(true);
+    expect(result.timedOut).toBe(false);
+
+    const pid = recordedPid(projectRoot);
+    expect(pid).toBeDefined();
+    try {
+      await expectGrandchildReaped(projectRoot);
+    } finally {
+      killRecordedGrandchild(projectRoot);
+    }
+  }, 20_000);
+
+  it('a wall-clock kill still reports timedOut: true, idledOut: false', async () => {
+    // The child keeps printing well inside the idle bound, so only the
+    // wall-clock timer can be the one that fires.
+    const result = await runHarnessProcess(
+      { command: 'sh', args: ['-c', 'while :; do printf x; sleep 0.05; done'] },
+      config({ timeoutMs: 400, idleTimeoutMs: 5_000 }),
+    );
+
+    expect(result.timedOut).toBe(true);
+    expect(result.idledOut).toBe(false);
+  });
+
+  it('attributes a wall-clock kill correctly even when idleTimeoutMs >= timeoutMs', async () => {
+    // The loader rejects this for a station; the runner itself does not. With
+    // equal deadlines both callbacks run in the same timers pass, wall-clock
+    // first, before `proc.exited` can resolve, so an unguarded idle callback
+    // would claim the kill every time.
+    const result = await runHarnessProcess(
+      { command: 'sh', args: ['-c', 'sleep 30'] },
+      config({ timeoutMs: 200, idleTimeoutMs: 200 }),
+    );
+
+    expect(result.timedOut).toBe(true);
+    expect(result.idledOut).toBe(false);
+  });
+
+  it('leaves behaviour unchanged when idleTimeoutMs is not set', async () => {
+    const result = await runHarnessProcess(
+      { command: 'sh', args: ['-c', 'sleep 0.1; exit 0'] },
+      config({ timeoutMs: 5_000 }),
+    );
+
+    expect(result.idledOut).toBe(false);
+    expect(result.timedOut).toBe(false);
   });
 });
 

@@ -234,6 +234,11 @@ async function run(flow: FlowConfig, registry: HarnessRegistry, at = 1000): Prom
 const FAILURE_CASES: Array<[string, Behavior, RegExp]> = [
   ['non-zero exit', { kind: 'throw', code: 'harness-nonzero-exit', message: 'claude-headless: exited with code 1: boom' }, /harness-nonzero-exit/i],
   ['timeout', { kind: 'throw', code: 'harness-timeout', message: 'claude-headless: invocation exceeded its timeout and was killed' }, /harness-timeout/i],
+  // Issue #31: an idle kill is retried and scrapped like a wall-clock timeout
+  // (same attempt-cap accounting, same terminal-scrap path), never parked. A park would leave the card ready behind cards.release_at, never
+  // reaching lane:'scrap', so this case failing to scrap would itself prove a
+  // wrongly-triggered park.
+  ['idle timeout', { kind: 'throw', code: 'harness-idle-timeout', message: 'claude-headless: invocation produced no output for longer than the idle timeout and was killed' }, /harness-idle-timeout/i],
   ['missing declared output', { kind: 'missing' }, /harness-output-missing/i],
   ['unparseable output', { kind: 'unparseable' }, /harness-output-unparseable/i],
   ['schema-invalid output', { kind: 'invalid' }, /harness-output-invalid/i],
@@ -301,6 +306,25 @@ describe('WI-566 — bounded retry actually retries and can recover', () => {
     expect(calls).toHaveLength(2);
     expect(getCard(db)?.lane).toBe('done');
     // The successful attempt wrote a checkpoint.
+    expect(coderCheckpoint(db)).not.toBeNull();
+  });
+
+  it('retries after an idle-timeout attempt and advances when the second attempt succeeds (issue #31)', async () => {
+    db = openDb();
+    const { adapter, calls } = makeScriptedHarness([
+      { kind: 'throw', code: 'harness-idle-timeout', message: 'claude-headless: invocation produced no output for longer than the idle timeout and was killed' },
+      { kind: 'ok' },
+    ]);
+    const registry = createHarnessRegistry([adapter]);
+    const flow = writeHarnessFlow(projectDir, registry, { maxAttempts: 2 });
+    seedCoderCard(db);
+
+    await run(flow, registry);
+
+    // Spent an execution attempt and retried. A park would never
+    // reach a second invocation without a release_at gate elapsing.
+    expect(calls).toHaveLength(2);
+    expect(getCard(db)?.lane).toBe('done');
     expect(coderCheckpoint(db)).not.toBeNull();
   });
 

@@ -68,6 +68,15 @@ hold it together:
   this, which is why the container boundary below still matters.
   Deployment guidance additionally recommends running the container as a dedicated non-root
   user for agentic/harness flows.
+- **Optional idle timeout.** `timeout_seconds` bounds the whole invocation, so a harness
+  stuck on a hung tool call runs until that bound. `idle_timeout_seconds` adds a second
+  bound, reset by every stdout line: if no line arrives for that long, the runner kills the
+  process group as it does on the wall-clock timeout
+  ([#31](https://github.com/theaiteam-dev/conduit/issues/31)). It applies only to
+  `kind: harness` stations and must be a positive integer below the wall-clock timeout
+  that applies (`timeout_seconds`, or the 300-second default). An idle kill fails as
+  `harness-idle-timeout` rather than `harness-timeout`, and is retried the same way: it
+  spends an execution attempt, bounded by `max_execution_attempts`, and is never parked.
 - **The ADR-0003 container wall.** [ADR-0003](../adr/0003-packaging-and-distribution.md)'s
   Docker packaging is the outer containment boundary for what a harness does inside its
   loop — the container, not the kernel, bounds the blast radius. Network-policy
@@ -182,7 +191,7 @@ Everything upstream and downstream of the tool loop is the same kernel machinery
 validation with coercive parsing, `check:` gates in both directions with journaled
 `gate_verdict` rows and all four rework guards, per-attempt journaling (harness identity,
 model, duration, artifact hashes, usage, and the binding stamp, effective
-`prompt_template_version`, agent and agent definition hash that produced the attempt), wall-clock timeout and execution-attempt caps,
+`prompt_template_version`, agent and agent definition hash that produced the attempt), wall-clock timeout (plus an optional idle timeout) and execution-attempt caps,
 liveness-watchdog integration so an in-flight attempt counts as progress, and the outbox +
 idempotency discipline for effectful stations. The tool loop is the only new freedom; the
 contract around it is unchanged.

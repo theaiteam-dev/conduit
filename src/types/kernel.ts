@@ -183,6 +183,14 @@ export interface StationConfig {
    * (agentic is not yet runnable; it will carry its own loop budget — SPEC §8.)
    */
   timeout_seconds?: number;
+  /**
+   * Idle bound in SECONDS for a `kind: harness` station's invocation (issue
+   * #31). The invocation is killed if the agent CLI writes no stdout line for
+   * this long. Validated at load: a positive integer, less than the wall-clock
+   * timeout that applies, and rejected on any other station kind. Absent: only
+   * the wall-clock timeout applies.
+   */
+  idle_timeout_seconds?: number;
   /** Path to the model station's prompt template, resolved relative to the flow.yaml dir. */
   prompt_file?: string;
   /**

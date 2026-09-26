@@ -107,7 +107,7 @@ function makeRun(
   const calls: RunnerCall[] = [];
   const run = async (cmd: HarnessCommand, config: HarnessRunnerConfig): Promise<HarnessSpawnResult> => {
     calls.push({ cmd, config });
-    return { exitCode: 0, stderr: '', durationMs: 4200, timedOut: false, ...spawn };
+    return { exitCode: 0, stderr: '', durationMs: 4200, timedOut: false, idledOut: false, ...spawn };
   };
   return { run, calls };
 }
@@ -492,6 +492,15 @@ describe('codex-exec adapter: named spawn failures', () => {
     await expect(adapter.invoke(invocation())).rejects.toThrow(/codex-exec/i);
   });
 
+  it('rejects with a distinct code when the process was killed for going idle (issue #31)', async () => {
+    const adapter = makeAdapter({ run: makeRun({ stdout: '', idledOut: true, exitCode: 137 }).run });
+
+    const err = await adapter.invoke(invocation()).catch((e: unknown) => e);
+
+    expect((err as Error).message).toMatch(/codex-exec/i);
+    expect((err as { code?: string }).code).toBe('harness-idle-timeout');
+  });
+
   it('rejects on a non-zero exit code even when stdout is empty', async () => {
     const adapter = makeAdapter({ run: makeRun({ stdout: '', exitCode: 1, stderr: 'auth error' }).run });
     await expect(adapter.invoke(invocation())).rejects.toThrow(/codex-exec/i);
@@ -565,6 +574,26 @@ describe('codex-exec adapter: usage carried through a billed throw (issue #26 AC
     expect(usageFromThrow(err)).toBeUndefined();
   });
 
+  it('an idle-timeout kill carries the SAME recovered usage a wall-clock kill would (issue #31)', async () => {
+    const stdout = [
+      JSON.stringify({ type: 'thread.started' }),
+      JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 50, cached_input_tokens: 5, output_tokens: 20, reasoning_output_tokens: 10 } }),
+    ].join('\n');
+    const adapter = makeAdapter({ run: makeRun({ stdout, idledOut: true, exitCode: 137 }).run });
+
+    const err = await adapter.invoke(invocation()).catch((e: unknown) => e);
+
+    expect((err as { code?: string }).code).toBe('harness-idle-timeout');
+    expect(usageFromThrow(err)).toEqual({
+      tokens: 80,
+      cost: 0,
+      breakdown: {
+        inputTokens: 45, outputTokens: 30,
+        cacheReadInputTokens: 5, cacheCreationInputTokens: 0,
+      },
+    });
+  });
+
   it('regression: a successful run with no usage event still returns { unknown: true }', async () => {
     const adapter = makeAdapter({ run: makeRun({ stdout: RECORDED_SUCCESS_NO_USAGE }).run });
 
@@ -584,7 +613,7 @@ describe('codex-exec adapter: config-only provider swap seam', () => {
     const claude = createClaudeHarnessAdapter({
       projectRoot: PROJECT_ROOT,
       envAllowlist: ['ANTHROPIC_API_KEY', 'PATH'],
-      run: async () => ({ exitCode: 0, stdout: '{}', stderr: '', durationMs: 1, timedOut: false }),
+      run: async () => ({ exitCode: 0, stdout: '{}', stderr: '', durationMs: 1, timedOut: false, idledOut: false }),
     });
     const registry = createHarnessRegistry([claude, codex]);
 

@@ -26,6 +26,16 @@ export interface MountedInput {
   path: string;
 }
 
+/**
+ * Default wall-clock bound (ms) for a harness invocation when the station
+ * declares no `timeout_seconds`. Harness attempts run 3-4 minutes by design
+ * (SPEC §7 / the agentic-harness-worker PRD), far longer than a transform's
+ * single model call, so this default is generous rather than reusing a
+ * transform-scale timeout. The loader also reads it, to check that an
+ * `idle_timeout_seconds` is below the timeout that will actually apply.
+ */
+export const DEFAULT_HARNESS_TIMEOUT_MS = 5 * 60 * 1000;
+
 /** Bounded request handed to a harness adapter's `invoke`. */
 export interface HarnessInvocation {
   /** Rendered prompt string — the full task text sent to the agent CLI. */
@@ -36,6 +46,13 @@ export interface HarnessInvocation {
   tools: string[];
   /** Wall-clock timeout bound in milliseconds. */
   timeoutMs: number;
+  /**
+   * Idle bound in milliseconds (issue #31): the invocation is killed if no
+   * stdout line arrives for this long, independently of `timeoutMs`. Absent:
+   * only the wall-clock bound applies. Passed to
+   * `HarnessRunnerConfig.idleTimeoutMs` unchanged.
+   */
+  idleTimeoutMs?: number;
   /**
    * Per-call model override (WI-589). Model is a per-STATION concern, not a
    * per-run one, so it cannot ride the per-run bound adapter config (WI-587)
@@ -150,7 +167,8 @@ export interface HarnessResult {
  * budgets instead of recording a failed-and-therefore-free call.
  *
  * `code` is the existing failure-class tag ('harness-timeout',
- * 'harness-nonzero-exit', 'harness-rate-limited') the executor already keys on.
+ * 'harness-idle-timeout', 'harness-nonzero-exit', 'harness-rate-limited') the
+ * executor already keys on.
  *
  * NOT every failure can carry usage, and that is not a defect: claude-headless
  * reports usage only in a terminal `result` event, so a call killed at the

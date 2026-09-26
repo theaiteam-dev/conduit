@@ -213,10 +213,10 @@ function accumulateUsage(stdout: string): AccumulatedUsage | null {
 
 /**
  * Build the structured `KnownUsage` object from accumulated per-turn usage.
- * ONE construction, shared by the success path and by the two throw sites
- * that can recover a genuine figure (`harness-timeout`, `harness-nonzero-exit`)
- * — issue #26 AC5 — so the shape can never drift between "this call succeeded"
- * and "this call failed but was billed".
+ * ONE construction, shared by the success path and by the three throw sites
+ * that can recover a genuine figure (`harness-timeout`, `harness-idle-timeout`,
+ * `harness-nonzero-exit`, per issue #26 AC5), so the shape cannot drift
+ * between "this call succeeded" and "this call failed but was billed".
  */
 function knownUsageFrom(usage: AccumulatedUsage): KnownUsage {
   // Token counts ARE genuinely available and useful for budget/andon
@@ -318,6 +318,7 @@ export function createCodexHarnessAdapter(config: CodexHarnessAdapterConfig): Ha
         {
           projectRoot: config.projectRoot,
           timeoutMs: call.timeoutMs,
+          ...(call.idleTimeoutMs !== undefined ? { idleTimeoutMs: call.idleTimeoutMs } : {}),
           envAllowlist: config.envAllowlist,
         },
       );
@@ -335,6 +336,17 @@ export function createCodexHarnessAdapter(config: CodexHarnessAdapterConfig): Ha
       const usage = accumulateUsage(spawnResult.stdout);
       const billedUsage = usage !== null ? knownUsageFrom(usage) : undefined;
 
+      if (spawnResult.idledOut) {
+        // Same usage recovery as the wall-clock branch below (issue #26 AC5):
+        // codex streams per-turn usage, so turns completed before the child
+        // went silent were billed. A distinct code (issue #31) keeps a hung
+        // call apart from a slow one in the journal; both retry the same way.
+        fail(
+          'invocation produced no output for longer than the idle timeout and was killed',
+          'harness-idle-timeout',
+          billedUsage !== undefined ? { usage: billedUsage } : undefined,
+        );
+      }
       if (spawnResult.timedOut) {
         fail(
           'invocation exceeded its timeout and was killed',

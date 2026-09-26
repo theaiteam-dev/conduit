@@ -21,6 +21,12 @@
  * trusted engine config (WI-560); the `tools` allowlist is enforced
  * elsewhere. Do NOT touch ./harness.ts (unrelated worker-pool subprocess
  * harness — naming collision only).
+ *
+ * Issue #31 adds an optional second timer: an idle bound, reset by every
+ * stdout line, that kills the process group when the child goes silent. The
+ * executor's liveness watchdog runs only between ticks, and a harness station
+ * awaits one `invoke()` for the whole tick, so this timer is the only check
+ * that runs while the child does.
  */
 
 import { resolve, sep } from 'node:path';
@@ -77,44 +83,65 @@ export interface HarnessRunnerConfig {
    * harness transcript in memory.
    */
   onStdoutLine?: (line: string) => void;
+  /**
+   * Idle bound in milliseconds (issue #31). Reset by every complete stdout
+   * line; when no line arrives for this long the process group is killed,
+   * independently of `timeoutMs`. Undefined: only the wall-clock timer applies.
+   */
+  idleTimeoutMs?: number;
 }
 
 /**
- * Drain a newline-delimited stream, retaining only the lines `keep` accepts.
+ * Drain a newline-delimited stream, observing each complete line as it
+ * arrives (`onLine`) and returning the text the caller wants retained.
+ *
+ * `keep` selects which lines survive into the returned string, filtered AS
+ * they arrive rather than buffered whole, the memory-saving mode a
+ * `stdoutLineFilter` uses. When `keep` is undefined every byte is retained
+ * verbatim: the returned string is exactly what `new Response(stream).text()`
+ * would produce, not a reconstruction from split lines, so a trailing newline
+ * is preserved. This mode exists so a caller with no filter (an idle timeout
+ * with no `stdoutLineFilter`) can still observe line boundaries through
+ * `onLine`, without changing what the stream retains.
  *
  * Decoding is incremental (`{ stream: true }`) so a multi-byte character split
- * across two chunks is not mangled, and only the current partial line plus the
- * kept lines are ever held.
+ * across two chunks is not mangled, and in filtered mode only the current
+ * partial line plus the kept lines are ever held.
  */
 async function readKeptLines(
   stream: ReadableStream<Uint8Array>,
-  keep: (line: string) => boolean,
+  keep: ((line: string) => boolean) | undefined,
   onLine?: (line: string) => void,
 ): Promise<string> {
   const decoder = new TextDecoder();
   const kept: string[] = [];
+  let full = '';
   let carry = '';
 
   for await (const chunk of stream) {
-    carry += decoder.decode(chunk, { stream: true });
+    const decoded = decoder.decode(chunk, { stream: true });
+    if (keep === undefined) full += decoded;
+    carry += decoded;
     let newline = carry.indexOf('\n');
     while (newline !== -1) {
       const line = carry.slice(0, newline);
       carry = carry.slice(newline + 1);
       onLine?.(line);
-      if (keep(line)) kept.push(line);
+      if (keep !== undefined && keep(line)) kept.push(line);
       newline = carry.indexOf('\n');
     }
   }
   // Flush the decoder, then the final unterminated line (a stream need not end
   // with a newline, and on a crash it very often does not).
-  carry += decoder.decode();
+  const flushed = decoder.decode();
+  if (keep === undefined) full += flushed;
+  carry += flushed;
   if (carry.length > 0) {
     onLine?.(carry);
-    if (keep(carry)) kept.push(carry);
+    if (keep !== undefined && keep(carry)) kept.push(carry);
   }
 
-  return kept.join('\n');
+  return keep === undefined ? full : kept.join('\n');
 }
 
 export interface HarnessSpawnResult {
@@ -125,6 +152,11 @@ export interface HarnessSpawnResult {
   durationMs: number;
   /** True iff the process was killed for exceeding timeoutMs (not a normal exit). */
   timedOut: boolean;
+  /**
+   * True iff the idle timer killed the process (issue #31): no stdout line
+   * arrived for `idleTimeoutMs`. Always false when it was not configured.
+   */
+  idledOut: boolean;
 }
 
 /** SIGKILL's conventional shell exit code (128 + 9), used when Bun reports no exit code. */
@@ -175,13 +207,15 @@ function resolveConfinedCwd(projectRoot: string, cwd: string | undefined): strin
 }
 
 /**
- * Spawn `cmd` bounded by `config.timeoutMs`. SIGKILLs the whole process group
- * (setsid-detached child) after the leader exits, on EVERY exit path, not only
- * on timeout (#17): a harness that finishes on its own but left a grandchild
- * backgrounded is reaped just the same, before the output drains are awaited,
- * so that grandchild cannot stall the runner until timeoutMs by holding the
- * inherited stdout/stderr pipes open. Only a genuine timeout resolves with
- * `timedOut: true`; a post-exit kill never marks a normal exit as one.
+ * Spawn `cmd` bounded by `config.timeoutMs`, and, when `config.idleTimeoutMs`
+ * is set, by a second independent idle bound (issue #31). SIGKILLs the whole
+ * process group (setsid-detached child) after the leader exits, on EVERY exit
+ * path, not only on timeout (#17): a harness that finishes on its own but left
+ * a grandchild backgrounded is reaped just the same, before the output drains
+ * are awaited, so that grandchild cannot stall the runner until timeoutMs by
+ * holding the inherited stdout/stderr pipes open. Only a genuine wall-clock
+ * timeout resolves with `timedOut: true`; only a genuine idle kill resolves
+ * with `idledOut: true`; a post-exit kill never marks a normal exit as either.
  */
 export async function runHarnessProcess(
   cmd: HarnessCommand,
@@ -209,17 +243,62 @@ export async function runHarnessProcess(
   // it for the kernel's signal and exit handlers (./process-group.ts).
   trackProcessGroup(proc.pid);
 
+  // `timedOutFired` stops a still-pending idle timer from claiming this kill:
+  // when idleTimeoutMs >= timeoutMs it can fire after this callback but before
+  // `proc.exited` resolves.
+  let timedOutFired = false;
   const timer = setTimeout(() => {
+    timedOutFired = true;
     killProcessGroup(proc.pid);
   }, config.timeoutMs);
 
+  // Idle timer (issue #31), reset by every complete stdout line rather than
+  // every chunk: chunk boundaries depend on pipe buffering, and a line is the
+  // unit `stdoutLineFilter`/`onStdoutLine` already observe.
+  //
+  // `idledOutFired` records which timer fired, since an idle kill has no fixed
+  // relationship to `timeoutMs` that a duration check could test. It is gated
+  // on `proc.signalCode` below for the same reason `timedOut` is.
+  //
+  // `exited` stops re-arming once the leader has exited. Lines a backgrounded
+  // descendant left in the pipe are still drained after that (#17), and a
+  // timer armed by them would SIGKILL a process group id the kernel may
+  // already have reused.
+  let idleTimer: ReturnType<typeof setTimeout> | undefined;
+  let idledOutFired = false;
+  let exited = false;
+  const resetIdleTimer = (): void => {
+    if (config.idleTimeoutMs === undefined || exited) return;
+    if (idleTimer !== undefined) clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => {
+      // The wall-clock kill already ended the child; `timedOut` reports it.
+      if (timedOutFired) return;
+      idledOutFired = true;
+      killProcessGroup(proc.pid);
+    }, config.idleTimeoutMs);
+  };
+  // Armed at spawn, so a child that never writes a line is caught too.
+  resetIdleTimer();
+
+  // Every observed line both resets the idle timer (when configured) and
+  // forwards to the caller's own onStdoutLine, if any.
+  const observeLine =
+    config.idleTimeoutMs !== undefined
+      ? (line: string) => {
+          resetIdleTimer();
+          config.onStdoutLine?.(line);
+        }
+      : config.onStdoutLine;
+
   // Start draining now so a harness that writes more than a pipe buffer is not
-  // blocked on a full pipe while we wait for it to exit.
+  // blocked on a full pipe while we wait for it to exit. With an idle timeout
+  // but no filter, the stream is still read line by line so the timer can be
+  // reset; `keep: undefined` retains the same bytes Response.text() would.
   const stdoutText =
     config.stdoutLineFilter !== undefined
-      ? readKeptLines(proc.stdout as ReadableStream<Uint8Array>, config.stdoutLineFilter, config.onStdoutLine)
-      : config.onStdoutLine !== undefined
-        ? readKeptLines(proc.stdout as ReadableStream<Uint8Array>, () => true, config.onStdoutLine)
+      ? readKeptLines(proc.stdout as ReadableStream<Uint8Array>, config.stdoutLineFilter, observeLine)
+      : observeLine !== undefined
+        ? readKeptLines(proc.stdout as ReadableStream<Uint8Array>, undefined, observeLine)
         : new Response(proc.stdout).text();
   const stderrText = new Response(proc.stderr as ReadableStream).text();
   // Attach a handler now: a throwing `stdoutLineFilter` rejects its drain while
@@ -232,7 +311,9 @@ export async function runHarnessProcess(
   try {
     exitCode = await proc.exited;
   } finally {
+    exited = true;
     clearTimeout(timer);
+    clearTimeout(idleTimer);
     // #17: the harness has exited, but a descendant it backgrounded may still
     // be running and holding the pipes. Kill the group BEFORE awaiting the
     // drains below so they settle. Bytes already written stay readable, so no
@@ -248,6 +329,9 @@ export async function runHarnessProcess(
 
   const durationMs = Date.now() - startedAt;
 
+  // Gated on signalCode for the same reason as timedOut below.
+  const idledOut = idledOutFired && proc.signalCode === 'SIGKILL';
+
   // Distinguish OUR timeout-kill from a normal exit. A shared flag set independently
   // inside the setTimeout callback would race: when the child exits naturally
   // right around the deadline, the timer can still fire and attempt a kill —
@@ -256,7 +340,11 @@ export async function runHarnessProcess(
   // `timedOut` from proc.signalCode AFTER the process has actually exited
   // avoids that race: an already-exited process never carries a SIGKILL
   // signalCode, no matter how the timer callback and the exit event interleave.
-  const timedOut = proc.signalCode === 'SIGKILL' && durationMs >= config.timeoutMs * 0.9;
+  //
+  // `!idledOut` keeps the two exclusive. The loader rejects idleTimeoutMs >=
+  // timeoutMs for a station, but this function does not rely on it: the
+  // `timedOutFired` guard keeps the idle timer from claiming a wall-clock kill.
+  const timedOut = !idledOut && proc.signalCode === 'SIGKILL' && durationMs >= config.timeoutMs * 0.9;
 
   return {
     exitCode: typeof exitCode === 'number' ? exitCode : SIGKILL_EXIT,
@@ -264,5 +352,6 @@ export async function runHarnessProcess(
     stderr,
     durationMs,
     timedOut,
+    idledOut,
   };
 }

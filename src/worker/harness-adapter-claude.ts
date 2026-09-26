@@ -551,6 +551,7 @@ export function createClaudeHarnessAdapter(config: ClaudeHarnessAdapterConfig): 
           {
             projectRoot: config.projectRoot,
             timeoutMs: call.timeoutMs,
+            ...(call.idleTimeoutMs !== undefined ? { idleTimeoutMs: call.idleTimeoutMs } : {}),
             envAllowlist: config.envAllowlist,
             ...(config.sourceEnv !== undefined ? { sourceEnv: config.sourceEnv } : {}),
             ...(configDir !== undefined ? { injectedEnv: { CLAUDE_CONFIG_DIR: configDir } } : {}),
@@ -563,6 +564,21 @@ export function createClaudeHarnessAdapter(config: ClaudeHarnessAdapterConfig): 
         );
       } finally {
         if (configDir !== undefined) removeRunScopedClaudeConfigDir(configDir);
+      }
+
+      if (spawnResult.idledOut) {
+        // A distinct code (issue #31) keeps a hung call apart from a slow one in
+        // the journal, though the executor retries both the same way. A CLI can
+        // emit its terminal `result` event and then hang on shutdown, so bill
+        // that usage when the event was kept (issue #26); without one the figure
+        // stays absent, never zero.
+        const { result: idlePayload, rateLimit: idleRateLimit } = parseClaudeStream(spawnResult.stdout);
+        const idleUsage = buildKnownUsage(idlePayload, idleRateLimit);
+        fail(
+          'invocation produced no output for longer than the idle timeout and was killed',
+          'harness-idle-timeout',
+          idleUsage !== undefined ? { usage: idleUsage } : undefined,
+        );
       }
 
       if (spawnResult.timedOut) {

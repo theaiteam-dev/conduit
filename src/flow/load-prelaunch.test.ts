@@ -16,6 +16,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import type { FlowConfig } from '../types/kernel';
 import { loadFlow, type LoadFlowResult } from './load';
+import { DEFAULT_HARNESS_TIMEOUT_MS } from '../worker/harness-adapter';
 
 function loadInline(
   yaml: string,
@@ -309,6 +310,126 @@ describe('loadFlow — deterministic timeout_seconds fail-closed (Item #8)', () 
   it('rejects a non-number timeout_seconds', () => {
     const result = loadInline(detFlow('"soon"'));
     expect(errorCodes(result)).toContain('INVALID_TIMEOUT_SECONDS');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Issue #31: idle_timeout_seconds for kind: harness stations.
+//
+// When present, idle_timeout_seconds must be a positive integer (>= 1),
+// declared only on a harness station, and strictly less than timeout_seconds
+// when both are set. Absent is legal (no idle bound, backwards-compatible).
+// ---------------------------------------------------------------------------
+
+describe('loadFlow: harness idle_timeout_seconds fail-closed (issue #31)', () => {
+  // A minimal harness station. `idleValue`/`timeoutValue` are interpolated
+  // verbatim; null omits the key entirely.
+  const harnessFlow = (idleValue: string | null, timeoutValue: string | null = null): string => {
+    const lines: string[] = [
+      'flow: harness-idle-timeout',
+      'flow_version: 1',
+      'terminal_lanes: [done, scrap, hold]',
+      'stations:',
+      '  - id: coder',
+      '    worker:',
+      '      kind: harness',
+      '      harness: claude-headless',
+      '      prompt_file: prompt.md',
+      '      prompt_version: "1"',
+      '      tools: [Read, Write, Bash]',
+      '      output_schema:',
+      '        fields:',
+      '          - { name: result, type: string, required: true }',
+    ];
+    if (timeoutValue !== null) lines.push(`      timeout_seconds: ${timeoutValue}`);
+    if (idleValue !== null) lines.push(`      idle_timeout_seconds: ${idleValue}`);
+    lines.push('    inputs: [task.md]');
+    lines.push('    outputs: [result.md]');
+    lines.push('    next: done');
+    return lines.join('\n') + '\n';
+  };
+  const PROMPT = { 'prompt.md': 'Do the task.' };
+
+  it('loads a valid positive integer idle_timeout_seconds onto the StationConfig', () => {
+    const flow = expectOk(loadInline(harnessFlow('30', '300'), PROMPT));
+    expect(flow.stations.coder!.idle_timeout_seconds).toBe(30);
+  });
+
+  it('loads OK when idle_timeout_seconds is absent (no idle bound, backwards-compatible)', () => {
+    const flow = expectOk(loadInline(harnessFlow(null), PROMPT));
+    expect(flow.stations.coder!.idle_timeout_seconds).toBeUndefined();
+  });
+
+  it('rejects idle_timeout_seconds: 0 with INVALID_IDLE_TIMEOUT_SECONDS naming the station', () => {
+    const result = loadInline(harnessFlow('0', '300'), PROMPT);
+    expect(errorCodes(result)).toContain('INVALID_IDLE_TIMEOUT_SECONDS');
+    expect(errorText(result)).toContain('coder');
+  });
+
+  it('rejects a negative idle_timeout_seconds', () => {
+    const result = loadInline(harnessFlow('-1', '300'), PROMPT);
+    expect(errorCodes(result)).toContain('INVALID_IDLE_TIMEOUT_SECONDS');
+  });
+
+  it('rejects a non-integer (float) idle_timeout_seconds', () => {
+    const result = loadInline(harnessFlow('1.5', '300'), PROMPT);
+    expect(errorCodes(result)).toContain('INVALID_IDLE_TIMEOUT_SECONDS');
+  });
+
+  it('rejects a non-number idle_timeout_seconds', () => {
+    const result = loadInline(harnessFlow('"soon"', '300'), PROMPT);
+    expect(errorCodes(result)).toContain('INVALID_IDLE_TIMEOUT_SECONDS');
+  });
+
+  it('rejects idle_timeout_seconds >= timeout_seconds with IDLE_TIMEOUT_NOT_LESS_THAN_TIMEOUT', () => {
+    const result = loadInline(harnessFlow('300', '300'), PROMPT);
+    expect(errorCodes(result)).toContain('IDLE_TIMEOUT_NOT_LESS_THAN_TIMEOUT');
+    expect(errorText(result)).toContain('coder');
+  });
+
+  it('rejects idle_timeout_seconds greater than timeout_seconds', () => {
+    const result = loadInline(harnessFlow('400', '300'), PROMPT);
+    expect(errorCodes(result)).toContain('IDLE_TIMEOUT_NOT_LESS_THAN_TIMEOUT');
+  });
+
+  it('accepts idle_timeout_seconds strictly less than timeout_seconds', () => {
+    const flow = expectOk(loadInline(harnessFlow('30', '300'), PROMPT));
+    expect(flow.stations.coder!.idle_timeout_seconds).toBe(30);
+    expect(flow.stations.coder!.timeout_seconds).toBe(300);
+  });
+
+  it('accepts idle_timeout_seconds with no timeout_seconds declared (only the wall-clock default applies)', () => {
+    const flow = expectOk(loadInline(harnessFlow('30'), PROMPT));
+    expect(flow.stations.coder!.idle_timeout_seconds).toBe(30);
+    expect(flow.stations.coder!.timeout_seconds).toBeUndefined();
+  });
+
+  it('rejects idle_timeout_seconds at or past the default harness timeout when timeout_seconds is absent', () => {
+    const defaultSeconds = String(DEFAULT_HARNESS_TIMEOUT_MS / 1000);
+    const result = loadInline(harnessFlow(defaultSeconds), PROMPT);
+    expect(errorCodes(result)).toContain('IDLE_TIMEOUT_NOT_LESS_THAN_TIMEOUT');
+    expect(errorText(result)).toContain('default harness timeout');
+  });
+
+  it('rejects idle_timeout_seconds on a non-harness station with IDLE_TIMEOUT_REQUIRES_HARNESS', () => {
+    const detFlow = [
+      'flow: det-idle-timeout',
+      'flow_version: 1',
+      'terminal_lanes: [done, scrap, hold]',
+      'stations:',
+      '  - id: render',
+      '    worker:',
+      '      kind: deterministic',
+      '      command: "true"',
+      '      idle_timeout_seconds: 30',
+      '    next: done',
+      'security:',
+      '  bash:',
+      '    allow: ["true"]',
+    ].join('\n') + '\n';
+    const result = loadInline(detFlow);
+    expect(errorCodes(result)).toContain('IDLE_TIMEOUT_REQUIRES_HARNESS');
+    expect(errorText(result)).toContain('render');
   });
 });
 

@@ -47,7 +47,7 @@ import { runTransformStation, coerciveParse, computeFindingsHash } from '../work
 import type {
   HarnessRegistry, MountedInput, HarnessResult, KnownUsage, RateLimitSnapshot,
 } from '../worker/harness-adapter';
-import { usageFromThrow, resolveHarnessAgent } from '../worker/harness-adapter';
+import { usageFromThrow, resolveHarnessAgent, DEFAULT_HARNESS_TIMEOUT_MS } from '../worker/harness-adapter';
 import { harnessRetryDelayMs } from '../worker/harness-retry';
 import { loadImageInput, hashImageInputs, assertImagePayloadWithinLimits } from '../worker/image-input';
 import type { ImageInput } from '../worker/image-input';
@@ -114,15 +114,6 @@ const POOL_WAIT_TIMEOUT_MS = 250;
 
 /** Worker ID prefix for this single-process executor. */
 const WORKER_ID_PREFIX = 'executor';
-
-/**
- * Default wall-clock bound (ms) for a harness invocation when the station
- * declares no `timeout_seconds` — harness attempts run 3-4 minutes by design
- * (SPEC §7 / the agentic-harness-worker PRD), far longer than a transform's
- * single model call, so this default is generous rather than reusing a
- * transform-scale timeout.
- */
-const DEFAULT_HARNESS_TIMEOUT_MS = 5 * 60 * 1000;
 
 /**
  * How long to park a rate-limited card when the provider reported no reset time.
@@ -3744,6 +3735,11 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
       stationConfig.timeout_seconds !== undefined
         ? stationConfig.timeout_seconds * 1000
         : DEFAULT_HARNESS_TIMEOUT_MS;
+    // Issue #31: opt-in idle bound, absent unless the station declares one.
+    // The loader has already validated it is positive and, when both are
+    // declared, strictly less than timeout_seconds.
+    const idleTimeoutMs =
+      stationConfig.idle_timeout_seconds !== undefined ? stationConfig.idle_timeout_seconds * 1000 : undefined;
 
     // ── WI-566: bounded retry loop, mirroring transform.ts runTransformStation
     // (`while callsMade < maxExecutionAttempts`). Every distinct failure class
@@ -3788,6 +3784,7 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
           timeoutMs,
           model: effectiveModel,
           onProgress: stampHarnessActivity,
+          ...(idleTimeoutMs !== undefined ? { idleTimeoutMs } : {}),
           ...(effectiveAgent !== undefined ? { agent: effectiveAgent } : {}),
         });
       } catch (invokeErr) {
@@ -3893,12 +3890,18 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
         // An UNTAGGED throw still scraps under a generic named reason — loud,
         // never a silent failure to classify.
         const code = (invokeErr as { code?: string }).code;
+        // Issue #31: an idle kill is retried like a wall-clock timeout (it
+        // spends an execution attempt and gets the same backoff below), but
+        // has its own scrap reason so a card that exhausts its attempts names
+        // which bound killed it.
         scrapReason =
           code === 'harness-timeout'
             ? 'harness-timeout'
-            : code === 'harness-nonzero-exit'
-              ? 'harness-nonzero-exit'
-              : `harness-invocation-failed: ${(invokeErr as Error).message}`;
+            : code === 'harness-idle-timeout'
+              ? 'harness-idle-timeout'
+              : code === 'harness-nonzero-exit'
+                ? 'harness-nonzero-exit'
+                : `harness-invocation-failed: ${(invokeErr as Error).message}`;
         // issue #26 AC5: a thrown invocation was still BILLED for whatever it
         // did before it died (a timeout or nonzero exit does not refund
         // tokens already consumed). usageFromThrow is the ONE reader for
