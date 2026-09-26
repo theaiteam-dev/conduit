@@ -72,20 +72,27 @@ failure of a second, forgotten listener started by hand.
 
 Whatever executes must not be writable by the thing executing it. Two compliant shapes:
 
-- **Baked-in** (`conduit build` per-flow images): the flow directory is a `COPY`d image
-  layer — immutable by construction.
 - **Mounted checkout** (engine image + external flow directory): mount it **`:ro`**, owned
-  by root or the deploy user on the host — never by the service user.
+  by root or the deploy user on the host, never by the service user.
+- **Baked-in** (`conduit build` per-flow images), run with a **read-only root
+  filesystem**. A baked-in flow is not read-only by default: the generated Dockerfile
+  copies it with `COPY --chown=conduit:conduit`, so the runtime user owns `/flow` and can
+  rewrite it in the container's writable layer. Start the container with `--read-only`
+  (Quadlet: `ReadOnly=true`). Podman then mounts a tmpfs at `/tmp` by default; under
+  Docker, add `--tmpfs /tmp` yourself, because the engine creates temporary directories
+  there (for example, the per-invocation config directory for `claude-headless` config
+  isolation).
 
 Either way, a compromised run cannot rewrite its own `flow.yaml`, prompts, or scripts to
-persist across the per-event fresh process. The **only writable path is the state volume**
-(`/data`) — one named volume, nothing else.
+persist across the per-event fresh process. The **writable paths are the state volume**
+(`/data`) and the workspace volumes the constraints below require, nothing else.
 
 Two constraints in the current engine affect this rule:
 
 - With `defaults.workspace: per_run`, each run's workspace is created at
-  `<project_root>/.conduit/runs/<run-id>/`, inside the flow directory. A `:ro` checkout
-  therefore needs a writable volume mounted over `.conduit/runs` for each served flow, plus
+  `<project_root>/.conduit/runs/<run-id>/`, inside the flow directory. A read-only flow directory,
+  mounted or baked in, therefore needs a writable volume mounted over `.conduit/runs` for
+  each served flow, plus
   one for any other path the flow writes. Station `command`/`args` resolve relative to that
   workspace, so the runs root cannot simply be moved elsewhere
   ([#56](https://github.com/theaiteam-dev/conduit/issues/56),
@@ -101,6 +108,11 @@ a floating tag. A version bump is a deliberate, reviewable act: change the pin i
 config that is your source of truth, redeploy, and "which engine vintage is running" stops
 being a forensic question. This is an operational rule with a security payoff — an
 unreproducible deployment is one you cannot reason about after an incident.
+
+`conduit build` always writes `FROM conduit-engine:latest` into the per-flow Dockerfile, so
+the engine version inside a per-flow image depends on what that local tag pointed to at
+build time. Pin the per-flow image you deploy, and record which engine release it was built
+from, since the build cannot be reproduced from the Dockerfile alone.
 
 ### 5. Publish no ports you don't serve
 
@@ -173,7 +185,7 @@ during an incident.
 |---|------|-------------|
 | 1 | Locked, empty service user; no extra groups | `id <svcuser>`; `sudo -u <svcuser> cat <your-secrets>` → denied |
 | 2 | Rootless Podman, Quadlet-managed, lingering on | `podman info --format '{{.Host.Security.Rootless}}'`; `loginctl show-user <svcuser>` |
-| 3 | Flow code baked-in or mounted `:ro`; only `/data` writable | inspect mounts; write-probe from inside the container |
+| 3 | Flow code mounted `:ro`, or baked in and run with a read-only root filesystem; writable only `/data` and the run-workspace volumes | inspect mounts and `ReadOnly`; write-probe `flow.yaml` from inside the container → read-only |
 | 4 | Image pinned by SHA/digest; no auto-update | unit file `Image=` line |
 | 5 | No published ports (Socket Mode) | `podman port <ctr>` → empty; scan from another host |
 | 6 | Secrets via one injected seam; none in repo/image | `podman image inspect` layers; git history |
