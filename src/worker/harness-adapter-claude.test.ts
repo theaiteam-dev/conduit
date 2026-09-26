@@ -882,7 +882,40 @@ describe('claude-headless adapter: usage carried through a billed throw (issue #
     expect(usageFromThrow(err)).toBeUndefined();
   });
 
-  it('an idle-timeout kill carries no usage either, for the same reason (issue #31)', async () => {
+  it('an idle-killed call whose retained stdout carries a terminal result event carries the real usage (issue #26/#31)', async () => {
+    // The CLI can emit its terminal `result` event, billing the call, and
+    // then hang during shutdown and go silent, getting idle-killed. Those
+    // tokens were spent and must reach the budget, same as any other billed
+    // throw (issue #26).
+    const stdout = JSON.stringify({
+      type: 'result',
+      subtype: 'success',
+      is_error: false,
+      result: 'finished, but the process hung during shutdown',
+      total_cost_usd: 0.0087,
+      usage: {
+        input_tokens: 500,
+        output_tokens: 200,
+        cache_creation_input_tokens: 50,
+        cache_read_input_tokens: 25,
+      },
+    });
+    const adapter = makeAdapter({ run: makeRun({ stdout, idledOut: true, exitCode: 137 }).run });
+
+    const err = await adapter.invoke(invocation()).catch((e: unknown) => e);
+
+    expect((err as { code?: string }).code).toBe('harness-idle-timeout');
+    expect(usageFromThrow(err)).toEqual({
+      tokens: 775,
+      cost: 0.0087,
+      breakdown: {
+        inputTokens: 500, outputTokens: 200,
+        cacheReadInputTokens: 25, cacheCreationInputTokens: 50,
+      },
+    });
+  });
+
+  it('an idle-killed call whose retained stdout carries NO result event has no usage to recover: absent, not zero', async () => {
     const adapter = makeAdapter({
       run: makeRun({ stdout: '', idledOut: true, exitCode: 137 }).run,
     });

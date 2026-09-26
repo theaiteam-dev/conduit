@@ -567,11 +567,18 @@ export function createClaudeHarnessAdapter(config: ClaudeHarnessAdapterConfig): 
       }
 
       if (spawnResult.idledOut) {
-        // No usage to recover, as in the wall-clock branch below: a call killed
-        // for going silent never emits the terminal `result` event. A distinct
-        // code (issue #31) keeps a hung call apart from a slow one in the
-        // journal, though the executor retries both the same way.
-        fail('invocation produced no output for longer than the idle timeout and was killed', 'harness-idle-timeout');
+        // A distinct code (issue #31) keeps a hung call apart from a slow one in
+        // the journal, though the executor retries both the same way. A CLI can
+        // emit its terminal `result` event and then hang on shutdown, so bill
+        // that usage when the event was kept (issue #26); without one the figure
+        // stays absent, never zero.
+        const { result: idlePayload, rateLimit: idleRateLimit } = parseClaudeStream(spawnResult.stdout);
+        const idleUsage = buildKnownUsage(idlePayload, idleRateLimit);
+        fail(
+          'invocation produced no output for longer than the idle timeout and was killed',
+          'harness-idle-timeout',
+          idleUsage !== undefined ? { usage: idleUsage } : undefined,
+        );
       }
 
       if (spawnResult.timedOut) {
