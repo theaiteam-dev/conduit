@@ -28,6 +28,7 @@ import { validateRunId } from '../run/run-id';
 import { registerRun, computeFingerprint } from '../run/run-registry';
 import { acquireRunLease, releaseRunLease, peekRunLeaseHolder, defaultIsPidAlive } from '../run/run-lock';
 import { getRunState, getRunParkedRelease, formatParkedRun, type RunStateResult } from '../run/run-state';
+import { getHarnessOccupancy, formatHarnessOccupancy } from '../run/harness-occupancy';
 import type { ModelAdapter, ModelCall, ModelResponse } from '../worker/adapter';
 import {
   buildHarnessDefinitionRegistry,
@@ -2163,6 +2164,13 @@ async function cmdRunManage(argv: string[], deps: CliDeps): Promise<number> {
   if (sub === 'status') {
     const state = getRunState(deps.db, runId, deps.now());
     deps.io.out(formatRunState(runId, state));
+    // Issue #30: a run with harness spans also reports how much of its wall
+    // clock each harness station held the serial dispatch path. A run with
+    // none prints only the line above.
+    const occupancy = state.status === 'not_found' ? null : getHarnessOccupancy(deps.db, runId);
+    if (occupancy !== null) {
+      for (const line of formatHarnessOccupancy(occupancy)) deps.io.out(line);
+    }
     // A not_found run is a non-zero (lookup miss) outcome; everything else is 0.
     return state.status === 'not_found' ? 1 : 0;
   }

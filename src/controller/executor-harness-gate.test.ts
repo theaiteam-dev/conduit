@@ -1000,3 +1000,57 @@ describe('issue #28 AC2: check.critic.agent reaches the harness critic\'s Harnes
     expect(getCard(db)?.lane).toBe('hold');
   });
 });
+
+// ---------------------------------------------------------------------------
+// Issue #30: ready_waiting must be sampled at the ACTUAL call
+// boundary, not the tick's stale currentNow. The critic runs after the maker's
+// own call, which can itself consume real wall-clock time; a card whose
+// release_at passes during that maker call must still be counted.
+// ---------------------------------------------------------------------------
+
+describe('issue #30: the critic samples ready_waiting when its own call starts', () => {
+  it('counts a card whose release_at passes while the maker call is still running', async () => {
+    db = openDb();
+    let clock = 1000;
+    const maker: HarnessAdapter = {
+      name: 'fake-harness',
+      reportsUsage: true,
+      canRestrictTools: true,
+      async probeBinary() {
+        return { present: true };
+      },
+      async invoke() {
+        // Models the maker call itself consuming real wall-clock time: the
+        // clock has moved on by the time the gate critic runs afterward.
+        clock += 10;
+        writeFileSync(join(process.cwd(), 'result.json'), JSON.stringify({ summary: 'implemented' }), 'utf-8');
+        return { outputs: [], usage: { tokens: 10, cost: 0.01 } };
+      },
+    };
+    const critic = makeHarnessCritic('pass', []);
+    const registry = createHarnessRegistry([maker, critic.adapter]);
+    const flow = writeGatedFlow(dir, registry, { harnessCritic: 'claude-critic', criticTools: ['Read', 'Write'] });
+    seedCard(db);
+    db.insertCard({
+      run_id: DEFAULT_RUN_ID, id: 'other', parent_id: null, lane: 'coder', status: 'ready',
+      attempt: 0, wave: 0, owned_paths: ['task.json', 'result.json'], rework_count: 0,
+    });
+    // Gated at tick start (release_at 1005 > currentNow 1000): planTick will
+    // not dispatch 'other' this tick, but the maker's invoke() above advances
+    // the clock to 1010 before the critic samples ready_waiting.
+    db.getStateDb()
+      .prepare('UPDATE cards SET release_at = $r WHERE run_id = $run AND id = $id')
+      .run({ $r: 1005, $run: DEFAULT_RUN_ID, $id: 'other' });
+
+    await runExecutor({
+      db: db!, flow, now: () => clock, adapter: neverModel, io, harnessRegistry: registry,
+    } as RunEngineArgs);
+
+    expect(getCard(db)?.lane).toBe('done');
+    const { spans } = db!.getHarnessTimingsForRun(DEFAULT_RUN_ID);
+    const makerSpan = spans.find((s) => s.role === 'maker');
+    const criticSpan = spans.find((s) => s.role === 'critic');
+    expect(makerSpan?.readyWaiting).toBe(0);
+    expect(criticSpan?.readyWaiting).toBe(1);
+  });
+});
