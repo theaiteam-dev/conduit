@@ -624,6 +624,56 @@ describe('runExecutor skip_when: concurrent claim during a hold decision', () =>
   });
 });
 
+// ---------------------------------------------------------------------------
+// Corrupt row regression (issue #32): applySkipWhen's candidate SELECT reads
+// owned_paths straight off the row before evaluateSkipWhen ever runs. A
+// corrupt column there must hold the one card, not throw out of applySkipWhen
+// and abort the whole tick loop the way parseColumn's rethrown SyntaxError
+// would otherwise do.
+// ---------------------------------------------------------------------------
+
+describe('runExecutor skip_when: corrupt owned_paths column', () => {
+  it('holds the card instead of throwing when owned_paths is corrupt JSON', async () => {
+    db = openFreshDb();
+    const seedDir = ownedDir('item', { name: 'item', no_test_needed: true });
+    seedCard(db, { id: 'item', lane: 'write_tests', owned_paths: [seedDir] });
+
+    // Corrupt the column directly in the state DB — not something insertCard
+    // would ever write, but exactly what a corrupt row looks like to
+    // applySkipWhen's candidate SELECT.
+    db.getStateDb()
+      .prepare("UPDATE cards SET owned_paths = '{not json' WHERE run_id = $runId AND id = $id")
+      .run({ $runId: DEFAULT_RUN_ID, $id: 'item' });
+
+    const adapter: ModelAdapter = {
+      async call(): Promise<ModelResponse> {
+        throw new Error('worker must not run: the card is a hold candidate, not a dispatch candidate');
+      },
+    };
+
+    // No throw out of runExecutor: if parseColumn's SyntaxError still
+    // propagated out of applySkipWhen, this await would reject.
+    await run(setupMemoFlow(projectDir), adapter);
+
+    // owned_paths is still corrupt on this row, so card()/db.getCard (which
+    // also runs it through parseColumn) would throw here too — read lane and
+    // status straight off the row instead.
+    const row = db
+      .getStateDb()
+      .prepare('SELECT lane, status FROM cards WHERE run_id = $runId AND id = $id')
+      .get({ $runId: DEFAULT_RUN_ID, $id: 'item' }) as { lane: string; status: string };
+    expect(row.lane).toBe('write_tests');
+    expect(row.status).toBe('held');
+
+    const reasonFor = (id: string): string => {
+      const t = db!.getCardLogForRun(DEFAULT_RUN_ID, id).find((e) => e.kind === 'terminal');
+      return t?.kind === 'terminal' ? t.reason : '';
+    };
+    expect(reasonFor('item')).toContain('skip_when');
+    expect(reasonFor('item')).toContain('owned_paths');
+  });
+});
+
 describe('runExecutor skip_when: memoized run decisions', () => {
   it('evaluates a run decision once, not on every tick a wip cap keeps it waiting', async () => {
     db = openFreshDb();

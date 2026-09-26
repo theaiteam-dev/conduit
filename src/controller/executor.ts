@@ -4953,9 +4953,27 @@ function applySkipWhen(args: ApplySkipWhenArgs): boolean {
     const { id, attempt } = row;
     const stationId = row.lane;
     // Reuse getCard's own owned_paths parsing (persistence/db.ts parseColumn)
-    // rather than duplicating the JSON.parse/error-wrapping here.
-    const ownedPaths = parseColumn(id, 'owned_paths', row.owned_paths) as string[];
+    // rather than duplicating the JSON.parse/error-wrapping here. parseColumn
+    // rethrows SyntaxError on malformed JSON, and a corrupt owned_paths column
+    // must not propagate out of applySkipWhen and abort the whole tick loop —
+    // it holds this one card the same way an unreadable predicate does, below.
+    let ownedPaths: string[];
+    try {
+      ownedPaths = parseColumn(id, 'owned_paths', row.owned_paths) as string[];
+    } catch (parseErr) {
+      const detail = parseErr instanceof Error ? parseErr.message : String(parseErr);
+      const held = withVerifiedReadyCard(stateDb, runId, id, { lane: stationId, attempt }, () => {
+        escalateToHold(stateDb, db, id, stationId, { lane: stationId, attempt },
+          `skip_when at station '${stationId}': owned_paths could not be parsed: ${detail}`, err, runId);
+      });
+      if (held) changed = true;
+      continue;
+    }
 
+    // A corrupt row is never memoized: it cannot reach the 'run' branch below,
+    // so it can never populate `runMemo` — the ordering here (parse before the
+    // memo check) is unaffected by the try/catch above.
+    //
     // A card whose predicate already evaluated to 'run' is left
     // alone until it either dispatches (leaving 'ready', which drops it from
     // `rows` above) or reworks/moves to a new lane (a new memo key). No
