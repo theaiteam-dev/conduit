@@ -183,6 +183,35 @@ describe('source: output', () => {
     writeClassifyCheckpoint(1, { needs_tests: 0 });
     expect(evaluateSkipWhen(OUTPUT_PRED, ctx()).action).toBe('hold');
   });
+
+  it('holds instead of throwing when the checkpoint output_json is corrupt', () => {
+    // Bypass writeCheckpoint (which always stores valid JSON) to simulate a
+    // truncated/corrupt row, e.g. from a crash mid-write. readLatestCheckpoint
+    // still throws on JSON.parse (it has its own contract, matching
+    // readCheckpoint); evaluateSkipWhen must not let that throw escape the
+    // tick — the documented contract is that an unreadable predicate holds.
+    stateDb
+      .prepare(
+        `INSERT INTO checkpoints (run_id, flow, card, station, attempt, binding_stamp, output_json)
+         VALUES ($run_id, $flow, $card, $station, $attempt, $stamp, $output)`,
+      )
+      .run({
+        $run_id: 'run-1',
+        $flow: '1',
+        $card: 'c1',
+        $station: 'classify',
+        $attempt: 0,
+        $stamp: 'stamp-0',
+        $output: '{ not valid json',
+      });
+
+    const decision = evaluateSkipWhen(OUTPUT_PRED, ctx());
+    expect(decision.action).toBe('hold');
+    if (decision.action === 'hold') {
+      expect(decision.reason).toContain('classify');
+      expect(decision.reason).toContain('c1');
+    }
+  });
 });
 
 describe('describeSkipWhen', () => {

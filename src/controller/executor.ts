@@ -404,6 +404,9 @@ export async function runExecutor(args: RunEngineArgs): Promise<void> {
   let lastAdapterActivityAt = runStartedAt;
   let halted = false;
   let andonTripped = false;
+  // skip_when (issue #32): 'run' decisions memoized for the lifetime of this
+  // runExecutor call, keyed by (card, lane, attempt) — see applySkipWhen.
+  const skipWhenRunMemo = new Set<string>();
 
   // Pool mode: real out-of-process workers report MARK_DONE asynchronously over
   // IPC (vs. the synchronous in-process path). Both seams must be wired.
@@ -720,7 +723,7 @@ export async function runExecutor(args: RunEngineArgs): Promise<void> {
     // re-enter the loop: the promote step readies a skipped card at its next
     // lane, and planning now would find nothing to dispatch for it and read
     // the run as stalled.
-    if (applySkipWhen({ db, stateDb, runId, flow, happyPathNext, terminalLanes, maxExecutionAttempts, now: currentNow, err: io.err })) {
+    if (applySkipWhen({ db, stateDb, runId, flow, happyPathNext, terminalLanes, maxExecutionAttempts, now: currentNow, err: io.err, runMemo: skipWhenRunMemo })) {
       lastLaneChangeAt = currentNow;
       continue;
     }
@@ -4835,6 +4838,21 @@ interface ApplySkipWhenArgs {
   maxExecutionAttempts: number;
   now: number;
   err: (msg: string) => void;
+  /**
+   * 'run' decisions memoized for the lifetime of the runExecutor call, keyed
+   * by `${cardId}\0${lane}\0${attempt}` (issue #32). A card whose predicate
+   * evaluated to 'run' but that planTick could not dispatch this tick (WIP
+   * cap, busy station) would otherwise re-read seed.json or re-query the
+   * upstream checkpoint on every later tick until it is finally claimed. Only
+   * 'run' is memoized: 'skip' and 'hold' both move the card out of 'ready',
+   * so neither can recur for the same key. A new execution attempt (rework)
+   * or a new lane is a fresh key, so it gets a fresh evaluation.
+   */
+  runMemo: Set<string>;
+}
+
+function skipWhenMemoKey(cardId: string, lane: string, attempt: number): string {
+  return `${cardId}\u0000${lane}\u0000${attempt}`;
 }
 
 /**
@@ -4846,13 +4864,17 @@ interface ApplySkipWhenArgs {
  *     The station never runs, so there is no claim, no worker, no checkpoint,
  *     and no counter change. The card_log gets an entered_lane row
  *     (reasonClass 'skip') and a 'skip' row naming the predicate and value.
- *   - run:  leave the card for planTick to dispatch.
+ *   - run:  leave the card for planTick to dispatch. Memoized in `runMemo` so
+ *     a card waiting several ticks for dispatch is evaluated once, not once
+ *     per tick.
  *   - hold: hold the card in place with a terminal reason (escalate ambiguity).
  *
- * Returns true when any card changed state.
+ * Returns true when any card actually changed state (transitioned or held) —
+ * a card whose predicate lost a race against a concurrent state change (see
+ * the write-lock re-check below) does not count.
  */
 function applySkipWhen(args: ApplySkipWhenArgs): boolean {
-  const { db, stateDb, runId, flow, happyPathNext, terminalLanes, maxExecutionAttempts, now, err } = args;
+  const { db, stateDb, runId, flow, happyPathNext, terminalLanes, maxExecutionAttempts, now, err, runMemo } = args;
   const skipStations = Object.keys(flow.stations).filter((id) => flow.stations[id]!.skip_when !== undefined);
   if (skipStations.length === 0) return false;
 
@@ -4872,6 +4894,14 @@ function applySkipWhen(args: ApplySkipWhenArgs): boolean {
     const card = db.getCard(runId, id);
     if (!card) continue;
     const stationId = card.lane;
+
+    // A card whose predicate already evaluated to 'run' is left
+    // alone until it either dispatches (leaving 'ready', which drops it from
+    // `rows` above) or reworks/moves to a new lane (a new memo key). No
+    // re-read of seed.json or the upstream checkpoint on the ticks in between.
+    const memoKey = skipWhenMemoKey(id, stationId, card.attempt);
+    if (runMemo.has(memoKey)) continue;
+
     const pred = flow.stations[stationId]!.skip_when!;
     const predicate = describeSkipWhen(pred);
     const decision = evaluateSkipWhen(pred, {
@@ -4881,12 +4911,15 @@ function applySkipWhen(args: ApplySkipWhenArgs): boolean {
       card: { id, owned_paths: card.owned_paths },
     });
 
-    if (decision.action === 'run') continue;
-    changed = true;
+    if (decision.action === 'run') {
+      runMemo.add(memoKey);
+      continue;
+    }
 
     if (decision.action === 'hold') {
       escalateToHold(stateDb, db, id, stationId, card,
         `skip_when ${predicate} could not be evaluated: ${decision.reason}`, err, runId);
+      changed = true;
       continue;
     }
 
@@ -4898,39 +4931,64 @@ function applySkipWhen(args: ApplySkipWhenArgs): boolean {
     );
     if (!result.ok) {
       escalateToHold(stateDb, db, id, stationId, card, `FSM illegal_transition on SKIP for station '${stationId}'`, err, runId);
+      changed = true;
       continue;
     }
     const nextLane = result.next.lane;
     const nextStatus = terminalLanes.has(nextLane) ? 'complete' : result.next.status;
 
-    // Journal-first, as advanceCard: a crash between these appends and the
-    // state commit leaves rows that INSERT OR IGNORE deduplicates on replay.
-    db.appendCardLog({
-      runId,
-      kind: 'entered_lane',
-      cardId: id,
-      station: stationId,
-      attempt: card.attempt,
-      sourceLane: stationId,
-      destLane: nextLane,
-      reasonClass: 'skip',
-    });
-    db.appendCardLog({
-      runId,
-      kind: 'skip',
-      cardId: id,
-      station: stationId,
-      attempt: card.attempt,
-      reason: `skip_when ${predicate} matched (read ${JSON.stringify(decision.value)})`,
-    });
-    // attempt and rework_count are deliberately not written: SKIP moves
-    // neither counter. The status guard keeps a concurrent change from being
-    // overwritten.
+    // Take the state-db write lock BEFORE journaling. A
+    // `BEGIN IMMEDIATE` transaction serializes against any other writer
+    // targeting this row, and re-reading status inside it catches a
+    // concurrent change (another writer claimed/held/moved the card between
+    // the SELECT at the top of this function and here) before anything is
+    // written — a lost race now leaves no card_log trace of a lane move that
+    // never happened, instead of journaling one ahead of a guarded UPDATE
+    // that then silently affects zero rows. The card_log's own append stays
+    // journal-first relative to the state commit (as advanceCard documents:
+    // a crash between the two leaves a phantom entry INSERT OR IGNORE
+    // deduplicates on replay); the journal DB is a separate SQLite file, so
+    // this transaction's lock only covers the state DB, which is exactly the
+    // resource the race is over.
+    let committed = false;
     stateDb
-      .prepare(
-        "UPDATE cards SET lane = $lane, status = $status WHERE run_id = $runId AND id = $id AND status = 'ready'",
-      )
-      .run({ $lane: nextLane, $status: nextStatus, $runId: runId, $id: id });
+      .transaction(() => {
+        const current = stateDb
+          .prepare("SELECT status FROM cards WHERE run_id = $runId AND id = $id")
+          .get({ $runId: runId, $id: id }) as { status: string } | undefined;
+        if (current === undefined || current.status !== 'ready') return; // lost the race — no-op, no journal
+
+        db.appendCardLog({
+          runId,
+          kind: 'entered_lane',
+          cardId: id,
+          station: stationId,
+          attempt: card.attempt,
+          sourceLane: stationId,
+          destLane: nextLane,
+          reasonClass: 'skip',
+        });
+        db.appendCardLog({
+          runId,
+          kind: 'skip',
+          cardId: id,
+          station: stationId,
+          attempt: card.attempt,
+          reason: `skip_when ${predicate} matched (read ${JSON.stringify(decision.value)})`,
+        });
+        // attempt and rework_count are deliberately not written: SKIP moves
+        // neither counter. The status guard is redundant with the re-check
+        // above (both run inside the same BEGIN IMMEDIATE) but kept as
+        // defense in depth.
+        stateDb
+          .prepare(
+            "UPDATE cards SET lane = $lane, status = $status WHERE run_id = $runId AND id = $id AND status = 'ready'",
+          )
+          .run({ $lane: nextLane, $status: nextStatus, $runId: runId, $id: id });
+        committed = true;
+      })
+      .immediate();
+    if (committed) changed = true;
   }
   return changed;
 }

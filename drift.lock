@@ -8,7 +8,7 @@ sig = "c589b70ef7bb72cd"
 [[bindings]]
 doc = "CLAUDE.md"
 target = "src/controller/executor.ts#runExecutor"
-sig = "76e3574f6a842537"
+sig = "43112be9f57e7183"
 
 [[bindings]]
 doc = "CLAUDE.md"
@@ -28,7 +28,7 @@ sig = "ab2bcfcf7bc19f36"
 [[bindings]]
 doc = "SPEC.md"
 target = "src/flow/load.ts#validateSkipWhen"
-sig = "0cec4222e686b316"
+sig = "619f4e1b2b5dbf22"
 
 [[bindings]]
 doc = "SPEC.md"

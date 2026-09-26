@@ -333,6 +333,43 @@ export function readCheckpoint(db: Database, key: CheckpointKey): CheckpointReco
  * station), or null if the station has none. A `skip_when` predicate with
  * `source: output` reads its value here (issue #32): the attempt that last ran
  * the upstream transform is the one whose payload is current.
+ *
+ * Unlike readCheckpoint (used by decideResume), this does NOT compare the
+ * stored binding stamp against the current config — a deliberate omission,
+ * not an oversight (reviewed on issue #32). It is safe because:
+ *
+ *   1. invalidateCheckpoint DELETEs the row for the stamp-mismatched attempt;
+ *      it never marks a row stale in place. A row this query can select was
+ *      therefore never the invalidated payload — it is either the still-valid
+ *      checkpoint or nothing.
+ *   2. A card's `attempt` for a given station only ever increases (a rework
+ *      re-execution writes attempt+1; nothing reuses or decrements an attempt
+ *      number). So "highest surviving attempt" is monotonically the most
+ *      recent execution among the rows that still exist, never a superseded
+ *      one masquerading as current.
+ *   3. The loader's SKIP_WHEN_OUTPUTS_CONSUMED / INVALID_SKIP_WHEN rules
+ *      (flow/load.ts validateSkipWhen) require the named upstream station to
+ *      be a plain `transform` reachable via `next` before this station, so in
+ *      the ordinary (non-crash) path it has already run and checkpointed for
+ *      this card by the time this station's card is dispatchable — this
+ *      reader is not racing the upstream write. The loader's
+ *      SKIP_WHEN_READS_SKIPPABLE rule closes the remaining gap: it rejects a
+ *      predicate whose named upstream station itself declares `skip_when`, so
+ *      that station can never be skipped on some later pass and leave this
+ *      reader picking up its checkpoint from an earlier one. Every row this
+ *      query can return was written by the upstream station actually running
+ *      for this card, never inherited from a pass where it was passed over.
+ *
+ * The one case where this can return an attempt *older* than the most recent
+ * one written is transient and harmless: if the newest attempt was just
+ * invalidated (cascade, on resume) and hasn't been re-executed yet, this
+ * returns the prior valid attempt's payload rather than null. That is not
+ * staleness a caller needs to guard against — the FSM does not let a
+ * downstream card become ready to evaluate a `source: output` predicate
+ * until this station's current attempt has completed and checkpointed again,
+ * so a `skip_when` evaluation can never actually observe that gap. See
+ * checkpoint.test.ts's "readLatestCheckpoint — invalidation cannot leak
+ * through" tests for the pinned behaviour in that gap.
  */
 export function readLatestCheckpoint(
   db: Database,

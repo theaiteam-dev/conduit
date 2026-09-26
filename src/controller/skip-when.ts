@@ -63,12 +63,23 @@ function readSeed(ctx: SkipEvalContext): DocumentRead {
 }
 
 function readOutput(ctx: SkipEvalContext, station: string): DocumentRead {
-  const record = readLatestCheckpoint(ctx.stateDb, {
-    run: ctx.runId,
-    flow: ctx.flowVersion,
-    card: ctx.card.id,
-    station,
-  });
+  // readLatestCheckpoint throws on a corrupt output_json (same contract as
+  // readCheckpoint — it does not swallow parse errors). A truncated row from
+  // a crash mid-write must not escape as an exception here: hold instead.
+  let record: ReturnType<typeof readLatestCheckpoint>;
+  try {
+    record = readLatestCheckpoint(ctx.stateDb, {
+      run: ctx.runId,
+      flow: ctx.flowVersion,
+      card: ctx.card.id,
+      station,
+    });
+  } catch (e) {
+    return {
+      ok: false,
+      reason: `station '${station}' checkpoint for card '${ctx.card.id}' is not valid JSON: ${(e as Error).message}`,
+    };
+  }
   if (record === null) {
     return { ok: false, reason: `station '${station}' has no checkpoint for card '${ctx.card.id}'` };
   }

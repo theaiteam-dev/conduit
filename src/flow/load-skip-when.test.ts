@@ -16,6 +16,12 @@
  *   - SKIP_WHEN_ON_REWORK_TARGET a gate's on_reject may not target the station:
  *                                the card would re-enter, skip again, and reach
  *                                the gate unchanged.
+ *   - SKIP_WHEN_READS_SKIPPABLE  a `source: output` predicate may not name a
+ *                                station that itself declares skip_when: a
+ *                                skipped station writes no checkpoint, so a
+ *                                pass where the upstream station skips would
+ *                                leave the reader looking at a stale checkpoint
+ *                                from an earlier pass.
  *
  * Every test drives the real loadFlow() against an inline flow.yaml.
  */
@@ -96,7 +102,7 @@ function chainYaml(opts: {
  * the `source: output` form. `classifyNext` lets a test put classify after the
  * skippable station instead.
  */
-function outputSourceYaml(opts: { skip: string; downstreamClassify?: boolean }): string {
+function outputSourceYaml(opts: { skip: string; downstreamClassify?: boolean; classifySkipWhen?: string }): string {
   const classify = [
     '  - id: classify',
     '    worker:',
@@ -109,6 +115,7 @@ function outputSourceYaml(opts: { skip: string; downstreamClassify?: boolean }):
     '          - { name: needs_tests, type: boolean, required: true }',
     '          - { name: notes, type: string, required: false }',
     '    inputs: [seed.json]',
+    ...(opts.classifySkipWhen !== undefined ? [opts.classifySkipWhen] : []),
   ];
   const writeTests = [
     '  - id: write_tests',
@@ -294,5 +301,29 @@ describe('SKIP_WHEN_ON_REWORK_TARGET', () => {
     );
     expect(codes(result)).toContain('SKIP_WHEN_ON_REWORK_TARGET');
     expect(messages(result)).toContain('implement');
+  });
+});
+
+describe('SKIP_WHEN_READS_SKIPPABLE', () => {
+  it('rejects a source: output predicate naming a station that itself declares skip_when', () => {
+    const result = loadInline(
+      outputSourceYaml({
+        skip: '    skip_when: { source: output, station: classify, field: needs_tests, equals: false }',
+        classifySkipWhen: '    skip_when: { source: seed, field: precomputed, equals: true }',
+      }),
+    );
+    expect(codes(result)).toContain('SKIP_WHEN_READS_SKIPPABLE');
+    expect(messages(result)).toContain('classify');
+    expect(messages(result)).toContain('write_tests');
+  });
+
+  it('accepts a source: output predicate naming a station with no skip_when of its own', () => {
+    expectOk(
+      loadInline(
+        outputSourceYaml({
+          skip: '    skip_when: { source: output, station: classify, field: needs_tests, equals: false }',
+        }),
+      ),
+    );
   });
 });

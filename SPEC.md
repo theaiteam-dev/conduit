@@ -425,8 +425,10 @@ declare a predicate that lets the kernel pass a card straight through to the sta
   `owned_paths[0]`, written at fan-out, §9).
 - **`source: output`** (with `station: <id>`) reads a top-level field of the payload that
   an upstream `transform` station produced for the same card, from that station's latest
-  checkpoint (§5). The station must declare the field in its `output_schema` and must
-  reach this station through its `next` chain.
+  checkpoint (§5). The station must declare the field in its `output_schema`, must reach
+  this station through its `next` chain, and must not itself declare `skip_when`: a
+  skipped station writes no checkpoint, so on a pass where it skips, the read would return
+  its checkpoint from an earlier pass instead of the current one.
 - **`equals`** is a string, number or boolean. The comparison is strict equality, with no
   coercion.
 
@@ -445,6 +447,7 @@ The loader rejects:
 | `SKIP_WHEN_WITHOUT_NEXT` | the station declares no `next` to skip to |
 | `SKIP_WHEN_OUTPUTS_CONSUMED` | another station lists one of this station's `outputs` in its `inputs`; a skipped station writes none of them |
 | `SKIP_WHEN_ON_REWORK_TARGET` | a `check.on_reject` targets this station; the card would skip again and return to the gate unchanged |
+| `SKIP_WHEN_READS_SKIPPABLE` | a `source: output` predicate names a station that itself declares `skip_when`; a pass where that station skips would leave the reader looking at a stale checkpoint from an earlier pass |
 
 ---
 
@@ -603,7 +606,11 @@ output, so there is nothing to stamp or replay. Resume needs no way to tell "ski
 from "not yet run", because a skipped card has already left the station's lane and the
 `card_log` records the skip. The loader's `SKIP_WHEN_OUTPUTS_CONSUMED` rule means no
 downstream station's `resolved_input_artifact_hashes` can depend on a skipped station's
-outputs, so cascade invalidation is unaffected.
+outputs, so cascade invalidation is unaffected. A `skip_when: { source: output }`
+predicate reads a checkpoint directly rather than through `resolved_input_artifact_hashes`,
+so the same gap reopens there: the loader's `SKIP_WHEN_READS_SKIPPABLE` rule closes it by
+rejecting a predicate that names a station which itself declares `skip_when`, since that
+station's checkpoint would go stale, not absent, once it skips.
 
 ### Effectful stations (rev-1 C3 — side effects aren't pure)
 Effectfulness is orthogonal to `kind` (§4): a pure `transform` critic skips everything in

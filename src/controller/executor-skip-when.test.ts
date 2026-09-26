@@ -18,7 +18,7 @@
  * whose prompt renders {{seed.json}}, so every adapter call records which card
  * it ran for.
  */
-import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
+import { describe, it, expect, beforeEach, afterEach, spyOn } from 'bun:test';
 import { join } from 'node:path';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -380,5 +380,160 @@ describe('runExecutor skip_when: upstream transform output', () => {
     expect(checkpointCount('item', 'write_tests')).toBe(1);
     expect(card('item').lane).toBe('done');
     expect(db.getCardLogForRun(DEFAULT_RUN_ID, 'item').some((e) => e.kind === 'skip')).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Race regression: a concurrent writer can change a card's status
+// between applySkipWhen's top-of-function SELECT and the guarded UPDATE that
+// commits a SKIP. The fix takes the state-db write lock (BEGIN IMMEDIATE) and
+// re-reads status inside it before journaling anything.
+// ---------------------------------------------------------------------------
+
+describe('runExecutor skip_when: concurrent status change', () => {
+  it('does not journal a skip when the card is no longer ready by the time the write lock is taken', async () => {
+    db = openFreshDb();
+    seedCard(db, { id: 'item', lane: 'classify' });
+    const calls: string[] = [];
+
+    // outputAdapter(false, ...) makes classify's payload match write_tests's
+    // skip_when, so the card is a skip candidate once it reaches write_tests.
+    const database = db;
+    const originalGetCard = database.getCard.bind(database);
+    let intercepted = false;
+    const getCardSpy = spyOn(database, 'getCard').mockImplementation((runId: string, id: string) => {
+      const found = originalGetCard(runId, id);
+      // This is the exact read applySkipWhen does for its skip candidate: the
+      // card is at write_tests and still 'ready'. Fire once, simulating
+      // another writer (e.g. a second process sharing the state DB) claiming
+      // the card in the window between that read and applySkipWhen's commit —
+      // both the status flip and the active_workers row a real claim would
+      // also write, so the only thing under test is applySkipWhen's own
+      // guard, not an unrelated "claimed with no worker" contradiction.
+      if (!intercepted && found && found.lane === 'write_tests' && found.status === 'ready') {
+        intercepted = true;
+        database
+          .getStateDb()
+          .prepare("UPDATE cards SET status = 'claimed' WHERE run_id = $runId AND id = $id")
+          .run({ $runId: DEFAULT_RUN_ID, $id: id });
+        database
+          .getStateDb()
+          .prepare(
+            "INSERT INTO active_workers (run_id, card_id, station, worker_id, started_at, lease_until) " +
+              "VALUES ($runId, $id, 'write_tests', 'other-writer', 0, 999999999)",
+          )
+          .run({ $runId: DEFAULT_RUN_ID, $id: id });
+      }
+      return found;
+    });
+
+    // The card is now genuinely claimed by "someone else": planTick has
+    // nothing left to do for it and the run halts on the stall diagnostic
+    // (`stuckCount > 0`) the very next tick — no need to wait out the
+    // liveness threshold, so the default frozen clock is fine here.
+    try {
+      await run(setupOutputFlow(projectDir), outputAdapter(false, calls));
+    } finally {
+      getCardSpy.mockRestore();
+    }
+
+    expect(intercepted).toBe(true);
+
+    // Neither card_log row for the never-happened move was written.
+    const log = db.getCardLogForRun(DEFAULT_RUN_ID, 'item');
+    expect(log.some((e) => e.kind === 'skip')).toBe(false);
+    expect(log.some((e) => e.kind === 'entered_lane' && e.sourceLane === 'write_tests')).toBe(false);
+
+    // The card is exactly where the simulated concurrent writer left it — the
+    // guarded UPDATE inside applySkipWhen must not have touched it.
+    expect(card('item').lane).toBe('write_tests');
+    expect(card('item').status).toBe('claimed');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Memoized 'run' decisions: a card whose predicate evaluates to
+// 'run' but that a wip cap keeps waiting must not have its seed.json (or
+// upstream checkpoint) re-read on every later tick.
+// ---------------------------------------------------------------------------
+
+function setupMemoFlow(dir: string): FlowConfig {
+  mkdirSync(join(dir, 'prompts'), { recursive: true });
+  writeFileSync(join(dir, 'prompts', 'tests.md'), 'Write tests for {{seed.json}}');
+  writeFileSync(
+    join(dir, 'flow.yaml'),
+    `
+flow: skip-when-memo
+project_root: .
+flow_version: 1
+budgets:
+  run: { wall_clock_minutes: 10, max_tokens: 100000 }
+  per_card: { max_execution_attempts: 4 }
+  liveness: { no_progress_minutes: 3 }
+defaults: { cap_policy: scrap, on_dep_scrap: hold }
+terminal_lanes: [done, scrap, hold]
+stations:
+  - id: write_tests
+    worker:
+      kind: transform
+      model: ${MODEL}
+      prompt_file: prompts/tests.md
+      prompt_version: "1"
+      output_schema:
+        fields:
+          - { name: ok, type: boolean, required: true }
+    inputs: [seed.json]
+    outputs: [tests.json]
+    output_scope: owned_dir
+    wip: 1
+    skip_when: { source: seed, field: no_test_needed, equals: true }
+    next: done
+`,
+  );
+  return loadOk(dir);
+}
+
+describe('runExecutor skip_when: memoized run decisions', () => {
+  it('evaluates a run decision once, not on every tick a wip cap keeps it waiting', async () => {
+    db = openFreshDb();
+    const seedDirs: Record<string, string> = {
+      c1: ownedDir('c1', { name: 'c1', no_test_needed: false }),
+      c2: ownedDir('c2', { name: 'c2', no_test_needed: false }),
+    };
+    seedCard(db, { id: 'c1', lane: 'write_tests', owned_paths: [seedDirs.c1!] });
+    seedCard(db, { id: 'c2', lane: 'write_tests', owned_paths: [seedDirs.c2!] });
+
+    // wip: 1 forces one of these two ready cards to wait behind the other.
+    // Whichever dispatches first, mutate the OTHER's seed.json — while it
+    // still sits 'ready' — to a value that skip_when would now match. If the
+    // waiting card's 'run' decision were re-evaluated on the tick it finally
+    // gets its turn, it would skip instead of running.
+    const calls: string[] = [];
+    let mutated = false;
+    const adapter: ModelAdapter = {
+      async call(req: ModelCall): Promise<ModelResponse> {
+        calls.push(req.prompt);
+        if (!mutated) {
+          mutated = true;
+          const loser = req.prompt.includes('"c1"') ? 'c2' : 'c1';
+          writeFileSync(join(seedDirs[loser]!, 'seed.json'), JSON.stringify({ name: loser, no_test_needed: true }), 'utf-8');
+        }
+        return response({ ok: true });
+      },
+    };
+
+    await run(setupMemoFlow(projectDir), adapter);
+
+    // Both cards ran the station — neither's memoized 'run' decision was
+    // reconsidered after the mutation.
+    expect(calls.some((p) => p.includes('"c1"'))).toBe(true);
+    expect(calls.some((p) => p.includes('"c2"'))).toBe(true);
+    expect(checkpointCount('c1', 'write_tests')).toBe(1);
+    expect(checkpointCount('c2', 'write_tests')).toBe(1);
+    for (const id of ['c1', 'c2']) {
+      expect(db.getCardLogForRun(DEFAULT_RUN_ID, id).some((e) => e.kind === 'skip')).toBe(false);
+      expect(card(id).lane).toBe('done');
+      expect(card(id).status).toBe('complete');
+    }
   });
 });

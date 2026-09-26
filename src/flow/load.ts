@@ -1911,6 +1911,10 @@ function copySkipWhen(raw: SkipWhenConfig): SkipWhenConfig {
  *   - SKIP_WHEN_ON_REWORK_TARGET: a gate that sends a card back here would get
  *     it back unchanged, and the no-progress guard would scrap it after a
  *     wasted rework cycle.
+ *   - SKIP_WHEN_READS_SKIPPABLE: a `source: output` predicate names a station
+ *     that itself declares skip_when. A skipped station writes no checkpoint,
+ *     so readLatestCheckpoint would return that station's older checkpoint on
+ *     a pass where it skips, and the predicate would decide on stale data.
  */
 function validateSkipWhen(stations: readonly RawStation[]): FlowValidationError[] {
   const errors: FlowValidationError[] = [];
@@ -1944,7 +1948,7 @@ function validateSkipWhen(stations: readonly RawStation[]): FlowValidationError[
           invalid('must declare equals as a string, number or boolean');
         }
         if (source === 'output') {
-          validateOutputSource(station, block['station'], field, byId, invalid);
+          validateOutputSource(station, block['station'], field, byId, errors, invalid);
         }
       }
     }
@@ -1990,6 +1994,7 @@ function validateOutputSource(
   sourceStation: unknown,
   field: unknown,
   byId: ReadonlyMap<string, RawStation>,
+  errors: FlowValidationError[],
   invalid: (why: string) => void,
 ): void {
   if (typeof sourceStation !== 'string' || sourceStation.length === 0) {
@@ -2008,6 +2013,20 @@ function validateOutputSource(
   const schemaFields = upstream.worker?.output_schema?.fields ?? [];
   if (typeof field === 'string' && !schemaFields.some((f) => f.name === field)) {
     invalid(`reads field '${field}', which station '${sourceStation}' does not declare in its output_schema`);
+  }
+  // A station whose skip_when is itself skippable writes no checkpoint on a
+  // pass where it skips, so readLatestCheckpoint would hand the reader a
+  // stale checkpoint from an earlier pass instead of a missing one it could
+  // detect. Reject the pairing at load rather than let it decide on stale data.
+  if (upstream.skip_when !== undefined) {
+    errors.push({
+      code: 'SKIP_WHEN_READS_SKIPPABLE',
+      message:
+        `Station '${station.id}' skip_when reads station '${sourceStation}', which itself declares ` +
+        `skip_when. A skipped station writes no checkpoint, so a pass where '${sourceStation}' skips ` +
+        `would leave '${station.id}' reading a stale checkpoint from an earlier pass instead of ` +
+        `current data.`,
+    });
   }
   // Walk the forward `next` chain from the source. It is acyclic once
   // CYCLIC_NEXT passes; the visited set keeps this loop finite when it does not.
