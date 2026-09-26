@@ -80,6 +80,38 @@ time. The flag cannot exceed a station's WIP. The harness raises `ideate.wip` to
 10 so the flag is what binds; in a real flow, set the station `wip` to the
 parallelism you actually want to allow.
 
+## Gotcha: harness stations run one card at a time
+
+`--concurrency K` parallelises two kinds of station: plain pure `deterministic`
+stations (the out-of-process worker pool) and plain `transform` stations
+(overlapping in-process model calls). A `kind: harness` station is neither. It
+runs on the synchronous path: the kernel awaits the agent CLI call and
+dispatches no other card until it returns, whatever K and the station `wip` are
+set to. A harness station with a `check:` gate is excluded a second time,
+because the critic call, the per-gate rework counter and the back-edge
+transition are serial in-process logic (SPEC §6). A pipeline of gated harness
+stations therefore runs one agent call at a time. This costs wall clock only;
+token spend and per-call context size do not change.
+
+To see what it cost a finished run, run `conduit run status --run <id>`. For a
+run with harness calls it prints, per harness station, the call count, the
+summed call duration and its share of the run's wall clock, and the
+card-seconds other ready cards spent waiting behind those calls:
+
+```text
+run job-1: terminal (outcome=complete)
+harness occupancy (serial under any --concurrency; run wall clock 100.0s):
+  research: 2 maker + 1 critic call(s), busy 60.0s (60.0% of wall clock), other ready cards waited 70.0 card-s
+  total: busy 60.0s (60.0% of wall clock)
+```
+
+Run wall clock is `runs.created_at` to the run's newest journal row, in whole
+seconds, and includes any time a resumed run spent stopped. The waiting figure
+counts every ready card, including ones a station `wip` cap would have held back
+anyway, so it is an upper bound on what overlap could recover. Calls journaled
+before this report existed carry no waiting sample and are listed as not
+sampled.
+
 ## What this validates
 
 - The event-driven worker pool is wired into the production binary (`cmdRun` /

@@ -549,6 +549,23 @@ export interface StoredJournalSpan {
   agentSha256?: string | null;
 }
 
+/** One harness span's timing, as read by getHarnessTimingsForRun. */
+export interface HarnessSpanTiming {
+  station: string;
+  /** 'maker' for `<station>.harness`, 'critic' for `<station>.harness-critic`. */
+  role: 'maker' | 'critic';
+  durationMs: number | null;
+  /** Other dispatchable cards when the call started; null when not recorded. */
+  readyWaiting: number | null;
+}
+
+/** A run's harness span timings plus the time of its newest journal row. */
+export interface HarnessTimings {
+  spans: HarnessSpanTiming[];
+  /** Epoch seconds of the run's newest journal row; null when there is none. */
+  lastSpanAt: number | null;
+}
+
 /** The typed DB handle every caller interacts with. */
 // ---------------------------------------------------------------------------
 // Ingress log types (WI-404)
@@ -833,6 +850,14 @@ export interface ConduitDB {
    * flow attributes a subflow child's spend into its own budgets from this.
    */
   getRunUsageTotals(runId: string): { tokens: number; costUsd: number };
+  /**
+   * Issue #30: every harness maker (`<station>.harness`) and harness critic
+   * (`<station>.harness-critic`) span of a run, with its duration, its
+   * `ready_waiting` sample (null on spans written before that attribute
+   * existed), plus the `created_at` of the run's newest journal row of any
+   * kind (null when the run has none). Read by run/harness-occupancy.ts.
+   */
+  getHarnessTimingsForRun(runId: string): HarnessTimings;
   /**
    * Append an ingress event outcome to the observability log (D5, FR-11).
    *
@@ -1280,6 +1305,36 @@ class ConduitDBImpl implements ConduitDB {
       )
       .get({ $run_id: runId }) as { tokens: number; cost_usd: number };
     return { tokens: row.tokens, costUsd: row.cost_usd };
+  }
+
+  getHarnessTimingsForRun(runId: string): HarnessTimings {
+    const rows = this.journalDb
+      .prepare(
+        `SELECT station, name, duration_ms,
+                json_extract(attributes_json, '$.ready_waiting') AS ready_waiting
+         FROM journal
+         WHERE run_id = $run_id
+           AND (name = station || '.harness' OR name = station || '.harness-critic')
+         ORDER BY id ASC`,
+      )
+      .all({ $run_id: runId }) as {
+        station: string;
+        name: string;
+        duration_ms: number | null;
+        ready_waiting: number | null;
+      }[];
+    const last = this.journalDb
+      .prepare('SELECT MAX(created_at) AS last FROM journal WHERE run_id = $run_id')
+      .get({ $run_id: runId }) as { last: number | null };
+    return {
+      spans: rows.map((row) => ({
+        station: row.station,
+        role: row.name.endsWith('.harness-critic') ? ('critic' as const) : ('maker' as const),
+        durationMs: row.duration_ms,
+        readyWaiting: typeof row.ready_waiting === 'number' ? row.ready_waiting : null,
+      })),
+      lastSpanAt: last.last,
+    };
   }
 
   getJournalSpansForRun(runId: string, cardId: string): StoredJournalSpan[] {
