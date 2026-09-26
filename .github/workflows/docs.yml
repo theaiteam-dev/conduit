@@ -13,7 +13,7 @@
 # in test.yml by name, and reusing it would fold this advisory job into the
 # required gate (the same constraint blackbox.yml documents).
 #
-# Burn-in-then-promote, matching blackbox.yml: run advisory-only for roughly
+# Burn-in-then-promote, the path blackbox.yml took: run advisory-only for roughly
 # 2 weeks / ~50 PRs, including at least ONE drift version bump, before
 # considering promotion to a required check. The version bump matters more here
 # than elsewhere: `sig` is an AST fingerprint, so if drift changes how it

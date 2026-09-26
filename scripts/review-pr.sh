@@ -262,8 +262,11 @@ tests_rc=${PIPESTATUS[0]}
 set -e
 (( tests_rc == 0 )) || failed+=(tests)
 
-note "black-box (network OFF, advisory)"
-sandbox none "$work" bun run test:blackbox || warn "blackbox failed — advisory, not a merge gate"
+# Warned, not added to `failed`: black-box is a required CI check, but the
+# base-commit attribution pass below covers `tests` only, so a sandbox-caused
+# failure here could not be told apart from one the pull request caused.
+note "black-box (network OFF)"
+sandbox none "$work" bun run test:blackbox || warn "blackbox failed — a required CI check; confirm against the PR's CI run"
 
 # ---------------------------------------------------------------------------
 # A red run is not yet a verdict. This suite exercises process-group reaping,

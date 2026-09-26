@@ -1,14 +1,21 @@
-# Black-box suite — separate, NOT a required check (DQ-3).
+# Black-box suite — a REQUIRED check, in its own workflow (DQ-3).
 #
-# This workflow runs blackbox/ against every PR for visibility, but it is
-# deliberately kept out of GitHub branch protection's required-check set.
-# The required gate is the `tests` job in test.yml only — this workflow must
-# never define a job named `tests`, or it would be folded into that gate.
+# The `main` ruleset requires two status checks by job name: `tests` (test.yml)
+# and `blackbox` (this file). Two constraints follow from matching by name:
 #
-# Burn-in-then-promote plan: run this suite as advisory-only (non-blocking)
-# for roughly 2 weeks / ~50 PRs to shake out flakiness and environment gaps
-# before it is considered for promotion to a required check. Once burn-in is
-# clean, a follow-up change flips branch protection to require this job too.
+#   - The job must stay named `blackbox`. Renaming it leaves the ruleset
+#     waiting on a check that never reports, which blocks every PR.
+#   - `pull_request` must stay unfiltered (no `paths:` / `branches:`). A
+#     required check whose workflow is skipped by a filter also never reports.
+#
+# It must also never define a job named `tests`, which the ruleset would read
+# as the test.yml gate.
+#
+# Burn-in record: added 2026-08-27 as advisory-only, with promotion planned
+# after roughly 2 weeks / ~50 PRs. By 2026-09-26 it had 50 runs: 48 passed and
+# the other 2 were fork PRs whose workflows were never approved, so no job ran
+# (every other `pull_request` workflow on those commits "failed" the same way).
+# No test in this suite failed during burn-in. Promoted to required then.
 name: Black-box
 
 on:
