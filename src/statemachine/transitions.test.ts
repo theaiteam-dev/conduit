@@ -339,6 +339,56 @@ describe('provider rate limit', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Issue #32: SKIP. A station's `skip_when` predicate matched, so the card
+// passes to the station's declared `next` without the station running.
+// ---------------------------------------------------------------------------
+
+describe('skip (issue #32)', () => {
+  it('ready + SKIP → happyPathNext[lane], status waiting', () => {
+    const out = next(mkState({ lane: 'draft', status: 'ready' }), { type: 'SKIP' });
+    expect(out.lane).toBe('publish');
+    expect(out.status).toBe('waiting');
+  });
+
+  it('SKIP from the last station → (done, complete), mirroring INTEGRITY_PASS', () => {
+    const out = next(mkState({ lane: 'assemble', status: 'ready' }), { type: 'SKIP' });
+    expect(out.lane).toBe('done');
+    expect(out.status).toBe('complete');
+  });
+
+  it('touches neither the execution attempt nor the rework counter', () => {
+    const before = mkState({ lane: 'draft', status: 'ready', executionAttempt: 2, reworkCount: 1 });
+    const out = next(before, { type: 'SKIP' });
+    expect(out.executionAttempt).toBe(2);
+    expect(out.reworkCount).toBe(1);
+    expect(out.scrapReason).toBeUndefined();
+  });
+
+  it('is ILLEGAL on a lane with no happy-path entry', () => {
+    const result = transition(mkState({ lane: 'nowhere', status: 'ready' }), { type: 'SKIP' }, mkCtx());
+    expect(result.ok).toBe(false);
+  });
+
+  it('is ILLEGAL from every status other than ready', () => {
+    const others = [
+      'waiting',
+      'claimed',
+      'working',
+      'done_pending_ack',
+      'interrupted',
+      'held',
+      'awaiting_children',
+      'complete',
+      'scrapped',
+    ] as const;
+    for (const status of others) {
+      const result = transition(mkState({ lane: 'draft', status }), { type: 'SKIP' }, mkCtx());
+      expect(result.ok).toBe(false);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Finding #8 — recovery OUT of interrupted (SPEC §15 reconcile). Without this
 // an interrupted card is stranded — no legal `from` leaves the state.
 // ---------------------------------------------------------------------------
