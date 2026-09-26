@@ -33,7 +33,7 @@ sig = "9e1b191a9ef4e321"
 [[bindings]]
 doc = "SPEC.md"
 target = "src/statemachine/transitions.ts#transition"
-sig = "9c9dfb188f55fac8"
+sig = "42305bed0d797a53"
 
 [[bindings]]
 doc = "SPEC.md"
