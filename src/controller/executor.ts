@@ -41,6 +41,7 @@ import type { ModelAdapter } from '../worker/adapter';
 import { DEFAULT_RUN_ID, type ConduitDB, type JournalSpanInput, type JournalProvenance } from '../persistence/db';
 import type { FlowConfig, StationConfig, FanInPolicyConfig, StationOutput, Card } from '../types/kernel';
 import { planTick } from './tick';
+import { evaluateSkipWhen, describeSkipWhen } from './skip-when';
 import { attemptClaim, beginWork, renewLease, reconcile } from '../dispatch/claim';
 import { checkCommandAllowed, runDeterministic, deterministicCardEnv } from '../worker/deterministic';
 import { runTransformStation, coerciveParse, computeFindingsHash } from '../worker/transform';
@@ -711,6 +712,18 @@ export async function runExecutor(args: RunEngineArgs): Promise<void> {
     stateDb
       .prepare(`UPDATE cards SET status = 'ready' WHERE run_id = $runId AND status IN ('waiting', 'interrupted') AND lane NOT IN (${terminalPlaceholders})`)
       .run({ $runId: runId, ...terminalParams });
+
+    // ── skip_when (issue #32) ──────────────────────────────────────────────
+    // A ready card at a station that declares skip_when is evaluated before
+    // planTick sees it: a match moves it on through the FSM's SKIP event, an
+    // unreadable predicate holds it. Either way the card left 'ready', so
+    // re-enter the loop: the promote step readies a skipped card at its next
+    // lane, and planning now would find nothing to dispatch for it and read
+    // the run as stalled.
+    if (applySkipWhen({ db, stateDb, runId, flow, happyPathNext, terminalLanes, maxExecutionAttempts, now: currentNow, err: io.err })) {
+      lastLaneChangeAt = currentNow;
+      continue;
+    }
 
     // ── Count active workers ──────────────────────────────────────────────
     const { n: activeCount } = stateDb
@@ -4806,6 +4819,120 @@ function consumptionHaltMessage(reason: ConsumptionAndon['reason'], rateLimitRel
     `soonest release_at=${rateLimitReleaseAt} (${formatReleaseAt(rateLimitReleaseAt)}) — ` +
     `cards are untouched and the run is resumable after that time`
   );
+}
+
+// ---------------------------------------------------------------------------
+// skip_when (issue #32)
+// ---------------------------------------------------------------------------
+
+interface ApplySkipWhenArgs {
+  db: ConduitDB;
+  stateDb: Database;
+  runId: string;
+  flow: FlowConfig;
+  happyPathNext: Record<string, string | null>;
+  terminalLanes: Set<string>;
+  maxExecutionAttempts: number;
+  now: number;
+  err: (msg: string) => void;
+}
+
+/**
+ * Evaluate skip_when for every dispatchable card at a station that declares
+ * it (SPEC §3/§4). Dispatchable means what planTick means: status 'ready' and
+ * no future release_at. For each card:
+ *
+ *   - skip: fire SKIP through the FSM and move the card to the station's next.
+ *     The station never runs, so there is no claim, no worker, no checkpoint,
+ *     and no counter change. The card_log gets an entered_lane row
+ *     (reasonClass 'skip') and a 'skip' row naming the predicate and value.
+ *   - run:  leave the card for planTick to dispatch.
+ *   - hold: hold the card in place with a terminal reason (escalate ambiguity).
+ *
+ * Returns true when any card changed state.
+ */
+function applySkipWhen(args: ApplySkipWhenArgs): boolean {
+  const { db, stateDb, runId, flow, happyPathNext, terminalLanes, maxExecutionAttempts, now, err } = args;
+  const skipStations = Object.keys(flow.stations).filter((id) => flow.stations[id]!.skip_when !== undefined);
+  if (skipStations.length === 0) return false;
+
+  const lanePlaceholders = skipStations.map((_, i) => `$s${i}`).join(', ');
+  const laneParams = Object.fromEntries(skipStations.map((id, i) => [`$s${i}`, id]));
+  const rows = stateDb
+    .prepare(
+      `SELECT id FROM cards
+       WHERE run_id = $runId AND status = 'ready' AND lane IN (${lanePlaceholders})
+         AND (release_at IS NULL OR release_at <= $now)
+       ORDER BY id ASC`,
+    )
+    .all({ $runId: runId, $now: now, ...laneParams }) as Array<{ id: string }>;
+
+  let changed = false;
+  for (const { id } of rows) {
+    const card = db.getCard(runId, id);
+    if (!card) continue;
+    const stationId = card.lane;
+    const pred = flow.stations[stationId]!.skip_when!;
+    const predicate = describeSkipWhen(pred);
+    const decision = evaluateSkipWhen(pred, {
+      stateDb,
+      runId,
+      flowVersion: String(flow.version),
+      card: { id, owned_paths: card.owned_paths },
+    });
+
+    if (decision.action === 'run') continue;
+    changed = true;
+
+    if (decision.action === 'hold') {
+      escalateToHold(stateDb, db, id, stationId, card,
+        `skip_when ${predicate} could not be evaluated: ${decision.reason}`, err, runId);
+      continue;
+    }
+
+    const ctx = buildTransitionContext(stationId, flow, happyPathNext, terminalLanes, maxExecutionAttempts);
+    const result = transition(
+      { lane: stationId, status: 'ready', executionAttempt: card.attempt, reworkCount: REWORK_COUNT_UNREAD },
+      { type: 'SKIP' },
+      ctx,
+    );
+    if (!result.ok) {
+      escalateToHold(stateDb, db, id, stationId, card, `FSM illegal_transition on SKIP for station '${stationId}'`, err, runId);
+      continue;
+    }
+    const nextLane = result.next.lane;
+    const nextStatus = terminalLanes.has(nextLane) ? 'complete' : result.next.status;
+
+    // Journal-first, as advanceCard: a crash between these appends and the
+    // state commit leaves rows that INSERT OR IGNORE deduplicates on replay.
+    db.appendCardLog({
+      runId,
+      kind: 'entered_lane',
+      cardId: id,
+      station: stationId,
+      attempt: card.attempt,
+      sourceLane: stationId,
+      destLane: nextLane,
+      reasonClass: 'skip',
+    });
+    db.appendCardLog({
+      runId,
+      kind: 'skip',
+      cardId: id,
+      station: stationId,
+      attempt: card.attempt,
+      reason: `skip_when ${predicate} matched (read ${JSON.stringify(decision.value)})`,
+    });
+    // attempt and rework_count are deliberately not written: SKIP moves
+    // neither counter. The status guard keeps a concurrent change from being
+    // overwritten.
+    stateDb
+      .prepare(
+        "UPDATE cards SET lane = $lane, status = $status WHERE run_id = $runId AND id = $id AND status = 'ready'",
+      )
+      .run({ $lane: nextLane, $status: nextStatus, $runId: runId, $id: id });
+  }
+  return changed;
 }
 
 // ---------------------------------------------------------------------------

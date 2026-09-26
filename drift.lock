@@ -8,7 +8,7 @@ sig = "c589b70ef7bb72cd"
 [[bindings]]
 doc = "CLAUDE.md"
 target = "src/controller/executor.ts#runExecutor"
-sig = "fe6ba4592371d9df"
+sig = "76e3574f6a842537"
 
 [[bindings]]
 doc = "CLAUDE.md"
@@ -19,6 +19,16 @@ sig = "6fa2fa6c576b623e"
 doc = "SPEC.md"
 target = "src/checkpoint/checkpoint.ts#computeBindingStamp"
 sig = "c285309b07a9de1d"
+
+[[bindings]]
+doc = "SPEC.md"
+target = "src/controller/skip-when.ts#evaluateSkipWhen"
+sig = "ab2bcfcf7bc19f36"
+
+[[bindings]]
+doc = "SPEC.md"
+target = "src/flow/load.ts#validateSkipWhen"
+sig = "0cec4222e686b316"
 
 [[bindings]]
 doc = "SPEC.md"
@@ -43,4 +53,4 @@ sig = "ec86cf6e6cd93960"
 [[bindings]]
 doc = "docs/installation.md"
 target = "src/cli/main.ts"
-sig = "c9ca268de42a2f36"
+sig = "c52f9436ba9ecbda"

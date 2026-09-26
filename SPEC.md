@@ -598,6 +598,13 @@ cascades downstream** (any station whose `resolved_input_artifact_hashes` change
 also invalid). `flow_version` is pinned at run start; resuming against a different
 `flow.yaml` requires an explicit `--rebind` and re-validates every stamp.
 
+A station passed over by `skip_when` (§4) writes **no checkpoint**: it produced no
+output, so there is nothing to stamp or replay. Resume needs no way to tell "skipped"
+from "not yet run", because a skipped card has already left the station's lane and the
+`card_log` records the skip. The loader's `SKIP_WHEN_OUTPUTS_CONSUMED` rule means no
+downstream station's `resolved_input_artifact_hashes` can depend on a skipped station's
+outputs, so cascade invalidation is unaffected.
+
 ### Effectful stations (rev-1 C3 — side effects aren't pure)
 Effectfulness is orthogonal to `kind` (§4): a pure `transform` critic skips everything in
 this subsection; an effectful `transform` (image-gen) and an `agentic` coder both need it.
