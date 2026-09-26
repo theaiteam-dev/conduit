@@ -78,25 +78,34 @@ Whatever executes must not be writable by the thing executing it. Two compliant 
   filesystem**. A baked-in flow is not read-only by default: the generated Dockerfile
   copies it with `COPY --chown=conduit:conduit`, so the runtime user owns `/flow` and can
   rewrite it in the container's writable layer. Start the container with `--read-only`
-  (Quadlet: `ReadOnly=true`). Podman then mounts a tmpfs at `/tmp` by default; under
-  Docker, add `--tmpfs /tmp` yourself, because the engine creates temporary directories
-  there (for example, the per-invocation config directory for `claude-headless` config
-  isolation).
+  (Quadlet: `ReadOnly=true`). Podman then mounts a tmpfs at `/tmp` by default (leave
+  Quadlet's `ReadOnlyTmpfs=` at its default of `true`); under Docker, add `--tmpfs /tmp`
+  yourself. Without a writable `/tmp`, `claude-headless` config isolation fails with
+  `EROFS` when it creates its per-invocation config directory, and any station command
+  that uses `mktemp` fails.
 
 Either way, a compromised run cannot rewrite its own `flow.yaml`, prompts, or scripts to
 persist across the per-event fresh process. The **writable paths are the state volume**
 (`/data`) and the workspace volumes the constraints below require, nothing else.
 
-Two constraints in the current engine affect this rule:
+Three constraints in the current engine affect this rule:
 
 - With `defaults.workspace: per_run`, each run's workspace is created at
-  `<project_root>/.conduit/runs/<run-id>/`, inside the flow directory. A read-only flow directory,
-  mounted or baked in, therefore needs a writable volume mounted over `.conduit/runs` for
-  each served flow, plus
-  one for any other path the flow writes. Station `command`/`args` resolve relative to that
-  workspace, so the runs root cannot simply be moved elsewhere
+  `<project_root>/.conduit/runs/<run-id>/`, inside the flow directory. A read-only flow
+  directory, mounted or baked in, therefore needs a writable volume mounted over
+  `.conduit/runs` for each served flow, plus one for any other path the flow writes.
+  Station `command`/`args` resolve relative to that workspace, so the runs root cannot
+  simply be moved elsewhere
   ([#56](https://github.com/theaiteam-dev/conduit/issues/56),
   [#54](https://github.com/theaiteam-dev/conduit/issues/54)).
+- Under Docker, the `.conduit/runs` volume must be writable by the `conduit` user. If the
+  directory does not exist in the image, Docker creates the mount point owned by root and
+  every run fails with `EACCES: permission denied, mkdir '/flow/.conduit/runs/<run-id>'`.
+  For a baked-in flow, create `.conduit/runs/` in the flow directory before `conduit build`
+  (a `.keep` file in it is enough): the `COPY --chown` then makes it `conduit`-owned, and
+  Docker copies that ownership into a new named volume. For a bind mount, the host
+  directory must be owned by the container's `conduit` UID. Rootless Podman gives a new
+  named volume the container user's ownership, so it needs neither step.
 - Do not mount a flow checkout at `/app`. The engine image keeps the kernel source there,
   and a mount over it fails at startup with `Module not found "src/cli/main.ts"`. Use a
   path such as `/flows` ([#55](https://github.com/theaiteam-dev/conduit/issues/55)).
