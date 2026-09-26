@@ -208,6 +208,8 @@ ANDed at a single atomic claim point (§7).
    any ──dep-scrap escalation / escalate-timeout──► lane=hold  ← LANE change; kernel terminal
    any ──cap reached / unrecoverable──► scrapped
    parent fanned-out ──► awaiting_children ──(fan-in policy met)──► ready (assembler)
+   ready ──SKIP (station's skip_when matched)──► next lane, status=waiting  ← station never runs
+                                                 (lane=done, status=complete if last station)
 ```
 
 Statuses: `waiting`, `ready`, `claimed`, `working`, `done_pending_ack`, `interrupted`,
@@ -268,6 +270,7 @@ against the matrix.
 |---|---|
 | Worker crash mid-`working` | → `interrupted`; reconcile re-hydrates (§9). Effectful side effects guarded by intent log (§5). |
 | Provider **rate limit** mid-`working` (agentic/harness) | → back to `ready` at the SAME lane, `cards.release_at` stamped with the provider's reported reset. Consumes **neither** the rework cap nor the execution-attempt cap: the work never ran and nothing was billed. This holds on a rework invocation exactly as on the first — a cap that lands after a QC reject parks the card, it does not scrap it. The release gate (§8) keeps the card undispatchable until then, and the liveness watchdog does not read a gated card as a stall — but the **consumption andon still applies**, so a cap the run cannot afford to wait out halts it rather than idling. That halt is **parked and resumable**, not a failure: nothing is scrapped, the card stays `ready` behind its gate, the run is recorded `status='halted', outcome='parked'`, and the operator is told the soonest `release_at` and the `conduit resume` command. A gate counts as a cap only when the card_log attributes it to one — the fan-out stagger (§8) stamps the same `release_at` column, and a run holding only stagger gates was halted for some other reason, so it must read as a plain halt. Under the ingress listener (§4A) that resume is automatic: the exit watchers keep the event `spawned` and the sweep issues `conduit resume` once the gate passes. An **effectful** station is the exception to all of this: its invoke is the billed or irreversible act, so a cap says only how the invocation ended, not whether its side effects landed first. A pending outbox intent (§5) therefore escalates to `hold` rather than parking, since a park spends no attempt and would re-dispatch at the same idempotency key, which reconcile can only ever answer `escalate_hold`. Because a park consumes none of the four guards, the parks themselves are bounded: a card that hits the cap `MAX_CONSECUTIVE_RATE_LIMIT_PARKS` times in a row without the station running escalates to `hold` rather than parking again, so a failure misreported as a cap — or a cap that never clears — ends in front of a human instead of looping. |
+| Card becomes `ready` at a station whose `skip_when` predicate matches (§4) | `SKIP`: → the station's declared `next`, `status=waiting` (or `lane=done, status=complete` when the station is the last one, as `INTEGRITY_PASS` does). Legal only from `ready`. The station never runs: no claim, no worker, no checkpoint (§5). Consumes **neither** the execution-attempt cap nor the rework cap. A `card_log` row records the predicate and the value it read. A predicate that cannot be evaluated (missing seed file or output checkpoint, missing field, type mismatch) holds the card (`status=held`, lane unchanged) instead of choosing skip or run. |
 | `MARK_DONE` fails the Summary Hook (integrity) | → back to `working`, counts against the **execution-attempt** cap (§7), not the rework cap. |
 | QC reject, under cap | → `on_reject` lane, `attempt++`, `status=waiting`. |
 | QC reject, cap reached, `cap_policy=scrap` | → `scrap`. |
@@ -406,6 +409,46 @@ security:                      # the Law (§7)
 
 Every knob here came from the three flows diverging or from a rev-1 finding. The seam
 is the whole product: *the flow is config; the kernel is the engine.*
+
+### Skipping a station (`skip_when`)
+
+Fan-out children are homogeneous: each one walks the same station chain. A station can
+declare a predicate that lets the kernel pass a card straight through to the station's
+`next` without running it:
+
+```yaml
+  - id: write_tests
+    skip_when: { source: seed, field: no_test_needed, equals: true }
+    next: implement
+```
+
+- **`source: seed`** reads a top-level field of the card's `seed.json` (in
+  `owned_paths[0]`, written at fan-out, §9).
+- **`source: output`** (with `station: <id>`) reads a top-level field of the payload that
+  an upstream `transform` station produced for the same card, from that station's latest
+  checkpoint (§5). The station must declare the field in its `output_schema`, must reach
+  this station through its `next` chain, and must not itself declare `skip_when`: a
+  skipped station writes no checkpoint, so on a pass where it skips, the read would return
+  its checkpoint from an earlier pass instead of the current one.
+- **`equals`** is a string, number or boolean. The comparison is strict equality, with no
+  coercion.
+
+The kernel evaluates the predicate each time a card becomes `ready` at the station
+(including after its release gate, §8, has passed). A match fires `SKIP` (§3): the card
+moves to the station's own `next`, so the skip adds no edge to the lane graph, and the
+acyclicity and reachability checks are unchanged. A predicate the kernel cannot evaluate
+(no seed file or checkpoint, the field is absent, or its value has a different type from
+`equals`) holds the card rather than guessing between skip and run.
+
+The loader rejects:
+
+| Code | When |
+|---|---|
+| `INVALID_SKIP_WHEN` | the block is not a mapping; the source is unknown; `field` is missing or empty; `equals` is missing or not a scalar; an unexpected key is present; or a `source: output` station is unknown, not a `transform`, missing the field from its `output_schema`, or not upstream |
+| `SKIP_WHEN_WITHOUT_NEXT` | the station declares no `next` to skip to |
+| `SKIP_WHEN_OUTPUTS_CONSUMED` | another station lists one of this station's `outputs` in its `inputs`; a skipped station writes none of them |
+| `SKIP_WHEN_ON_REWORK_TARGET` | a `check.on_reject` targets this station; the card would skip again and return to the gate unchanged |
+| `SKIP_WHEN_READS_SKIPPABLE` | a `source: output` predicate names a station that itself declares `skip_when`; a pass where that station skips would leave the reader looking at a stale checkpoint from an earlier pass |
 
 ---
 
@@ -558,6 +601,17 @@ current config.** On mismatch the checkpoint is **invalidated and the invalidati
 cascades downstream** (any station whose `resolved_input_artifact_hashes` changed is
 also invalid). `flow_version` is pinned at run start; resuming against a different
 `flow.yaml` requires an explicit `--rebind` and re-validates every stamp.
+
+A station passed over by `skip_when` (§4) writes **no checkpoint**: it produced no
+output, so there is nothing to stamp or replay. Resume needs no way to tell "skipped"
+from "not yet run", because a skipped card has already left the station's lane and the
+`card_log` records the skip. The loader's `SKIP_WHEN_OUTPUTS_CONSUMED` rule means no
+downstream station's `resolved_input_artifact_hashes` can depend on a skipped station's
+outputs, so cascade invalidation is unaffected. A `skip_when: { source: output }`
+predicate reads a checkpoint directly rather than through `resolved_input_artifact_hashes`,
+so the same gap reopens there: the loader's `SKIP_WHEN_READS_SKIPPABLE` rule closes it by
+rejecting a predicate that names a station which itself declares `skip_when`, since that
+station's checkpoint would go stale, not absent, once it skips.
 
 ### Effectful stations (rev-1 C3 — side effects aren't pure)
 Effectfulness is orthogonal to `kind` (§4): a pure `transform` critic skips everything in

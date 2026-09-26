@@ -1857,6 +1857,9 @@ async function cmdJournal(argv: string[], deps: CliDeps): Promise<number> {
         case 'terminal':
           deps.io.out(`${p} terminal: ${entry.reason}`);
           break;
+        case 'skip':
+          deps.io.out(`${p} skip: ${entry.station}: ${entry.reason}`);
+          break;
       }
     }
   }

@@ -43,6 +43,7 @@ import type {
   StationRankConfig,
   ImageInputDeclaration,
   StationDeliverConfig,
+  SkipWhenConfig,
 } from '../types/kernel';
 import { findCycleNodes } from './dag-utils';
 import { resolveSkill, type ResolveSkillResult } from '../skills/resolve';
@@ -232,6 +233,11 @@ interface RawStation {
    * before buildStationConfig casts it onto StationConfig.deliver.
    */
   deliver?: unknown;
+  /**
+   * Issue #32: kernel-evaluated skip predicate. Untrusted: validated by
+   * validateSkipWhen in collectErrors before buildStationConfig copies it.
+   */
+  skip_when?: unknown;
 }
 
 /** Parsed security block from flow.yaml. */
@@ -377,6 +383,9 @@ function buildStationConfig(
 
   // WI-351: real-run config surface (populated when present in the YAML).
   if (raw.next !== undefined) config.next = raw.next;
+  // Issue #32: validateSkipWhen has already rejected every malformed shape, so
+  // the cast is sound. Copied field by field so no stray key survives.
+  if (raw.skip_when !== undefined) config.skip_when = copySkipWhen(raw.skip_when as SkipWhenConfig);
 
   const w = raw.worker;
   if (w?.role !== undefined) config.role = w.role;
@@ -1864,7 +1873,171 @@ function collectErrors(
     }
   }
 
+  // ── skip_when predicates (issue #32) ──────────────────────────────────────
+  errors.push(...validateSkipWhen(stations));
+
   return errors;
+}
+
+const SKIP_WHEN_KEYS: Record<SkipWhenConfig['source'], readonly string[]> = {
+  seed: ['source', 'field', 'equals'],
+  output: ['source', 'station', 'field', 'equals'],
+};
+
+function isSkipWhenScalar(value: unknown): boolean {
+  return typeof value === 'string' || typeof value === 'boolean' || (typeof value === 'number' && Number.isFinite(value));
+}
+
+/** Copy a validated skip_when block onto a fresh object (no stray keys). */
+function copySkipWhen(raw: SkipWhenConfig): SkipWhenConfig {
+  return raw.source === 'seed'
+    ? { source: 'seed', field: raw.field, equals: raw.equals }
+    : { source: 'output', station: raw.station, field: raw.field, equals: raw.equals };
+}
+
+/**
+ * Validate every station's `skip_when` (issue #32). A skipped station runs no
+ * worker and writes none of its outputs, and the kernel moves the card to the
+ * station's `next`. The rules follow from that:
+ *
+ *   - INVALID_SKIP_WHEN: the block is a mapping with a known `source`, a
+ *     non-empty `field`, and a string/number/boolean `equals`, and no other
+ *     keys. `source: output` also names a `transform` station whose
+ *     `output_schema` declares `field` and whose `next` chain reaches this
+ *     station, so the payload exists by the time the card arrives.
+ *   - SKIP_WHEN_WITHOUT_NEXT: the skip target is the station's own `next`.
+ *   - SKIP_WHEN_OUTPUTS_CONSUMED: a station reading one of the skipped
+ *     station's outputs would find it missing.
+ *   - SKIP_WHEN_ON_REWORK_TARGET: a gate that sends a card back here would get
+ *     it back unchanged, and the no-progress guard would scrap it after a
+ *     wasted rework cycle.
+ *   - SKIP_WHEN_READS_SKIPPABLE: a `source: output` predicate names a station
+ *     that itself declares skip_when. A skipped station writes no checkpoint,
+ *     so readLatestCheckpoint would return that station's older checkpoint on
+ *     a pass where it skips, and the predicate would decide on stale data.
+ */
+function validateSkipWhen(stations: readonly RawStation[]): FlowValidationError[] {
+  const errors: FlowValidationError[] = [];
+  const byId = new Map(stations.map((s) => [s.id, s]));
+
+  for (const station of stations) {
+    const raw = station.skip_when;
+    if (raw === undefined) continue;
+    const invalid = (why: string): void => {
+      errors.push({ code: 'INVALID_SKIP_WHEN', message: `Station '${station.id}' skip_when ${why}` });
+    };
+
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+      invalid('must be a mapping { source, field, equals }');
+    } else {
+      const block = raw as Record<string, unknown>;
+      const source = block['source'];
+      if (source !== 'seed' && source !== 'output') {
+        invalid(`has unknown source '${String(source)}' — must be one of: seed, output`);
+      } else {
+        const allowed = SKIP_WHEN_KEYS[source];
+        const extra = Object.keys(block).filter((k) => !allowed.includes(k));
+        if (extra.length > 0) {
+          invalid(`has unexpected key(s) ${extra.join(', ')} for source '${source}' (allowed: ${allowed.join(', ')})`);
+        }
+        const field = block['field'];
+        if (typeof field !== 'string' || field.length === 0) {
+          invalid('must declare a non-empty string field');
+        }
+        if (!('equals' in block) || !isSkipWhenScalar(block['equals'])) {
+          invalid('must declare equals as a string, number or boolean');
+        }
+        if (source === 'output') {
+          validateOutputSource(station, block['station'], field, byId, errors, invalid);
+        }
+      }
+    }
+
+    if (station.next === undefined) {
+      errors.push({
+        code: 'SKIP_WHEN_WITHOUT_NEXT',
+        message: `Station '${station.id}' declares skip_when but no next — a skipped card moves to the station's next`,
+      });
+    }
+
+    for (const output of station.outputs ?? []) {
+      for (const reader of stations) {
+        if (reader.id !== station.id && (reader.inputs ?? []).includes(output)) {
+          errors.push({
+            code: 'SKIP_WHEN_OUTPUTS_CONSUMED',
+            message:
+              `Station '${station.id}' declares skip_when but station '${reader.id}' reads its output ` +
+              `'${output}' — a skipped station writes none of its outputs`,
+          });
+        }
+      }
+    }
+
+    for (const gate of stations) {
+      if (gate.check?.on_reject === station.id) {
+        errors.push({
+          code: 'SKIP_WHEN_ON_REWORK_TARGET',
+          message:
+            `Station '${station.id}' declares skip_when but station '${gate.id}' routes rework to it ` +
+            `(check.on_reject) — the card would skip again and return to the gate unchanged`,
+        });
+      }
+    }
+  }
+
+  return errors;
+}
+
+/** The `source: output` half of validateSkipWhen. */
+function validateOutputSource(
+  station: RawStation,
+  sourceStation: unknown,
+  field: unknown,
+  byId: ReadonlyMap<string, RawStation>,
+  errors: FlowValidationError[],
+  invalid: (why: string) => void,
+): void {
+  if (typeof sourceStation !== 'string' || sourceStation.length === 0) {
+    invalid('with source: output must name the upstream transform station');
+    return;
+  }
+  const upstream = byId.get(sourceStation);
+  if (upstream === undefined) {
+    invalid(`names unknown station '${sourceStation}'`);
+    return;
+  }
+  if (resolveStationKind(upstream) !== 'transform') {
+    invalid(`names station '${sourceStation}', which is not a transform station`);
+    return;
+  }
+  const schemaFields = upstream.worker?.output_schema?.fields ?? [];
+  if (typeof field === 'string' && !schemaFields.some((f) => f.name === field)) {
+    invalid(`reads field '${field}', which station '${sourceStation}' does not declare in its output_schema`);
+  }
+  // A station whose skip_when is itself skippable writes no checkpoint on a
+  // pass where it skips, so readLatestCheckpoint would hand the reader a
+  // stale checkpoint from an earlier pass instead of a missing one it could
+  // detect. Reject the pairing at load rather than let it decide on stale data.
+  if (upstream.skip_when !== undefined) {
+    errors.push({
+      code: 'SKIP_WHEN_READS_SKIPPABLE',
+      message:
+        `Station '${station.id}' skip_when reads station '${sourceStation}', which itself declares ` +
+        `skip_when. A skipped station writes no checkpoint, so a pass where '${sourceStation}' skips ` +
+        `would leave '${station.id}' reading a stale checkpoint from an earlier pass instead of ` +
+        `current data.`,
+    });
+  }
+  // Walk the forward `next` chain from the source. It is acyclic once
+  // CYCLIC_NEXT passes; the visited set keeps this loop finite when it does not.
+  const visited = new Set<string>();
+  let cursor = upstream.next;
+  while (cursor !== undefined && !visited.has(cursor)) {
+    if (cursor === station.id) return;
+    visited.add(cursor);
+    cursor = byId.get(cursor)?.next;
+  }
+  invalid(`names station '${sourceStation}', which is not upstream of '${station.id}' in the next chain`);
 }
 
 /**

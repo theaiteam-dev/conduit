@@ -60,8 +60,13 @@ function validateLane(cardId: string, lane: string): string {
   return lane;
 }
 
-/** JSON.parse a persisted column, rethrowing SyntaxError WITH card id + column. */
-function parseColumn(cardId: string, column: string, raw: string): unknown {
+/**
+ * JSON.parse a persisted column, rethrowing SyntaxError WITH card id + column.
+ * Exported so callers that read individual card columns without a full
+ * `getCard` (issue #32's `applySkipWhen` candidate scan) parse `owned_paths`
+ * the same way `getCard` does, instead of duplicating the try/catch.
+ */
+export function parseColumn(cardId: string, column: string, raw: string): unknown {
   try {
     return JSON.parse(raw);
   } catch (err) {
@@ -402,8 +407,11 @@ const CARD_LOG_FINDING_MAX_LENGTH = 4096;
  * gate's cap, so a provider cap classed that way would consume budget it never
  * used, and 'hold' would imply a human has to release it when the release gate
  * is automatic.
+ *
+ * 'skip' (issue #32) marks a move made by the SKIP event: the station's
+ * skip_when predicate matched and the station did not run.
  */
-export type ReasonClass = 'forward' | 'rework' | 'scrap' | 'hold' | 'rate_limited';
+export type ReasonClass = 'forward' | 'rework' | 'scrap' | 'hold' | 'rate_limited' | 'skip';
 
 /** The two possible gate verdicts from a QC station. */
 export type GateVerdict = 'pass' | 'reject';
@@ -434,7 +442,12 @@ export type CardLogEntryInput =
       findings: string[];
       returnTo: string | null;
     })
-  | (CardLogBase & { kind: 'terminal'; reason: string });
+  | (CardLogBase & { kind: 'terminal'; reason: string })
+  /**
+   * Issue #32: a station's skip_when matched. `reason` names the predicate and
+   * the value read, e.g. `skip_when seed.no_test_needed == true matched (read true)`.
+   */
+  | (CardLogBase & { kind: 'skip'; reason: string });
 
 /**
  * A stored card_log row as returned by getCardLog. Shape mirrors
@@ -453,7 +466,12 @@ export type StoredCardLogEntry =
       findings: string[];
       returnTo: string | null;
     })
-  | (CardLogBase & { kind: 'terminal'; reason: string });
+  | (CardLogBase & { kind: 'terminal'; reason: string })
+  /**
+   * Issue #32: a station's skip_when matched. `reason` names the predicate and
+   * the value read, e.g. `skip_when seed.no_test_needed == true matched (read true)`.
+   */
+  | (CardLogBase & { kind: 'skip'; reason: string });
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -1599,7 +1617,7 @@ class ConduitDBImpl implements ConduitDB {
         ),
       );
       returnTo = (safe.returnTo as string | null) ?? null;
-    } else if (kind === 'terminal') {
+    } else if (kind === 'terminal' || kind === 'skip') {
       reason = safe.reason as string;
     }
 
@@ -1700,6 +1718,14 @@ class ConduitDBImpl implements ConduitDB {
         };
       }
 
+      if (row.kind === 'skip') {
+        return {
+          ...base,
+          kind: 'skip',
+          reason: row.reason ?? '',
+        };
+      }
+
       throw new Error(
         `corrupt card_log row for card '${row.card_id}': unknown kind '${row.kind}'`,
       );
@@ -1768,6 +1794,14 @@ class ConduitDBImpl implements ConduitDB {
         return {
           ...base,
           kind: 'terminal',
+          reason: row.reason ?? '',
+        };
+      }
+
+      if (row.kind === 'skip') {
+        return {
+          ...base,
+          kind: 'skip',
           reason: row.reason ?? '',
         };
       }

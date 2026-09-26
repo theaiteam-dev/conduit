@@ -85,6 +85,7 @@ import {
   ensureCheckpointSchema,
   writeCheckpoint,
   readCheckpoint,
+  readLatestCheckpoint,
   invalidateCheckpoint,
   decideResume,
   cascadeInvalidation,
@@ -216,6 +217,63 @@ describe('writeCheckpoint / readCheckpoint (AC1)', () => {
 
     // ...holding the latest stamp + output.
     expect(readCheckpoint(db, KEY)).toEqual({ output: sampleOutput({ v: 2 }), stamp: 'stamp-new' });
+  });
+});
+
+// ===========================================================================
+// readLatestCheckpoint (issue #32 skip_when, reviewer follow-up) — pins that
+// invalidation can never surface through the "highest attempt" reader.
+//
+// readLatestCheckpoint does no stamp check of its own (see its doc comment).
+// These tests pin the two facts that make that safe: invalidateCheckpoint
+// DELETEs the row rather than marking it stale, and a card's attempt number
+// for a given station only ever increases, so the highest surviving attempt
+// is never a payload that was invalidated out from under it.
+// ===========================================================================
+
+describe('readLatestCheckpoint — invalidation cannot leak through (reviewer follow-up)', () => {
+  it('returns null, not the invalidated payload, once the latest attempt is invalidated', () => {
+    const stamp = computeBindingStamp(STAMP_INPUTS);
+    writeCheckpoint(db, { ...KEY, attempt: 0 }, { output: sampleOutput({ v: 0 }), stamp });
+    invalidateCheckpoint(db, { ...KEY, attempt: 0 });
+
+    expect(readLatestCheckpoint(db, KEY)).toBeNull();
+  });
+
+  it('falls back to an older, still-valid attempt when only the newest is invalidated', () => {
+    // attempt 0 completed normally; attempt 1 (a later rework pass) is the
+    // one whose stamp went stale and was invalidated. Nothing deletes
+    // attempt 0 — it was never the row identified as invalid.
+    const stamp = computeBindingStamp(STAMP_INPUTS);
+    writeCheckpoint(db, { ...KEY, attempt: 0 }, { output: sampleOutput({ v: 0 }), stamp });
+    writeCheckpoint(db, { ...KEY, attempt: 1 }, { output: sampleOutput({ v: 1 }), stamp });
+    invalidateCheckpoint(db, { ...KEY, attempt: 1 });
+
+    // Conclusion (see readLatestCheckpoint's doc comment): this is not a
+    // staleness bug. Returning attempt 0's payload here is indistinguishable
+    // from a skip_when predicate being evaluated BEFORE attempt 1 ever ran —
+    // a state the reader already has to tolerate (SPEC §4: an unreadable/
+    // not-yet-produced value holds, a readable one is honoured). The FSM
+    // never lets a downstream card become ready to read this station's
+    // output until this station's current attempt has completed and
+    // checkpointed, so a skip_when evaluation can never observe the gap
+    // between "attempt 1 invalidated" and "attempt 2 written" in the first
+    // place — this test pins the reader's behaviour in that gap anyway.
+    expect(readLatestCheckpoint(db, KEY)?.output.payload).toEqual({ v: 0 });
+  });
+
+  it('picks up the fresh checkpoint once the invalidated attempt is re-executed', () => {
+    const stampOld = computeBindingStamp(STAMP_INPUTS);
+    writeCheckpoint(db, { ...KEY, attempt: 0 }, { output: sampleOutput({ v: 'stale' }), stamp: stampOld });
+    invalidateCheckpoint(db, { ...KEY, attempt: 0 });
+
+    // Re-execution never reuses a deleted attempt number — the kernel's
+    // attempt counter for a card only increases — so the fresh run lands at
+    // attempt 1, strictly higher than the invalidated (and now-absent) 0.
+    const stampNew = computeBindingStamp({ ...STAMP_INPUTS, modelId: 'gemini-2.5-pro' });
+    writeCheckpoint(db, { ...KEY, attempt: 1 }, { output: sampleOutput({ v: 'fresh' }), stamp: stampNew });
+
+    expect(readLatestCheckpoint(db, KEY)?.output.payload).toEqual({ v: 'fresh' });
   });
 });
 

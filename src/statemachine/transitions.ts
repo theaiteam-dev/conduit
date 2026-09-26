@@ -14,6 +14,8 @@
  *   - QC_REJECT attributes rework to reworkCount (NOT executionAttempt).
  *   - held vs hold: NEEDS_JUDGMENT freezes the card in-place (lane unchanged);
  *     DEP_SCRAP changes lane to the 'hold' terminal.
+ *   - SKIP (issue #32) passes a ready card to happyPathNext without running the
+ *     station; no counter moves.
  *   - Every (from, event) pair not in the matrix returns {ok:false} — no guessing.
  *   - Returns a NEW FsmState; the input is never mutated.
  */
@@ -59,7 +61,8 @@ export type KernelEvent =
   | { type: 'FAN_IN_MET' }
   | { type: 'WORKER_CRASH' }
   | { type: 'RATE_LIMITED' }
-  | { type: 'REHYDRATE' };
+  | { type: 'REHYDRATE' }
+  | { type: 'SKIP' };
 
 /**
  * Per-flow routing context derived from a validated FlowConfig (WI-292).
@@ -274,6 +277,24 @@ export function transition(
       // but that lives in the reconcile layer, not this pure FSM.
       if (state.status !== 'interrupted') return ILLEGAL;
       return advance(state, { status: 'ready' });
+
+    // ── skip_when pass-through (issue #32) ───────────────────────────────────
+
+    case 'SKIP': {
+      // The station's skip_when predicate matched, so the card moves to the
+      // station's declared `next` without the station running. Only a 'ready'
+      // card can skip: the controller evaluates the predicate when the card
+      // becomes dispatchable, before any claim. The destination mirrors
+      // INTEGRITY_PASS, but neither executionAttempt nor reworkCount moves: no
+      // work ran, so nothing was attempted and nothing was reworked.
+      if (state.status !== 'ready') return ILLEGAL;
+      const nextLane = ctx.happyPathNext[state.lane];
+      if (nextLane === undefined) return ILLEGAL;
+      if (nextLane === null) {
+        return advance(state, { lane: 'done', status: 'complete' });
+      }
+      return advance(state, { lane: nextLane, status: 'waiting' });
+    }
 
     default:
       // TypeScript exhaustiveness guard — unreachable at runtime.
