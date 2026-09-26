@@ -154,6 +154,11 @@ mechanical, the other is judgment. (SPEC §5, §6)
 **back-edge** — the reject route from a check to an earlier station (`on_reject:`).
 Validated against the lane graph at load.
 
+**skip_when** — a station-level predicate (`{ source: seed | output, field, equals }`)
+the kernel evaluates when a card becomes ready at the station. On a match the card moves
+to the station's `next` through the `SKIP` event without the station running: no worker,
+no checkpoint, no counter spent. An unreadable predicate holds the card. (SPEC §3, §4)
+
 **rework** — a card bouncing down a back-edge to be redone with the critic's findings as
 feedback. Bounded by four independent guards (below).
 

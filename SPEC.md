@@ -409,6 +409,43 @@ security:                      # the Law (§7)
 Every knob here came from the three flows diverging or from a rev-1 finding. The seam
 is the whole product: *the flow is config; the kernel is the engine.*
 
+### Skipping a station (`skip_when`)
+
+Fan-out children are homogeneous: each one walks the same station chain. A station can
+declare a predicate that lets the kernel pass a card straight through to the station's
+`next` without running it:
+
+```yaml
+  - id: write_tests
+    skip_when: { source: seed, field: no_test_needed, equals: true }
+    next: implement
+```
+
+- **`source: seed`** reads a top-level field of the card's `seed.json` (in
+  `owned_paths[0]`, written at fan-out, §9).
+- **`source: output`** (with `station: <id>`) reads a top-level field of the payload that
+  an upstream `transform` station produced for the same card, from that station's latest
+  checkpoint (§5). The station must declare the field in its `output_schema` and must
+  reach this station through its `next` chain.
+- **`equals`** is a string, number or boolean. The comparison is strict equality, with no
+  coercion.
+
+The kernel evaluates the predicate each time a card becomes `ready` at the station
+(including after its release gate, §8, has passed). A match fires `SKIP` (§3): the card
+moves to the station's own `next`, so the skip adds no edge to the lane graph, and the
+acyclicity and reachability checks are unchanged. A predicate the kernel cannot evaluate
+(no seed file or checkpoint, the field is absent, or its value has a different type from
+`equals`) holds the card rather than guessing between skip and run.
+
+The loader rejects:
+
+| Code | When |
+|---|---|
+| `INVALID_SKIP_WHEN` | the block is not a mapping; the source is unknown; `field` is missing or empty; `equals` is missing or not a scalar; an unexpected key is present; or a `source: output` station is unknown, not a `transform`, missing the field from its `output_schema`, or not upstream |
+| `SKIP_WHEN_WITHOUT_NEXT` | the station declares no `next` to skip to |
+| `SKIP_WHEN_OUTPUTS_CONSUMED` | another station lists one of this station's `outputs` in its `inputs`; a skipped station writes none of them |
+| `SKIP_WHEN_ON_REWORK_TARGET` | a `check.on_reject` targets this station; the card would skip again and return to the gate unchanged |
+
 ---
 
 ## 4A. Channels — the flow's edges (triggers, HITL, delivery)
