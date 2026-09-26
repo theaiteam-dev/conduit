@@ -16,6 +16,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import type { FlowConfig } from '../types/kernel';
 import { loadFlow, type LoadFlowResult } from './load';
+import { DEFAULT_HARNESS_TIMEOUT_MS } from '../worker/harness-adapter';
 
 function loadInline(
   yaml: string,
@@ -313,14 +314,14 @@ describe('loadFlow — deterministic timeout_seconds fail-closed (Item #8)', () 
 });
 
 // ---------------------------------------------------------------------------
-// Issue #31 — idle_timeout_seconds for kind: harness stations.
+// Issue #31: idle_timeout_seconds for kind: harness stations.
 //
 // When present, idle_timeout_seconds must be a positive integer (>= 1),
 // declared only on a harness station, and strictly less than timeout_seconds
 // when both are set. Absent is legal (no idle bound, backwards-compatible).
 // ---------------------------------------------------------------------------
 
-describe('loadFlow — harness idle_timeout_seconds fail-closed (issue #31)', () => {
+describe('loadFlow: harness idle_timeout_seconds fail-closed (issue #31)', () => {
   // A minimal harness station. `idleValue`/`timeoutValue` are interpolated
   // verbatim; null omits the key entirely.
   const harnessFlow = (idleValue: string | null, timeoutValue: string | null = null): string => {
@@ -401,6 +402,13 @@ describe('loadFlow — harness idle_timeout_seconds fail-closed (issue #31)', ()
     const flow = expectOk(loadInline(harnessFlow('30'), PROMPT));
     expect(flow.stations.coder!.idle_timeout_seconds).toBe(30);
     expect(flow.stations.coder!.timeout_seconds).toBeUndefined();
+  });
+
+  it('rejects idle_timeout_seconds at or past the default harness timeout when timeout_seconds is absent', () => {
+    const defaultSeconds = String(DEFAULT_HARNESS_TIMEOUT_MS / 1000);
+    const result = loadInline(harnessFlow(defaultSeconds), PROMPT);
+    expect(errorCodes(result)).toContain('IDLE_TIMEOUT_NOT_LESS_THAN_TIMEOUT');
+    expect(errorText(result)).toContain('default harness timeout');
   });
 
   it('rejects idle_timeout_seconds on a non-harness station with IDLE_TIMEOUT_REQUIRES_HARNESS', () => {

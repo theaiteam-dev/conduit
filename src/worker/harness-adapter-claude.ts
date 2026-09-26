@@ -567,13 +567,10 @@ export function createClaudeHarnessAdapter(config: ClaudeHarnessAdapterConfig): 
       }
 
       if (spawnResult.idledOut) {
-        // Same reasoning as the wall-clock branch below: claude-headless
-        // reports usage only in a terminal `result` event, and a call killed
-        // for going silent never emits one either. Distinct code (issue #31)
-        // so the executor can retry it the same way as a wall-clock timeout
-        // without conflating the two in the journal or in operator-facing
-        // diagnostics — a hung tool call and a genuinely slow one are
-        // different failures even though both are retried identically today.
+        // No usage to recover, as in the wall-clock branch below: a call killed
+        // for going silent never emits the terminal `result` event. A distinct
+        // code (issue #31) keeps a hung call apart from a slow one in the
+        // journal, though the executor retries both the same way.
         fail('invocation produced no output for longer than the idle timeout and was killed', 'harness-idle-timeout');
       }
 

@@ -23,12 +23,10 @@
  * harness — naming collision only).
  *
  * Issue #31 adds an optional second timer: an idle bound, reset by every
- * stdout line, that kills the process group when the child goes silent well
- * under the wall-clock bound. This is the only thing that can actually catch
- * a hung harness call — a mid-call liveness stamp on the executor side
- * (issue #33) has no observable effect, because the executor's liveness
- * watchdog runs only between ticks and a harness station awaits one
- * `invoke()` call for the whole tick.
+ * stdout line, that kills the process group when the child goes silent. The
+ * executor's liveness watchdog runs only between ticks, and a harness station
+ * awaits one `invoke()` for the whole tick, so this timer is the only check
+ * that runs while the child does.
  */
 
 import { resolve, sep } from 'node:path';
@@ -88,14 +86,7 @@ export interface HarnessRunnerConfig {
   /**
    * Idle bound in milliseconds (issue #31). Reset by every complete stdout
    * line; when no line arrives for this long the process group is killed,
-   * independently of `timeoutMs`. The mid-call liveness stamp added in #33
-   * (`onStdoutLine` feeding the executor's watchdog) has no observable effect
-   * on its own: the executor's liveness check runs only between ticks, and a
-   * harness station awaits one `invoke()` call for the whole tick, so nothing
-   * ever reads the mid-call stamp before it is overwritten. This is the actual
-   * bound — the runner is the only place that watches the child while it runs.
-   * Undefined leaves every code path below unchanged: only the wall-clock
-   * timer bounds a silent child, exactly as before this field existed.
+   * independently of `timeoutMs`. Undefined: only the wall-clock timer applies.
    */
   idleTimeoutMs?: number;
 }
@@ -105,7 +96,7 @@ export interface HarnessRunnerConfig {
  * arrives (`onLine`) and returning the text the caller wants retained.
  *
  * `keep` selects which lines survive into the returned string, filtered AS
- * THEY ARRIVE rather than buffered whole — the memory-saving mode a
+ * they arrive rather than buffered whole, the memory-saving mode a
  * `stdoutLineFilter` uses. When `keep` is undefined every byte is retained
  * verbatim: the returned string is exactly what `new Response(stream).text()`
  * would produce, not a reconstruction from split lines, so a trailing newline
@@ -162,12 +153,8 @@ export interface HarnessSpawnResult {
   /** True iff the process was killed for exceeding timeoutMs (not a normal exit). */
   timedOut: boolean;
   /**
-   * True iff the IDLE timer killed the process (issue #31): no stdout line
-   * arrived for `idleTimeoutMs`, distinct from a wall-clock kill. Recorded
-   * directly from which timer fired, not derived from duration the way
-   * `timedOut` is — an idle kill can land at any point in the run, so it has
-   * no fixed relationship to `timeoutMs` a duration threshold could check.
-   * Always false when `idleTimeoutMs` was not configured.
+   * True iff the idle timer killed the process (issue #31): no stdout line
+   * arrived for `idleTimeoutMs`. Always false when it was not configured.
    */
   idledOut: boolean;
 }
@@ -260,35 +247,30 @@ export async function runHarnessProcess(
     killProcessGroup(proc.pid);
   }, config.timeoutMs);
 
-  // Idle timer (issue #31): independent of `timer` above, reset by every
-  // complete stdout LINE rather than every chunk. A chunk boundary is an
-  // artifact of the pipe buffer size, not of the child's behavior, so
-  // resetting on partial chunks would let a child dodge the idle check by
-  // trickling bytes of one buffered write without ever completing a line. A
-  // line is also the unit `stdoutLineFilter`/`onStdoutLine` already observe,
-  // so "idle" means the same thing here as it does to those callers.
+  // Idle timer (issue #31), reset by every complete stdout line rather than
+  // every chunk: chunk boundaries depend on pipe buffering, and a line is the
+  // unit `stdoutLineFilter`/`onStdoutLine` already observe.
   //
-  // `idledOutFired` is set directly inside the timer callback rather than
-  // derived from duration the way `timedOut` is below: an idle kill can land
-  // at any point in the run, so there is no fixed fraction of `timeoutMs` (or
-  // of anything else) to compare against. It is still gated on
-  // `proc.signalCode` once the process has actually exited, for the same
-  // reason `timedOut` is: a flag set inside a timer callback can still fire
-  // after the process already exited naturally at almost the same instant,
-  // and only `signalCode` proves the kill actually happened.
+  // `idledOutFired` records which timer fired, since an idle kill has no fixed
+  // relationship to `timeoutMs` that a duration check could test. It is gated
+  // on `proc.signalCode` below for the same reason `timedOut` is.
+  //
+  // `exited` stops re-arming once the leader has exited. Lines a backgrounded
+  // descendant left in the pipe are still drained after that (#17), and a
+  // timer armed by them would SIGKILL a process group id the kernel may
+  // already have reused.
   let idleTimer: ReturnType<typeof setTimeout> | undefined;
   let idledOutFired = false;
+  let exited = false;
   const resetIdleTimer = (): void => {
-    if (config.idleTimeoutMs === undefined) return;
+    if (config.idleTimeoutMs === undefined || exited) return;
     if (idleTimer !== undefined) clearTimeout(idleTimer);
     idleTimer = setTimeout(() => {
       idledOutFired = true;
       killProcessGroup(proc.pid);
     }, config.idleTimeoutMs);
   };
-  // Arm the clock from the moment the child starts: a child that never writes
-  // anything at all must still be caught, not only one that goes silent after
-  // an initial line.
+  // Armed at spawn, so a child that never writes a line is caught too.
   resetIdleTimer();
 
   // Every observed line both resets the idle timer (when configured) and
@@ -302,12 +284,9 @@ export async function runHarnessProcess(
       : config.onStdoutLine;
 
   // Start draining now so a harness that writes more than a pipe buffer is not
-  // blocked on a full pipe while we wait for it to exit. When idleTimeoutMs is
-  // set but neither stdoutLineFilter nor onStdoutLine is, `observeLine` is
-  // still defined (it must reset the idle timer), so the stream is still read
-  // incrementally rather than buffered in one Response.text() call — the
-  // `keep: undefined` mode of readKeptLines below retains exactly the same
-  // bytes that call would have, just observed one line at a time.
+  // blocked on a full pipe while we wait for it to exit. With an idle timeout
+  // but no filter, the stream is still read line by line so the timer can be
+  // reset; `keep: undefined` retains the same bytes Response.text() would.
   const stdoutText =
     config.stdoutLineFilter !== undefined
       ? readKeptLines(proc.stdout as ReadableStream<Uint8Array>, config.stdoutLineFilter, observeLine)
@@ -325,6 +304,7 @@ export async function runHarnessProcess(
   try {
     exitCode = await proc.exited;
   } finally {
+    exited = true;
     clearTimeout(timer);
     clearTimeout(idleTimer);
     // #17: the harness has exited, but a descendant it backgrounded may still
@@ -342,11 +322,7 @@ export async function runHarnessProcess(
 
   const durationMs = Date.now() - startedAt;
 
-  // Which timer actually killed the process (issue #31), gated on
-  // proc.signalCode for the same reason timedOut is below: a flag set inside a
-  // setTimeout callback can still fire after the process already exited
-  // naturally at nearly the same instant, and only signalCode, read AFTER
-  // proc.exited resolves, proves a SIGKILL actually happened.
+  // Gated on signalCode for the same reason as timedOut below.
   const idledOut = idledOutFired && proc.signalCode === 'SIGKILL';
 
   // Distinguish OUR timeout-kill from a normal exit. A shared flag set independently
@@ -358,10 +334,9 @@ export async function runHarnessProcess(
   // avoids that race: an already-exited process never carries a SIGKILL
   // signalCode, no matter how the timer callback and the exit event interleave.
   //
-  // `!idledOut` keeps the two mutually exclusive even under a misconfigured
-  // idleTimeoutMs close to timeoutMs (the loader rejects that combination for
-  // a station, but this function takes no config validation on trust): an
-  // idle kill is never also reported as a wall-clock timeout.
+  // `!idledOut` keeps the two exclusive when idleTimeoutMs is close to
+  // timeoutMs. The loader rejects that for a station, but this function does
+  // not rely on it.
   const timedOut = !idledOut && proc.signalCode === 'SIGKILL' && durationMs >= config.timeoutMs * 0.9;
 
   return {

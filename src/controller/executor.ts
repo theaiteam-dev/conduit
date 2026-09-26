@@ -47,7 +47,7 @@ import { runTransformStation, coerciveParse, computeFindingsHash } from '../work
 import type {
   HarnessRegistry, MountedInput, HarnessResult, KnownUsage, RateLimitSnapshot,
 } from '../worker/harness-adapter';
-import { usageFromThrow, resolveHarnessAgent } from '../worker/harness-adapter';
+import { usageFromThrow, resolveHarnessAgent, DEFAULT_HARNESS_TIMEOUT_MS } from '../worker/harness-adapter';
 import { harnessRetryDelayMs } from '../worker/harness-retry';
 import { loadImageInput, hashImageInputs, assertImagePayloadWithinLimits } from '../worker/image-input';
 import type { ImageInput } from '../worker/image-input';
@@ -114,15 +114,6 @@ const POOL_WAIT_TIMEOUT_MS = 250;
 
 /** Worker ID prefix for this single-process executor. */
 const WORKER_ID_PREFIX = 'executor';
-
-/**
- * Default wall-clock bound (ms) for a harness invocation when the station
- * declares no `timeout_seconds` — harness attempts run 3-4 minutes by design
- * (SPEC §7 / the agentic-harness-worker PRD), far longer than a transform's
- * single model call, so this default is generous rather than reusing a
- * transform-scale timeout.
- */
-const DEFAULT_HARNESS_TIMEOUT_MS = 5 * 60 * 1000;
 
 /**
  * How long to park a rate-limited card when the provider reported no reset time.
@@ -3899,11 +3890,10 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
         // An UNTAGGED throw still scraps under a generic named reason — loud,
         // never a silent failure to classify.
         const code = (invokeErr as { code?: string }).code;
-        // Issue #31: an idle kill is retried exactly like a wall-clock
-        // timeout — it spends an execution attempt, bounded by
-        // max_execution_attempts, and paced by the same backoff below — but
-        // gets its own scrap reason so a card that exhausts its attempts
-        // names which bound actually killed it.
+        // Issue #31: an idle kill is retried like a wall-clock timeout (it
+        // spends an execution attempt and gets the same backoff below), but
+        // has its own scrap reason so a card that exhausts its attempts names
+        // which bound killed it.
         scrapReason =
           code === 'harness-timeout'
             ? 'harness-timeout'

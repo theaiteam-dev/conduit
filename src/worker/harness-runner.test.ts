@@ -377,12 +377,42 @@ describe('harness runner: stdout line filter', () => {
 // ---------------------------------------------------------------------------
 // Idle timeout (issue #31). A second timer, independent of the wall-clock
 // one, resets on every stdout line and kills the process group when the
-// child goes silent — the bound issue #33's mid-call liveness stamp never
-// actually provided, since the executor cannot check liveness while a
-// harness station's single `invoke()` call is in flight.
+// child goes silent. The executor cannot check liveness while a harness
+// station's `invoke()` is in flight, so this is the only bound on a hung call.
 // ---------------------------------------------------------------------------
 
 describe('harness runner: idle timeout (issue #31)', () => {
+  it('does not re-arm the idle timer for lines drained after the child exits', async () => {
+    // The leader exits at once while a backgrounded writer keeps the pipe
+    // full, so lines are still drained after proc.exited resolves and the
+    // group is reaped (#17). A timer re-armed by those lines would later
+    // SIGKILL a process group id the kernel may have reused. The writer is
+    // capped at 4MB to bound the drain on a loaded machine.
+    const kills: number[] = [];
+    const realKill = process.kill.bind(process);
+    const result = await (async () => {
+      process.kill = ((pid: number, signal?: string | number) => {
+        kills.push(pid);
+        return realKill(pid, signal);
+      }) as typeof process.kill;
+      try {
+        const r = await runHarnessProcess(
+          { command: 'sh', args: ['-c', 'yes | head -c 4000000 & exit 0'] },
+          config({ timeoutMs: 10_000, idleTimeoutMs: 100 }),
+        );
+        kills.length = 0;
+        await Bun.sleep(300);
+        return r;
+      } finally {
+        process.kill = realKill;
+      }
+    })();
+
+    expect(result.exitCode).toBe(0);
+    expect(result.idledOut).toBe(false);
+    expect(kills).toEqual([]);
+  }, 30_000);
+
   it('completes normally when stdout lines keep arriving inside the idle bound', async () => {
     const result = await runHarnessProcess(
       {
@@ -422,8 +452,8 @@ describe('harness runner: idle timeout (issue #31)', () => {
 
   it('resets on every line, including lines a stdoutLineFilter discards', async () => {
     // Noise lines (discarded by the filter) arrive faster than the idle
-    // bound, so the timer must reset on each one — not only on a KEPT line —
-    // or the process would be killed before it ever reaches the result line.
+    // bound, so the timer must reset on each one, not only on a kept line, or
+    // the process would be killed before it reaches the result line.
     const result = await runHarnessProcess(
       {
         command: 'sh',
@@ -448,8 +478,8 @@ describe('harness runner: idle timeout (issue #31)', () => {
     // The containment fixture (issue #27) never writes to stdout, so with no
     // stdoutLineFilter or onStdoutLine configured, idleTimeoutMs alone must
     // still observe the (silent) stream well enough to arm and fire the
-    // timer — proving the "observe stdout incrementally with no filter"
-    // requirement, not just the reset-on-line path exercised above.
+    // timer. This covers the no-filter path, not just the reset-on-line path
+    // exercised above.
     const result = await runHarnessProcess(
       { command: CONTAINMENT_FIXTURE, args: [] },
       { projectRoot, timeoutMs: 10_000, idleTimeoutMs: 300 },

@@ -68,18 +68,15 @@ hold it together:
   this, which is why the container boundary below still matters.
   Deployment guidance additionally recommends running the container as a dedicated non-root
   user for agentic/harness flows.
-- **Optional idle timeout, independent of the wall-clock one.** A station's `timeout_seconds`
-  bounds the whole invocation; it does not by itself catch a harness that is alive but stuck
-  (a hung tool call, a stuck prompt) well under that bound. `idle_timeout_seconds`, when
-  declared, is a second bound reset by every stdout line the harness produces: if none
-  arrives for that long, the runner kills the process group the same way it does on the
-  wall-clock timeout, before the wall-clock bound would otherwise have to elapse
-  ([#31](https://github.com/theaiteam-dev/conduit/issues/31)). It is opt-in, must be a
-  positive integer strictly less than `timeout_seconds` when both are set (validated at
-  load), and applies only to `kind: harness` stations. An idle kill is a distinct adapter
-  failure class (`harness-idle-timeout`) from a wall-clock one (`harness-timeout`), but is
-  retried the same way: it spends an execution attempt, bounded by
-  `max_execution_attempts`, and never triggers the rate-limit park.
+- **Optional idle timeout.** `timeout_seconds` bounds the whole invocation, so a harness
+  stuck on a hung tool call runs until that bound. `idle_timeout_seconds` adds a second
+  bound, reset by every stdout line: if no line arrives for that long, the runner kills the
+  process group as it does on the wall-clock timeout
+  ([#31](https://github.com/theaiteam-dev/conduit/issues/31)). It applies only to
+  `kind: harness` stations and must be a positive integer below the wall-clock timeout
+  that applies (`timeout_seconds`, or the 300-second default). An idle kill fails as
+  `harness-idle-timeout` rather than `harness-timeout`, and is retried the same way: it
+  spends an execution attempt, bounded by `max_execution_attempts`, and is never parked.
 - **The ADR-0003 container wall.** [ADR-0003](../adr/0003-packaging-and-distribution.md)'s
   Docker packaging is the outer containment boundary for what a harness does inside its
   loop — the container, not the kernel, bounds the blast radius. Network-policy
