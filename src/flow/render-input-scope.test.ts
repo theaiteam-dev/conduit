@@ -34,7 +34,7 @@
  */
 import { describe, it, expect, afterEach } from 'bun:test';
 import { join } from 'node:path';
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { renderPrompt } from './render';
 
@@ -306,5 +306,34 @@ describe('renderPrompt — backward compatibility (issue #51 AC4)', () => {
     );
 
     expect(result).toBe('patch=MY_SHARD fb=REWORK_NOTE');
+  });
+});
+
+// ===========================================================================
+// Review finding — a RELATIVE ownedPaths[0] must resolve against projectRoot,
+// not against process.cwd(). commitFanOut proposals commonly carry a relative
+// owned dir (e.g. 'out/c1.json'; see dag/expand.ts), and the executor's
+// output side already resolves it via `resolve(projectRoot, owned)`. Reading
+// through renderPrompt must land on the SAME file, or the prompt the model
+// sees and the file the binding stamp hashes can diverge.
+// ===========================================================================
+
+describe('renderPrompt — a relative owned dir resolves against projectRoot (review finding)', () => {
+  it('reads a card-scoped input from <projectRoot>/<relative ownedPaths[0]>/<name>', () => {
+    const root = makeDir();
+    mkdirSync(join(root, 'children', 'a'), { recursive: true });
+    writeFileSync(join(root, 'children', 'a', 'patch.txt'), 'MY_SHARD', 'utf-8');
+
+    const result = renderPrompt(
+      '{{patch.txt}}',
+      ['patch.txt'],
+      root,
+      undefined,
+      undefined,
+      ['children/a'],
+      ['patch.txt'],
+    );
+
+    expect(result).toBe('MY_SHARD');
   });
 });

@@ -3709,26 +3709,50 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
 
   if (stationOutput === null) {
     // ── Render prompt + mount declared inputs (AC1) ──────────────────────────
-    const promptTemplate = stationConfig.prompt_content ?? readFileSync(stationConfig.prompt_file!, 'utf-8');
-    const prompt = renderPrompt(
-      promptTemplate, stationConfig.inputs, projectRoot, feedbackString, [], card.owned_paths,
-      stationConfig.input_scope?.owned_dir,
-    );
+    // Both renderPrompt and resolveInputPath below can throw for a card-scoped
+    // input whose owned dir doesn't exist (resolve-input.ts's documented
+    // escalate-rather-than-execute-against-the-wrong-artifact contract). One
+    // try covers both: whichever throws first, the card must escalate to hold
+    // rather than let the throw propagate out of runExecutor uncaught, which
+    // would crash the run and leave the card stuck at status='working' with a
+    // stale claim — and, for an effectful station, a pending outbox intent of
+    // unknown outcome, since nothing was actually invoked yet.
+    let prompt: string;
+    let mountedInputs: MountedInput[];
+    try {
+      const promptTemplate = stationConfig.prompt_content ?? readFileSync(stationConfig.prompt_file!, 'utf-8');
+      prompt = renderPrompt(
+        promptTemplate, stationConfig.inputs, projectRoot, feedbackString, [], card.owned_paths,
+        stationConfig.input_scope?.owned_dir,
+      );
 
-    // Declared inputs are MOUNTED (name + path), not inlined bytes — the
-    // reserved synthetic inputs ('feedback', 'seed.json') have no on-disk
-    // artifact of their own and are threaded via the prompt only.
-    //
-    // A card-scoped input (issue #51) must mount from the card's owned dir:
-    // mounting join(projectRoot, name) would hand the agent the shared artifact
-    // while its prompt quotes the per-child one — two different files under one
-    // name, the worst version of this bug to debug.
-    const mountedInputs: MountedInput[] = stationConfig.inputs
-      .filter((name) => name !== 'feedback' && name !== 'seed.json')
-      .map((name) => ({
-        name,
-        path: resolveInputPath(name, projectRoot, card.owned_paths, stationConfig.input_scope?.owned_dir),
-      }));
+      // Declared inputs are MOUNTED (name + path), not inlined bytes — the
+      // reserved synthetic inputs ('feedback', 'seed.json') have no on-disk
+      // artifact of their own and are threaded via the prompt only.
+      //
+      // A card-scoped input (issue #51) must mount from the card's owned dir:
+      // mounting join(projectRoot, name) would hand the agent the shared artifact
+      // while its prompt quotes the per-child one — two different files under one
+      // name, the worst version of this bug to debug.
+      mountedInputs = stationConfig.inputs
+        .filter((name) => name !== 'feedback' && name !== 'seed.json')
+        .map((name) => ({
+          name,
+          path: resolveInputPath(name, projectRoot, card.owned_paths, stationConfig.input_scope?.owned_dir),
+        }));
+    } catch (resolveErr) {
+      // Nothing was invoked yet — discard rather than leave a PENDING intent
+      // of unknown outcome for a future resume to escalate_hold on.
+      if (pendingIntentKey !== null) {
+        discardIntent(stateDb, pendingIntentKey);
+      }
+      escalateToHold(
+        stateDb, db, cardId, stationId, card,
+        `harness station '${stationId}' could not render/mount its inputs: ${(resolveErr as Error).message}`,
+        err, runId, true,
+      );
+      return false;
+    }
 
     const timeoutMs =
       stationConfig.timeout_seconds !== undefined

@@ -62,6 +62,14 @@ describe('resolveInputPath — card scope wins over projectRoot (issue #51)', ()
     );
   });
 
+  it('resolves an absolute owned dir OUTSIDE projectRoot unchanged', () => {
+    // resolve() already handles this: an absolute later segment wins outright,
+    // so an owned dir that lives nowhere near projectRoot must keep working.
+    expect(resolveInputPath('patch.txt', ROOT, ['/elsewhere/child-a'], ['patch.txt'])).toBe(
+      join('/elsewhere/child-a', 'patch.txt'),
+    );
+  });
+
   it('THROWS rather than falling back to projectRoot when the card has no owned dir', () => {
     // Review finding: the fallback returned <projectRoot>/<name> — the SHARED
     // artifact the per-child copy was meant to replace. Silently handing that
@@ -191,6 +199,28 @@ describe('resolveInputPath — traversal confinement (issue #51)', () => {
     const viaLink = join(linkedRoot, 'child-a');
     expect(resolveInputPath('patch.txt', linkedRoot, [viaLink], ['patch.txt'])).toBe(
       join(viaLink, 'patch.txt'),
+    );
+  });
+
+  it('resolves a RELATIVE owned dir against projectRoot, not against cwd (review finding)', () => {
+    // Review finding: the card-scoped branch passed ownedPaths[0] straight to
+    // confineToBase, so a relative entry resolved against process.cwd() instead
+    // of projectRoot — while the output side (executor.ts) already does
+    // `resolve(projectRoot, owned)`. Whenever projectRoot !== cwd (the normal
+    // case for a CLI invoked from outside the project directory) the read path
+    // and the write path landed on two different files, and the binding stamp
+    // hashed whichever one the read side picked.
+    //
+    // `root` here is a realpath'd tmp dir that is NOT process.cwd(), so a
+    // regression that resolves 'children/a' against cwd instead of `root`
+    // produces a path outside `root` entirely (or a bare relative path), never
+    // `join(root, 'children/a', 'patch.txt')`.
+    expect(process.cwd()).not.toBe(root);
+    mkdirSync(join(root, 'children', 'a'), { recursive: true });
+    writeFileSync(join(root, 'children', 'a', 'patch.txt'), 'MY_SHARD', 'utf-8');
+
+    expect(resolveInputPath('patch.txt', root, ['children/a'], ['patch.txt'])).toBe(
+      join(root, 'children/a', 'patch.txt'),
     );
   });
 });

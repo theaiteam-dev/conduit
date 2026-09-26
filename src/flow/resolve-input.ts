@@ -59,7 +59,10 @@ export function isCardScoped(name: string, ownedDirInputs?: readonly string[]): 
  * Absolute on-disk path a declared input is read from.
  *
  * Card-scoped names resolve to `<ownedPaths[0]>/<name>`; everything else to
- * `<projectRoot>/<name>`.
+ * `<projectRoot>/<name>`. A relative `ownedPaths[0]` resolves against
+ * `projectRoot`, not `process.cwd()`, the same rule the `output_scope: owned_dir`
+ * write side uses, so the input read and the output write agree on the file the
+ * binding stamp hashes. An absolute one, even outside `projectRoot`, is kept.
  *
  * FAIL-CLOSED. A card-scoped name on a card with NO owned dir THROWS; it does
  * not fall back to `<projectRoot>/<name>`. That fallback is precisely the bug
@@ -83,7 +86,8 @@ export function isCardScoped(name: string, ownedDirInputs?: readonly string[]): 
  *
  * @param name           - Declared input artifact name.
  * @param projectRoot    - Absolute project root (the default scope).
- * @param ownedPaths     - The card's owned paths; `[0]` is the child dir.
+ * @param ownedPaths     - The card's owned paths; `[0]` is the child dir,
+ *                         resolved against `projectRoot` when relative.
  * @param ownedDirInputs - The station's `input_scope.owned_dir` list.
  * @throws If `name` is card-scoped but `ownedPaths` is empty/absent.
  */
@@ -101,7 +105,7 @@ export function resolveInputPath(
           `Refusing to fall back to the project-root artifact of the same name.`,
       );
     }
-    return confineToBase(ownedDir, name, 'owned directory');
+    return confineToBase(resolve(projectRoot, ownedDir), name, 'owned directory');
   }
   return confineToBase(projectRoot, name, 'project root');
 }

@@ -15,7 +15,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 
 import { openConduitDB, type ConduitDB, DEFAULT_RUN_ID } from '../persistence/db';
-import { ensureCheckpointSchema } from '../checkpoint/checkpoint';
+import { ensureCheckpointSchema, getIntentStatus } from '../checkpoint/checkpoint';
 import { loadFlow } from '../flow/load';
 import type { FlowConfig } from '../types/kernel';
 import { runExecutor } from './executor';
@@ -212,13 +212,16 @@ describe('harness maker — card-scoped input mounts (issue #51)', () => {
     expect(mounted).not.toBe(join(projectDir, 'patch.txt'));
   });
 
-  it('FAILS CLOSED on a card with no owned dir instead of mounting the project-root decoy', async () => {
+  it('escalates to hold on a card with no owned dir instead of mounting the project-root decoy', async () => {
     // Review finding. renderPrompt's fail-closed guard only fires for
     // names the TEMPLATE references — and a harness station does not have to
     // reference what it mounts. This prompt names no artifact at all, so render
     // passes cleanly and the mount was the only thing standing between an
     // unscoped card and DECOY_WHOLE_DIFF being handed over under the name of a
-    // shard. resolveInputPath now throws for every caller, not just render.
+    // shard. resolveInputPath now throws for every caller, not just render —
+    // and executeHarnessStation catches that throw and escalates to hold
+    // (CodeRabbit finding on PR #62) rather than letting it propagate out of
+    // runExecutor and crash the run.
     const { adapter: harness, calls } = makeRecordingHarness();
     const registry = createHarnessRegistry([harness]);
     const flow = writeShardHarnessFlow(projectDir, registry, { promptBody: 'Review the mounted shard.' });
@@ -236,25 +239,35 @@ describe('harness maker — card-scoped input mounts (issue #51)', () => {
       rework_count: 0,
     });
 
-    await expect(
-      runExecutor({
-        db: db!, flow, now: SECONDS(1000), adapter: makeThrowingModel(), io: makeIO().io,
-        harnessRegistry: registry,
-      } as RunEngineArgs),
-    ).rejects.toThrow(/Card-scoped input "patch\.txt" cannot be resolved/);
+    // runExecutor resolves — the resolution failure is escalated, not thrown.
+    await runExecutor({
+      db: db!, flow, now: SECONDS(1000), adapter: makeThrowingModel(), io: makeIO().io,
+      harnessRegistry: registry,
+    } as RunEngineArgs);
 
     // The agent was never handed the shared artifact under the card-scoped
     // name — the whole point of the fix.
     expect(calls.length).toBe(0);
-    expect(db!.getCard(DEFAULT_RUN_ID, 'entry')?.lane).not.toBe('done');
+    const card = db!.getCard(DEFAULT_RUN_ID, 'entry');
+    expect(card?.lane).toBe('hold');
+    expect(card?.lane).not.toBe('done');
+    expect(card?.status).toBe('held');
+
+    const reasons = db!
+      .getCardLog('entry')
+      .filter((e): e is Extract<typeof e, { kind: 'terminal' }> => e.kind === 'terminal')
+      .map((e) => e.reason)
+      .join(' | ');
+    expect(reasons).toMatch(/could not render\/mount its inputs/);
+    expect(reasons).toMatch(/Card-scoped input "patch\.txt" cannot be resolved/);
   });
 
   it('fails the same way whether the unresolvable scope is caught by render or by the mount', async () => {
     // Shape check: the mount's new throw is not a novel failure mode. The
-    // template-quoting variant of the very same flow already fail-closed out of
-    // runExecutor via render's guard, so both halves of the fix escalate
-    // identically — what changed is only that the mount-only shape stopped
-    // silently succeeding.
+    // template-quoting variant of the very same flow already escalates to
+    // hold out of runExecutor via render's guard, so both halves of the fix
+    // escalate identically — what changed is only that the mount-only shape
+    // stopped silently succeeding.
     const { adapter: harness, calls } = makeRecordingHarness();
     const registry = createHarnessRegistry([harness]);
     const flow = writeShardHarnessFlow(projectDir, registry); // default: quotes {{patch.txt}}
@@ -271,13 +284,95 @@ describe('harness maker — card-scoped input mounts (issue #51)', () => {
       rework_count: 0,
     });
 
-    await expect(
-      runExecutor({
-        db: db!, flow, now: SECONDS(1000), adapter: makeThrowingModel(), io: makeIO().io,
-        harnessRegistry: registry,
-      } as RunEngineArgs),
-    ).rejects.toThrow(/no owned_paths scope was supplied for this card/);
+    await runExecutor({
+      db: db!, flow, now: SECONDS(1000), adapter: makeThrowingModel(), io: makeIO().io,
+      harnessRegistry: registry,
+    } as RunEngineArgs);
 
     expect(calls.length).toBe(0);
+    const card = db!.getCard(DEFAULT_RUN_ID, 'entry');
+    expect(card?.lane).toBe('hold');
+    expect(card?.status).toBe('held');
+
+    const reasons = db!
+      .getCardLog('entry')
+      .filter((e): e is Extract<typeof e, { kind: 'terminal' }> => e.kind === 'terminal')
+      .map((e) => e.reason)
+      .join(' | ');
+    expect(reasons).toMatch(/no owned_paths scope was supplied for this card/);
+  });
+
+  it('discards the pending outbox intent and holds when an effectful harness station cannot resolve its inputs', async () => {
+    // Same resolution failure, but on an EFFECTFUL station: writePendingIntent
+    // already ran (before render/mount) when the throw happens, so the fix must
+    // discard that dangling intent — otherwise a future replay of this attempt
+    // hits reconcileOnResume's escalate_hold for an effect that was never
+    // actually invoked.
+    const { adapter: harness, calls } = makeRecordingHarness();
+    const registry = createHarnessRegistry([harness]);
+    mkdirSync(join(projectDir, 'prompts'), { recursive: true });
+    writeFileSync(join(projectDir, 'prompts', 'review.md'), 'Review the mounted shard.');
+    writeFileSync(join(projectDir, 'style-guide.md'), 'HOUSE_STYLE');
+    writeFileSync(
+      join(projectDir, 'flow.yaml'),
+      `
+flow: harness-input-scope-effectful
+project_root: .
+flow_version: 1
+budgets:
+  run: { wall_clock_minutes: 10, max_tokens: 100000 }
+  per_card: { max_execution_attempts: 2 }
+  liveness: { no_progress_minutes: 3 }
+terminal_lanes: [done, scrap, hold]
+stations:
+  - id: review_shard
+    effectful: true
+    worker:
+      kind: harness
+      harness: fake-harness
+      model: sonnet
+      prompt_file: prompts/review.md
+      prompt_version: "1"
+      tools: [Read, Write]
+      output_schema:
+        fields:
+          - { name: summary, type: string, required: true }
+    inputs: [patch.txt, style-guide.md]
+    input_scope:
+      owned_dir: [patch.txt]
+    outputs: [result.json]
+    next: done
+`,
+    );
+    const loaded = loadFlow(join(projectDir, 'flow.yaml'), { harnessRegistry: registry });
+    if (!loaded.ok) throw new Error(`fixture flow invalid: ${JSON.stringify(loaded.errors)}`);
+    const flow = loaded.flow;
+
+    db!.insertCard({
+      run_id: DEFAULT_RUN_ID,
+      id: 'entry',
+      parent_id: null,
+      lane: 'review_shard',
+      status: 'ready',
+      attempt: 0,
+      wave: 0,
+      // No owned dir — the card has no per-child copy of patch.txt to read.
+      owned_paths: [],
+      rework_count: 0,
+    });
+
+    await runExecutor({
+      db: db!, flow, now: SECONDS(1000), adapter: makeThrowingModel(), io: makeIO().io,
+      harnessRegistry: registry,
+    } as RunEngineArgs);
+
+    expect(calls.length).toBe(0);
+    const card = db!.getCard(DEFAULT_RUN_ID, 'entry');
+    expect(card?.lane).toBe('hold');
+
+    // No dangling PENDING outbox row: the intent written before render/mount
+    // was discarded rather than left for a future replay to escalate_hold on.
+    const idempotencyKey = `1:entry:review_shard:0`;
+    expect(getIntentStatus(db!.getStateDb(), idempotencyKey)).toBe('none');
   });
 });
