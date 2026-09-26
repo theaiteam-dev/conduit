@@ -41,6 +41,13 @@ warnings `doctor` gives you when something's off.
 | `CONDUIT_HARNESS_<NAME>_ENV` | Yes, per registered adapter | Comma-separated env var **names** the harness child process may see. Explicit-only — the engine never injects a baseline; `HOME`/`PATH` are not assumed. An empty string is legal (an intentionally empty allowlist); an *absent* var for a registered adapter is a hard config error at engine boot. |
 | `CONDUIT_HARNESS_<NAME>_COMMAND` | No | Overrides the binary invoked (default: the adapter's own name, e.g. `claude`, `codex`). See [Use absolute paths](#_command-use-absolute-paths) below. |
 | `CONDUIT_HARNESS_<NAME>_MODEL` | No | The adapter's deployment-default model. A station's own `model:` in `flow.yaml` **wins** when both are set — see [Model precedence](#model-precedence-station-wins-over-_model). |
+| `CONDUIT_HARNESS_<NAME>_AGENT` | No, `claude-headless` only | The adapter's default named agent (`<plugin>:<agent>`), passed as `--agent`. A station's own `agent:` wins. The value is trimmed; setting it to an empty or whitespace-only string is a boot error naming the variable, not a silently empty default. See [Named agents and plugin dirs](#named-agents-and-plugin-dirs). |
+| `CONDUIT_HARNESS_<NAME>_PLUGIN_DIRS` | No, `claude-headless` only | Comma-separated **absolute** plugin directories, one `--plugin-dir` each. Absent or empty: no flag. A relative entry is a boot error; a missing or non-directory entry fails when the adapter is built. |
+| `CONDUIT_HARNESS_<NAME>_ISOLATE_CONFIG` | No, `claude-headless` only | `1`/`true` gives the child a run-scoped config dir instead of the operator's `~/.claude`; `0`/`false` or absent keeps today's behaviour. Any other value is a boot error. See [Isolating the child's Claude config](#isolating-the-childs-claude-config-_isolate_config). |
+
+Setting `_AGENT`, `_PLUGIN_DIRS` or `_ISOLATE_CONFIG` for an adapter that does
+not act on it (e.g. `codex-exec`) fails registry construction at boot, naming
+the adapter and the variable, rather than being ignored.
 
 ### Deriving `<NAME>` from an adapter name
 
@@ -265,12 +272,15 @@ smoke test: a DevTrack telemetry hook silently bootstrapped a
 `devtrack.yaml` into the confined root on the harness's first invocation
 (reported upstream).
 
-**Guard or disable file-writing user-level hooks on hosts that run harness
-flows.** Options, in order of preference: run the engine under a dedicated
-user whose `~/.claude` carries no hooks; add a guard condition to the hook
-so it skips harness working directories; or disable the hook on that host.
-A per-adapter knob to suppress child hooks at invocation time is under
-consideration as a follow-up — for now the boundary is operator-owned.
+**For `claude-headless`, set `CONDUIT_HARNESS_CLAUDE_HEADLESS_ISOLATE_CONFIG=1`.**
+The child then reads a config dir the adapter constructs per invocation, so
+the operator's `~/.claude/settings.json` hooks, plugins, agents and
+`CLAUDE.md` are not loaded. See
+[Isolating the child's Claude config](#isolating-the-childs-claude-config-_isolate_config).
+Without it, guard or disable file-writing user-level hooks on hosts that run
+harness flows: run the engine under a dedicated user whose `~/.claude`
+carries no hooks, add a guard condition to the hook so it skips harness
+working directories, or disable the hook on that host.
 
 ## `_COMMAND`: use absolute paths
 
@@ -360,6 +370,113 @@ none, or neither — no `--model` flag is passed at all when both are unset)
 is exactly the value passed to the harness CLI *and* recorded in the resume
 binding stamp, so the two never disagree — a resume after only the adapter
 default changed correctly re-invokes rather than silently skipping.
+
+## Named agents and plugin dirs
+
+A `claude-headless` station can run a named Claude Code agent out of a plugin
+directory the deployment supplies, without that plugin being installed in
+anyone's user config:
+
+```sh
+export CONDUIT_HARNESS_CLAUDE_HEADLESS_PLUGIN_DIRS=/opt/conduit/plugins
+```
+
+```yaml
+  - id: coder
+    worker:
+      kind: harness
+      harness: claude-headless
+      agent: ai-team:murdock        # <plugin>:<agent>
+      prompt_file: prompts/coder.md
+      prompt_version: "1"
+      tools: [Read, Write, Bash]
+```
+
+A gate critic takes the same field as `check.critic.agent`, next to
+`check.critic.harness`.
+
+- **Precedence.** The station's `agent:` wins over `_AGENT`, exactly as
+  `model:` wins over `_MODEL`. Neither set: no `--agent` flag.
+- **Plugin dirs are per run, agents are per station.** `_PLUGIN_DIRS` is
+  engine config and applies to every invocation through the adapter; each
+  entry becomes one `--plugin-dir`. An entry holding
+  `.claude-plugin/plugin.json` is one plugin; any other entry is a folder of
+  plugins, and each child holding that manifest is loaded. Only directories are
+  accepted. The CLI also takes a `.zip`, but the kernel has to read the
+  agent's definition file.
+- **Agent names are `<plugin>:<agent>`.** The plugin part is the manifest's
+  `name`; the agent part is the definition file's frontmatter `name:`, not its
+  filename. A `--plugin-dir` plugin takes precedence over an installed plugin
+  of the same name.
+- **The agent is part of the binding stamp.** The kernel finds the agent's
+  definition file in the configured plugin dirs (`agents/*.md`, plus any
+  paths the manifest's `agents` field lists) and folds the agent name and the
+  file's SHA-256 into the station's `prompt_template_version`. Editing the
+  agent body invalidates the checkpoint and cascades downstream, the same as
+  editing a `worker.uses` skill. Other plugin files (skills, hooks, commands)
+  are not hashed. Every `<station>.harness` journal row records the agent
+  name and that SHA-256 in its `agent` and `agent_sha256` columns, next to
+  the `binding_stamp` and folded `prompt_template_version`, so a result stays
+  attributable to the agent version that produced it after the checkpoint is
+  gone. A harness critic's `<station>.harness-critic` row records its agent
+  the same way, with no stamp, since a critic writes no checkpoint.
+- **It fails closed.** An agent with no definition file in the plugin dirs, a
+  name without a `<plugin>:` part, or more than one matching file is rejected
+  at flow load (`UNRESOLVED_HARNESS_AGENT`) when a registry is configured, and
+  again at dispatch, where the card hard-pauses to `hold` without invoking the
+  harness. `agent:` on a station that is not `kind: harness`, or on a critic
+  with no `harness`, is `INVALID_HARNESS_AGENT`. A name the CLI itself does
+  not know makes `claude` exit 1 naming it, which the adapter reports as a
+  `harness-nonzero-exit` attempt failure.
+
+## Isolating the child's Claude config: `_ISOLATE_CONFIG`
+
+With `HOME` allowlisted, `claude -p` reads the operator's `~/.claude`:
+installed and skills-dir plugins, user agents, `settings.json` and its hooks,
+the user `CLAUDE.md`, and the account's claude.ai MCP connectors. Two
+operators running the same flow get different child behaviour, and none of
+it is in the binding stamp.
+
+```sh
+export CONDUIT_HARNESS_CLAUDE_HEADLESS_ISOLATE_CONFIG=1
+```
+
+With this set, each invocation:
+
+1. creates a fresh directory under the engine's temp dir and sets
+   `CLAUDE_CONFIG_DIR` to it for the child, overriding any allowlisted value;
+2. symlinks the operator's `.credentials.json` into it (from the engine's own
+   `CLAUDE_CONFIG_DIR`, else `$HOME/.claude`). The file is linked, never
+   copied or read. When `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`,
+   `CLAUDE_CODE_OAUTH_TOKEN` or a `CLAUDE_CODE_USE_*` provider variable is
+   allowlisted and set, nothing is linked;
+3. passes `--strict-mcp-config`, which drops user-level and claude.ai MCP
+   servers;
+4. deletes the directory when the invocation returns or throws.
+
+If there is neither a credentials file nor an allowlisted auth variable, the
+invocation fails before spawning, naming what it looked for.
+
+Verified against `claude` 2.1.282: subscription auth works with only the
+credentials link present, and the child loads no user plugin, user agent,
+user `CLAUDE.md` or MCP server. What the fence does not cover is listed in
+[`harness-containment.md`](./harness-containment.md#the-childs-configuration-surface).
+Two of those gaps are operational:
+
+- **Token refresh.** The CLI writes `.credentials.json` with an atomic rename
+  that does not follow symlinks. If the child refreshes the OAuth token, the
+  new token lands in the run-scoped dir and is deleted with it, and the
+  operator's file keeps the old one. If the provider rotated the refresh
+  token, the operator has to log in again. A long-lived
+  `CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token`) on the allowlist
+  avoids the file entirely and is the recommended credential under isolation.
+- **macOS.** Subscription credentials live in the Keychain there, not in a
+  file, so isolation needs one of the auth variables above.
+
+Isolation is off by default so existing deployments keep the child surface
+they have today. In the Docker walkthrough above, the read-only
+`~/.claude` mount works unchanged: the CLI writes its session state into the
+run-scoped dir, not the mount.
 
 ## A harness station's `outputs[0]` is its typed result
 
@@ -510,6 +627,19 @@ verdicts, maker spans recorded) and this was live-model variance, not a
 defect. **Re-run it.** A failure prefixed `WIRING FAILURE:` instead means
 the evidence doesn't look like a clean critic rejection — that one is worth
 investigating.
+
+### The plugin-dir agent evidence
+
+A second flag-gated test checks that a `--plugin-dir` agent runs while an
+identically named agent exists in ambient config, and that the ambient one is
+unreachable under `_ISOLATE_CONFIG`:
+
+```sh
+CONDUIT_E2E_CLAUDE=1 bun test src/integration/harness-e2e-claude-agent.test.ts
+```
+
+It needs a `.credentials.json` in your Claude config dir (it is symlinked into
+a scratch dir, never copied) and costs two Haiku calls.
 
 ## See also
 

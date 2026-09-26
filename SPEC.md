@@ -546,6 +546,13 @@ stamp**:
 binding = hash(model_id, prompt_template_version, resolved_input_artifact_hashes, flow_version)
 ```
 
+`prompt_template_version` covers everything that becomes part of the worker's prompt,
+not only the template file. A `worker.uses` station folds the content hash of each
+injected skill into it, in declared order. A `kind: harness` station that runs a named
+agent folds in the agent's name and the SHA-256 of its definition file, which the kernel
+locates in the adapter's configured plugin dirs. A station whose agent definition cannot be
+located holds rather than stamping on the name alone.
+
 On resume, a completed station is skipped **only if its binding stamp matches the
 current config.** On mismatch the checkpoint is **invalidated and the invalidation
 cascades downstream** (any station whose `resolved_input_artifact_hashes` changed is
@@ -866,7 +873,7 @@ write-lock contention at batch scale (rev-1 M1).
 
 | Table | Purpose |
 |---|---|
-| `journal` | OTel spans, worker "thoughts," tool i/o, **per-station token/cost attribution** |
+| `journal` | OTel spans, worker "thoughts," tool i/o, **per-station token/cost attribution**, and **config provenance**: a stamped station execution's spans record its binding stamp (§5), effective `prompt_template_version`, and harness agent with its definition-file SHA-256 |
 | `work_summaries` | one-to-many chain-of-custody summaries per card |
 | `mutations` | proposed improvements — *human-gated* (§13) |
 | `post_mortems` | run summaries + success metrics |
@@ -973,7 +980,10 @@ shapes, open questions — is in [`docs/feedback-loops.md`](docs/feedback-loops.
 **Two joins are the spine.** Learning connects an outcome to the decisions that caused it:
 **attribution** (`outcome ↔ asset` — the only non-backfillable piece, rev-1 F3) and
 **provenance** (`asset ↔ prompt/rubric/model/skill` — already in the journal). They rendezvous
-on a stable asset ID.
+on a stable asset ID. Provenance joins on the journal row rather than the checkpoint, which is
+per-run and deleted on invalidation: each span a stamped station execution writes carries its
+own binding stamp, effective `prompt_template_version`, and agent name and definition-file
+SHA-256.
 
 **Insurance to take now:** `output.tag_assets` stamps every asset with a stable ID
 (into the Meta CSV / UTMs). Attribution is the *only* loop piece that can't be backfilled

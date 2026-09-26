@@ -15,7 +15,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { StationGateConfig } from '../types/kernel';
 import type { ModelAdapter } from '../worker/adapter';
-import type { HarnessRegistry } from '../worker/harness-adapter';
+import { resolveHarnessAgent, type HarnessRegistry } from '../worker/harness-adapter';
 import { DEFAULT_RUN_ID, type ConduitDB, type StoredCardLogEntry } from '../persistence/db';
 import { runGateCheck, runHarnessGateCheck, computeFindingsHash, type CriticUsage } from '../quality/gate';
 import { renderPrompt } from '../flow/render';
@@ -211,6 +211,25 @@ export async function runGateRework(input: GateReworkInput): Promise<GateReworkD
         // would never fall through to the adapter default (`''` is not
         // nullish). Resolve '' as absent explicitly instead.
         const criticModel = gateConfig.criticModel !== '' ? gateConfig.criticModel : resolved.adapter.model;
+        // Issue #28: the critic's named agent, same precedence. The loader
+        // leaves an absent criticAgent absent (no '' sentinel), so `??` is
+        // correct here. Resolved before invoking so an agent without a
+        // definition file throws, which the executor turns into a hold, rather
+        // than running a critic the kernel cannot identify.
+        const criticAgent = gateConfig.criticAgent ?? resolved.adapter.agent;
+        // The definition hash rides to the journal's critic span on
+        // CriticUsage, so this is the only resolution. It is not folded into
+        // a binding stamp because a gate critic writes no checkpoint and is
+        // never skipped on resume: every attempt re-runs the critic against
+        // the current definition file.
+        let criticAgentSha256: string | undefined;
+        if (criticAgent !== undefined) {
+          const definition = resolveHarnessAgent(resolved.adapter, criticAgent);
+          if (!definition.ok) {
+            throw new Error(`harness critic agent unresolved for station '${workerStationId}': ${definition.error}`);
+          }
+          criticAgentSha256 = definition.sha256;
+        }
         return runHarnessGateCheck({
           cardId,
           station: workerStationId,
@@ -221,6 +240,7 @@ export async function runGateRework(input: GateReworkInput): Promise<GateReworkD
           projectRoot,
           timeoutMs: gateConfig.criticTimeoutMs ?? DEFAULT_HARNESS_CRITIC_TIMEOUT_MS,
           model: criticModel,
+          ...(criticAgent !== undefined ? { agent: criticAgent, agentSha256: criticAgentSha256 } : {}),
           onReject: gateConfig.onReject,
           validBackEdges,
           tools: gateConfig.criticTools,

@@ -40,7 +40,7 @@
 
 import { createHash } from 'node:crypto';
 import type { StationOutput } from '../types/kernel';
-import type { ConduitDB } from '../persistence/db';
+import type { ConduitDB, JournalProvenance } from '../persistence/db';
 import type { ModelAdapter, ModelResponse } from './adapter';
 import type { ImageInput } from './image-input';
 
@@ -90,6 +90,13 @@ export interface TransformContext<T> {
    * adapter's explicit engine-default timeout (not truly unbounded — the original transform-timeout work).
    */
   timeoutMs?: number;
+  /**
+   * Provenance of the station execution this call belongs to (binding stamp
+   * and effective prompt_template_version), written onto every usage span.
+   * Omitted by a caller that computes no stamp, such as a transform gate
+   * critic, which leaves the columns NULL.
+   */
+  provenance?: JournalProvenance;
 }
 
 /** What runTransformStation returns to the tick dispatcher. */
@@ -382,6 +389,7 @@ export async function runTransformStation<T>(
       runId: ctx.runId,
       attempt: attemptIndex,
       name: `${ctx.station}.transform`,
+      ...ctx.provenance,
       usage: {
         model: ctx.model,
         inputTokens: response.inputTokens,

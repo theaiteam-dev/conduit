@@ -584,7 +584,7 @@ function makeRun(): {
   const calls: RunnerCall[] = [];
   const run = async (cmd: HarnessCommand, config: HarnessRunnerConfig): Promise<HarnessSpawnResult> => {
     calls.push({ cmd, config });
-    return { exitCode: 0, stdout: RECORDED_CLAUDE_SUCCESS, stderr: '', durationMs: 1, timedOut: false };
+    return { exitCode: 0, stdout: RECORDED_CLAUDE_SUCCESS, stderr: '', durationMs: 1, timedOut: false, idledOut: false };
   };
   return { run, calls };
 }

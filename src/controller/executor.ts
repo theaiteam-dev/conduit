@@ -38,7 +38,7 @@ import { deriveSubflowRunId } from '../run/run-id';
 import type { StartWorkMessage } from '../worker/ipc-protocol';
 import { sanitizeStderrTail } from '../worker/ipc-protocol';
 import type { ModelAdapter } from '../worker/adapter';
-import { DEFAULT_RUN_ID, type ConduitDB, type JournalSpanInput } from '../persistence/db';
+import { DEFAULT_RUN_ID, type ConduitDB, type JournalSpanInput, type JournalProvenance } from '../persistence/db';
 import type { FlowConfig, StationConfig, FanInPolicyConfig, StationOutput, Card } from '../types/kernel';
 import { planTick } from './tick';
 import { attemptClaim, beginWork, renewLease, reconcile } from '../dispatch/claim';
@@ -47,7 +47,7 @@ import { runTransformStation, coerciveParse, computeFindingsHash } from '../work
 import type {
   HarnessRegistry, MountedInput, HarnessResult, KnownUsage, RateLimitSnapshot,
 } from '../worker/harness-adapter';
-import { usageFromThrow } from '../worker/harness-adapter';
+import { usageFromThrow, resolveHarnessAgent, DEFAULT_HARNESS_TIMEOUT_MS } from '../worker/harness-adapter';
 import { harnessRetryDelayMs } from '../worker/harness-retry';
 import { loadImageInput, hashImageInputs, assertImagePayloadWithinLimits } from '../worker/image-input';
 import type { ImageInput } from '../worker/image-input';
@@ -57,6 +57,7 @@ import { runGateRework } from './gate-rework';
 import {
   computeBindingStamp,
   computeSkillAwarePromptTemplateVersion,
+  computeAgentAwarePromptTemplateVersion,
   writeCheckpoint,
   readCheckpoint,
   invalidateCheckpoint,
@@ -113,15 +114,6 @@ const POOL_WAIT_TIMEOUT_MS = 250;
 
 /** Worker ID prefix for this single-process executor. */
 const WORKER_ID_PREFIX = 'executor';
-
-/**
- * Default wall-clock bound (ms) for a harness invocation when the station
- * declares no `timeout_seconds` — harness attempts run 3-4 minutes by design
- * (SPEC §7 / the agentic-harness-worker PRD), far longer than a transform's
- * single model call, so this default is generous rather than reusing a
- * transform-scale timeout.
- */
-const DEFAULT_HARNESS_TIMEOUT_MS = 5 * 60 * 1000;
 
 /**
  * How long to park a rate-limited card when the provider reported no reset time.
@@ -253,6 +245,28 @@ function rateLimitAttributes(snapshot: RateLimitSnapshot | undefined): Record<st
     attrs[`rate_limit_${w.name}_resets_at`] = w.resetsAtMs;
   }
   return attrs;
+}
+
+/**
+ * Issue #30: the number of OTHER cards in this run that are dispatchable now
+ * (status 'ready', release gate passed, using planTick's rule). A harness call
+ * runs on the serial in-process path, so the tick loop dispatches nothing else
+ * until it returns. Recorded as `ready_waiting` on every harness maker and
+ * harness critic span, so a finished run can report how many card-seconds
+ * waited behind each harness station (`run/harness-occupancy.ts`). Pass a
+ * clock read taken just before the call, not the tick's `currentNow`. The
+ * figure is an estimate: it misses a card that becomes dispatchable during the
+ * call, and it counts cards a station `wip` cap would have held back anyway.
+ */
+function countReadyWaiting(stateDb: Database, runId: string, cardId: string, nowSeconds: number): number {
+  const row = stateDb
+    .prepare(
+      `SELECT COUNT(*) AS n FROM cards
+       WHERE run_id = $runId AND id != $cardId AND status = 'ready'
+         AND (release_at IS NULL OR release_at <= $now)`,
+    )
+    .get({ $runId: runId, $cardId: cardId, $now: nowSeconds }) as { n: number };
+  return row.n;
 }
 
 /** True when some ready card is still gated behind a future release_at. */
@@ -1168,6 +1182,7 @@ export async function runExecutor(args: RunEngineArgs): Promise<void> {
           maxExecutionAttempts,
           projectRoot,
           currentNow,
+          now,
           runStartedAt,
           wallClockSeconds,
           maxTokens,
@@ -1231,6 +1246,7 @@ export async function runExecutor(args: RunEngineArgs): Promise<void> {
               maxExecutionAttempts,
               projectRoot,
               currentNow,
+              now,
               runStartedAt,
               wallClockSeconds,
               maxTokens,
@@ -1467,6 +1483,12 @@ interface ExecuteStationArgs {
   maxExecutionAttempts: number;
   projectRoot: string;
   currentNow: number;
+  /**
+   * The executor's injected clock. `currentNow` is fixed at tick start and is
+   * stale after a retry backoff or a long call; issue #30's `ready_waiting`
+   * samples read this instead.
+   */
+  now: () => number;
   runStartedAt: number;
   wallClockSeconds: number;
   maxTokens: number;
@@ -1525,6 +1547,7 @@ async function executeStation(args: ExecuteStationArgs): Promise<boolean> {
     maxExecutionAttempts,
     projectRoot,
     currentNow,
+    now,
     runStartedAt,
     wallClockSeconds,
     maxTokens,
@@ -1584,6 +1607,7 @@ async function executeStation(args: ExecuteStationArgs): Promise<boolean> {
       // exactly like a gated transform station.
       trackingAdapter,
       currentNow,
+      now,
       runStartedAt,
       wallClockSeconds,
       maxTokens,
@@ -1618,6 +1642,7 @@ async function executeStation(args: ExecuteStationArgs): Promise<boolean> {
       projectRoot,
       flow,
       currentNow,
+      now,
       runStartedAt,
       wallClockSeconds,
       maxTokens,
@@ -1650,6 +1675,7 @@ async function executeStation(args: ExecuteStationArgs): Promise<boolean> {
       projectRoot,
       flow,
       currentNow,
+      now,
       runStartedAt,
       wallClockSeconds,
       maxTokens,
@@ -1678,6 +1704,7 @@ async function executeStation(args: ExecuteStationArgs): Promise<boolean> {
       projectRoot,
       flow,
       currentNow,
+      now,
       runStartedAt,
       wallClockSeconds,
       maxTokens,
@@ -1728,6 +1755,8 @@ interface DeterministicArgs {
    */
   trackingAdapter: ModelAdapter;
   currentNow: number;
+  /** See ExecuteStationArgs.now. */
+  now: () => number;
   runStartedAt: number;
   wallClockSeconds: number;
   maxTokens: number;
@@ -2057,7 +2086,7 @@ function countDeterministicFailure(
 async function executeDeterministicStation(args: DeterministicArgs): Promise<boolean> {
   const {
     db, stateDb, runId, stationConfig, stationId, cardId, commandAllowlist, happyPathNext, terminalLanes,
-    projectRoot, flow, maxExecutionAttempts, trackingAdapter, currentNow, runStartedAt, wallClockSeconds,
+    projectRoot, flow, maxExecutionAttempts, trackingAdapter, currentNow, now, runStartedAt, wallClockSeconds,
     maxTokens, getTokensSpent, onAndonTrip, harnessRegistry, stampActivity, foldHarnessUsage, err,
   } = args;
 
@@ -2119,7 +2148,7 @@ async function executeDeterministicStation(args: DeterministicArgs): Promise<boo
         db, stateDb, runId, stationConfig, stationId, cardId, card,
         stationOutput: readDeterministicStationOutput(stationConfig, projectRoot),
         trackingAdapter, projectRoot, flow, happyPathNext, terminalLanes, maxExecutionAttempts,
-        currentNow, runStartedAt, wallClockSeconds, maxTokens, getTokensSpent, onAndonTrip, harnessRegistry, foldHarnessUsage, err,
+        currentNow, now, runStartedAt, wallClockSeconds, maxTokens, getTokensSpent, onAndonTrip, harnessRegistry, foldHarnessUsage, err,
       });
     }
 
@@ -2176,7 +2205,7 @@ async function executeDeterministicStation(args: DeterministicArgs): Promise<boo
         db, stateDb, runId, stationConfig, stationId, cardId, card,
         stationOutput: readDeterministicStationOutput(stationConfig, projectRoot),
         trackingAdapter, projectRoot, flow, happyPathNext, terminalLanes, maxExecutionAttempts,
-        currentNow, runStartedAt, wallClockSeconds, maxTokens, getTokensSpent, onAndonTrip, harnessRegistry, foldHarnessUsage, err,
+        currentNow, now, runStartedAt, wallClockSeconds, maxTokens, getTokensSpent, onAndonTrip, harnessRegistry, foldHarnessUsage, err,
       });
     } else {
       // Command failed with the intent still PENDING. A nonzero exit does NOT
@@ -2237,7 +2266,7 @@ async function executeDeterministicStation(args: DeterministicArgs): Promise<boo
       db, stateDb, runId, stationConfig, stationId, cardId, card,
       stationOutput: readDeterministicStationOutput(stationConfig, projectRoot),
       trackingAdapter, projectRoot, flow, happyPathNext, terminalLanes, maxExecutionAttempts,
-      currentNow, runStartedAt, wallClockSeconds, maxTokens, getTokensSpent, onAndonTrip, harnessRegistry, foldHarnessUsage, err,
+      currentNow, now, runStartedAt, wallClockSeconds, maxTokens, getTokensSpent, onAndonTrip, harnessRegistry, foldHarnessUsage, err,
     });
   } else {
     // Command failed → count it toward the attempt cap: retry below the cap,
@@ -2290,6 +2319,8 @@ interface GateCheckOrAdvanceArgs {
   terminalLanes: Set<string>;
   maxExecutionAttempts: number;
   currentNow: number;
+  /** See ExecuteStationArgs.now. Read just before the critic call. */
+  now: () => number;
   runStartedAt: number;
   wallClockSeconds: number;
   maxTokens: number;
@@ -2726,7 +2757,7 @@ async function performStationDelivery(args: {
 async function runGateCheckOrAdvance(args: GateCheckOrAdvanceArgs): Promise<boolean> {
   const {
     db, stateDb, runId, stationConfig, stationId, cardId, card, stationOutput, trackingAdapter, projectRoot,
-    flow, happyPathNext, terminalLanes, maxExecutionAttempts, currentNow, runStartedAt, wallClockSeconds,
+    flow, happyPathNext, terminalLanes, maxExecutionAttempts, currentNow, now, runStartedAt, wallClockSeconds,
     maxTokens, getTokensSpent, onAndonTrip, harnessRegistry, foldHarnessUsage, err,
   } = args;
 
@@ -2747,6 +2778,9 @@ async function runGateCheckOrAdvance(args: GateCheckOrAdvanceArgs): Promise<bool
     // mirroring the maker-side adapter-unresolved pattern above (~2383):
     // escalate ambiguity, never guess, never crash the run over one card's
     // config error.
+    // Issue #30: the critic runs after the maker's call, so `currentNow` is
+    // stale here; read the clock fresh.
+    const criticReadyWaiting = countReadyWaiting(stateDb, runId, cardId, now());
     let gateDecision: Awaited<ReturnType<typeof runGateRework>>;
     try {
       gateDecision = await runGateRework({
@@ -2805,11 +2839,19 @@ async function runGateCheckOrAdvance(args: GateCheckOrAdvanceArgs): Promise<bool
         station: stationId,
         attempt: card.attempt,
         name: `${stationId}.harness-critic`,
+        // Provenance: the critic's agent and its definition hash. The critic
+        // writes no checkpoint, so it has no binding stamp to record.
+        ...(gateDecision.criticUsage.agent !== undefined
+          ? { agent: gateDecision.criticUsage.agent, agentSha256: gateDecision.criticUsage.agentSha256 }
+          : {}),
         adapter: adapterName,
         durationMs,
         usageUnknown: !usageKnown,
         usage: usageKnown ? harnessJournalUsage(usage, model) : undefined,
-        attributes: usageKnown ? rateLimitAttributes(usage.rateLimit) : {},
+        attributes: {
+          ...(usageKnown ? rateLimitAttributes(usage.rateLimit) : {}),
+          ready_waiting: criticReadyWaiting,
+        },
       });
     }
 
@@ -3018,6 +3060,8 @@ interface TransformArgs {
   projectRoot: string;
   flow: FlowConfig;
   currentNow: number;
+  /** See ExecuteStationArgs.now. */
+  now: () => number;
   runStartedAt: number;
   wallClockSeconds: number;
   maxTokens: number;
@@ -3056,6 +3100,7 @@ async function executeTransformStation(args: TransformArgs): Promise<boolean> {
     projectRoot,
     flow,
     currentNow,
+    now,
     runStartedAt,
     wallClockSeconds,
     maxTokens,
@@ -3273,6 +3318,8 @@ async function executeTransformStation(args: TransformArgs): Promise<boolean> {
       // engine-default timeout (not truly unbounded — the original transform-timeout work).
       timeoutMs:
         stationConfig.timeout_seconds !== undefined ? stationConfig.timeout_seconds * 1000 : undefined,
+      // Journal provenance: the stamp and the effective prompt version it folded.
+      provenance: { bindingStamp, promptTemplateVersion },
     });
 
     // ── Andon check after model call ──────────────────────────────────────────
@@ -3448,7 +3495,7 @@ async function executeTransformStation(args: TransformArgs): Promise<boolean> {
     db, stateDb, runId, stationConfig, stationId, cardId, card,
     stationOutput,
     trackingAdapter, projectRoot, flow, happyPathNext, terminalLanes, maxExecutionAttempts,
-    currentNow, runStartedAt, wallClockSeconds, maxTokens, getTokensSpent, onAndonTrip, harnessRegistry, foldHarnessUsage, err,
+    currentNow, now, runStartedAt, wallClockSeconds, maxTokens, getTokensSpent, onAndonTrip, harnessRegistry, foldHarnessUsage, err,
   });
 }
 
@@ -3471,6 +3518,8 @@ interface HarnessArgs {
   projectRoot: string;
   flow: FlowConfig;
   currentNow: number;
+  /** See ExecuteStationArgs.now. Read just before each maker invoke(). */
+  now: () => number;
   runStartedAt: number;
   wallClockSeconds: number;
   maxTokens: number;
@@ -3526,7 +3575,7 @@ interface HarnessArgs {
 async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
   const {
     db, stateDb, runId, stationConfig, stationId, cardId, trackingAdapter, happyPathNext, terminalLanes,
-    maxExecutionAttempts, projectRoot, flow, currentNow, runStartedAt, wallClockSeconds, maxTokens,
+    maxExecutionAttempts, projectRoot, flow, currentNow, now, runStartedAt, wallClockSeconds, maxTokens,
     getTokensSpent, onAndonTrip, harnessRegistry, foldHarnessUsage, stampHarnessActivity, sleep, err,
   } = args;
 
@@ -3563,6 +3612,32 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
   // only ever saw the adapter's config default — a silent divergence that
   // let a changed adapter default wrongly skip on resume).
   const effectiveModel = stationConfig.model ?? harnessAdapter.model;
+
+  // ── Effective agent (issue #28): same precedence as the model, computed
+  // once so the stamp and the invocation agree. The definition file is
+  // resolved HERE, at dispatch, not only at load: plugin dirs are engine
+  // config, and the file may have changed since the flow loaded. An agent that
+  // cannot be resolved is a configuration failure, so the card holds rather
+  // than stamping on the name alone, which would let an edited agent replay
+  // from a stale checkpoint.
+  const effectiveAgent = stationConfig.agent ?? harnessAdapter.agent;
+  let promptTemplateVersion = stationConfig.prompt_version ?? '';
+  let agentSha256: string | undefined;
+  if (effectiveAgent !== undefined) {
+    const definition = resolveHarnessAgent(harnessAdapter, effectiveAgent);
+    if (!definition.ok) {
+      escalateToHold(
+        stateDb, db, cardId, stationId, card,
+        `harness agent unresolved for station '${stationId}': ${definition.error}`,
+        err, runId, true,
+      );
+      return false;
+    }
+    agentSha256 = definition.sha256;
+    promptTemplateVersion = computeAgentAwarePromptTemplateVersion(
+      promptTemplateVersion, effectiveAgent, definition.sha256,
+    );
+  }
 
   // ── Accumulate prior gate rejection findings for feedback (FR-5) ──────────
   // Identical to the transform path: {{feedback}} is prompt-threaded, zero new
@@ -3601,7 +3676,8 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
 
   const bindingStamp = computeBindingStamp({
     modelId: effectiveModel ?? '',
-    promptTemplateVersion: stationConfig.prompt_version ?? '',
+    // prompt_version, with the effective agent folded in when there is one.
+    promptTemplateVersion,
     inputArtifactHashes: inputHashes,
     flowVersion: flow.version,
     // WI-572 / review #7: the adapter's identity rides the dedicated
@@ -3611,6 +3687,14 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
     // modelId stays semantically the model id.
     adapterName: harnessAdapter.name,
   });
+
+  // Journal provenance, written on every `<station>.harness` span below so each
+  // result is attributable to the exact config that produced it across runs.
+  const provenance: JournalProvenance = {
+    bindingStamp,
+    promptTemplateVersion,
+    ...(effectiveAgent !== undefined ? { agent: effectiveAgent, agentSha256 } : {}),
+  };
 
   // ── WI-571: effectful-station outbox discipline (Phase 3, FR-11) ────────
   // Mirrors the transform effectful path exactly (SPEC §5 exactly-once): for
@@ -3701,6 +3785,11 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
       stationConfig.timeout_seconds !== undefined
         ? stationConfig.timeout_seconds * 1000
         : DEFAULT_HARNESS_TIMEOUT_MS;
+    // Issue #31: opt-in idle bound, absent unless the station declares one.
+    // The loader has already validated it is positive and, when both are
+    // declared, strictly less than timeout_seconds.
+    const idleTimeoutMs =
+      stationConfig.idle_timeout_seconds !== undefined ? stationConfig.idle_timeout_seconds * 1000 : undefined;
 
     // ── WI-566: bounded retry loop, mirroring transform.ts runTransformStation
     // (`while callsMade < maxExecutionAttempts`). Every distinct failure class
@@ -3731,6 +3820,10 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
       // performs the only write, from the model's structured response).
       const integrityBaseline = snapshotTree(projectRoot);
 
+      // Issue #30: read the clock fresh, since a retry runs after this loop's
+      // backoff sleep. Written on every span this attempt produces.
+      const readyWaiting = countReadyWaiting(stateDb, runId, cardId, now());
+
       let invokeResult: HarnessResult;
       try {
         // The original adapter-liveness work: stamp fresh liveness progress BEFORE awaiting invoke() too
@@ -3744,6 +3837,9 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
           tools: stationConfig.tools ?? [],
           timeoutMs,
           model: effectiveModel,
+          onProgress: stampHarnessActivity,
+          ...(idleTimeoutMs !== undefined ? { idleTimeoutMs } : {}),
+          ...(effectiveAgent !== undefined ? { agent: effectiveAgent } : {}),
         });
       } catch (invokeErr) {
         // WI-567 FR-8 fix: stamp fresh liveness progress even on a thrown
@@ -3783,7 +3879,7 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
             parkedJournalUsage = harnessJournalUsage(parkedUsage, effectiveModel);
           }
           db.appendJournalSpan({
-            runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.harness`,
+            runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.harness`, ...provenance,
             adapter: harnessAdapter.name, durationMs: Date.now() - invokeStartedAt,
             usageUnknown: !parkedUsageKnown, usage: parkedJournalUsage,
             attributes: {
@@ -3791,6 +3887,7 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
               // what separates "capped, cost nothing" from "ran for minutes and
               // its spend is unrecorded" without inferring it from duration.
               outcome: 'harness-rate-limited',
+              ready_waiting: readyWaiting,
               rate_limit_release_at: releaseAt,
               rate_limit_reset_reported: resetAtMs ?? null,
               ...rateLimitAttributes((invokeErr as { rateLimit?: RateLimitSnapshot }).rateLimit),
@@ -3848,12 +3945,18 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
         // An UNTAGGED throw still scraps under a generic named reason — loud,
         // never a silent failure to classify.
         const code = (invokeErr as { code?: string }).code;
+        // Issue #31: an idle kill is retried like a wall-clock timeout (it
+        // spends an execution attempt and gets the same backoff below), but
+        // has its own scrap reason so a card that exhausts its attempts names
+        // which bound killed it.
         scrapReason =
           code === 'harness-timeout'
             ? 'harness-timeout'
-            : code === 'harness-nonzero-exit'
-              ? 'harness-nonzero-exit'
-              : `harness-invocation-failed: ${(invokeErr as Error).message}`;
+            : code === 'harness-idle-timeout'
+              ? 'harness-idle-timeout'
+              : code === 'harness-nonzero-exit'
+                ? 'harness-nonzero-exit'
+                : `harness-invocation-failed: ${(invokeErr as Error).message}`;
         // issue #26 AC5: a thrown invocation was still BILLED for whatever it
         // did before it died (a timeout or nonzero exit does not refund
         // tokens already consumed). usageFromThrow is the ONE reader for
@@ -3874,10 +3977,10 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
           thrownJournalUsage = harnessJournalUsage(thrownUsage, effectiveModel);
         }
         db.appendJournalSpan({
-          runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.harness`,
+          runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.harness`, ...provenance,
           adapter: harnessAdapter.name, durationMs: Date.now() - invokeStartedAt,
           usageUnknown: !thrownUsageKnown, usage: thrownJournalUsage,
-          attributes: { outcome: scrapReason },
+          attributes: { outcome: scrapReason, ready_waiting: readyWaiting },
         });
         // Issue #3: back off before the next attempt. Without this,
         // max_execution_attempts doubled as the wall-clock retry policy and any
@@ -3956,9 +4059,9 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
           : runOwnedPathsIntegrity(projectRoot, ownedPaths, touchedPaths);
       if (integrityViolation && !integrityViolation.ok) {
         db.appendJournalSpan({
-          runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.harness`,
+          runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.harness`, ...provenance,
           adapter: harnessAdapter.name, durationMs, usageUnknown: !usageKnown, usage: journalUsage,
-          attributes: { outcome: `integrity_violation: ${describeIntegrity(integrityViolation)}` },
+          attributes: { outcome: `integrity_violation: ${describeIntegrity(integrityViolation)}`, ready_waiting: readyWaiting },
         });
         escalateToHold(
           stateDb, db, cardId, stationId, card,
@@ -3976,9 +4079,9 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
         callsMade++;
         scrapReason = `harness-output-missing: ${missingOutputs.join(', ')}`;
         db.appendJournalSpan({
-          runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.harness`,
+          runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.harness`, ...provenance,
           adapter: harnessAdapter.name, durationMs, usageUnknown: !usageKnown, usage: journalUsage,
-          attributes: { outcome: scrapReason },
+          attributes: { outcome: scrapReason, ready_waiting: readyWaiting },
         });
         continue;
       }
@@ -3998,9 +4101,9 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
         callsMade++;
         scrapReason = `harness-output-unparseable: station '${stationId}' output '${outputFile ?? '(none declared)'}' is not valid JSON`;
         db.appendJournalSpan({
-          runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.harness`,
+          runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.harness`, ...provenance,
           adapter: harnessAdapter.name, durationMs, usageUnknown: !usageKnown, usage: journalUsage,
-          attributes: { outcome: scrapReason },
+          attributes: { outcome: scrapReason, ready_waiting: readyWaiting },
         });
         continue;
       }
@@ -4009,9 +4112,9 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
         callsMade++;
         scrapReason = `harness-output-invalid: station '${stationId}': ${validated.error}`;
         db.appendJournalSpan({
-          runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.harness`,
+          runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.harness`, ...provenance,
           adapter: harnessAdapter.name, durationMs, usageUnknown: !usageKnown, usage: journalUsage,
-          attributes: { outcome: scrapReason },
+          attributes: { outcome: scrapReason, ready_waiting: readyWaiting },
         });
         continue;
       }
@@ -4046,12 +4149,12 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
         }
       }
       db.appendJournalSpan({
-        runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.harness`,
+        runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.harness`, ...provenance,
         adapter: harnessAdapter.name, durationMs, usageUnknown: !usageKnown, usage: journalUsage,
         // Issue #5: the capacity snapshot rides along on the priced row, so
         // "what did this run draw against the plan" is a query rather than an
         // inference from interactive usage bars.
-        attributes: { artifact_hashes: artifactHashes, outcome: 'success', ...rateLimitAttrs },
+        attributes: { artifact_hashes: artifactHashes, outcome: 'success', ready_waiting: readyWaiting, ...rateLimitAttrs },
       });
 
       // ── Write checkpoint (binding stamp) ───────────────────────────────────
@@ -4116,7 +4219,7 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
     db, stateDb, runId, stationConfig, stationId, cardId, card,
     stationOutput,
     trackingAdapter, projectRoot, flow, happyPathNext, terminalLanes, maxExecutionAttempts,
-    currentNow, runStartedAt, wallClockSeconds, maxTokens, getTokensSpent, onAndonTrip,
+    currentNow, now, runStartedAt, wallClockSeconds, maxTokens, getTokensSpent, onAndonTrip,
     harnessRegistry, foldHarnessUsage, err,
   });
 }
@@ -4167,6 +4270,8 @@ interface SubflowArgs {
   projectRoot: string;
   flow: FlowConfig;
   currentNow: number;
+  /** See ExecuteStationArgs.now. */
+  now: () => number;
   runStartedAt: number;
   wallClockSeconds: number;
   maxTokens: number;
@@ -4200,7 +4305,7 @@ interface SubflowArgs {
 async function executeSubflowStation(args: SubflowArgs): Promise<boolean> {
   const {
     db, stateDb, runId, stationConfig, stationId, cardId, trackingAdapter, happyPathNext,
-    terminalLanes, maxExecutionAttempts, projectRoot, flow, currentNow, runStartedAt,
+    terminalLanes, maxExecutionAttempts, projectRoot, flow, currentNow, now, runStartedAt,
     wallClockSeconds, maxTokens, getTokensSpent, onAndonTrip, harnessRegistry,
     foldHarnessUsage, stampHarnessActivity, runSubflow, err,
   } = args;
@@ -4302,11 +4407,14 @@ async function executeSubflowStation(args: SubflowArgs): Promise<boolean> {
         ? { model: '', inputTokens: result.tokens ?? 0, outputTokens: 0, costUsd: result.costUsd ?? 0 }
         : undefined;
 
+      // Subflow spans record only bindingStamp as provenance: a subflow
+      // station has no prompt, so its stamp is computed with an empty
+      // promptTemplateVersion and no agent, and there is nothing else to record.
       if (result.outcome !== 'done') {
         callsMade++;
         scrapReason = `subflow-${result.outcome}: ${result.reason}`;
         db.appendJournalSpan({
-          runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.subflow`,
+          runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.subflow`, bindingStamp,
           adapter: `subflow:${childFlowPath}`, durationMs, usageUnknown: !usageKnown, usage: journalUsage,
           attributes: { child_run_id: childRunId, outcome: scrapReason },
         });
@@ -4321,7 +4429,7 @@ async function executeSubflowStation(args: SubflowArgs): Promise<boolean> {
         callsMade++;
         scrapReason = `subflow-output-missing: ${missingOutputs.join(', ')}`;
         db.appendJournalSpan({
-          runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.subflow`,
+          runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.subflow`, bindingStamp,
           adapter: `subflow:${childFlowPath}`, durationMs, usageUnknown: !usageKnown, usage: journalUsage,
           attributes: { child_run_id: childRunId, outcome: scrapReason },
         });
@@ -4339,7 +4447,7 @@ async function executeSubflowStation(args: SubflowArgs): Promise<boolean> {
       stationOutput = output;
 
       db.appendJournalSpan({
-        runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.subflow`,
+        runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.subflow`, bindingStamp,
         adapter: `subflow:${childFlowPath}`, durationMs, usageUnknown: !usageKnown, usage: journalUsage,
         attributes: { child_run_id: childRunId, outcome: 'success' },
       });
@@ -4376,7 +4484,7 @@ async function executeSubflowStation(args: SubflowArgs): Promise<boolean> {
     db, stateDb, runId, stationConfig, stationId, cardId, card,
     stationOutput,
     trackingAdapter, projectRoot, flow, happyPathNext, terminalLanes, maxExecutionAttempts,
-    currentNow, runStartedAt, wallClockSeconds, maxTokens, getTokensSpent, onAndonTrip,
+    currentNow, now, runStartedAt, wallClockSeconds, maxTokens, getTokensSpent, onAndonTrip,
     harnessRegistry, foldHarnessUsage, err,
   });
 }

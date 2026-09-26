@@ -85,6 +85,10 @@ export interface CriticUsage {
   model?: string;
   /** Wall-clock duration of the invoke(), in milliseconds. */
   durationMs: number;
+  /** Effective agent the critic ran, when one was resolved (journal provenance). */
+  agent?: string;
+  /** SHA-256 of that agent's definition file, as the caller resolved it. */
+  agentSha256?: string;
   /** The adapter's own report. `{ unknown: true }` stays unknown, never zero. */
   usage: UsageReport;
 }
@@ -266,6 +270,16 @@ export interface HarnessGateConfig {
    * default," never coerced to a placeholder.
    */
   model?: string;
+  /**
+   * Resolved EFFECTIVE agent for this invocation (issue #28), resolved and
+   * checked by the CALLER like `model`. Omitted means no `--agent`.
+   */
+  agent?: string;
+  /**
+   * SHA-256 of `agent`'s definition file, from the caller's resolution. Carried
+   * onto CriticUsage for the journal so the definition is not resolved twice.
+   */
+  agentSha256?: string;
   onReject: Lane;
   validBackEdges: ReadonlyArray<{ from: string; to: string }>;
   /**
@@ -280,6 +294,18 @@ export interface HarnessGateConfig {
    * exercised for a harness critic.
    */
   tools?: string[];
+}
+
+/**
+ * The agent fields of a CriticUsage: `agent` when the critic ran one, and
+ * `agentSha256` only when the caller passed the resolved definition hash.
+ * gate-rework.ts resolves the definition before invoking and always passes
+ * both, so a journal row with `agent` and no hash comes from a caller that
+ * skipped resolution.
+ */
+function criticAgentProvenance(config: HarnessGateConfig): Pick<CriticUsage, 'agent' | 'agentSha256'> {
+  if (config.agent === undefined) return {};
+  return { agent: config.agent, ...(config.agentSha256 !== undefined ? { agentSha256: config.agentSha256 } : {}) };
 }
 
 /**
@@ -327,6 +353,7 @@ export async function runHarnessGateCheck(config: HarnessGateConfig): Promise<Ga
       tools: config.tools ?? [],
       timeoutMs: config.timeoutMs,
       ...(config.model !== undefined ? { model: config.model } : {}),
+      ...(config.agent !== undefined ? { agent: config.agent } : {}),
     });
   } catch (err) {
     // A thrown invocation (timeout/nonzero-exit/untagged) never yields a
@@ -343,6 +370,7 @@ export async function runHarnessGateCheck(config: HarnessGateConfig): Promise<Ga
       criticUsage: {
         adapterName: config.harnessAdapter.name,
         ...(config.model !== undefined ? { model: config.model } : {}),
+        ...criticAgentProvenance(config),
         durationMs: Date.now() - invokeStartedAt,
         usage: usageFromThrow(err) ?? { unknown: true },
       },
@@ -356,6 +384,7 @@ export async function runHarnessGateCheck(config: HarnessGateConfig): Promise<Ga
   const criticUsage: CriticUsage = {
     adapterName: config.harnessAdapter.name,
     ...(config.model !== undefined ? { model: config.model } : {}),
+    ...criticAgentProvenance(config),
     durationMs: Date.now() - invokeStartedAt,
     usage: result.usage,
   };

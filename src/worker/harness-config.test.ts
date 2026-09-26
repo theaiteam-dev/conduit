@@ -329,3 +329,83 @@ describe('parseHarnessConfig', () => {
     });
   });
 });
+
+// ---------------------------------------------------------------------------
+// Issues #28 / #29: named agent default, per-run plugin dirs, and config-dir
+// isolation. All three are engine config, parsed here, never from flow.yaml.
+// ---------------------------------------------------------------------------
+describe('parseHarnessConfig: _AGENT, _PLUGIN_DIRS, _ISOLATE_CONFIG (issues #28, #29)', () => {
+  function claudeEnv(extra: Record<string, string>): Record<string, string | undefined> {
+    return {
+      CONDUIT_HARNESS_ADAPTERS: 'claude-headless',
+      CONDUIT_HARNESS_CLAUDE_HEADLESS_ENV: 'HOME,PATH',
+      ...extra,
+    };
+  }
+
+  it('leaves agent, pluginDirs and isolateConfig absent when none of the vars is set', () => {
+    const [def] = expectOk(parseHarnessConfig(claudeEnv({})));
+    expect('agent' in def!).toBe(false);
+    expect('pluginDirs' in def!).toBe(false);
+    expect('isolateConfig' in def!).toBe(false);
+  });
+
+  it('populates agent from _AGENT as the adapter default', () => {
+    const [def] = expectOk(parseHarnessConfig(claudeEnv({ CONDUIT_HARNESS_CLAUDE_HEADLESS_AGENT: 'ai-team:murdock' })));
+    expect(def!.agent).toBe('ai-team:murdock');
+  });
+
+  it('trims _AGENT before storing it', () => {
+    const [def] = expectOk(parseHarnessConfig(claudeEnv({ CONDUIT_HARNESS_CLAUDE_HEADLESS_AGENT: ' plug:agent ' })));
+    expect(def!.agent).toBe('plug:agent');
+  });
+
+  it('rejects an empty _AGENT, naming the variable, rather than storing "" and silently holding every station', () => {
+    const error = expectErr(parseHarnessConfig(claudeEnv({ CONDUIT_HARNESS_CLAUDE_HEADLESS_AGENT: '' })));
+    expect(error).toContain('CONDUIT_HARNESS_CLAUDE_HEADLESS_AGENT');
+    expect(error).toContain('empty');
+  });
+
+  it('rejects a whitespace-only _AGENT the same way', () => {
+    const error = expectErr(parseHarnessConfig(claudeEnv({ CONDUIT_HARNESS_CLAUDE_HEADLESS_AGENT: '   ' })));
+    expect(error).toContain('CONDUIT_HARNESS_CLAUDE_HEADLESS_AGENT');
+    expect(error).toContain('empty');
+  });
+
+  it('splits _PLUGIN_DIRS as CSV into one entry per path, trimming whitespace and dropping empty tokens', () => {
+    const [def] = expectOk(
+      parseHarnessConfig(claudeEnv({ CONDUIT_HARNESS_CLAUDE_HEADLESS_PLUGIN_DIRS: ' /opt/plugins/a ,,/opt/plugins/b ' })),
+    );
+    expect(def!.pluginDirs).toEqual(['/opt/plugins/a', '/opt/plugins/b']);
+  });
+
+  it('treats an empty _PLUGIN_DIRS as absent (no plugin dirs, no flag)', () => {
+    const [def] = expectOk(parseHarnessConfig(claudeEnv({ CONDUIT_HARNESS_CLAUDE_HEADLESS_PLUGIN_DIRS: '' })));
+    expect('pluginDirs' in def!).toBe(false);
+  });
+
+  it('rejects a relative _PLUGIN_DIRS entry, naming the variable and the entry', () => {
+    const error = expectErr(
+      parseHarnessConfig(claudeEnv({ CONDUIT_HARNESS_CLAUDE_HEADLESS_PLUGIN_DIRS: '/opt/plugins/a,plugins/b' })),
+    );
+    expect(error).toContain('CONDUIT_HARNESS_CLAUDE_HEADLESS_PLUGIN_DIRS');
+    expect(error).toContain('plugins/b');
+    expect(error).toContain('absolute');
+  });
+
+  it.each([
+    ['1', true],
+    ['true', true],
+    ['0', false],
+    ['false', false],
+  ])('parses _ISOLATE_CONFIG=%s as %s', (raw, expected) => {
+    const [def] = expectOk(parseHarnessConfig(claudeEnv({ CONDUIT_HARNESS_CLAUDE_HEADLESS_ISOLATE_CONFIG: raw })));
+    expect(def!.isolateConfig).toBe(expected);
+  });
+
+  it('rejects an unrecognised _ISOLATE_CONFIG value rather than guessing, naming the variable', () => {
+    const error = expectErr(parseHarnessConfig(claudeEnv({ CONDUIT_HARNESS_CLAUDE_HEADLESS_ISOLATE_CONFIG: 'yes' })));
+    expect(error).toContain('CONDUIT_HARNESS_CLAUDE_HEADLESS_ISOLATE_CONFIG');
+    expect(error).toContain('yes');
+  });
+});
