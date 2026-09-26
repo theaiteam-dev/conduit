@@ -60,8 +60,13 @@ function validateLane(cardId: string, lane: string): string {
   return lane;
 }
 
-/** JSON.parse a persisted column, rethrowing SyntaxError WITH card id + column. */
-function parseColumn(cardId: string, column: string, raw: string): unknown {
+/**
+ * JSON.parse a persisted column, rethrowing SyntaxError WITH card id + column.
+ * Exported so callers that read individual card columns without a full
+ * `getCard` (issue #32's `applySkipWhen` candidate scan) parse `owned_paths`
+ * the same way `getCard` does, instead of duplicating the try/catch.
+ */
+export function parseColumn(cardId: string, column: string, raw: string): unknown {
   try {
     return JSON.parse(raw);
   } catch (err) {

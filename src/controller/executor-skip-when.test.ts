@@ -18,7 +18,7 @@
  * whose prompt renders {{seed.json}}, so every adapter call records which card
  * it ran for.
  */
-import { describe, it, expect, beforeEach, afterEach, spyOn } from 'bun:test';
+import { describe, it, expect, beforeEach, afterEach, afterAll, mock } from 'bun:test';
 import { join } from 'node:path';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -30,6 +30,30 @@ import { openConduitDB, type ConduitDB, DEFAULT_RUN_ID } from '../persistence/db
 import { ensureCheckpointSchema } from '../checkpoint/checkpoint';
 import { loadFlow } from '../flow/load';
 import { runExecutor } from './executor';
+
+// ── skip-when.ts module seam (issue #32) ────────────────────────────────────
+// applySkipWhen no longer re-reads the card via db.getCard between its
+// candidate SELECT and its guarded commit (a per-card read there was an N+1),
+// so a race test can no longer hook a getCard spy to land a concurrent write
+// in that window. evaluateSkipWhen is the function applySkipWhen calls in
+// exactly that window instead, so it is the seam these race tests hook: keep
+// the real implementation, but run a caller-supplied hook right after it, to
+// simulate a second writer's change landing before applySkipWhen takes its
+// write lock.
+import * as skipWhenNs from './skip-when';
+const realSkipWhen: Record<string, unknown> = { ...skipWhenNs };
+let onEvaluate: (() => void) | null = null;
+const evaluateSkipWhenMock = mock(
+  (pred: Parameters<typeof skipWhenNs.evaluateSkipWhen>[0], ctx: Parameters<typeof skipWhenNs.evaluateSkipWhen>[1]) => {
+    const decision = (realSkipWhen.evaluateSkipWhen as typeof skipWhenNs.evaluateSkipWhen)(pred, ctx);
+    onEvaluate?.();
+    return decision;
+  },
+);
+mock.module('./skip-when', () => ({ ...realSkipWhen, evaluateSkipWhen: evaluateSkipWhenMock }));
+afterAll(() => {
+  mock.module('./skip-when', () => realSkipWhen);
+});
 
 const MODEL = 'gpt-4o-mini';
 const PARENT_ID = 'root';
@@ -43,6 +67,7 @@ beforeEach(() => {
   projectDir = mkdtempSync(join(tmpdir(), 'conduit-skip-when-exec-'));
   process.chdir(projectDir);
   db = null;
+  onEvaluate = null;
 });
 
 afterEach(() => {
@@ -384,10 +409,11 @@ describe('runExecutor skip_when: upstream transform output', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Race regression: a concurrent writer can change a card's status
-// between applySkipWhen's top-of-function SELECT and the guarded UPDATE that
-// commits a SKIP. The fix takes the state-db write lock (BEGIN IMMEDIATE) and
-// re-reads status inside it before journaling anything.
+// Race regressions (issue #32): a concurrent writer can change a card's
+// status or lane between applySkipWhen's top-of-function SELECT and the
+// guarded UPDATE that commits a SKIP. The fix takes the state-db write lock
+// (BEGIN IMMEDIATE) and re-reads status, lane and attempt inside it before
+// journaling anything.
 // ---------------------------------------------------------------------------
 
 describe('runExecutor skip_when: concurrent status change', () => {
@@ -399,43 +425,34 @@ describe('runExecutor skip_when: concurrent status change', () => {
     // outputAdapter(false, ...) makes classify's payload match write_tests's
     // skip_when, so the card is a skip candidate once it reaches write_tests.
     const database = db;
-    const originalGetCard = database.getCard.bind(database);
     let intercepted = false;
-    const getCardSpy = spyOn(database, 'getCard').mockImplementation((runId: string, id: string) => {
-      const found = originalGetCard(runId, id);
-      // This is the exact read applySkipWhen does for its skip candidate: the
-      // card is at write_tests and still 'ready'. Fire once, simulating
-      // another writer (e.g. a second process sharing the state DB) claiming
-      // the card in the window between that read and applySkipWhen's commit —
-      // both the status flip and the active_workers row a real claim would
-      // also write, so the only thing under test is applySkipWhen's own
-      // guard, not an unrelated "claimed with no worker" contradiction.
-      if (!intercepted && found && found.lane === 'write_tests' && found.status === 'ready') {
-        intercepted = true;
-        database
-          .getStateDb()
-          .prepare("UPDATE cards SET status = 'claimed' WHERE run_id = $runId AND id = $id")
-          .run({ $runId: DEFAULT_RUN_ID, $id: id });
-        database
-          .getStateDb()
-          .prepare(
-            "INSERT INTO active_workers (run_id, card_id, station, worker_id, started_at, lease_until) " +
-              "VALUES ($runId, $id, 'write_tests', 'other-writer', 0, 999999999)",
-          )
-          .run({ $runId: DEFAULT_RUN_ID, $id: id });
-      }
-      return found;
-    });
+    onEvaluate = () => {
+      // Fire once, simulating another writer (e.g. a second process sharing
+      // the state DB) claiming the card in the window between applySkipWhen's
+      // candidate SELECT and its guarded commit — both the status flip and
+      // the active_workers row a real claim would also write, so the only
+      // thing under test is applySkipWhen's own guard, not an unrelated
+      // "claimed with no worker" contradiction.
+      if (intercepted) return;
+      intercepted = true;
+      database
+        .getStateDb()
+        .prepare("UPDATE cards SET status = 'claimed' WHERE run_id = $runId AND id = $id")
+        .run({ $runId: DEFAULT_RUN_ID, $id: 'item' });
+      database
+        .getStateDb()
+        .prepare(
+          "INSERT INTO active_workers (run_id, card_id, station, worker_id, started_at, lease_until) " +
+            "VALUES ($runId, 'item', 'write_tests', 'other-writer', 0, 999999999)",
+        )
+        .run({ $runId: DEFAULT_RUN_ID });
+    };
 
     // The card is now genuinely claimed by "someone else": planTick has
     // nothing left to do for it and the run halts on the stall diagnostic
     // (`stuckCount > 0`) the very next tick — no need to wait out the
     // liveness threshold, so the default frozen clock is fine here.
-    try {
-      await run(setupOutputFlow(projectDir), outputAdapter(false, calls));
-    } finally {
-      getCardSpy.mockRestore();
-    }
+    await run(setupOutputFlow(projectDir), outputAdapter(false, calls));
 
     expect(intercepted).toBe(true);
 
@@ -448,6 +465,54 @@ describe('runExecutor skip_when: concurrent status change', () => {
     // guarded UPDATE inside applySkipWhen must not have touched it.
     expect(card('item').lane).toBe('write_tests');
     expect(card('item').status).toBe('claimed');
+  });
+});
+
+describe('runExecutor skip_when: concurrent lane change (issue #32)', () => {
+  it('does not throw or journal a skip when a concurrent writer moves the card off the station before commit', async () => {
+    db = openFreshDb();
+    seedCard(db, { id: 'item', lane: 'classify' });
+    const calls: string[] = [];
+
+    // outputAdapter(false, ...) makes classify's payload match write_tests's
+    // skip_when, so the card is a skip candidate once it reaches write_tests,
+    // and applySkipWhen's candidate SELECT fixes stationId = 'write_tests'.
+    const database = db;
+    let intercepted = false;
+    onEvaluate = () => {
+      if (intercepted) return;
+      intercepted = true;
+      // Simulate a concurrent writer moving the card to 'hold' — a terminal
+      // lane declared in terminal_lanes but not in flow.stations, so it has
+      // no skip_when — in the window between the SELECT and applySkipWhen's
+      // guarded commit. Before the issue #32 fix, applySkipWhen re-read the
+      // card via db.getCard in this same window and used ITS lane as
+      // stationId, so a stale lane like this one would have been dereferenced
+      // as `flow.stations[stationId]!.skip_when!` and thrown, crashing the
+      // tick loop. Taking stationId from the SELECT instead removes that
+      // re-read entirely: only the guarded commit can lose this race now, and
+      // it must lose quietly.
+      database
+        .getStateDb()
+        .prepare("UPDATE cards SET lane = 'hold' WHERE run_id = $runId AND id = $id")
+        .run({ $runId: DEFAULT_RUN_ID, $id: 'item' });
+    };
+
+    // No throw: if the old getCard-based crash reappeared, this await would
+    // reject and fail the test before any assertion below runs.
+    await run(setupOutputFlow(projectDir), outputAdapter(false, calls));
+
+    expect(intercepted).toBe(true);
+
+    // No phantom skip journaled for the lane move applySkipWhen never made.
+    const log = db.getCardLogForRun(DEFAULT_RUN_ID, 'item');
+    expect(log.some((e) => e.kind === 'skip')).toBe(false);
+    expect(log.some((e) => e.kind === 'entered_lane' && e.sourceLane === 'write_tests')).toBe(false);
+
+    // The card is exactly where the concurrent writer left it — the guarded
+    // UPDATE (now also gated on `lane = stationId`) must not have touched it.
+    expect(card('item').lane).toBe('hold');
+    expect(card('item').status).toBe('ready');
   });
 });
 

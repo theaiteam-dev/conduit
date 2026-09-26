@@ -38,7 +38,7 @@ import { deriveSubflowRunId } from '../run/run-id';
 import type { StartWorkMessage } from '../worker/ipc-protocol';
 import { sanitizeStderrTail } from '../worker/ipc-protocol';
 import type { ModelAdapter } from '../worker/adapter';
-import { DEFAULT_RUN_ID, type ConduitDB, type JournalSpanInput, type JournalProvenance } from '../persistence/db';
+import { DEFAULT_RUN_ID, parseColumn, type ConduitDB, type JournalSpanInput, type JournalProvenance } from '../persistence/db';
 import type { FlowConfig, StationConfig, FanInPolicyConfig, StationOutput, Card } from '../types/kernel';
 import { planTick } from './tick';
 import { evaluateSkipWhen, describeSkipWhen } from './skip-when';
@@ -4880,26 +4880,41 @@ function applySkipWhen(args: ApplySkipWhenArgs): boolean {
 
   const lanePlaceholders = skipStations.map((_, i) => `$s${i}`).join(', ');
   const laneParams = Object.fromEntries(skipStations.map((id, i) => [`$s${i}`, id]));
+  // Fetch every column the loop (or escalateToHold) needs
+  // right here, instead of a per-card db.getCard(runId, id) re-read below —
+  // that turned one query into N+1 for a station with many ready candidates.
+  // `lane` is included so it can be used AS stationId: it is
+  // guaranteed to be one of `skipStations` by the WHERE clause below, whereas
+  // a getCard re-read could return a lane a concurrent writer had already
+  // moved the card to — one without skip_when, or a terminal lane not in
+  // flow.stations at all — and crash on `flow.stations[stationId]!.skip_when!`.
   const rows = stateDb
     .prepare(
-      `SELECT id FROM cards
+      `SELECT id, lane, attempt, owned_paths FROM cards
        WHERE run_id = $runId AND status = 'ready' AND lane IN (${lanePlaceholders})
          AND (release_at IS NULL OR release_at <= $now)
        ORDER BY id ASC`,
     )
-    .all({ $runId: runId, $now: now, ...laneParams }) as Array<{ id: string }>;
+    .all({ $runId: runId, $now: now, ...laneParams }) as Array<{
+      id: string;
+      lane: string;
+      attempt: number;
+      owned_paths: string;
+    }>;
 
   let changed = false;
-  for (const { id } of rows) {
-    const card = db.getCard(runId, id);
-    if (!card) continue;
-    const stationId = card.lane;
+  for (const row of rows) {
+    const { id, attempt } = row;
+    const stationId = row.lane;
+    // Reuse getCard's own owned_paths parsing (persistence/db.ts parseColumn)
+    // rather than duplicating the JSON.parse/error-wrapping here.
+    const ownedPaths = parseColumn(id, 'owned_paths', row.owned_paths) as string[];
 
     // A card whose predicate already evaluated to 'run' is left
     // alone until it either dispatches (leaving 'ready', which drops it from
     // `rows` above) or reworks/moves to a new lane (a new memo key). No
     // re-read of seed.json or the upstream checkpoint on the ticks in between.
-    const memoKey = skipWhenMemoKey(id, stationId, card.attempt);
+    const memoKey = skipWhenMemoKey(id, stationId, attempt);
     if (runMemo.has(memoKey)) continue;
 
     const pred = flow.stations[stationId]!.skip_when!;
@@ -4908,7 +4923,7 @@ function applySkipWhen(args: ApplySkipWhenArgs): boolean {
       stateDb,
       runId,
       flowVersion: String(flow.version),
-      card: { id, owned_paths: card.owned_paths },
+      card: { id, owned_paths: ownedPaths },
     });
 
     if (decision.action === 'run') {
@@ -4917,7 +4932,7 @@ function applySkipWhen(args: ApplySkipWhenArgs): boolean {
     }
 
     if (decision.action === 'hold') {
-      escalateToHold(stateDb, db, id, stationId, card,
+      escalateToHold(stateDb, db, id, stationId, { lane: stationId, attempt },
         `skip_when ${predicate} could not be evaluated: ${decision.reason}`, err, runId);
       changed = true;
       continue;
@@ -4925,12 +4940,12 @@ function applySkipWhen(args: ApplySkipWhenArgs): boolean {
 
     const ctx = buildTransitionContext(stationId, flow, happyPathNext, terminalLanes, maxExecutionAttempts);
     const result = transition(
-      { lane: stationId, status: 'ready', executionAttempt: card.attempt, reworkCount: REWORK_COUNT_UNREAD },
+      { lane: stationId, status: 'ready', executionAttempt: attempt, reworkCount: REWORK_COUNT_UNREAD },
       { type: 'SKIP' },
       ctx,
     );
     if (!result.ok) {
-      escalateToHold(stateDb, db, id, stationId, card, `FSM illegal_transition on SKIP for station '${stationId}'`, err, runId);
+      escalateToHold(stateDb, db, id, stationId, { lane: stationId, attempt }, `FSM illegal_transition on SKIP for station '${stationId}'`, err, runId);
       changed = true;
       continue;
     }
@@ -4939,31 +4954,42 @@ function applySkipWhen(args: ApplySkipWhenArgs): boolean {
 
     // Take the state-db write lock BEFORE journaling. A
     // `BEGIN IMMEDIATE` transaction serializes against any other writer
-    // targeting this row, and re-reading status inside it catches a
-    // concurrent change (another writer claimed/held/moved the card between
-    // the SELECT at the top of this function and here) before anything is
-    // written — a lost race now leaves no card_log trace of a lane move that
-    // never happened, instead of journaling one ahead of a guarded UPDATE
-    // that then silently affects zero rows. The card_log's own append stays
-    // journal-first relative to the state commit (as advanceCard documents:
-    // a crash between the two leaves a phantom entry INSERT OR IGNORE
-    // deduplicates on replay); the journal DB is a separate SQLite file, so
-    // this transaction's lock only covers the state DB, which is exactly the
-    // resource the race is over.
+    // targeting this row, and re-reading status/lane/attempt inside it
+    // catches a concurrent change (another writer claimed/held/moved/reworked
+    // the card between the SELECT at the top of this function and here)
+    // before anything is written — a lost race now leaves no card_log trace
+    // of a lane move that never happened, instead of journaling one ahead of
+    // a guarded UPDATE that then silently affects zero rows. Checking `lane`
+    // here is what makes the stale-lane race safe without a
+    // getCard re-read: a writer that moved the card off `stationId` fails
+    // this re-check and the guarded UPDATE below, rather than being
+    // overwritten by a SKIP computed against a lane the card is no longer on.
+    // The card_log's own append stays journal-first relative to the state
+    // commit (as advanceCard documents: a crash between the two leaves a
+    // phantom entry INSERT OR IGNORE deduplicates on replay); the journal DB
+    // is a separate SQLite file, so this transaction's lock only covers the
+    // state DB, which is exactly the resource the race is over.
     let committed = false;
     stateDb
       .transaction(() => {
         const current = stateDb
-          .prepare("SELECT status FROM cards WHERE run_id = $runId AND id = $id")
-          .get({ $runId: runId, $id: id }) as { status: string } | undefined;
-        if (current === undefined || current.status !== 'ready') return; // lost the race — no-op, no journal
+          .prepare("SELECT status, lane, attempt FROM cards WHERE run_id = $runId AND id = $id")
+          .get({ $runId: runId, $id: id }) as { status: string; lane: string; attempt: number } | undefined;
+        if (
+          current === undefined ||
+          current.status !== 'ready' ||
+          current.lane !== stationId ||
+          current.attempt !== attempt
+        ) {
+          return; // lost the race — no-op, no journal
+        }
 
         db.appendCardLog({
           runId,
           kind: 'entered_lane',
           cardId: id,
           station: stationId,
-          attempt: card.attempt,
+          attempt,
           sourceLane: stationId,
           destLane: nextLane,
           reasonClass: 'skip',
@@ -4973,18 +4999,18 @@ function applySkipWhen(args: ApplySkipWhenArgs): boolean {
           kind: 'skip',
           cardId: id,
           station: stationId,
-          attempt: card.attempt,
+          attempt,
           reason: `skip_when ${predicate} matched (read ${JSON.stringify(decision.value)})`,
         });
         // attempt and rework_count are deliberately not written: SKIP moves
-        // neither counter. The status guard is redundant with the re-check
-        // above (both run inside the same BEGIN IMMEDIATE) but kept as
-        // defense in depth.
+        // neither counter. The status/lane guards are redundant with the
+        // re-check above (both run inside the same BEGIN IMMEDIATE) but kept
+        // as defense in depth.
         stateDb
           .prepare(
-            "UPDATE cards SET lane = $lane, status = $status WHERE run_id = $runId AND id = $id AND status = 'ready'",
+            "UPDATE cards SET lane = $lane, status = $status WHERE run_id = $runId AND id = $id AND status = 'ready' AND lane = $stationId",
           )
-          .run({ $lane: nextLane, $status: nextStatus, $runId: runId, $id: id });
+          .run({ $lane: nextLane, $status: nextStatus, $runId: runId, $id: id, $stationId: stationId });
         committed = true;
       })
       .immediate();
