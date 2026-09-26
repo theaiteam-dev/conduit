@@ -509,6 +509,20 @@ describe('harness runner: idle timeout (issue #31)', () => {
     expect(result.idledOut).toBe(false);
   });
 
+  it('attributes a wall-clock kill correctly even when idleTimeoutMs >= timeoutMs', async () => {
+    // The loader rejects this for a station; the runner itself does not. With
+    // equal deadlines both callbacks run in the same timers pass, wall-clock
+    // first, before `proc.exited` can resolve, so an unguarded idle callback
+    // would claim the kill every time.
+    const result = await runHarnessProcess(
+      { command: 'sh', args: ['-c', 'sleep 30'] },
+      config({ timeoutMs: 200, idleTimeoutMs: 200 }),
+    );
+
+    expect(result.timedOut).toBe(true);
+    expect(result.idledOut).toBe(false);
+  });
+
   it('leaves behaviour unchanged when idleTimeoutMs is not set', async () => {
     const result = await runHarnessProcess(
       { command: 'sh', args: ['-c', 'sleep 0.1; exit 0'] },

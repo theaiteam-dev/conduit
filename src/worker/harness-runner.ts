@@ -243,7 +243,12 @@ export async function runHarnessProcess(
   // it for the kernel's signal and exit handlers (./process-group.ts).
   trackProcessGroup(proc.pid);
 
+  // `timedOutFired` stops a still-pending idle timer from claiming this kill:
+  // when idleTimeoutMs >= timeoutMs it can fire after this callback but before
+  // `proc.exited` resolves.
+  let timedOutFired = false;
   const timer = setTimeout(() => {
+    timedOutFired = true;
     killProcessGroup(proc.pid);
   }, config.timeoutMs);
 
@@ -266,6 +271,8 @@ export async function runHarnessProcess(
     if (config.idleTimeoutMs === undefined || exited) return;
     if (idleTimer !== undefined) clearTimeout(idleTimer);
     idleTimer = setTimeout(() => {
+      // The wall-clock kill already ended the child; `timedOut` reports it.
+      if (timedOutFired) return;
       idledOutFired = true;
       killProcessGroup(proc.pid);
     }, config.idleTimeoutMs);
@@ -334,9 +341,9 @@ export async function runHarnessProcess(
   // avoids that race: an already-exited process never carries a SIGKILL
   // signalCode, no matter how the timer callback and the exit event interleave.
   //
-  // `!idledOut` keeps the two exclusive when idleTimeoutMs is close to
-  // timeoutMs. The loader rejects that for a station, but this function does
-  // not rely on it.
+  // `!idledOut` keeps the two exclusive. The loader rejects idleTimeoutMs >=
+  // timeoutMs for a station, but this function does not rely on it: the
+  // `timedOutFired` guard keeps the idle timer from claiming a wall-clock kill.
   const timedOut = !idledOut && proc.signalCode === 'SIGKILL' && durationMs >= config.timeoutMs * 0.9;
 
   return {
