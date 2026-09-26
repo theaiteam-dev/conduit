@@ -247,6 +247,28 @@ function rateLimitAttributes(snapshot: RateLimitSnapshot | undefined): Record<st
   return attrs;
 }
 
+/**
+ * Issue #30: the number of OTHER cards in this run that are dispatchable now
+ * (status 'ready', release gate passed, using planTick's rule). A harness call
+ * runs on the serial in-process path, so the tick loop dispatches nothing else
+ * until it returns. Recorded as `ready_waiting` on every harness maker and
+ * harness critic span, so a finished run can report how many card-seconds
+ * waited behind each harness station (`run/harness-occupancy.ts`). Pass a
+ * clock read taken just before the call, not the tick's `currentNow`. The
+ * figure is an estimate: it misses a card that becomes dispatchable during the
+ * call, and it counts cards a station `wip` cap would have held back anyway.
+ */
+function countReadyWaiting(stateDb: Database, runId: string, cardId: string, nowSeconds: number): number {
+  const row = stateDb
+    .prepare(
+      `SELECT COUNT(*) AS n FROM cards
+       WHERE run_id = $runId AND id != $cardId AND status = 'ready'
+         AND (release_at IS NULL OR release_at <= $now)`,
+    )
+    .get({ $runId: runId, $cardId: cardId, $now: nowSeconds }) as { n: number };
+  return row.n;
+}
+
 /** True when some ready card is still gated behind a future release_at. */
 function hasReleaseGatedCards(stateDb: Database, runId: string, nowSeconds: number): boolean {
   const row = stateDb
@@ -1160,6 +1182,7 @@ export async function runExecutor(args: RunEngineArgs): Promise<void> {
           maxExecutionAttempts,
           projectRoot,
           currentNow,
+          now,
           runStartedAt,
           wallClockSeconds,
           maxTokens,
@@ -1223,6 +1246,7 @@ export async function runExecutor(args: RunEngineArgs): Promise<void> {
               maxExecutionAttempts,
               projectRoot,
               currentNow,
+              now,
               runStartedAt,
               wallClockSeconds,
               maxTokens,
@@ -1459,6 +1483,12 @@ interface ExecuteStationArgs {
   maxExecutionAttempts: number;
   projectRoot: string;
   currentNow: number;
+  /**
+   * The executor's injected clock. `currentNow` is fixed at tick start and is
+   * stale after a retry backoff or a long call; issue #30's `ready_waiting`
+   * samples read this instead.
+   */
+  now: () => number;
   runStartedAt: number;
   wallClockSeconds: number;
   maxTokens: number;
@@ -1517,6 +1547,7 @@ async function executeStation(args: ExecuteStationArgs): Promise<boolean> {
     maxExecutionAttempts,
     projectRoot,
     currentNow,
+    now,
     runStartedAt,
     wallClockSeconds,
     maxTokens,
@@ -1576,6 +1607,7 @@ async function executeStation(args: ExecuteStationArgs): Promise<boolean> {
       // exactly like a gated transform station.
       trackingAdapter,
       currentNow,
+      now,
       runStartedAt,
       wallClockSeconds,
       maxTokens,
@@ -1610,6 +1642,7 @@ async function executeStation(args: ExecuteStationArgs): Promise<boolean> {
       projectRoot,
       flow,
       currentNow,
+      now,
       runStartedAt,
       wallClockSeconds,
       maxTokens,
@@ -1642,6 +1675,7 @@ async function executeStation(args: ExecuteStationArgs): Promise<boolean> {
       projectRoot,
       flow,
       currentNow,
+      now,
       runStartedAt,
       wallClockSeconds,
       maxTokens,
@@ -1670,6 +1704,7 @@ async function executeStation(args: ExecuteStationArgs): Promise<boolean> {
       projectRoot,
       flow,
       currentNow,
+      now,
       runStartedAt,
       wallClockSeconds,
       maxTokens,
@@ -1720,6 +1755,8 @@ interface DeterministicArgs {
    */
   trackingAdapter: ModelAdapter;
   currentNow: number;
+  /** See ExecuteStationArgs.now. */
+  now: () => number;
   runStartedAt: number;
   wallClockSeconds: number;
   maxTokens: number;
@@ -2049,7 +2086,7 @@ function countDeterministicFailure(
 async function executeDeterministicStation(args: DeterministicArgs): Promise<boolean> {
   const {
     db, stateDb, runId, stationConfig, stationId, cardId, commandAllowlist, happyPathNext, terminalLanes,
-    projectRoot, flow, maxExecutionAttempts, trackingAdapter, currentNow, runStartedAt, wallClockSeconds,
+    projectRoot, flow, maxExecutionAttempts, trackingAdapter, currentNow, now, runStartedAt, wallClockSeconds,
     maxTokens, getTokensSpent, onAndonTrip, harnessRegistry, stampActivity, foldHarnessUsage, err,
   } = args;
 
@@ -2111,7 +2148,7 @@ async function executeDeterministicStation(args: DeterministicArgs): Promise<boo
         db, stateDb, runId, stationConfig, stationId, cardId, card,
         stationOutput: readDeterministicStationOutput(stationConfig, projectRoot),
         trackingAdapter, projectRoot, flow, happyPathNext, terminalLanes, maxExecutionAttempts,
-        currentNow, runStartedAt, wallClockSeconds, maxTokens, getTokensSpent, onAndonTrip, harnessRegistry, foldHarnessUsage, err,
+        currentNow, now, runStartedAt, wallClockSeconds, maxTokens, getTokensSpent, onAndonTrip, harnessRegistry, foldHarnessUsage, err,
       });
     }
 
@@ -2168,7 +2205,7 @@ async function executeDeterministicStation(args: DeterministicArgs): Promise<boo
         db, stateDb, runId, stationConfig, stationId, cardId, card,
         stationOutput: readDeterministicStationOutput(stationConfig, projectRoot),
         trackingAdapter, projectRoot, flow, happyPathNext, terminalLanes, maxExecutionAttempts,
-        currentNow, runStartedAt, wallClockSeconds, maxTokens, getTokensSpent, onAndonTrip, harnessRegistry, foldHarnessUsage, err,
+        currentNow, now, runStartedAt, wallClockSeconds, maxTokens, getTokensSpent, onAndonTrip, harnessRegistry, foldHarnessUsage, err,
       });
     } else {
       // Command failed with the intent still PENDING. A nonzero exit does NOT
@@ -2229,7 +2266,7 @@ async function executeDeterministicStation(args: DeterministicArgs): Promise<boo
       db, stateDb, runId, stationConfig, stationId, cardId, card,
       stationOutput: readDeterministicStationOutput(stationConfig, projectRoot),
       trackingAdapter, projectRoot, flow, happyPathNext, terminalLanes, maxExecutionAttempts,
-      currentNow, runStartedAt, wallClockSeconds, maxTokens, getTokensSpent, onAndonTrip, harnessRegistry, foldHarnessUsage, err,
+      currentNow, now, runStartedAt, wallClockSeconds, maxTokens, getTokensSpent, onAndonTrip, harnessRegistry, foldHarnessUsage, err,
     });
   } else {
     // Command failed → count it toward the attempt cap: retry below the cap,
@@ -2282,6 +2319,8 @@ interface GateCheckOrAdvanceArgs {
   terminalLanes: Set<string>;
   maxExecutionAttempts: number;
   currentNow: number;
+  /** See ExecuteStationArgs.now. Read just before the critic call. */
+  now: () => number;
   runStartedAt: number;
   wallClockSeconds: number;
   maxTokens: number;
@@ -2718,7 +2757,7 @@ async function performStationDelivery(args: {
 async function runGateCheckOrAdvance(args: GateCheckOrAdvanceArgs): Promise<boolean> {
   const {
     db, stateDb, runId, stationConfig, stationId, cardId, card, stationOutput, trackingAdapter, projectRoot,
-    flow, happyPathNext, terminalLanes, maxExecutionAttempts, currentNow, runStartedAt, wallClockSeconds,
+    flow, happyPathNext, terminalLanes, maxExecutionAttempts, currentNow, now, runStartedAt, wallClockSeconds,
     maxTokens, getTokensSpent, onAndonTrip, harnessRegistry, foldHarnessUsage, err,
   } = args;
 
@@ -2739,6 +2778,9 @@ async function runGateCheckOrAdvance(args: GateCheckOrAdvanceArgs): Promise<bool
     // mirroring the maker-side adapter-unresolved pattern above (~2383):
     // escalate ambiguity, never guess, never crash the run over one card's
     // config error.
+    // Issue #30: the critic runs after the maker's call, so `currentNow` is
+    // stale here; read the clock fresh.
+    const criticReadyWaiting = countReadyWaiting(stateDb, runId, cardId, now());
     let gateDecision: Awaited<ReturnType<typeof runGateRework>>;
     try {
       gateDecision = await runGateRework({
@@ -2806,7 +2848,10 @@ async function runGateCheckOrAdvance(args: GateCheckOrAdvanceArgs): Promise<bool
         durationMs,
         usageUnknown: !usageKnown,
         usage: usageKnown ? harnessJournalUsage(usage, model) : undefined,
-        attributes: usageKnown ? rateLimitAttributes(usage.rateLimit) : {},
+        attributes: {
+          ...(usageKnown ? rateLimitAttributes(usage.rateLimit) : {}),
+          ready_waiting: criticReadyWaiting,
+        },
       });
     }
 
@@ -3015,6 +3060,8 @@ interface TransformArgs {
   projectRoot: string;
   flow: FlowConfig;
   currentNow: number;
+  /** See ExecuteStationArgs.now. */
+  now: () => number;
   runStartedAt: number;
   wallClockSeconds: number;
   maxTokens: number;
@@ -3053,6 +3100,7 @@ async function executeTransformStation(args: TransformArgs): Promise<boolean> {
     projectRoot,
     flow,
     currentNow,
+    now,
     runStartedAt,
     wallClockSeconds,
     maxTokens,
@@ -3447,7 +3495,7 @@ async function executeTransformStation(args: TransformArgs): Promise<boolean> {
     db, stateDb, runId, stationConfig, stationId, cardId, card,
     stationOutput,
     trackingAdapter, projectRoot, flow, happyPathNext, terminalLanes, maxExecutionAttempts,
-    currentNow, runStartedAt, wallClockSeconds, maxTokens, getTokensSpent, onAndonTrip, harnessRegistry, foldHarnessUsage, err,
+    currentNow, now, runStartedAt, wallClockSeconds, maxTokens, getTokensSpent, onAndonTrip, harnessRegistry, foldHarnessUsage, err,
   });
 }
 
@@ -3470,6 +3518,8 @@ interface HarnessArgs {
   projectRoot: string;
   flow: FlowConfig;
   currentNow: number;
+  /** See ExecuteStationArgs.now. Read just before each maker invoke(). */
+  now: () => number;
   runStartedAt: number;
   wallClockSeconds: number;
   maxTokens: number;
@@ -3525,7 +3575,7 @@ interface HarnessArgs {
 async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
   const {
     db, stateDb, runId, stationConfig, stationId, cardId, trackingAdapter, happyPathNext, terminalLanes,
-    maxExecutionAttempts, projectRoot, flow, currentNow, runStartedAt, wallClockSeconds, maxTokens,
+    maxExecutionAttempts, projectRoot, flow, currentNow, now, runStartedAt, wallClockSeconds, maxTokens,
     getTokensSpent, onAndonTrip, harnessRegistry, foldHarnessUsage, stampHarnessActivity, sleep, err,
   } = args;
 
@@ -3770,6 +3820,10 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
       // performs the only write, from the model's structured response).
       const integrityBaseline = snapshotTree(projectRoot);
 
+      // Issue #30: read the clock fresh, since a retry runs after this loop's
+      // backoff sleep. Written on every span this attempt produces.
+      const readyWaiting = countReadyWaiting(stateDb, runId, cardId, now());
+
       let invokeResult: HarnessResult;
       try {
         // The original adapter-liveness work: stamp fresh liveness progress BEFORE awaiting invoke() too
@@ -3833,6 +3887,7 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
               // what separates "capped, cost nothing" from "ran for minutes and
               // its spend is unrecorded" without inferring it from duration.
               outcome: 'harness-rate-limited',
+              ready_waiting: readyWaiting,
               rate_limit_release_at: releaseAt,
               rate_limit_reset_reported: resetAtMs ?? null,
               ...rateLimitAttributes((invokeErr as { rateLimit?: RateLimitSnapshot }).rateLimit),
@@ -3925,7 +3980,7 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
           runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.harness`, ...provenance,
           adapter: harnessAdapter.name, durationMs: Date.now() - invokeStartedAt,
           usageUnknown: !thrownUsageKnown, usage: thrownJournalUsage,
-          attributes: { outcome: scrapReason },
+          attributes: { outcome: scrapReason, ready_waiting: readyWaiting },
         });
         // Issue #3: back off before the next attempt. Without this,
         // max_execution_attempts doubled as the wall-clock retry policy and any
@@ -4006,7 +4061,7 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
         db.appendJournalSpan({
           runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.harness`, ...provenance,
           adapter: harnessAdapter.name, durationMs, usageUnknown: !usageKnown, usage: journalUsage,
-          attributes: { outcome: `integrity_violation: ${describeIntegrity(integrityViolation)}` },
+          attributes: { outcome: `integrity_violation: ${describeIntegrity(integrityViolation)}`, ready_waiting: readyWaiting },
         });
         escalateToHold(
           stateDb, db, cardId, stationId, card,
@@ -4026,7 +4081,7 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
         db.appendJournalSpan({
           runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.harness`, ...provenance,
           adapter: harnessAdapter.name, durationMs, usageUnknown: !usageKnown, usage: journalUsage,
-          attributes: { outcome: scrapReason },
+          attributes: { outcome: scrapReason, ready_waiting: readyWaiting },
         });
         continue;
       }
@@ -4048,7 +4103,7 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
         db.appendJournalSpan({
           runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.harness`, ...provenance,
           adapter: harnessAdapter.name, durationMs, usageUnknown: !usageKnown, usage: journalUsage,
-          attributes: { outcome: scrapReason },
+          attributes: { outcome: scrapReason, ready_waiting: readyWaiting },
         });
         continue;
       }
@@ -4059,7 +4114,7 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
         db.appendJournalSpan({
           runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.harness`, ...provenance,
           adapter: harnessAdapter.name, durationMs, usageUnknown: !usageKnown, usage: journalUsage,
-          attributes: { outcome: scrapReason },
+          attributes: { outcome: scrapReason, ready_waiting: readyWaiting },
         });
         continue;
       }
@@ -4099,7 +4154,7 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
         // Issue #5: the capacity snapshot rides along on the priced row, so
         // "what did this run draw against the plan" is a query rather than an
         // inference from interactive usage bars.
-        attributes: { artifact_hashes: artifactHashes, outcome: 'success', ...rateLimitAttrs },
+        attributes: { artifact_hashes: artifactHashes, outcome: 'success', ready_waiting: readyWaiting, ...rateLimitAttrs },
       });
 
       // ── Write checkpoint (binding stamp) ───────────────────────────────────
@@ -4164,7 +4219,7 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
     db, stateDb, runId, stationConfig, stationId, cardId, card,
     stationOutput,
     trackingAdapter, projectRoot, flow, happyPathNext, terminalLanes, maxExecutionAttempts,
-    currentNow, runStartedAt, wallClockSeconds, maxTokens, getTokensSpent, onAndonTrip,
+    currentNow, now, runStartedAt, wallClockSeconds, maxTokens, getTokensSpent, onAndonTrip,
     harnessRegistry, foldHarnessUsage, err,
   });
 }
@@ -4215,6 +4270,8 @@ interface SubflowArgs {
   projectRoot: string;
   flow: FlowConfig;
   currentNow: number;
+  /** See ExecuteStationArgs.now. */
+  now: () => number;
   runStartedAt: number;
   wallClockSeconds: number;
   maxTokens: number;
@@ -4248,7 +4305,7 @@ interface SubflowArgs {
 async function executeSubflowStation(args: SubflowArgs): Promise<boolean> {
   const {
     db, stateDb, runId, stationConfig, stationId, cardId, trackingAdapter, happyPathNext,
-    terminalLanes, maxExecutionAttempts, projectRoot, flow, currentNow, runStartedAt,
+    terminalLanes, maxExecutionAttempts, projectRoot, flow, currentNow, now, runStartedAt,
     wallClockSeconds, maxTokens, getTokensSpent, onAndonTrip, harnessRegistry,
     foldHarnessUsage, stampHarnessActivity, runSubflow, err,
   } = args;
@@ -4427,7 +4484,7 @@ async function executeSubflowStation(args: SubflowArgs): Promise<boolean> {
     db, stateDb, runId, stationConfig, stationId, cardId, card,
     stationOutput,
     trackingAdapter, projectRoot, flow, happyPathNext, terminalLanes, maxExecutionAttempts,
-    currentNow, runStartedAt, wallClockSeconds, maxTokens, getTokensSpent, onAndonTrip,
+    currentNow, now, runStartedAt, wallClockSeconds, maxTokens, getTokensSpent, onAndonTrip,
     harnessRegistry, foldHarnessUsage, err,
   });
 }
