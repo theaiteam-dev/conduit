@@ -502,7 +502,7 @@ function makeScriptedClaudeSpawn(
       if ((scripted.exitCode ?? 0) === 0) {
         writeFileSync(join(process.cwd(), 'result.json'), JSON.stringify({ summary: 'narrated' }), 'utf-8');
       }
-      return { exitCode: 0, stderr: '', durationMs: 1, timedOut: false, ...scripted };
+      return { exitCode: 0, stderr: '', durationMs: 1, timedOut: false, idledOut: false, ...scripted };
     },
   });
   return {

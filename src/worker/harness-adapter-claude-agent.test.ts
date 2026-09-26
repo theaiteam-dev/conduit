@@ -65,7 +65,7 @@ function makeRun(result: Partial<HarnessSpawnResult> = {}): {
   const run = async (cmd: HarnessCommand, config: HarnessRunnerConfig): Promise<HarnessSpawnResult> => {
     const dir = config.injectedEnv?.CLAUDE_CONFIG_DIR;
     calls.push({ cmd, config, ...(dir !== undefined ? { configDirEntries: readdirSync(dir).sort() } : {}) });
-    return { exitCode: 0, stdout: RECORDED_SUCCESS, stderr: '', durationMs: 1, timedOut: false, ...result };
+    return { exitCode: 0, stdout: RECORDED_SUCCESS, stderr: '', durationMs: 1, timedOut: false, idledOut: false, ...result };
   };
   return { run, calls };
 }
@@ -238,7 +238,7 @@ describe('claude-headless isolateConfig: a constructed config dir per invocation
       const link = join(config.injectedEnv!.CLAUDE_CONFIG_DIR!, '.credentials.json');
       isLink = lstatSync(link).isSymbolicLink();
       linkTarget = readlinkSync(link);
-      return { exitCode: 0, stdout: RECORDED_SUCCESS, stderr: '', durationMs: 1, timedOut: false };
+      return { exitCode: 0, stdout: RECORDED_SUCCESS, stderr: '', durationMs: 1, timedOut: false, idledOut: false };
     };
     await adapter({ isolateConfig: true, sourceEnv: { CLAUDE_CONFIG_DIR: ambient }, run }).invoke(invocation());
 
@@ -253,7 +253,7 @@ describe('claude-headless isolateConfig: a constructed config dir per invocation
     let linkTarget: string | undefined;
     const run = async (_cmd: HarnessCommand, config: HarnessRunnerConfig): Promise<HarnessSpawnResult> => {
       linkTarget = readlinkSync(join(config.injectedEnv!.CLAUDE_CONFIG_DIR!, '.credentials.json'));
-      return { exitCode: 0, stdout: RECORDED_SUCCESS, stderr: '', durationMs: 1, timedOut: false };
+      return { exitCode: 0, stdout: RECORDED_SUCCESS, stderr: '', durationMs: 1, timedOut: false, idledOut: false };
     };
     await adapter({ isolateConfig: true, sourceEnv: { HOME: home }, run }).invoke(invocation());
 
