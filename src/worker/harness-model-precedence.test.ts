@@ -87,7 +87,7 @@ function makeRun(stdout: string): {
   const calls: Array<{ cmd: HarnessCommand; config: HarnessRunnerConfig }> = [];
   const run = async (cmd: HarnessCommand, config: HarnessRunnerConfig): Promise<HarnessSpawnResult> => {
     calls.push({ cmd, config });
-    return { exitCode: 0, stdout, stderr: '', durationMs: 1, timedOut: false };
+    return { exitCode: 0, stdout, stderr: '', durationMs: 1, timedOut: false, idledOut: false };
   };
   return { run, calls };
 }

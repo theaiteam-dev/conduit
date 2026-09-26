@@ -47,6 +47,7 @@ import type {
 } from './harness-runner';
 import { usageFromThrow } from './harness-adapter';
 import type { HarnessAdapter, HarnessInvocation, BinaryProbe } from './harness-adapter';
+import { describeHarnessContainmentConformance } from './harness-containment.conformance';
 
 // ---------------------------------------------------------------------------
 // Recorded `claude -p --output-format stream-json --verbose` payloads (no live
@@ -107,6 +108,7 @@ function makeRun(
       stderr: '',
       durationMs: 5321,
       timedOut: false,
+      idledOut: false,
       ...spawn,
     };
   };
@@ -201,6 +203,17 @@ describe('claude-headless adapter: invocation building (AC1)', () => {
     expect(config.timeoutMs).toBe(90_000);
     // NFR-Security-2: only engine-config-allowlisted names reach the child.
     expect(config.envAllowlist).toEqual(ENV_ALLOWLIST);
+  });
+
+  it('threads streamed stdout progress back to the invocation caller', async () => {
+    const { run, calls } = makeRun({ stdout: RECORDED_SUCCESS });
+    let progressEvents = 0;
+    const adapter = makeAdapter({ run });
+
+    await adapter.invoke(invocation({ onProgress: () => { progressEvents += 1; } }));
+
+    calls[0]!.config.onStdoutLine?.('{"type":"assistant"}');
+    expect(progressEvents).toBe(1);
   });
 
   it('passes the configured binary command through to the runner', async () => {
@@ -348,6 +361,17 @@ describe('claude-headless adapter: named parse failures, never silent zero-usage
     });
 
     await expect(adapter.invoke(invocation())).rejects.toThrow(/claude-headless/i);
+  });
+
+  it('rejects when the process was killed for going idle, with a distinct code from a wall-clock timeout (issue #31)', async () => {
+    const adapter = makeAdapter({
+      run: makeRun({ stdout: '', idledOut: true, exitCode: 137 }).run,
+    });
+
+    const err = await adapter.invoke(invocation()).catch((e: unknown) => e);
+
+    expect((err as Error).message).toMatch(/claude-headless/i);
+    expect((err as { code?: string }).code).toBe('harness-idle-timeout');
   });
 
   it('rejects on a non-zero exit code even when stdout is empty', async () => {
@@ -857,4 +881,56 @@ describe('claude-headless adapter: usage carried through a billed throw (issue #
     expect((err as { code?: string }).code).toBe('harness-timeout');
     expect(usageFromThrow(err)).toBeUndefined();
   });
+
+  it('an idle-killed call whose retained stdout carries a terminal result event carries the real usage (issue #26/#31)', async () => {
+    // The CLI can emit its terminal `result` event, billing the call, and
+    // then hang during shutdown and go silent, getting idle-killed. Those
+    // tokens were spent and must reach the budget, same as any other billed
+    // throw (issue #26).
+    const stdout = JSON.stringify({
+      type: 'result',
+      subtype: 'success',
+      is_error: false,
+      result: 'finished, but the process hung during shutdown',
+      total_cost_usd: 0.0087,
+      usage: {
+        input_tokens: 500,
+        output_tokens: 200,
+        cache_creation_input_tokens: 50,
+        cache_read_input_tokens: 25,
+      },
+    });
+    const adapter = makeAdapter({ run: makeRun({ stdout, idledOut: true, exitCode: 137 }).run });
+
+    const err = await adapter.invoke(invocation()).catch((e: unknown) => e);
+
+    expect((err as { code?: string }).code).toBe('harness-idle-timeout');
+    expect(usageFromThrow(err)).toEqual({
+      tokens: 775,
+      cost: 0.0087,
+      breakdown: {
+        inputTokens: 500, outputTokens: 200,
+        cacheReadInputTokens: 25, cacheCreationInputTokens: 50,
+      },
+    });
+  });
+
+  it('an idle-killed call whose retained stdout carries NO result event has no usage to recover: absent, not zero', async () => {
+    const adapter = makeAdapter({
+      run: makeRun({ stdout: '', idledOut: true, exitCode: 137 }).run,
+    });
+
+    const err = await adapter.invoke(invocation()).catch((e: unknown) => e);
+
+    expect((err as { code?: string }).code).toBe('harness-idle-timeout');
+    expect(usageFromThrow(err)).toBeUndefined();
+  });
 });
+
+// ---------------------------------------------------------------------------
+// Containment conformance (issue #27): the real runner, a real `sh` fixture as
+// the binary, and a grandchild that must die when the invocation times out.
+// ---------------------------------------------------------------------------
+
+describeHarnessContainmentConformance('claude-headless', (opts) =>
+  createClaudeHarnessAdapter({ ...opts, envAllowlist: [] }));

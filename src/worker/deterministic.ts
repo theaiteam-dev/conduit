@@ -11,7 +11,13 @@
  *
  * Denylist-based approaches are insufficient on an untrusted substrate — only a
  * positive allowlist guarantees the blast radius stays bounded.
+ *
+ * Containment (issues #10, #17): the command runs as its own process group, and
+ * the runner SIGKILLs that group on timeout and again after the command exits,
+ * so nothing the station started outlives it, whatever the exit reason.
  */
+
+import { killProcessGroup, trackProcessGroup, untrackProcessGroup } from './process-group';
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -29,8 +35,9 @@ export interface LawLiteConfig {
   cwd?: string;
   /**
    * Optional wall-clock timeout in MILLISECONDS (pre-launch punch-list #8).
-   * When set (> 0), the spawned command is killed (SIGKILL) if it exceeds the
-   * deadline and runDeterministic returns a timeout failure rather than hanging.
+   * When set (> 0), the spawned command's process group is killed (SIGKILL) if
+   * it exceeds the deadline and runDeterministic returns a timeout failure
+   * rather than hanging.
    * Absent / undefined → unbounded (today's behaviour). The executor converts a
    * station's `timeout_seconds` to ms and threads it here.
    */
@@ -162,6 +169,11 @@ export function deterministicCardEnv(reworkCount: number, attempt: number): Reco
  *
  * Uses Bun.spawn with an array (no shell) so no metacharacter expansion can
  * occur at the OS level even if the guard were somehow bypassed.
+ *
+ * The command is spawned detached (its own process group). The group is
+ * SIGKILLed when the timeout fires and again once the command has exited, so
+ * a descendant it backgrounded neither keeps running nor holds the output
+ * pipes open past the return.
  */
 export async function runDeterministic(
   cmd: DeterministicCommand,
@@ -174,13 +186,9 @@ export async function runDeterministic(
     );
   }
 
-  // Punch-list #8 — enforce an optional wall-clock timeout. Bun.spawn's native
-  // `timeout` + `killSignal` kills the process at the deadline (no leaked timer
-  // to clear, unlike a manual setTimeout race) and resolves `proc.exited`, so
-  // the function returns at ~the timeout window rather than hanging. A timeout
-  // <= 0 or absent means unbounded (today's behaviour, byte-for-byte).
+  // Punch-list #8: an optional wall-clock timeout. A timeout <= 0 or absent
+  // means unbounded.
   const hasTimeout = typeof config.timeoutMs === 'number' && config.timeoutMs > 0;
-  const startedAt = Date.now();
 
   // Env injection: when extra vars are supplied, spawn with an explicit env that
   // is the inherited process env with the injected vars layered on top. Bun.spawn
@@ -193,32 +201,67 @@ export async function runDeterministic(
   const proc = Bun.spawn([cmd.command, ...cmd.args], {
     stdout: 'pipe',
     stderr: 'pipe',
+    // setsid(): the child becomes its own session/process-group leader, so
+    // `-proc.pid` addresses the whole group (grandchildren included) below.
+    detached: true,
     ...(config.cwd ? { cwd: config.cwd } : {}),
     ...(hasEnv ? { env: { ...process.env, ...config.env } } : {}),
-    ...(hasTimeout ? { timeout: config.timeoutMs, killSignal: 'SIGKILL' as const } : {}),
   });
+  // The detached group no longer receives the terminal's Ctrl-C, so register
+  // it for the kernel's signal and exit handlers until the final kill below.
+  trackProcessGroup(proc.pid);
 
-  const [exitCode, stdout, stderr] = await Promise.all([
-    proc.exited,
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr as ReadableStream).text(),
-  ]);
+  // Our own timer instead of Bun.spawn's native `timeout`, which kills only the
+  // immediate child (#10). Killing the group also closes the pipes any
+  // descendant inherited, so the drains below settle at the deadline.
+  let timerFired = false;
+  const timer = hasTimeout
+    ? setTimeout(() => {
+        timerFired = true;
+        killProcessGroup(proc.pid);
+      }, config.timeoutMs)
+    : undefined;
 
-  // Distinguish OUR timeout-kill from an unrelated SIGKILL (OOM-killer, a child
-  // that self-kills, a propagated signal). Bun exposes no "killed by my timeout"
-  // flag, so we require BOTH a SIGKILL signal AND that it landed at/after the
-  // deadline — a SIGKILL well before the timeout could not have been ours. This
-  // keeps the timeout diagnostic honest (never claim a timeout we can't prove).
+  // Start draining now so a command that writes more than a pipe buffer is not
+  // blocked on a full pipe while we wait for it to exit.
+  const stdoutText = new Response(proc.stdout).text();
+  const stderrText = new Response(proc.stderr as ReadableStream).text();
+  // Attach a handler now: a drain that rejects while we await proc.exited
+  // would otherwise be an unhandled rejection. `await drains` below rethrows it.
+  const drains = Promise.all([stdoutText, stderrText]);
+  drains.catch(() => {});
+
+  let exitCode: number;
+  try {
+    exitCode = await proc.exited;
+  } finally {
+    clearTimeout(timer);
+    // #17: the command has exited, but a descendant it backgrounded may still
+    // be running and holding the pipes. Kill the group BEFORE awaiting the
+    // drains so they settle. Bytes already written stay readable, so no output
+    // is lost. The leader has already exited, so this does not change its exit
+    // status. While any member is alive the group id cannot be reused, so the
+    // signal reaches only this command's descendants; an empty group is ESRCH.
+    killProcessGroup(proc.pid);
+    untrackProcessGroup(proc.pid);
+  }
+
+  const [stdout, stderr] = await drains;
+
+  // Distinguish OUR timeout-kill from a normal exit or an unrelated SIGKILL
+  // (OOM-killer, a child that self-kills). Both must hold: our timer fired, and
+  // the leader died of SIGKILL. The timer can fire in the gap between a natural
+  // exit and the clearTimeout above; the leader then exited on its own, carries
+  // no SIGKILL signalCode, and is not reported as timed out. The post-exit
+  // group kill never reaches the leader, so it cannot mark a normal exit either.
   // Either way an unsuccessful exit is a failure (ok:false) on the same path;
-  // only the `timedOut` label + message are gated on this stricter check.
-  const elapsed = Date.now() - startedAt;
-  const timedOut =
-    hasTimeout && proc.signalCode === 'SIGKILL' && elapsed >= config.timeoutMs! * 0.9;
+  // only the `timedOut` label + message are gated on this check.
+  const timedOut = timerFired && proc.signalCode === 'SIGKILL';
 
   if (timedOut) {
-    // On a Bun timeout-kill, `await proc.exited` resolves to 137 (128 + SIGKILL),
-    // even though the `proc.exitCode` getter reads null. We use the resolved
-    // value; SIGKILL_EXIT is a defensive fallback for that getter/promise skew.
+    // On a SIGKILL, `await proc.exited` resolves to 137 (128 + SIGKILL), even
+    // though the `proc.exitCode` getter reads null. We use the resolved value;
+    // SIGKILL_EXIT is a defensive fallback for that getter/promise skew.
     const SIGKILL_EXIT = 137;
     return {
       ok: false,

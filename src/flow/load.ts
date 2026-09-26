@@ -49,7 +49,12 @@ import { FEEDBACK_INPUT } from './render';
 import { resolveSkill, type ResolveSkillResult } from '../skills/resolve';
 import type { ParsedSkill } from '../skills/parse';
 import { detectExecutionSurface, type ExecutionSurfaceWarning } from '../skills/detect-surface';
-import { adapterCanExpressTools, type HarnessRegistry } from '../worker/harness-adapter';
+import {
+  adapterCanExpressTools,
+  resolveHarnessAgent,
+  DEFAULT_HARNESS_TIMEOUT_MS,
+  type HarnessRegistry,
+} from '../worker/harness-adapter';
 
 // ---------------------------------------------------------------------------
 // Public contract
@@ -98,6 +103,13 @@ interface RawWorker {
    * collectErrors before buildStationConfig copies it onto the StationConfig.
    */
   timeout_seconds?: unknown;
+  /**
+   * Idle bound in seconds for a `kind: harness` station's invocation (issue
+   * #31). Untrusted: collectErrors validates it (positive integer, below the
+   * wall-clock timeout that applies, harness stations only) before
+   * buildStationConfig copies it onto the StationConfig.
+   */
+  idle_timeout_seconds?: unknown;
   /** Path to the model station's prompt template (relative to flow.yaml dir). */
   prompt_file?: string;
   /** Version stamp of the prompt template. */
@@ -110,6 +122,11 @@ interface RawWorker {
   uses?: string[];
   /** Adapter name for a `kind: harness` station (WI-559/563). */
   harness?: string;
+  /**
+   * Named agent for a `kind: harness` station (issue #28). Untrusted: validated
+   * to a non-empty string on a harness station in collectErrors.
+   */
+  agent?: unknown;
   /** Child flow.yaml path for a `kind: subflow` station (the original multi-flow engine work). */
   flow?: string;
   /** Tools allowlist for a harness station's underlying agent-CLI. */
@@ -138,6 +155,11 @@ interface RawCritic {
   harness?: string;
   /** Tools allowlist for an agentic (harness) critic's invocation (WI-595). */
   tools?: string[];
+  /**
+   * Named agent for an agentic (harness) critic (issue #28). Untrusted:
+   * validated in collectErrors.
+   */
+  agent?: unknown;
   /**
    * Wall-clock bound for an agentic (harness) critic's invocation, in seconds.
    * Absent -> the engine's DEFAULT_HARNESS_CRITIC_TIMEOUT_MS (5 minutes). A
@@ -371,12 +393,19 @@ function buildStationConfig(
   // Punch-list #8 — copy the (already-validated) deterministic timeout. Cast is
   // sound: collectErrors rejected any non-positive-integer value before here.
   if (w?.timeout_seconds !== undefined) config.timeout_seconds = w.timeout_seconds as number;
+  // Issue #31: copy the already-validated harness idle bound. Cast is sound:
+  // collectErrors rejected any value that is not a positive integer, not below
+  // the effective timeout, or not on a harness station.
+  if (w?.idle_timeout_seconds !== undefined) config.idle_timeout_seconds = w.idle_timeout_seconds as number;
   if (w?.prompt_file !== undefined) config.prompt_file = join(flowDir, w.prompt_file);
   if (w?.prompt_version !== undefined) config.prompt_version = String(w.prompt_version);
   if (w?.params !== undefined) config.params = w.params;
   // WI-563: lift harness fields (adapter name, tools allowlist, waiver) onto the
   // flat StationConfig — mirrors the model/prompt fields above.
   if (w?.harness !== undefined) config.harness = w.harness;
+  // Issue #28: absent stays absent (no key), as for model; collectErrors has
+  // already rejected a non-string or empty value.
+  if (typeof w?.agent === 'string') config.agent = w.agent;
   // The original multi-flow engine work: lift the subflow child-flow reference, resolved to an absolute
   // path against the parent flow's directory (mirrors prompt_file resolution).
   if (w?.flow !== undefined) config.flow = isAbsolute(w.flow) ? w.flow : resolve(flowDir, w.flow);
@@ -513,6 +542,8 @@ function buildStationConfig(
     if (chk.critic.harness !== undefined) gateCheck.criticHarness = chk.critic.harness;
     // WI-595: the critic's tools allowlist, threaded to its harness invocation.
     if (chk.critic.tools !== undefined) gateCheck.criticTools = chk.critic.tools;
+    // Issue #28: the critic's named agent (omit when absent, never a false '').
+    if (typeof chk.critic.agent === 'string') gateCheck.criticAgent = chk.critic.agent;
     // Harness-critic wall-clock bound (validated positive integer in
     // collectErrors) — threaded to runHarnessGateCheck in ms; absent falls
     // back to the engine default there.
@@ -835,6 +866,48 @@ function collectErrors(
           `Station '${station.id}' has invalid timeout_seconds '${String(timeoutSeconds)}' — ` +
           `must be an integer >= 1`,
       });
+    }
+    // Issue #31: idle_timeout_seconds gets the same guard as timeout_seconds,
+    // plus two of its own. It applies only to a harness station (declared on
+    // another kind it would be ignored, the same posture as
+    // CRITIC_TIMEOUT_REQUIRES_HARNESS below), and it must be strictly less
+    // than the wall-clock timeout that will apply: timeout_seconds when set,
+    // otherwise DEFAULT_HARNESS_TIMEOUT_MS. An idle bound at or past it can
+    // never fire first.
+    const idleTimeoutSeconds = station.worker?.idle_timeout_seconds;
+    const effectiveTimeoutSeconds =
+      timeoutSeconds === undefined ? DEFAULT_HARNESS_TIMEOUT_MS / 1000 : timeoutSeconds;
+    if (idleTimeoutSeconds !== undefined) {
+      if (!isIntInRange(idleTimeoutSeconds, 1)) {
+        errors.push({
+          code: 'INVALID_IDLE_TIMEOUT_SECONDS',
+          message:
+            `Station '${station.id}' has invalid idle_timeout_seconds ` +
+            `'${String(idleTimeoutSeconds)}': must be an integer >= 1`,
+        });
+      } else if (resolveStationKind(station) !== 'harness') {
+        errors.push({
+          code: 'IDLE_TIMEOUT_REQUIRES_HARNESS',
+          message:
+            `Station '${station.id}' sets idle_timeout_seconds but is not a harness station. ` +
+            `The bound applies only to a harness invocation's stdout and would be ignored; ` +
+            `remove it or set worker.kind: harness`,
+        });
+      } else if (
+        isIntInRange(effectiveTimeoutSeconds, 1) &&
+        (idleTimeoutSeconds as number) >= (effectiveTimeoutSeconds as number)
+      ) {
+        const timeoutSource =
+          timeoutSeconds === undefined
+            ? `the default harness timeout (${String(effectiveTimeoutSeconds)}s)`
+            : `timeout_seconds (${String(timeoutSeconds)})`;
+        errors.push({
+          code: 'IDLE_TIMEOUT_NOT_LESS_THAN_TIMEOUT',
+          message:
+            `Station '${station.id}' has idle_timeout_seconds (${String(idleTimeoutSeconds)}) >= ` +
+            `${timeoutSource}: the idle bound can never fire before the wall-clock one`,
+        });
+      }
     }
     // Same foot-gun guard for the harness critic's bound (mirrors the worker
     // timeout: 0 = "kill instantly" is rejected fail-closed at load).
@@ -1517,6 +1590,69 @@ function collectErrors(
               `Station '${station.id}' declares a tools allowlist that adapter ` +
               `'${resolved.adapter.name}' cannot narrow/express — ` +
               `set unrestricted_tools: true to waive this check`,
+          });
+        }
+      }
+    }
+  }
+
+  // ── Issue #28: named-agent validation (worker.agent, check.critic.agent) ──
+  // An agent only means something to a harness adapter that passes it on
+  // (`--agent`), so it is rejected anywhere it would be dropped. With a
+  // registry injected, the adapter must also be able to locate the agent's
+  // definition file, which the executor hashes into the binding stamp; the
+  // executor repeats that resolution at dispatch, since plugin dirs are engine
+  // config and their files can change after load.
+  for (const station of stations) {
+    const agent = station.worker?.agent;
+    if (agent !== undefined) {
+      const kind = resolveStationKind(station);
+      if (typeof agent !== 'string' || agent.trim() === '') {
+        errors.push({
+          code: 'INVALID_HARNESS_AGENT',
+          message: `Station '${station.id}' has invalid worker.agent '${String(agent)}': must be a non-empty string`,
+        });
+      } else if (kind !== 'harness') {
+        errors.push({
+          code: 'INVALID_HARNESS_AGENT',
+          message:
+            `Station '${station.id}' sets worker.agent but is kind=${String(kind)}; only a kind: harness ` +
+            `station passes an agent to its adapter`,
+        });
+      } else if (harnessRegistry !== undefined && station.worker?.harness !== undefined) {
+        const resolved = harnessRegistry.resolve(station.worker.harness);
+        if (resolved.ok) {
+          const definition = resolveHarnessAgent(resolved.adapter, agent);
+          if (!definition.ok) {
+            errors.push({ code: 'UNRESOLVED_HARNESS_AGENT', message: `Station '${station.id}': ${definition.error}` });
+          }
+        }
+      }
+    }
+
+    const critic = station.check?.critic;
+    const criticAgent = critic?.agent;
+    if (criticAgent === undefined) continue;
+    if (typeof criticAgent !== 'string' || criticAgent.trim() === '') {
+      errors.push({
+        code: 'INVALID_HARNESS_AGENT',
+        message: `Station '${station.id}' has invalid check.critic.agent '${String(criticAgent)}': must be a non-empty string`,
+      });
+    } else if (critic?.harness === undefined || station.check?.kind === 'rank') {
+      errors.push({
+        code: 'INVALID_HARNESS_AGENT',
+        message:
+          `Station '${station.id}' sets check.critic.agent but its critic is not a harness gate critic; ` +
+          `only a check.critic.harness gate critic passes an agent to its adapter`,
+      });
+    } else if (harnessRegistry !== undefined) {
+      const resolved = harnessRegistry.resolve(critic.harness);
+      if (resolved.ok) {
+        const definition = resolveHarnessAgent(resolved.adapter, criticAgent);
+        if (!definition.ok) {
+          errors.push({
+            code: 'UNRESOLVED_HARNESS_AGENT',
+            message: `Station '${station.id}' gate critic: ${definition.error}`,
           });
         }
       }

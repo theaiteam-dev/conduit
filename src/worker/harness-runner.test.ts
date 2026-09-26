@@ -15,15 +15,26 @@
  *   3. a child that spawns a grandchild is FULLY reaped on timeout — the recorded
  *      grandchild pid is dead afterward (process-GROUP kill, not child.kill).
  *   4. cwd is set inside the project root; a cwd resolving OUTSIDE it is rejected.
+ *   5. (#17) a grandchild backgrounded by a harness that exits on its own (0 or
+ *      nonzero, well before the timeout) is reaped too, and does not stall the
+ *      output drains: the runner returns promptly with the output written
+ *      before the exit, not at timeoutMs.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
-import { mkdtempSync, mkdirSync, rmSync, readFileSync, realpathSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync, realpathSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   runHarnessProcess,
   type HarnessRunnerConfig,
 } from './harness-runner';
+import {
+  describeContainmentConformance,
+  CONTAINMENT_FIXTURE,
+  recordedPid,
+  expectGrandchildReaped,
+  killRecordedGrandchild,
+} from './harness-containment.conformance';
 
 // ---------------------------------------------------------------------------
 // Fixtures: an isolated project root per test + tracked pids for cleanup so a
@@ -278,6 +289,24 @@ describe('harness runner: stdout line filter', () => {
     expect(result.stdout).toBe('{"type":"result","ok":1}');
   });
 
+  it('notifies progress for every line, including lines discarded by the filter', async () => {
+    const lines: string[] = [];
+    const result = await runHarnessProcess(
+      {
+        command: 'sh',
+        args: ['-c', 'printf \'{"type":"assistant"}\\n{"type":"result","ok":1}\\n{"type":"tool"}\\n\''],
+      },
+      config({
+        timeoutMs: 5_000,
+        stdoutLineFilter: keepResult,
+        onStdoutLine: (line) => lines.push(line),
+      }),
+    );
+
+    expect(lines).toEqual(['{"type":"assistant"}', '{"type":"result","ok":1}', '{"type":"tool"}']);
+    expect(result.stdout).toBe('{"type":"result","ok":1}');
+  });
+
   it('keeps a final line with no trailing newline — a crashed stream rarely has one', async () => {
     const result = await runHarnessProcess(
       { command: 'sh', args: ['-c', 'printf \'{"type":"noise"}\\n{"type":"result","ok":2}\''] },
@@ -285,6 +314,16 @@ describe('harness runner: stdout line filter', () => {
     );
 
     expect(result.stdout).toBe('{"type":"result","ok":2}');
+  });
+
+  it('notifies progress for a final line with no trailing newline', async () => {
+    const lines: string[] = [];
+    await runHarnessProcess(
+      { command: 'sh', args: ['-c', 'printf \'partial\''] },
+      config({ timeoutMs: 5_000, onStdoutLine: (line) => lines.push(line) }),
+    );
+
+    expect(lines).toEqual(['partial']);
   });
 
   it('does not hold the discarded bulk — the point of filtering at all', async () => {
@@ -332,5 +371,301 @@ describe('harness runner: stdout line filter', () => {
     );
 
     expect(result.stdout).toBe('a\nb\n');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Idle timeout (issue #31). A second timer, independent of the wall-clock
+// one, resets on every stdout line and kills the process group when the
+// child goes silent. The executor cannot check liveness while a harness
+// station's `invoke()` is in flight, so this is the only bound on a hung call.
+// ---------------------------------------------------------------------------
+
+describe('harness runner: idle timeout (issue #31)', () => {
+  it('does not re-arm the idle timer for lines drained after the child exits', async () => {
+    // The leader exits at once while a backgrounded writer keeps the pipe
+    // full, so lines are still drained after proc.exited resolves and the
+    // group is reaped (#17). A timer re-armed by those lines would later
+    // SIGKILL a process group id the kernel may have reused. The writer is
+    // capped at 4MB to bound the drain on a loaded machine.
+    const kills: number[] = [];
+    const realKill = process.kill.bind(process);
+    const result = await (async () => {
+      process.kill = ((pid: number, signal?: string | number) => {
+        kills.push(pid);
+        return realKill(pid, signal);
+      }) as typeof process.kill;
+      try {
+        const r = await runHarnessProcess(
+          { command: 'sh', args: ['-c', 'yes | head -c 4000000 & exit 0'] },
+          config({ timeoutMs: 10_000, idleTimeoutMs: 100 }),
+        );
+        kills.length = 0;
+        await Bun.sleep(300);
+        return r;
+      } finally {
+        process.kill = realKill;
+      }
+    })();
+
+    expect(result.exitCode).toBe(0);
+    expect(result.idledOut).toBe(false);
+    expect(kills).toEqual([]);
+  }, 30_000);
+
+  it('completes normally when stdout lines keep arriving inside the idle bound', async () => {
+    const result = await runHarnessProcess(
+      {
+        command: 'sh',
+        args: [
+          '-c',
+          'i=0; while [ $i -lt 8 ]; do printf "line%s\\n" $i; sleep 0.05; i=$((i+1)); done; exit 0',
+        ],
+      },
+      config({ timeoutMs: 10_000, idleTimeoutMs: 300 }),
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.timedOut).toBe(false);
+    expect(result.idledOut).toBe(false);
+    // Byte-exact: the idle-observing drain path must retain exactly what an
+    // unobserved run would (trailing newline included), not a lossy
+    // reconstruction from split lines.
+    expect(result.stdout).toBe('line0\nline1\nline2\nline3\nline4\nline5\nline6\nline7\n');
+  });
+
+  it('kills a silent child well before the wall-clock timeout', async () => {
+    const start = Date.now();
+    const result = await runHarnessProcess(
+      { command: 'sh', args: ['-c', 'sleep 30'] },
+      config({ timeoutMs: 10_000, idleTimeoutMs: 250 }),
+    );
+    const elapsed = Date.now() - start;
+
+    expect(result.idledOut).toBe(true);
+    expect(result.timedOut).toBe(false);
+    // Killed by the idle timer, nowhere near the 10s wall-clock bound.
+    expect(result.durationMs).toBeGreaterThanOrEqual(200);
+    expect(result.durationMs).toBeLessThan(3_000);
+    expect(elapsed).toBeLessThan(3_000);
+  });
+
+  it('resets on every line, including lines a stdoutLineFilter discards', async () => {
+    // Noise lines (discarded by the filter) arrive faster than the idle
+    // bound, so the timer must reset on each one, not only on a kept line, or
+    // the process would be killed before it reaches the result line.
+    const result = await runHarnessProcess(
+      {
+        command: 'sh',
+        args: [
+          '-c',
+          'i=0; while [ $i -lt 6 ]; do printf "noise%s\\n" $i; sleep 0.05; i=$((i+1)); done; printf "RESULT\\n"; exit 0',
+        ],
+      },
+      config({
+        timeoutMs: 10_000,
+        idleTimeoutMs: 300,
+        stdoutLineFilter: (line) => line === 'RESULT',
+      }),
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.idledOut).toBe(false);
+    expect(result.stdout).toBe('RESULT');
+  });
+
+  it('reaps a grandchild backgrounded by a child the idle timer killed', async () => {
+    // The containment fixture (issue #27) never writes to stdout, so with no
+    // stdoutLineFilter or onStdoutLine configured, idleTimeoutMs alone must
+    // still observe the (silent) stream well enough to arm and fire the
+    // timer. This covers the no-filter path, not just the reset-on-line path
+    // exercised above.
+    const result = await runHarnessProcess(
+      { command: CONTAINMENT_FIXTURE, args: [] },
+      { projectRoot, timeoutMs: 10_000, idleTimeoutMs: 300 },
+    );
+
+    expect(result.idledOut).toBe(true);
+    expect(result.timedOut).toBe(false);
+
+    const pid = recordedPid(projectRoot);
+    expect(pid).toBeDefined();
+    try {
+      await expectGrandchildReaped(projectRoot);
+    } finally {
+      killRecordedGrandchild(projectRoot);
+    }
+  }, 20_000);
+
+  it('a wall-clock kill still reports timedOut: true, idledOut: false', async () => {
+    // The child keeps printing well inside the idle bound, so only the
+    // wall-clock timer can be the one that fires.
+    const result = await runHarnessProcess(
+      { command: 'sh', args: ['-c', 'while :; do printf x; sleep 0.05; done'] },
+      config({ timeoutMs: 400, idleTimeoutMs: 5_000 }),
+    );
+
+    expect(result.timedOut).toBe(true);
+    expect(result.idledOut).toBe(false);
+  });
+
+  it('attributes a wall-clock kill correctly even when idleTimeoutMs >= timeoutMs', async () => {
+    // The loader rejects this for a station; the runner itself does not. With
+    // equal deadlines both callbacks run in the same timers pass, wall-clock
+    // first, before `proc.exited` can resolve, so an unguarded idle callback
+    // would claim the kill every time.
+    const result = await runHarnessProcess(
+      { command: 'sh', args: ['-c', 'sleep 30'] },
+      config({ timeoutMs: 200, idleTimeoutMs: 200 }),
+    );
+
+    expect(result.timedOut).toBe(true);
+    expect(result.idledOut).toBe(false);
+  });
+
+  it('leaves behaviour unchanged when idleTimeoutMs is not set', async () => {
+    const result = await runHarnessProcess(
+      { command: 'sh', args: ['-c', 'sleep 0.1; exit 0'] },
+      config({ timeoutMs: 5_000 }),
+    );
+
+    expect(result.idledOut).toBe(false);
+    expect(result.timedOut).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Containment conformance (issue #17, mirroring runDeterministic). The runner
+// spawns the harness as its own process group and must SIGKILL the group after
+// the leader exits, not only on timeout, so the fixture's grandchild dies on
+// every exit path.
+// ---------------------------------------------------------------------------
+
+/** Test-local label for `result.timedOut === true`. HarnessSpawnResult carries a boolean. */
+const HARNESS_RUNNER_TIMEOUT_LABEL = 'timedOut';
+
+describeContainmentConformance(
+  'harness-runner',
+  async ({ projectRoot, fixture, timeoutMs, fixtureArgs }) => {
+    const result = await runHarnessProcess(
+      { command: fixture, args: fixtureArgs },
+      { projectRoot, timeoutMs },
+    );
+    return result.timedOut === true ? HARNESS_RUNNER_TIMEOUT_LABEL : undefined;
+  },
+  { timeoutClass: HARNESS_RUNNER_TIMEOUT_LABEL, reapsOnExit: true },
+);
+
+// ---------------------------------------------------------------------------
+// #17: a descendant that keeps the inherited stdout/stderr pipes open. The
+// conformance fixture above sends its grandchild's stdio to /dev/null, so it
+// proves reaping but not the drain stall; this script does not redirect, so a
+// surviving grandchild would keep `Promise.all`'s drains pending until
+// timeoutMs. The post-exit group kill must close the pipes so the runner
+// returns promptly, and output written before the exit must still be captured.
+// ---------------------------------------------------------------------------
+
+describe('runHarnessProcess: descendants holding the output pipes (#17)', () => {
+  /** Grandchild pids a test recorded; afterEach SIGKILLs any that survived. */
+  const recorded: number[] = [];
+
+  afterEach(() => {
+    // Single pids only, never a group: a leaked grandchild of an undetached
+    // spawn shares the test runner's process group.
+    for (const pid of recorded.splice(0)) {
+      try {
+        process.kill(pid, 'SIGKILL');
+      } catch {
+        /* already gone: the expected case */
+      }
+    }
+  });
+
+  /**
+   * A script that writes to stdout and stderr, backgrounds a `sleep 30` that
+   * inherits both pipes, records its pid, then exits with `tail`.
+   */
+  function pipeHoldingScript(tail: string): string {
+    const script = join(projectRoot, 'hold.sh');
+    writeFileSync(
+      script,
+      ['echo before-out', 'echo before-err >&2', 'sleep 30 &', 'echo "$!" > grandchild.pid', tail, ''].join('\n'),
+    );
+    return script;
+  }
+
+  function grandchildPid(): number {
+    const pid = Number(readFileSync(join(projectRoot, 'grandchild.pid'), 'utf-8').trim());
+    expect(Number.isInteger(pid) && pid > 1).toBe(true);
+    recorded.push(pid);
+    return pid;
+  }
+
+  for (const [label, code] of [
+    ['exits 0', 0],
+    ['exits nonzero', 4],
+  ] as const) {
+    it(`returns promptly with the output written before it ${label}, and the grandchild is gone`, async () => {
+      const script = pipeHoldingScript(`exit ${code}`);
+      const start = Date.now();
+      // A generous timeout the fix must beat by a wide margin: without the
+      // post-exit group kill, the drains wait out the full 30s sleep instead.
+      const result = await runHarnessProcess({ command: 'sh', args: [script] }, config({ timeoutMs: 60_000 }));
+      const elapsed = Date.now() - start;
+
+      expect(elapsed).toBeLessThan(10_000);
+      expect(result.exitCode).toBe(code);
+      expect(result.timedOut).toBe(false);
+      expect(result.stdout).toBe('before-out\n');
+      expect(result.stderr).toBe('before-err\n');
+      expect(await waitForPidGone(grandchildPid(), 3_000)).toBe(true);
+    }, 40_000);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// A `stdoutLineFilter` that throws before `proc.exited` resolves. The filter
+// runs inside `readKeptLines`'s `for await` loop as lines arrive, so a filter
+// that throws on an early line rejects the stdout drain promise while the
+// child is still running (the `sleep` below keeps `proc.exited` pending).
+// Before the fix, that promise had no handler attached until after the
+// process-group kill, so the rejection could go unhandled in the gap; bun:test
+// treats an unhandled rejection as a failure independent of what this function
+// returns.
+// ---------------------------------------------------------------------------
+
+describe('runHarnessProcess: a throwing stdoutLineFilter does not produce an unhandled rejection', () => {
+  it('rejects with the filter error, and the drain rejection is never unhandled', async () => {
+    const filterError = new Error('stdoutLineFilter boom');
+    const throwingFilter = (): boolean => {
+      throw filterError;
+    };
+
+    let unhandled: unknown;
+    const onUnhandledRejection = (reason: unknown) => {
+      unhandled = reason;
+    };
+    process.on('unhandledRejection', onUnhandledRejection);
+
+    try {
+      await expect(
+        runHarnessProcess(
+          // Prints a line immediately (the filter throws on it), then keeps the
+          // process alive briefly so proc.exited has not resolved yet when the
+          // filter throws.
+          { command: 'sh', args: ['-c', 'echo x; sleep 1'] },
+          config({ timeoutMs: 5_000, stdoutLineFilter: throwingFilter }),
+        ),
+      ).rejects.toBe(filterError);
+
+      // Let the event loop settle so a rejection that only becomes unhandled
+      // after this test's assertions (e.g. once the group kill finally runs)
+      // has had a chance to fire the listener above.
+      await new Promise((resolve) => setTimeout(resolve, 200));
+
+      expect(unhandled).toBeUndefined();
+    } finally {
+      process.off('unhandledRejection', onUnhandledRejection);
+    }
   });
 });

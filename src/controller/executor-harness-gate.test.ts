@@ -105,6 +105,10 @@ function makeConfigurableHarnessCritic(
     name?: string;
     adapterModel?: string;
     sameFindings?: boolean;
+    /** issue #28: the adapter's default agent. */
+    adapterAgent?: string;
+    /** issue #28: when set, the critic runs named agents and resolves exactly these. */
+    knownAgents?: string[];
   } = {},
 ): { adapter: HarnessAdapter; calls: HarnessInvocation[] } {
   const verdict = opts.verdict ?? 'reject';
@@ -116,6 +120,15 @@ function makeConfigurableHarnessCritic(
     reportsUsage: true,
     canRestrictTools: true,
     ...(opts.adapterModel !== undefined ? { model: opts.adapterModel } : {}),
+    ...(opts.adapterAgent !== undefined ? { agent: opts.adapterAgent } : {}),
+    ...(opts.knownAgents !== undefined
+      ? {
+          resolveAgentDefinition: (agent: string) =>
+            opts.knownAgents!.includes(agent)
+              ? { ok: true as const, path: `/plugins/${agent}.md`, sha256: 'b'.repeat(64) }
+              : { ok: false as const, error: `agent '${agent}' not found in plugin dirs` },
+        }
+      : {}),
     async probeBinary() {
       return { present: true };
     },
@@ -175,6 +188,8 @@ function writeGatedFlow(
     criticTools?: string[];
     /** issue #26 AC4: an explicit `check.critic.model` override for a harness critic. */
     criticModel?: string;
+    /** issue #28: an explicit `check.critic.agent` for a harness critic. */
+    criticAgent?: string;
     /** issue #26 AC3: the run's token budget, so a test can size it below/above a critic's known spend. */
     runMaxTokens?: number;
   } = {},
@@ -191,8 +206,9 @@ function writeGatedFlow(
   // critic's invocation (gate.ts) — only meaningful on the harness branch.
   const criticToolsPart = opts.criticTools !== undefined ? `tools: [${opts.criticTools.join(', ')}], ` : '';
   const criticModelPart = opts.criticModel !== undefined ? `model: ${opts.criticModel}, ` : '';
+  const criticAgentPart = opts.criticAgent !== undefined ? `agent: ${opts.criticAgent}, ` : '';
   const criticBlock = opts.harnessCritic !== undefined
-    ? `critic: { role: critic, harness: ${opts.harnessCritic}, ${criticModelPart}${criticToolsPart}prompt_file: prompts/verify.md, prompt_version: "1" }`
+    ? `critic: { role: critic, harness: ${opts.harnessCritic}, ${criticModelPart}${criticAgentPart}${criticToolsPart}prompt_file: prompts/verify.md, prompt_version: "1" }`
     : `critic: { role: critic, model: ${CRITIC_MODEL}, prompt_file: prompts/verify.md, prompt_version: "1" }`;
 
   const flowYaml = `
@@ -881,5 +897,160 @@ describe('issue #26 AC4 — check.critic.model reaches the harness critic\'s Har
 
     expect(critic.calls).toHaveLength(1);
     expect(critic.calls[0]!.model).toBe('adapter-default-model');
+  });
+});
+
+describe('issue #28 AC2: check.critic.agent reaches the harness critic\'s HarnessInvocation.agent', () => {
+  it('threads an explicit check.critic.agent into the invocation, winning over the adapter default', async () => {
+    db = openDb();
+    const maker = makeZeroUsageHarnessMaker();
+    const critic = makeConfigurableHarnessCritic({
+      verdict: 'pass', adapterAgent: 'team:default', knownAgents: ['team:default', 'team:reviewer'],
+    });
+    const registry = createHarnessRegistry([maker.adapter, critic.adapter]);
+    const flow = writeGatedFlow(dir, registry, {
+      harnessCritic: 'claude-critic', criticTools: ['Read', 'Write'], criticAgent: 'team:reviewer',
+    });
+    seedCard(db);
+
+    await run(flow, registry, neverModel);
+
+    expect(critic.calls).toHaveLength(1);
+    expect(critic.calls[0]!.agent).toBe('team:reviewer');
+  });
+
+  it('falls back to the adapter default agent when check.critic.agent is absent', async () => {
+    db = openDb();
+    const maker = makeZeroUsageHarnessMaker();
+    const critic = makeConfigurableHarnessCritic({ verdict: 'pass', adapterAgent: 'team:default', knownAgents: ['team:default'] });
+    const registry = createHarnessRegistry([maker.adapter, critic.adapter]);
+    const flow = writeGatedFlow(dir, registry, { harnessCritic: 'claude-critic', criticTools: ['Read', 'Write'] });
+    seedCard(db);
+
+    await run(flow, registry, neverModel);
+
+    expect(critic.calls).toHaveLength(1);
+    expect(critic.calls[0]!.agent).toBe('team:default');
+  });
+
+  it('passes no agent when neither the critic nor the adapter names one', async () => {
+    db = openDb();
+    const maker = makeZeroUsageHarnessMaker();
+    const critic = makeConfigurableHarnessCritic({ verdict: 'pass' });
+    const registry = createHarnessRegistry([maker.adapter, critic.adapter]);
+    const flow = writeGatedFlow(dir, registry, { harnessCritic: 'claude-critic', criticTools: ['Read', 'Write'] });
+    seedCard(db);
+
+    await run(flow, registry, neverModel);
+
+    expect(critic.calls).toHaveLength(1);
+    expect(critic.calls[0]!.agent).toBeUndefined();
+  });
+
+  it('journals the critic agent and its definition sha256 on the <station>.harness-critic span, with no stamp', async () => {
+    db = openDb();
+    const maker = makeZeroUsageHarnessMaker();
+    const critic = makeConfigurableHarnessCritic({
+      verdict: 'pass', adapterAgent: 'team:default', knownAgents: ['team:default', 'team:reviewer'],
+    });
+    const registry = createHarnessRegistry([maker.adapter, critic.adapter]);
+    const flow = writeGatedFlow(dir, registry, {
+      harnessCritic: 'claude-critic', criticTools: ['Read', 'Write'], criticAgent: 'team:reviewer',
+    });
+    seedCard(db);
+
+    await run(flow, registry, neverModel);
+
+    const spans = db.getJournalSpansForRun(DEFAULT_RUN_ID, 'entry').filter((s) => s.name === 'coder.harness-critic');
+    expect(spans).toHaveLength(1);
+    expect(spans[0]!.agent).toBe('team:reviewer');
+    expect(spans[0]!.agentSha256).toBe('b'.repeat(64));
+    // The critic writes no checkpoint, so there is no stamp to record.
+    expect(spans[0]!.bindingStamp).toBeNull();
+    expect(spans[0]!.promptTemplateVersion).toBeNull();
+  });
+
+  it('journals NULL agent columns on the critic span when the critic runs no agent', async () => {
+    db = openDb();
+    const maker = makeZeroUsageHarnessMaker();
+    const critic = makeConfigurableHarnessCritic({ verdict: 'pass' });
+    const registry = createHarnessRegistry([maker.adapter, critic.adapter]);
+    const flow = writeGatedFlow(dir, registry, { harnessCritic: 'claude-critic', criticTools: ['Read', 'Write'] });
+    seedCard(db);
+
+    await run(flow, registry, neverModel);
+
+    const spans = db.getJournalSpansForRun(DEFAULT_RUN_ID, 'entry').filter((s) => s.name === 'coder.harness-critic');
+    expect(spans).toHaveLength(1);
+    expect(spans[0]!.agent).toBeNull();
+    expect(spans[0]!.agentSha256).toBeNull();
+  });
+
+  it('holds the card without invoking the critic when its adapter-default agent cannot be resolved', async () => {
+    db = openDb();
+    const maker = makeZeroUsageHarnessMaker();
+    const critic = makeConfigurableHarnessCritic({ verdict: 'pass', adapterAgent: 'team:missing', knownAgents: [] });
+    const registry = createHarnessRegistry([maker.adapter, critic.adapter]);
+    const flow = writeGatedFlow(dir, registry, { harnessCritic: 'claude-critic', criticTools: ['Read', 'Write'] });
+    seedCard(db);
+
+    await run(flow, registry, neverModel);
+
+    expect(critic.calls).toHaveLength(0);
+    expect(getCard(db)?.lane).toBe('hold');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Issue #30: ready_waiting must be sampled at the ACTUAL call
+// boundary, not the tick's stale currentNow. The critic runs after the maker's
+// own call, which can itself consume real wall-clock time; a card whose
+// release_at passes during that maker call must still be counted.
+// ---------------------------------------------------------------------------
+
+describe('issue #30: the critic samples ready_waiting when its own call starts', () => {
+  it('counts a card whose release_at passes while the maker call is still running', async () => {
+    db = openDb();
+    let clock = 1000;
+    const maker: HarnessAdapter = {
+      name: 'fake-harness',
+      reportsUsage: true,
+      canRestrictTools: true,
+      async probeBinary() {
+        return { present: true };
+      },
+      async invoke() {
+        // Models the maker call itself consuming real wall-clock time: the
+        // clock has moved on by the time the gate critic runs afterward.
+        clock += 10;
+        writeFileSync(join(process.cwd(), 'result.json'), JSON.stringify({ summary: 'implemented' }), 'utf-8');
+        return { outputs: [], usage: { tokens: 10, cost: 0.01 } };
+      },
+    };
+    const critic = makeHarnessCritic('pass', []);
+    const registry = createHarnessRegistry([maker, critic.adapter]);
+    const flow = writeGatedFlow(dir, registry, { harnessCritic: 'claude-critic', criticTools: ['Read', 'Write'] });
+    seedCard(db);
+    db.insertCard({
+      run_id: DEFAULT_RUN_ID, id: 'other', parent_id: null, lane: 'coder', status: 'ready',
+      attempt: 0, wave: 0, owned_paths: ['task.json', 'result.json'], rework_count: 0,
+    });
+    // Gated at tick start (release_at 1005 > currentNow 1000): planTick will
+    // not dispatch 'other' this tick, but the maker's invoke() above advances
+    // the clock to 1010 before the critic samples ready_waiting.
+    db.getStateDb()
+      .prepare('UPDATE cards SET release_at = $r WHERE run_id = $run AND id = $id')
+      .run({ $r: 1005, $run: DEFAULT_RUN_ID, $id: 'other' });
+
+    await runExecutor({
+      db: db!, flow, now: () => clock, adapter: neverModel, io, harnessRegistry: registry,
+    } as RunEngineArgs);
+
+    expect(getCard(db)?.lane).toBe('done');
+    const { spans } = db!.getHarnessTimingsForRun(DEFAULT_RUN_ID);
+    const makerSpan = spans.find((s) => s.role === 'maker');
+    const criticSpan = spans.find((s) => s.role === 'critic');
+    expect(makerSpan?.readyWaiting).toBe(0);
+    expect(criticSpan?.readyWaiting).toBe(1);
   });
 });

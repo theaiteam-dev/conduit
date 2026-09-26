@@ -202,6 +202,14 @@ export interface StationConfig {
    * (agentic is not yet runnable; it will carry its own loop budget — SPEC §8.)
    */
   timeout_seconds?: number;
+  /**
+   * Idle bound in SECONDS for a `kind: harness` station's invocation (issue
+   * #31). The invocation is killed if the agent CLI writes no stdout line for
+   * this long. Validated at load: a positive integer, less than the wall-clock
+   * timeout that applies, and rejected on any other station kind. Absent: only
+   * the wall-clock timeout applies.
+   */
+  idle_timeout_seconds?: number;
   /** Path to the model station's prompt template, resolved relative to the flow.yaml dir. */
   prompt_file?: string;
   /**
@@ -238,6 +246,14 @@ export interface StationConfig {
    * required for harness stations, absent otherwise (WI-559).
    */
   harness?: string;
+  /**
+   * Named agent for a `kind: harness` station (issue #28), e.g. `team:coder`,
+   * from `worker.agent`. Absent when undeclared: the executor uses
+   * `agent ?? adapter default`, threads it to HarnessInvocation.agent, and
+   * folds its name and definition-file hash into the binding stamp's
+   * promptTemplateVersion (computeAgentAwarePromptTemplateVersion).
+   */
+  agent?: string;
   /**
    * Absolute path to the child flow.yaml for a `kind: subflow` station
    * (the original multi-flow engine work, flow-as-station composition) — required for subflow stations,
@@ -386,6 +402,12 @@ export interface StationGateConfig {
    * cannot host a critic at all).
    */
   criticTools?: string[];
+  /**
+   * Named agent for an agentic (harness) critic (issue #28), from
+   * `check.critic.agent`. Absent when undeclared, never `''` (unlike
+   * `criticModel`); the gate uses `criticAgent ?? adapter default`.
+   */
+  criticAgent?: string;
   /**
    * Wall-clock bound for an agentic (harness) critic's invocation, in ms
    * (check.critic.timeout_seconds * 1000). Absent -> the engine default

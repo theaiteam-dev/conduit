@@ -25,7 +25,7 @@
  *     // MUST call checkCommandAllowed first and THROW (refuse) before spawning if denied.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
-import { existsSync, mkdtempSync, rmSync, writeFileSync, chmodSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -34,6 +34,7 @@ import {
   type DeterministicCommand,
   type LawLiteConfig,
 } from './deterministic';
+import { describeContainmentConformance } from './harness-containment.conformance';
 
 const ALLOW: LawLiteConfig = { allowlist: ['bun'] };
 
@@ -192,7 +193,7 @@ describe('runDeterministic — timeout enforcement (punch-list #8)', () => {
 
   // Code-review fix #1 — a SIGKILL that is NOT from our timeout (here: the child
   // kills itself well before the deadline) must NOT be mislabeled `timedOut`.
-  // The elapsed-time guard keeps the timeout diagnostic honest. The self-kill
+  // `timedOut` requires that our own timer fired, which keeps the diagnostic honest. The self-kill
   // lives in a SCRIPT FILE (not argv) so the Law-lite metacharacter scan — which
   // only inspects argv — admits it; the path is plain safe-charset.
   it('does NOT report timedOut for a SIGKILL that landed well before the deadline', async () => {
@@ -287,4 +288,146 @@ describe('runDeterministic — env injection', () => {
     expect(result.stdout.length).toBeGreaterThan(0);
     expect(result.stdout).toBe(process.env.PATH ?? '');
   });
+});
+
+// ---------------------------------------------------------------------------
+// Containment conformance (issues #27, #10, #17). runDeterministic spawns the
+// command as its own process group and SIGKILLs the group on timeout and after
+// a normal or nonzero exit, so the fixture's grandchild dies on every path.
+// `reapsOnExit` adds the exit-0 and nonzero-exit scenarios to the timeout one.
+// ---------------------------------------------------------------------------
+
+/**
+ * Test-local label for `result.timedOut === true`. DeterministicResult carries
+ * a boolean, not a classification code, so the suite compares against this.
+ */
+const DETERMINISTIC_TIMEOUT_LABEL = 'timedOut';
+
+describeContainmentConformance(
+  'deterministic',
+  async ({ projectRoot, fixture, timeoutMs, fixtureArgs }) => {
+    const result = await runDeterministic(
+      { command: fixture, args: fixtureArgs },
+      { allowlist: [fixture], cwd: projectRoot, timeoutMs },
+    );
+    return result.timedOut === true ? DETERMINISTIC_TIMEOUT_LABEL : undefined;
+  },
+  { timeoutClass: DETERMINISTIC_TIMEOUT_LABEL, reapsOnExit: true },
+);
+
+// ---------------------------------------------------------------------------
+// #10 / #17: a descendant that keeps the inherited stdout/stderr pipes open.
+// The conformance fixture sends its grandchild's stdio to /dev/null; these
+// scripts do not, so a surviving grandchild would keep the drains pending.
+// The group kill must close the pipes, and output written before the exit or
+// the timeout must still be captured.
+// ---------------------------------------------------------------------------
+
+describe('runDeterministic: descendants holding the output pipes (#10, #17)', () => {
+  /** Grandchild pids a test recorded; afterEach SIGKILLs any that survived. */
+  const recorded: number[] = [];
+
+  afterEach(() => {
+    // Single pids only, never a group: a leaked grandchild of an undetached
+    // spawn shares the test runner's process group.
+    for (const pid of recorded.splice(0)) {
+      try {
+        process.kill(pid, 'SIGKILL');
+      } catch {
+        /* already gone: the expected case */
+      }
+    }
+  });
+
+  /**
+   * A script that writes to stdout and stderr, backgrounds a `sleep 30` that
+   * inherits both pipes, records its pid, then runs `tail`.
+   */
+  function pipeHoldingScript(tail: string): string {
+    const script = join(dir, 'hold.sh');
+    writeFileSync(
+      script,
+      ['echo before-out', 'echo before-err >&2', 'sleep 30 &', 'echo "$!" > grandchild.pid', tail, ''].join('\n'),
+    );
+    return script;
+  }
+
+  function grandchildPid(): number {
+    const pid = Number(readFileSync(join(dir, 'grandchild.pid'), 'utf-8').trim());
+    expect(Number.isInteger(pid) && pid > 1).toBe(true);
+    recorded.push(pid);
+    return pid;
+  }
+
+  async function waitForPidGone(pid: number): Promise<boolean> {
+    const deadline = Date.now() + 3_000;
+    while (Date.now() < deadline) {
+      try {
+        process.kill(pid, 0);
+      } catch {
+        return true;
+      }
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    return false;
+  }
+
+  for (const [label, code] of [
+    ['exits 0', 0],
+    ['exits nonzero', 4],
+  ] as const) {
+    it(`returns promptly with the output written before it ${label}, and the grandchild is gone`, async () => {
+      const script = pipeHoldingScript(`exit ${code}`);
+      const start = Date.now();
+      const result = await runDeterministic({ command: 'sh', args: [script] }, { allowlist: ['sh'], cwd: dir });
+      const elapsed = Date.now() - start;
+
+      // Without the group kill the drains wait out the 30s sleep.
+      expect(elapsed).toBeLessThan(10_000);
+      expect(result.exitCode).toBe(code);
+      expect(result.ok).toBe(code === 0);
+      expect(result.timedOut).toBeFalsy();
+      expect(result.stdout).toBe('before-out\n');
+      expect(result.stderr).toBe('before-err\n');
+      expect(await waitForPidGone(grandchildPid())).toBe(true);
+    }, 40_000);
+  }
+
+  it('does not report a timeout when the group is killed after a normal exit', async () => {
+    const script = pipeHoldingScript('exit 0');
+    const start = Date.now();
+    const result = await runDeterministic(
+      { command: 'sh', args: [script] },
+      { allowlist: ['sh'], cwd: dir, timeoutMs: 20_000 },
+    );
+
+    // Without the post-exit group kill the drains wait for the 20s timer,
+    // which reaps the grandchild and reports no timeout, so only the elapsed
+    // time tells the two apart.
+    expect(Date.now() - start).toBeLessThan(10_000);
+    expect(result.ok).toBe(true);
+    expect(result.exitCode).toBe(0);
+    expect(result.timedOut).toBeFalsy();
+    expect(result.stderr).not.toMatch(/exceeded its timeout/i);
+    expect(await waitForPidGone(grandchildPid())).toBe(true);
+  }, 40_000);
+
+  it('returns promptly after the deadline and keeps the output written before the timeout', async () => {
+    const script = pipeHoldingScript('wait');
+    const start = Date.now();
+    const result = await runDeterministic(
+      { command: 'sh', args: [script] },
+      { allowlist: ['sh'], cwd: dir, timeoutMs: 300 },
+    );
+    const elapsed = Date.now() - start;
+
+    // #10's reproduction returned only when the descendant exited.
+    expect(elapsed).toBeLessThan(10_000);
+    expect(result.ok).toBe(false);
+    expect(result.timedOut).toBe(true);
+    expect(result.stdout).toBe('before-out\n');
+    expect(result.stderr).toStartWith('before-err\n');
+    expect(result.stderr).toMatch(/exceeded its timeout of 300ms/);
+    expect(await waitForPidGone(grandchildPid())).toBe(true);
+  }, 40_000);
 });
