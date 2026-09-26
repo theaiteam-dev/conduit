@@ -107,10 +107,11 @@ harness occupancy (serial under any --concurrency; run wall clock 100.0s):
 
 Run wall clock is `runs.created_at` to the run's newest journal row, in whole
 seconds, and includes any time a resumed run spent stopped. The waiting figure
-counts every ready card, including ones a station `wip` cap would have held back
-anyway, so it is an upper bound on what overlap could recover. Calls journaled
-before this report existed carry no waiting sample and are listed as not
-sampled.
+is an estimate. It is sampled once when each call starts, so a card that
+becomes dispatchable during the call, for example when its `release_at` passes,
+is not counted. It also counts ready cards that a station `wip` cap would have
+held back anyway. Calls journaled before this report existed carry no waiting
+sample and are listed as not sampled.
 
 ## What this validates
 

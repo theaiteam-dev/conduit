@@ -154,6 +154,102 @@ stations:
   });
 });
 
+describe('issue #30: ready_waiting is sampled when each harness call starts', () => {
+  it('counts a card whose release_at passes during a maker retry backoff', async () => {
+    // Card 'a' fails its first attempt and retries; the backoff sleep between
+    // attempts advances the injected clock past card 'b's release_at. The
+    // second attempt's ready_waiting must see 'b' as dispatchable even though
+    // the tick's currentNow (sampled once, before either attempt) does not.
+    let calls = 0;
+    let clock = 1000;
+    const harness: HarnessAdapter = {
+      name: 'fake-harness',
+      reportsUsage: true,
+      canRestrictTools: true,
+      async probeBinary() {
+        return { present: true };
+      },
+      async invoke() {
+        calls++;
+        if (calls === 1) {
+          throw Object.assign(new Error('boom'), { code: 'harness-nonzero-exit' });
+        }
+        writeFileSync(join(process.cwd(), 'result.json'), JSON.stringify({ summary: 'ok' }), 'utf-8');
+        return { outputs: [], usage: { tokens: 10, cost: 0 } };
+      },
+    };
+    const registry = createHarnessRegistry([harness]);
+    mkdirSync(join(dir, 'prompts'), { recursive: true });
+    writeFileSync(join(dir, 'prompts', 'coder.md'), 'TASK: {{task.json}}');
+    writeFileSync(join(dir, 'task.json'), '{"task":"x"}');
+    writeFileSync(
+      join(dir, 'flow.yaml'),
+      `
+flow: harness-occupancy-boundary
+project_root: .
+flow_version: 1
+budgets:
+  run: { wall_clock_minutes: 10, max_tokens: 100000 }
+  per_card: { max_execution_attempts: 2 }
+  liveness: { no_progress_minutes: 3 }
+terminal_lanes: [done, scrap, hold]
+stations:
+  - id: coder
+    worker:
+      kind: harness
+      harness: fake-harness
+      model: sonnet
+      prompt_file: prompts/coder.md
+      prompt_version: "1"
+      tools: [Read, Write, Bash]
+      output_schema:
+        fields:
+          - { name: summary, type: string, required: true }
+    inputs: [task.json]
+    outputs: [result.json]
+    next: done
+`,
+    );
+    const loaded = loadFlow(join(dir, 'flow.yaml'), { harnessRegistry: registry });
+    if (!loaded.ok) throw new Error(`fixture flow invalid: ${JSON.stringify(loaded.errors)}`);
+
+    db.insertCard({
+      run_id: DEFAULT_RUN_ID, id: 'a', parent_id: null, lane: 'coder', status: 'ready',
+      attempt: 0, wave: 0, owned_paths: ['task.json', 'result.json'], rework_count: 0,
+    });
+    db.insertCard({
+      run_id: DEFAULT_RUN_ID, id: 'b', parent_id: null, lane: 'coder', status: 'ready',
+      attempt: 0, wave: 0, owned_paths: ['task.json', 'result.json'], rework_count: 0,
+    });
+    // Gated at tick start (release_at 1001 > currentNow 1000): planTick will
+    // not dispatch 'b' this tick, but the retry backoff below advances the
+    // clock to 1001 before 'a's second attempt samples ready_waiting.
+    db.getStateDb()
+      .prepare('UPDATE cards SET release_at = $r WHERE run_id = $run AND id = $id')
+      .run({ $r: 1001, $run: DEFAULT_RUN_ID, $id: 'b' });
+
+    await runExecutor({
+      db,
+      flow: loaded.flow,
+      now: () => clock,
+      // Advances the clock instead of paying the real backoff delay: models
+      // the wall-clock time a retry's sleep actually consumes.
+      sleep: async (ms: number) => {
+        clock += ms / 1000;
+      },
+      adapter: throwingModel,
+      io: { out: () => {}, err: () => {} },
+      harnessRegistry: registry,
+    } as RunEngineArgs);
+
+    expect(db.getCard(DEFAULT_RUN_ID, 'a')?.lane).toBe('done');
+
+    const { spans } = db.getHarnessTimingsForRun(DEFAULT_RUN_ID);
+    const aSpans = spans.filter((_s, i) => i < 2); // 'a's two attempts land first
+    expect(aSpans.map((s) => s.readyWaiting)).toEqual([0, 1]);
+  });
+});
+
 describe('issue #30: getHarnessOccupancy', () => {
   it('returns null for a run with no harness spans', () => {
     insertRun('r0');
