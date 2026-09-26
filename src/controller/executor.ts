@@ -4856,6 +4856,52 @@ function skipWhenMemoKey(cardId: string, lane: string, attempt: number): string 
 }
 
 /**
+ * Take the state-db write lock and run `fn` only if `cardId` is still
+ * `ready` on `expected.lane` at `expected.attempt` (issue #32). Shared by
+ * every terminal outcome of a skip_when candidate row — the skip commit and
+ * both hold branches — so a candidate that lost a race against a concurrent
+ * writer (a claim, an unrelated hold, a rework) gets identical treatment
+ * regardless of which outcome applySkipWhen computed for it: the `BEGIN
+ * IMMEDIATE` transaction serializes against that writer, and re-reading
+ * status/lane/attempt inside it catches the change before anything is
+ * written, rather than journaling ahead of a guarded UPDATE that then
+ * silently affects zero rows (skip) or, worse, an unguarded one that
+ * overwrites the writer's row (hold — escalateToHold's own UPDATE carries no
+ * status/lane guard, since it is also called from contexts that already hold
+ * a verified row).
+ *
+ * Returns whether `fn` ran, so a caller sets `changed = true` only on a
+ * verified transition, never on a lost race.
+ */
+function withVerifiedReadyCard(
+  stateDb: Database,
+  runId: string,
+  cardId: string,
+  expected: { lane: string; attempt: number },
+  fn: () => void,
+): boolean {
+  let ran = false;
+  stateDb
+    .transaction(() => {
+      const current = stateDb
+        .prepare("SELECT status, lane, attempt FROM cards WHERE run_id = $runId AND id = $id")
+        .get({ $runId: runId, $id: cardId }) as { status: string; lane: string; attempt: number } | undefined;
+      if (
+        current === undefined ||
+        current.status !== 'ready' ||
+        current.lane !== expected.lane ||
+        current.attempt !== expected.attempt
+      ) {
+        return; // lost the race — no-op, no journal
+      }
+      fn();
+      ran = true;
+    })
+    .immediate();
+  return ran;
+}
+
+/**
  * Evaluate skip_when for every dispatchable card at a station that declares
  * it (SPEC §3/§4). Dispatchable means what planTick means: status 'ready' and
  * no future release_at. For each card:
@@ -4932,9 +4978,11 @@ function applySkipWhen(args: ApplySkipWhenArgs): boolean {
     }
 
     if (decision.action === 'hold') {
-      escalateToHold(stateDb, db, id, stationId, { lane: stationId, attempt },
-        `skip_when ${predicate} could not be evaluated: ${decision.reason}`, err, runId);
-      changed = true;
+      const held = withVerifiedReadyCard(stateDb, runId, id, { lane: stationId, attempt }, () => {
+        escalateToHold(stateDb, db, id, stationId, { lane: stationId, attempt },
+          `skip_when ${predicate} could not be evaluated: ${decision.reason}`, err, runId);
+      });
+      if (held) changed = true;
       continue;
     }
 
@@ -4945,75 +4993,62 @@ function applySkipWhen(args: ApplySkipWhenArgs): boolean {
       ctx,
     );
     if (!result.ok) {
-      escalateToHold(stateDb, db, id, stationId, { lane: stationId, attempt }, `FSM illegal_transition on SKIP for station '${stationId}'`, err, runId);
-      changed = true;
+      const held = withVerifiedReadyCard(stateDb, runId, id, { lane: stationId, attempt }, () => {
+        escalateToHold(stateDb, db, id, stationId, { lane: stationId, attempt }, `FSM illegal_transition on SKIP for station '${stationId}'`, err, runId);
+      });
+      if (held) changed = true;
       continue;
     }
     const nextLane = result.next.lane;
     const nextStatus = terminalLanes.has(nextLane) ? 'complete' : result.next.status;
 
-    // Take the state-db write lock BEFORE journaling. A
-    // `BEGIN IMMEDIATE` transaction serializes against any other writer
-    // targeting this row, and re-reading status/lane/attempt inside it
-    // catches a concurrent change (another writer claimed/held/moved/reworked
-    // the card between the SELECT at the top of this function and here)
-    // before anything is written — a lost race now leaves no card_log trace
-    // of a lane move that never happened, instead of journaling one ahead of
-    // a guarded UPDATE that then silently affects zero rows. Checking `lane`
-    // here is what makes the stale-lane race safe without a
-    // getCard re-read: a writer that moved the card off `stationId` fails
-    // this re-check and the guarded UPDATE below, rather than being
-    // overwritten by a SKIP computed against a lane the card is no longer on.
-    // The card_log's own append stays journal-first relative to the state
-    // commit (as advanceCard documents: a crash between the two leaves a
-    // phantom entry INSERT OR IGNORE deduplicates on replay); the journal DB
-    // is a separate SQLite file, so this transaction's lock only covers the
-    // state DB, which is exactly the resource the race is over.
-    let committed = false;
-    stateDb
-      .transaction(() => {
-        const current = stateDb
-          .prepare("SELECT status, lane, attempt FROM cards WHERE run_id = $runId AND id = $id")
-          .get({ $runId: runId, $id: id }) as { status: string; lane: string; attempt: number } | undefined;
-        if (
-          current === undefined ||
-          current.status !== 'ready' ||
-          current.lane !== stationId ||
-          current.attempt !== attempt
-        ) {
-          return; // lost the race — no-op, no journal
-        }
-
-        db.appendCardLog({
-          runId,
-          kind: 'entered_lane',
-          cardId: id,
-          station: stationId,
-          attempt,
-          sourceLane: stationId,
-          destLane: nextLane,
-          reasonClass: 'skip',
-        });
-        db.appendCardLog({
-          runId,
-          kind: 'skip',
-          cardId: id,
-          station: stationId,
-          attempt,
-          reason: `skip_when ${predicate} matched (read ${JSON.stringify(decision.value)})`,
-        });
-        // attempt and rework_count are deliberately not written: SKIP moves
-        // neither counter. The status/lane guards are redundant with the
-        // re-check above (both run inside the same BEGIN IMMEDIATE) but kept
-        // as defense in depth.
-        stateDb
-          .prepare(
-            "UPDATE cards SET lane = $lane, status = $status WHERE run_id = $runId AND id = $id AND status = 'ready' AND lane = $stationId",
-          )
-          .run({ $lane: nextLane, $status: nextStatus, $runId: runId, $id: id, $stationId: stationId });
-        committed = true;
-      })
-      .immediate();
+    // Take the state-db write lock BEFORE journaling, via the same
+    // withVerifiedReadyCard the hold branches above use. The `BEGIN
+    // IMMEDIATE` transaction serializes against any other writer targeting
+    // this row, and re-reading status/lane/attempt inside it catches a
+    // concurrent change (another writer claimed/held/moved/reworked the card
+    // between the SELECT at the top of this function and here) before
+    // anything is written — a lost race now leaves no card_log trace of a
+    // lane move that never happened, instead of journaling one ahead of a
+    // guarded UPDATE that then silently affects zero rows. Checking `lane`
+    // here is what makes the stale-lane race safe without a getCard re-read:
+    // a writer that moved the card off `stationId` fails the re-check and the
+    // guarded UPDATE below, rather than being overwritten by a SKIP computed
+    // against a lane the card is no longer on. The card_log's own append
+    // stays journal-first relative to the state commit (as advanceCard
+    // documents: a crash between the two leaves a phantom entry INSERT OR
+    // IGNORE deduplicates on replay); the journal DB is a separate SQLite
+    // file, so this transaction's lock only covers the state DB, which is
+    // exactly the resource the race is over.
+    const committed = withVerifiedReadyCard(stateDb, runId, id, { lane: stationId, attempt }, () => {
+      db.appendCardLog({
+        runId,
+        kind: 'entered_lane',
+        cardId: id,
+        station: stationId,
+        attempt,
+        sourceLane: stationId,
+        destLane: nextLane,
+        reasonClass: 'skip',
+      });
+      db.appendCardLog({
+        runId,
+        kind: 'skip',
+        cardId: id,
+        station: stationId,
+        attempt,
+        reason: `skip_when ${predicate} matched (read ${JSON.stringify(decision.value)})`,
+      });
+      // attempt and rework_count are deliberately not written: SKIP moves
+      // neither counter. The status/lane guards on this UPDATE are redundant
+      // with withVerifiedReadyCard's own re-check (both run inside the same
+      // BEGIN IMMEDIATE) but kept as defense in depth.
+      stateDb
+        .prepare(
+          "UPDATE cards SET lane = $lane, status = $status WHERE run_id = $runId AND id = $id AND status = 'ready' AND lane = $stationId",
+        )
+        .run({ $lane: nextLane, $status: nextStatus, $runId: runId, $id: id, $stationId: stationId });
+    });
     if (committed) changed = true;
   }
   return changed;

@@ -99,10 +99,23 @@ function chainYaml(opts: {
 
 /**
  * A chain with a transform `classify` upstream of the skippable station, for
- * the `source: output` form. `classifyNext` lets a test put classify after the
- * skippable station instead.
+ * the `source: output` form. `downstreamClassify` puts classify after the
+ * skippable station instead (the not-upstream negative). `hops` controls how
+ * many `next` edges separate classify from write_tests: the default, 1, is
+ * the direct single-hop chain; hops > 1 splices `hops - 1` intermediate
+ * deterministic stations (mid1, mid2, ...) in between, so the loader's
+ * transitive `next`-chain walk in validateOutputSource must actually iterate
+ * rather than compare a single next pointer.
  */
-function outputSourceYaml(opts: { skip: string; downstreamClassify?: boolean; classifySkipWhen?: string }): string {
+function outputSourceYaml(opts: {
+  skip: string;
+  downstreamClassify?: boolean;
+  classifySkipWhen?: string;
+  hops?: number;
+}): string {
+  const hops = opts.hops ?? 1;
+  const midIds = Array.from({ length: Math.max(hops - 1, 0) }, (_, i) => `mid${i + 1}`);
+
   const classify = [
     '  - id: classify',
     '    worker:',
@@ -122,9 +135,17 @@ function outputSourceYaml(opts: { skip: string; downstreamClassify?: boolean; cl
     '    worker: { kind: deterministic, command: "true" }',
     opts.skip,
   ];
-  const lines = opts.downstreamClassify === true
-    ? [...writeTests, '    next: classify', ...classify, '    next: done']
-    : [...classify, '    next: write_tests', ...writeTests, '    next: done'];
+  const mid = (id: string): string[] => [`  - id: ${id}`, '    worker: { kind: deterministic, command: "true" }'];
+
+  // Wire `next` between consecutive entries in the chain, ending at `done`.
+  const chain: Array<{ id: string; body: string[] }> = opts.downstreamClassify === true
+    ? [{ id: 'write_tests', body: writeTests }, ...midIds.map((id) => ({ id, body: mid(id) })), { id: 'classify', body: classify }]
+    : [{ id: 'classify', body: classify }, ...midIds.map((id) => ({ id, body: mid(id) })), { id: 'write_tests', body: writeTests }];
+  const lines: string[] = [];
+  for (let i = 0; i < chain.length; i++) {
+    lines.push(...chain[i]!.body, `    next: ${i < chain.length - 1 ? chain[i + 1]!.id : 'done'}`);
+  }
+
   return [
     'flow: skiptest',
     'flow_version: 1',
@@ -241,6 +262,78 @@ describe('INVALID_SKIP_WHEN — malformed predicate', () => {
         downstreamClassify: true,
       }),
     );
+    expect(codes(result)).toContain('INVALID_SKIP_WHEN');
+    expect(messages(result)).toContain('upstream');
+  });
+});
+
+describe('source: output — transitive next-chain walk', () => {
+  it('accepts a source: output predicate with an intermediate deterministic station between the upstream transform and the skip station', () => {
+    const flow = expectOk(
+      loadInline(
+        outputSourceYaml({
+          skip: '    skip_when: { source: output, station: classify, field: needs_tests, equals: false }',
+          hops: 2,
+        }),
+      ),
+    );
+    expect(flow.stations['mid1']!.kind).toBe('deterministic');
+    expect(flow.stations['write_tests']!.skip_when).toEqual({
+      source: 'output',
+      station: 'classify',
+      field: 'needs_tests',
+      equals: false,
+    });
+  });
+
+  it('rejects source: output naming a transform that is two hops downstream of the skip station', () => {
+    const result = loadInline(
+      outputSourceYaml({
+        skip: '    skip_when: { source: output, station: classify, field: needs_tests, equals: false }',
+        downstreamClassify: true,
+        hops: 2,
+      }),
+    );
+    expect(codes(result)).toContain('INVALID_SKIP_WHEN');
+    expect(messages(result)).toContain('upstream');
+  });
+
+  // A cycle in the upstream station's own `next` chain (independent of
+  // write_tests, which sits outside it) is already rejected by CYCLIC_NEXT,
+  // but validateSkipWhen runs unconditionally alongside every other check
+  // (load.ts collects all errors rather than short-circuiting), so this still
+  // drives validateOutputSource's walk through a cycle. Without the visited
+  // set the while loop would spin forever between classify and mid; with it,
+  // the walk terminates and correctly falls through to INVALID_SKIP_WHEN
+  // because the cycle never reaches write_tests.
+  it('terminates (does not hang) when the named station is on a cyclic next chain that never reaches the skip station', () => {
+    const yaml = [
+      'flow: skiptest',
+      'flow_version: 1',
+      'terminal_lanes: [done, scrap, hold]',
+      'security:',
+      '  bash: { allow: ["true"] }',
+      'stations:',
+      '  - id: classify',
+      '    worker:',
+      '      kind: transform',
+      '      model: m',
+      '      prompt_file: classify.md',
+      '      prompt_version: 1',
+      '      output_schema:',
+      '        fields:',
+      '          - { name: needs_tests, type: boolean, required: true }',
+      '    inputs: [seed.json]',
+      '    next: mid',
+      '  - id: mid',
+      '    worker: { kind: deterministic, command: "true" }',
+      '    next: classify',
+      '  - id: write_tests',
+      '    worker: { kind: deterministic, command: "true" }',
+      '    skip_when: { source: output, station: classify, field: needs_tests, equals: false }',
+      '    next: done',
+    ].join('\n');
+    const result = loadInline(yaml);
     expect(codes(result)).toContain('INVALID_SKIP_WHEN');
     expect(messages(result)).toContain('upstream');
   });

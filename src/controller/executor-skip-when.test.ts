@@ -558,6 +558,72 @@ stations:
   return loadOk(dir);
 }
 
+// ---------------------------------------------------------------------------
+// Race regression (issue #32): the hold branch must guard against a
+// concurrent writer exactly like the skip commit above. escalateToHold's own
+// UPDATE carries no status/lane guard, so calling it against a stale
+// candidate row would overwrite whatever a concurrent writer already did.
+// ---------------------------------------------------------------------------
+
+describe('runExecutor skip_when: concurrent claim during a hold decision', () => {
+  it('does not overwrite a concurrent claim when the predicate is unreadable', async () => {
+    db = openFreshDb();
+    // no_test_needed is a string, not a boolean like skip_when's `equals`
+    // compares against, so evaluateSkipWhen returns a hold decision.
+    const seedDir = ownedDir('item', { name: 'item', no_test_needed: 'yes' });
+    seedCard(db, { id: 'item', lane: 'write_tests', owned_paths: [seedDir] });
+
+    const database = db;
+    let intercepted = false;
+    onEvaluate = () => {
+      // Simulate a second writer claiming the card in the window between
+      // applySkipWhen's candidate SELECT and its guarded escalation — the
+      // same status flip and active_workers row the skip-path race tests
+      // above use, so the only thing under test is applySkipWhen's own
+      // guard on the hold branch.
+      if (intercepted) return;
+      intercepted = true;
+      database
+        .getStateDb()
+        .prepare("UPDATE cards SET status = 'claimed' WHERE run_id = $runId AND id = $id")
+        .run({ $runId: DEFAULT_RUN_ID, $id: 'item' });
+      database
+        .getStateDb()
+        .prepare(
+          "INSERT INTO active_workers (run_id, card_id, station, worker_id, started_at, lease_until) " +
+            "VALUES ($runId, 'item', 'write_tests', 'other-writer', 0, 999999999)",
+        )
+        .run({ $runId: DEFAULT_RUN_ID });
+    };
+
+    const adapter: ModelAdapter = {
+      async call(): Promise<ModelResponse> {
+        throw new Error('worker must not run: the card is a hold candidate, not a dispatch candidate');
+      },
+    };
+
+    await run(setupMemoFlow(projectDir), adapter);
+
+    expect(intercepted).toBe(true);
+
+    // No hold row for the escalation that must not have happened.
+    const log = db.getCardLogForRun(DEFAULT_RUN_ID, 'item');
+    expect(log.some((e) => e.kind === 'terminal')).toBe(false);
+    expect(log.some((e) => e.kind === 'entered_lane' && e.reasonClass === 'hold')).toBe(false);
+
+    // The card and its worker slot are exactly as the concurrent writer left
+    // them — escalateToHold's unguarded UPDATE (and its active_workers
+    // DELETE) must not have run against this stale row.
+    expect(card('item').lane).toBe('write_tests');
+    expect(card('item').status).toBe('claimed');
+    const workers = db
+      .getStateDb()
+      .prepare('SELECT COUNT(*) AS n FROM active_workers WHERE run_id = $runId AND card_id = $id')
+      .get({ $runId: DEFAULT_RUN_ID, $id: 'item' }) as { n: number };
+    expect(workers.n).toBe(1);
+  });
+});
+
 describe('runExecutor skip_when: memoized run decisions', () => {
   it('evaluates a run decision once, not on every tick a wip cap keeps it waiting', async () => {
     db = openFreshDb();

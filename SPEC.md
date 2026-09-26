@@ -209,6 +209,7 @@ ANDed at a single atomic claim point (§7).
    any ──cap reached / unrecoverable──► scrapped
    parent fanned-out ──► awaiting_children ──(fan-in policy met)──► ready (assembler)
    ready ──SKIP (station's skip_when matched)──► next lane, status=waiting  ← station never runs
+                                                 (lane=done, status=complete if last station)
 ```
 
 Statuses: `waiting`, `ready`, `claimed`, `working`, `done_pending_ack`, `interrupted`,
