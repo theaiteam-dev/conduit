@@ -3744,6 +3744,11 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
       stationConfig.timeout_seconds !== undefined
         ? stationConfig.timeout_seconds * 1000
         : DEFAULT_HARNESS_TIMEOUT_MS;
+    // Issue #31: opt-in idle bound, absent unless the station declares one.
+    // The loader has already validated it is positive and, when both are
+    // declared, strictly less than timeout_seconds.
+    const idleTimeoutMs =
+      stationConfig.idle_timeout_seconds !== undefined ? stationConfig.idle_timeout_seconds * 1000 : undefined;
 
     // ── WI-566: bounded retry loop, mirroring transform.ts runTransformStation
     // (`while callsMade < maxExecutionAttempts`). Every distinct failure class
@@ -3788,6 +3793,7 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
           timeoutMs,
           model: effectiveModel,
           onProgress: stampHarnessActivity,
+          ...(idleTimeoutMs !== undefined ? { idleTimeoutMs } : {}),
           ...(effectiveAgent !== undefined ? { agent: effectiveAgent } : {}),
         });
       } catch (invokeErr) {
@@ -3893,12 +3899,19 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
         // An UNTAGGED throw still scraps under a generic named reason — loud,
         // never a silent failure to classify.
         const code = (invokeErr as { code?: string }).code;
+        // Issue #31: an idle kill is retried exactly like a wall-clock
+        // timeout — it spends an execution attempt, bounded by
+        // max_execution_attempts, and paced by the same backoff below — but
+        // gets its own scrap reason so a card that exhausts its attempts
+        // names which bound actually killed it.
         scrapReason =
           code === 'harness-timeout'
             ? 'harness-timeout'
-            : code === 'harness-nonzero-exit'
-              ? 'harness-nonzero-exit'
-              : `harness-invocation-failed: ${(invokeErr as Error).message}`;
+            : code === 'harness-idle-timeout'
+              ? 'harness-idle-timeout'
+              : code === 'harness-nonzero-exit'
+                ? 'harness-nonzero-exit'
+                : `harness-invocation-failed: ${(invokeErr as Error).message}`;
         // issue #26 AC5: a thrown invocation was still BILLED for whatever it
         // did before it died (a timeout or nonzero exit does not refund
         // tokens already consumed). usageFromThrow is the ONE reader for

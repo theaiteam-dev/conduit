@@ -97,6 +97,14 @@ interface RawWorker {
    * collectErrors before buildStationConfig copies it onto the StationConfig.
    */
   timeout_seconds?: unknown;
+  /**
+   * Idle bound in seconds for a `kind: harness` station's invocation (issue
+   * #31). Untrusted: validated to a positive integer, less than
+   * `timeout_seconds` when both are set, and declared only on a harness
+   * station, in collectErrors before buildStationConfig copies it onto the
+   * StationConfig.
+   */
+  idle_timeout_seconds?: unknown;
   /** Path to the model station's prompt template (relative to flow.yaml dir). */
   prompt_file?: string;
   /** Version stamp of the prompt template. */
@@ -374,6 +382,10 @@ function buildStationConfig(
   // Punch-list #8 — copy the (already-validated) deterministic timeout. Cast is
   // sound: collectErrors rejected any non-positive-integer value before here.
   if (w?.timeout_seconds !== undefined) config.timeout_seconds = w.timeout_seconds as number;
+  // Issue #31 — copy the (already-validated) harness idle bound. Cast is sound:
+  // collectErrors rejected any non-positive-integer, >= timeout_seconds, or
+  // non-harness-station value before here.
+  if (w?.idle_timeout_seconds !== undefined) config.idle_timeout_seconds = w.idle_timeout_seconds as number;
   if (w?.prompt_file !== undefined) config.prompt_file = join(flowDir, w.prompt_file);
   if (w?.prompt_version !== undefined) config.prompt_version = String(w.prompt_version);
   if (w?.params !== undefined) config.params = w.params;
@@ -787,6 +799,45 @@ function collectErrors(
           `Station '${station.id}' has invalid timeout_seconds '${String(timeoutSeconds)}' — ` +
           `must be an integer >= 1`,
       });
+    }
+    // Issue #31 — idle_timeout_seconds: same foot-gun guard as timeout_seconds
+    // (0/negative/float/non-number rejected fail-closed), plus two bounds
+    // specific to it: it applies only to a harness station's invocation (a
+    // declared-but-ignored bound on another kind would be silently dropped,
+    // same posture as CRITIC_TIMEOUT_REQUIRES_HARNESS below), and it must be
+    // strictly less than timeout_seconds when both are set — an idle bound
+    // that could never fire before the wall-clock one is dead configuration,
+    // and one equal to or past it would race the two kills against each other.
+    const idleTimeoutSeconds = station.worker?.idle_timeout_seconds;
+    if (idleTimeoutSeconds !== undefined) {
+      if (!isIntInRange(idleTimeoutSeconds, 1)) {
+        errors.push({
+          code: 'INVALID_IDLE_TIMEOUT_SECONDS',
+          message:
+            `Station '${station.id}' has invalid idle_timeout_seconds ` +
+            `'${String(idleTimeoutSeconds)}' — must be an integer >= 1`,
+        });
+      } else if (resolveStationKind(station) !== 'harness') {
+        errors.push({
+          code: 'IDLE_TIMEOUT_REQUIRES_HARNESS',
+          message:
+            `Station '${station.id}' sets idle_timeout_seconds but is not a harness station — ` +
+            `the bound applies only to a harness invocation's stdout and would be silently ` +
+            `ignored; remove it or set worker.kind: harness`,
+        });
+      } else if (
+        timeoutSeconds !== undefined &&
+        isIntInRange(timeoutSeconds, 1) &&
+        (idleTimeoutSeconds as number) >= (timeoutSeconds as number)
+      ) {
+        errors.push({
+          code: 'IDLE_TIMEOUT_NOT_LESS_THAN_TIMEOUT',
+          message:
+            `Station '${station.id}' has idle_timeout_seconds (${String(idleTimeoutSeconds)}) >= ` +
+            `timeout_seconds (${String(timeoutSeconds)}) — the idle bound must fire before the ` +
+            `wall-clock one to mean anything`,
+        });
+      }
     }
     // Same foot-gun guard for the harness critic's bound (mirrors the worker
     // timeout: 0 = "kill instantly" is rejected fail-closed at load).
