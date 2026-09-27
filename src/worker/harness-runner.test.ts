@@ -240,6 +240,12 @@ describe('harness runner: timeout/natural-exit boundary race (AC2 regression)', 
     // enough to the deadline that the timeout timer routinely fires — the exact
     // interleaving that surfaced the flag-race bug.
     const sleepSeconds = ((timeoutMs * 0.9) / 1000).toFixed(3); // '0.045'
+    // Process-group containment: joining a cgroup costs the child 5-20ms
+    // before it runs (the kernel waits for an RCU grace period on migration),
+    // which would push a 45ms child past a 50ms deadline and turn this into a
+    // test of that overhead. The labelling logic under test does not depend on
+    // the mechanism.
+    const containment = { mechanism: 'process-group', reason: 'boundary-race timing test' } as const;
 
     // Collect every violation so a failure names how often and how it broke,
     // rather than aborting on the first (a 1/300 flake vs a systemic regression
@@ -250,7 +256,7 @@ describe('harness runner: timeout/natural-exit boundary race (AC2 regression)', 
     for (let iter = 0; iter < ITERATIONS; iter++) {
       const result = await runHarnessProcess(
         { command: 'sh', args: ['-c', `sleep ${sleepSeconds}; exit 0`] },
-        config({ timeoutMs }),
+        config({ timeoutMs, containment }),
       );
       // The bug signature: a run that exited 0 but was flagged timedOut.
       if (result.timedOut) {

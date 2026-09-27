@@ -61,6 +61,7 @@ import {
   buildProjectRootProbe,
   buildFlowPrereqsProbe,
   buildModelEndpointProbe,
+  buildProcessContainmentProbe,
   type CliDeps,
   type CliIO,
   type PrereqProbe,
@@ -488,5 +489,26 @@ describe('conduit listen — doctor pre-flight gate (AC12/FR-2)', () => {
 
     expect(code).not.toBe(0);
     expect(listenerStarted).toBe(false); // no boot when pre-flight fails
+  });
+});
+
+describe('buildProcessContainmentProbe — containment mechanism (issue #77)', () => {
+  it('reports cgroup containment and passes', async () => {
+    const probe = buildProcessContainmentProbe(async () => ({ mechanism: 'cgroup', parent: '/sys/fs/cgroup/app.slice' }));
+    expect(probe.name).toBe('process-containment');
+    expect(await probe.check()).toEqual({
+      ok: true,
+      detail: 'cgroup v2, one cgroup per invocation under /sys/fs/cgroup/app.slice',
+    });
+  });
+
+  it('passes on the process-group fallback but warns with the reason', async () => {
+    const probe = buildProcessContainmentProbe(async () => ({
+      mechanism: 'process-group',
+      reason: 'cannot create a cgroup under /sys/fs/cgroup (EROFS)',
+    }));
+    const result = await probe.check();
+    expect(result.ok).toBe(true);
+    expect(result.detail).toStartWith('warning: process group only (cannot create a cgroup under /sys/fs/cgroup (EROFS))');
   });
 });

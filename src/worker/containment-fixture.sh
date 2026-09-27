@@ -32,13 +32,6 @@
 PATH="/usr/local/bin:/usr/bin:/bin${PATH:+:$PATH}"
 export PATH
 
-# Without setsid the fixture cannot model the escape, and the suite would pass
-# without testing it. Fail loudly instead.
-if ! command -v setsid >/dev/null 2>&1; then
-  echo "containment-fixture: setsid not found on PATH" >&2
-  exit 97
-fi
-
 (
   while :; do
     touch containment.sentinel
@@ -48,17 +41,24 @@ fi
 echo "$!" > containment.pid
 
 # `-f` forks unconditionally, so the loop always runs as a new session leader
-# even if this shell happens to lead its own process group.
-setsid -f sh -c '
-  echo "$$" > containment.setsid.pid
-  while :; do
-    touch containment.setsid.sentinel
-    sleep 0.1
-  done
-' </dev/null >/dev/null 2>&1
+# even if this shell happens to lead its own process group. The util-linux
+# `setsid` binary is absent on macOS; the fixture then starts only the plain
+# grandchild, and the suite, which requires the setsid one wherever it
+# requires cgroup containment, fails on the missing pid file.
+has_setsid=
+if command -v setsid >/dev/null 2>&1; then
+  has_setsid=1
+  setsid -f sh -c '
+    echo "$$" > containment.setsid.pid
+    while :; do
+      touch containment.setsid.sentinel
+      sleep 0.1
+    done
+  ' </dev/null >/dev/null 2>&1
+fi
 
 if [ "$1" = "--exit" ]; then
-  while [ ! -f containment.sentinel ] || [ ! -f containment.setsid.sentinel ]; do
+  while [ ! -f containment.sentinel ] || { [ -n "$has_setsid" ] && [ ! -f containment.setsid.sentinel ]; }; do
     sleep 0.05
   done
   exit "${2:-0}"

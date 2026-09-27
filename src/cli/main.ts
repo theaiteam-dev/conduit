@@ -41,6 +41,7 @@ import type {
   HarnessAdapterDefinition,
 } from '../worker/harness-adapter';
 import { parseHarnessConfig } from '../worker/harness-config';
+import { describeContainment, resolveContainment, type Containment } from '../worker/cgroup-containment';
 import { loadFlow, probeHarnessBinaries } from '../flow/load';
 import { reclaimOrphanedWorkers } from '../dispatch/claim';
 import { ensureCheckpointSchema, reconcileOnResume } from '../checkpoint/checkpoint';
@@ -405,6 +406,26 @@ export function buildProjectRootProbe(projectRoot: string | undefined): PrereqPr
         };
       }
       return { ok: true };
+    },
+  };
+}
+
+/**
+ * Process-containment probe (issue #77): reports whether station and harness
+ * processes run in a per-invocation cgroup or under the process-group kill
+ * alone. Never FAILs: the fallback is a weaker guarantee, not a broken
+ * install, and a default Docker container has no writable cgroup. It is
+ * reported so the weaker guarantee is visible before anything dispatches.
+ */
+export function buildProcessContainmentProbe(
+  resolveMechanism: () => Promise<Containment> = resolveContainment,
+): PrereqProbe {
+  return {
+    name: 'process-containment',
+    async check() {
+      const containment = await resolveMechanism();
+      const detail = describeContainment(containment);
+      return { ok: true, detail: containment.mechanism === 'cgroup' ? detail : `warning: ${detail}` };
     },
   };
 }
@@ -2318,6 +2339,7 @@ export function buildProductionDeps(): CliDeps {
   const prereqs: PrereqProbe[] = [
     buildStateDirProbe(stateDbPath),
     buildProjectRootProbe(process.env.CONDUIT_PROJECT_ROOT),
+    buildProcessContainmentProbe(),
     {
       name: 'model_api_key',
       check: () => {

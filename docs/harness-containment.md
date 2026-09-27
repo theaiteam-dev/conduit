@@ -46,24 +46,27 @@ hold it together:
   (trusted), never in `flow.yaml` (validated, untrusted). An allowlisted `HOME` is more
   than a variable: it hands a CLI the operator's home directory, including its config. See
   [The child's configuration surface](#the-childs-configuration-surface).
-- **Process-group termination.** The harness runs as its own process group; a timeout or
-  run halt kills the group, not a lone pid, so a harness that has spawned its own
-  subprocesses (a shell, a browser, a language server) doesn't leave zombies behind.
+- **Process-tree termination.** A timeout, idle timeout or run halt kills everything the
+  harness started, not a lone pid, so a harness that has spawned its own subprocesses (a
+  shell, a browser, a language server) doesn't leave them running. See
+  [Process-tree termination](#process-tree-termination) below for the mechanism, what it
+  requires of the host, and what happens on a host that lacks it.
   The evidence is the containment conformance suite,
   [`src/worker/harness-containment.conformance.ts`](../src/worker/harness-containment.conformance.ts).
   Each shipped adapter runs it through its own spawn path with a stand-in binary that
-  backgrounds a grandchild, and must show that the grandchild's pid is gone and its
-  sentinel file stops changing after the timeout.
+  starts two grandchildren, one backgrounded in the binary's own process group and one
+  started with `setsid` in a new session, and must show that each grandchild's pid is gone
+  and its sentinel file stops changing after the timeout.
   `src/worker/harness-containment-registry.test.ts` fails if an adapter ships without a
   conformance call. The deterministic station runner and the harness runner, two separate
   spawn paths, both pass the same suite, and both also run its exit scenarios: when the
-  command exits 0 or nonzero before its timeout, the runner kills the command's process
-  group before it returns, so a grandchild does not outlive a station or a harness
-  invocation that finished on its own
+  command exits 0 or nonzero before its timeout, the runner kills what the command started
+  before it returns, so a grandchild does not outlive a station or a harness invocation
+  that finished on its own
   ([#10](https://github.com/theaiteam-dev/conduit/issues/10),
   [#17](https://github.com/theaiteam-dev/conduit/issues/17)). For the harness runner this
   also keeps a grandchild that inherited the stdout/stderr pipes from stalling the output
-  drains past its actual finish. Both runners also kill every live station process group
+  drains past its actual finish. Both runners also kill every live station process tree
   when the kernel receives SIGINT, SIGTERM or SIGHUP, or exits; a SIGKILLed kernel cannot do
   this, which is why the container boundary below still matters.
   Deployment guidance additionally recommends running the container as a dedicated non-root
@@ -96,6 +99,73 @@ advance the card), by the env allowlist (there's little worth exfiltrating), by 
 container (the operator's network/process boundary), and by the adversarial gate
 (corrupted output gets caught before it ships) — and that every attempt is legible in the
 journal (hashes and usage, never raw transcripts).
+
+## Process-tree termination
+
+Claude Code's Bash tool runs every command in a new session (`setsid`), and so does any
+tool that daemonizes. A process-group kill cannot reach such a command: it has left the
+group ([#77](https://github.com/theaiteam-dev/conduit/issues/77)). The runners therefore
+use two mechanisms together.
+
+**cgroup v2, where the host allows it.** Each invocation, harness or deterministic station,
+runs in its own cgroup, `conduit-<kernel pid>-<n>`, created under the cgroup the kernel
+itself runs in. The child joins it before it runs: the runner spawns
+`/bin/sh -c 'echo $$ > <cgroup>/cgroup.procs && exec <command>'`, so the command is in the
+cgroup before it can fork. No descendant can leave a cgroup without write access to the
+cgroup tree, whatever session or process group it creates. On every path that kills the
+process group (wall-clock timeout, idle timeout, the post-exit reap, and the kernel's
+signal and exit handlers), the runner also writes `1` to the cgroup's `cgroup.kill`, which
+SIGKILLs every process in it, and then removes the cgroup. A kernel that is SIGKILLed
+leaves its cgroups behind; the next kernel started in the same cgroup kills whatever is
+still in them and removes them.
+
+This requires:
+
+- Linux with the cgroup v2 (unified) hierarchy mounted at `/sys/fs/cgroup`;
+- kernel 5.14 or later, for `cgroup.kill`;
+- write access, for the user the kernel runs as, to the cgroup the kernel runs in. A
+  systemd user session provides this: processes started from a login shell run in a
+  cgroup the user owns. No controllers are enabled on the created cgroups.
+
+The kernel checks this once per process, by creating a probe cgroup, moving a real process
+into it, and killing it through `cgroup.kill`. `conduit doctor` reports the result as the
+`process-containment` probe.
+
+**The process-group kill, always.** Each child is also its own process group (it is
+spawned detached), and every kill path still SIGKILLs the group. Where cgroups are
+available this is a second mechanism alongside `cgroup.kill`; where they are not, it is the
+only one.
+
+**Where cgroup containment is unavailable** (no cgroup v2, an older kernel, or a read-only
+or root-owned `/sys/fs/cgroup`, which is the default in a Docker or Podman container), the
+kernel falls back to the process-group kill alone. It does not refuse to run. It prints a
+warning naming the reason once per process, and `conduit doctor` reports
+`process-containment: ok — warning: process group only (<reason>)`. On such a host the
+process-tree guarantee is weaker: **a command that calls `setsid`, which includes every
+command Claude Code's Bash tool runs, can outlive its invocation.** The container boundary
+is then what bounds it, and a stopped container takes it down.
+
+To get cgroup containment inside a container, the container needs a writable cgroup
+namespace, and the kernel's user needs a cgroup it owns. With rootless Podman (which
+[`deployment-hardening.md`](deployment-hardening.md) already recommends),
+`--systemd=always` mounts the container's own cgroup read-write. The engine image runs as
+the non-root `conduit` user, which cannot write the root-owned container cgroup, so start
+the container as root, delegate a subtree to `conduit`, and drop privileges before the
+kernel starts:
+
+```sh
+podman run --systemd=always --user root --entrypoint sh <image> -c '
+  mkdir /sys/fs/cgroup/conduit &&
+  chown -R conduit:conduit /sys/fs/cgroup/conduit &&
+  echo $$ > /sys/fs/cgroup/conduit/cgroup.procs &&
+  exec setpriv --reuid=conduit --regid=conduit --init-groups bun src/cli/main.ts "$@"' sh doctor
+```
+
+Docker mounts `/sys/fs/cgroup` read-only in every container that is not `--privileged`,
+and `--privileged` removes more isolation than this recovers, so under Docker expect the
+fallback. The kernel's own tests require the cgroup mechanism in CI
+(`CONDUIT_REQUIRE_CGROUP_CONTAINMENT=1`); on a development host without it, the tests that
+need it are reported as skipped with the reason.
 
 ## The child's configuration surface
 

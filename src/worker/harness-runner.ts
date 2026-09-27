@@ -12,10 +12,17 @@
  * init and survives. This runner instead spawns the child DETACHED (`setsid()`,
  * so the child's pid becomes its own process-group id) and sends SIGKILL to the
  * negative pid, which is the whole group, grandchildren included
- * (`killProcessGroup` in ./process-group.ts, shared with runDeterministic):
+ * (`killContained` in ./process-group.ts, shared with runDeterministic):
  * on timeout, AND again once the harness leader has exited on its own (#17):
  * a backgrounded grandchild that inherited the stdout/stderr pipes would
  * otherwise keep them open and stall the drains until the timeout fires.
+ *
+ * A descendant that calls setsid() leaves the group; Claude Code's Bash tool
+ * does that for every command (issue #77). Where the host has a writable
+ * cgroup v2 hierarchy, the child also runs in its own cgroup, which no
+ * descendant can leave, and every kill below writes that cgroup's
+ * `cgroup.kill` too (./cgroup-containment.ts). Elsewhere the group kill is all
+ * there is, and the kernel says so once on stderr.
  *
  * Do NOT apply a command allowlist here — the harness binary comes from
  * trusted engine config (WI-560); the `tools` allowlist is enforced
@@ -31,7 +38,8 @@
 
 import { resolve, sep } from 'node:path';
 import { existsSync, statSync } from 'node:fs';
-import { killProcessGroup, trackProcessGroup, untrackProcessGroup } from './process-group';
+import { killContained, trackProcessGroup, untrackProcessGroup } from './process-group';
+import { prepareContainedCommand, removeCgroup, resolveContainment, type Containment } from './cgroup-containment';
 
 /** The command + argv to spawn (no shell — array form, per the Law-lite pattern). */
 export interface HarnessCommand {
@@ -89,6 +97,11 @@ export interface HarnessRunnerConfig {
    * independently of `timeoutMs`. Undefined: only the wall-clock timer applies.
    */
   idleTimeoutMs?: number;
+  /**
+   * The containment mechanism to use. Injected for tests; defaults to the
+   * process-wide detection in ./cgroup-containment.ts.
+   */
+  containment?: Containment;
 }
 
 /**
@@ -207,6 +220,26 @@ function resolveConfinedCwd(projectRoot: string, cwd: string | undefined): strin
 }
 
 /**
+ * Spawn the (possibly cgroup-wrapped) harness argv. Split out so the caller
+ * can remove an already-created cgroup when the spawn itself throws.
+ */
+function spawnHarness(argv: string[], cwd: string, env: Record<string, string>) {
+  return Bun.spawn(argv, {
+    cwd,
+    stdout: 'pipe',
+    stderr: 'pipe',
+    // setsid(): the child becomes its own session/process-group leader, so
+    // `-proc.pid` addresses the whole group (grandchildren included) below.
+    // Under cgroup containment the wrapper shell execs the command, so the
+    // command keeps this pid and group.
+    detached: true,
+    // Never inherit the parent env wholesale: only the allowlisted names plus
+    // what the adapter constructed.
+    env,
+  });
+}
+
+/**
  * Spawn `cmd` bounded by `config.timeoutMs`, and, when `config.idleTimeoutMs`
  * is set, by a second independent idle bound (issue #31). SIGKILLs the whole
  * process group (setsid-detached child) after the leader exits, on EVERY exit
@@ -227,21 +260,25 @@ export async function runHarnessProcess(
     ...config.injectedEnv,
   };
 
-  const startedAt = Date.now();
-  const proc = Bun.spawn([cmd.command, ...cmd.args], {
+  const containment = config.containment ?? (await resolveContainment());
+  const contained = prepareContainedCommand(containment, [cmd.command, ...cmd.args], {
     cwd: resolvedCwd,
-    stdout: 'pipe',
-    stderr: 'pipe',
-    // setsid(): the child becomes its own session/process-group leader, so
-    // `-proc.pid` addresses the whole group (grandchildren included) below.
-    detached: true,
-    // Never inherit the parent env wholesale: only the allowlisted names plus
-    // what the adapter constructed.
     env: childEnv,
   });
+  const { cgroup } = contained;
+
+  const startedAt = Date.now();
+  let proc: ReturnType<typeof spawnHarness>;
+  try {
+    proc = spawnHarness(contained.argv, resolvedCwd, childEnv);
+  } catch (err) {
+    if (cgroup !== undefined) await removeCgroup(cgroup);
+    throw err;
+  }
   // The detached group no longer receives the terminal's Ctrl-C, so register
   // it for the kernel's signal and exit handlers (./process-group.ts).
-  trackProcessGroup(proc.pid);
+  trackProcessGroup(proc.pid, cgroup);
+  const kill = (): void => killContained(proc.pid, cgroup);
 
   // `timedOutFired` stops a still-pending idle timer from claiming this kill:
   // when idleTimeoutMs >= timeoutMs it can fire after this callback but before
@@ -249,7 +286,7 @@ export async function runHarnessProcess(
   let timedOutFired = false;
   const timer = setTimeout(() => {
     timedOutFired = true;
-    killProcessGroup(proc.pid);
+    kill();
   }, config.timeoutMs);
 
   // Idle timer (issue #31), reset by every complete stdout line rather than
@@ -274,7 +311,7 @@ export async function runHarnessProcess(
       // The wall-clock kill already ended the child; `timedOut` reports it.
       if (timedOutFired) return;
       idledOutFired = true;
-      killProcessGroup(proc.pid);
+      kill();
     }, config.idleTimeoutMs);
   };
   // Armed at spawn, so a child that never writes a line is caught too.
@@ -320,14 +357,22 @@ export async function runHarnessProcess(
     // output is lost. The leader has already exited, so this does not change
     // its exit status or signalCode. While any member is alive the group id
     // cannot be reused, so the signal reaches only this harness's descendants;
-    // an empty group is ESRCH.
-    killProcessGroup(proc.pid);
+    // an empty group is ESRCH. The cgroup kill reaches what left the group.
+    kill();
     untrackProcessGroup(proc.pid);
   }
 
-  const [stdout, stderr] = await drains;
-
-  const durationMs = Date.now() - startedAt;
+  let stdout: string;
+  let stderr: string;
+  let durationMs: number;
+  try {
+    [stdout, stderr] = await drains;
+    durationMs = Date.now() - startedAt;
+  } finally {
+    // After the duration is taken, so waiting for the killed cgroup to empty
+    // is not billed to the harness.
+    if (cgroup !== undefined) await removeCgroup(cgroup);
+  }
 
   // Gated on signalCode for the same reason as timedOut below.
   const idledOut = idledOutFired && proc.signalCode === 'SIGKILL';

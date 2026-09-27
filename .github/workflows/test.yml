@@ -44,8 +44,22 @@ jobs:
       - name: Typecheck
         run: bun run typecheck
 
+      # Issue #77: the containment suite proves a command that calls setsid
+      # (as every Claude Code Bash-tool command does) dies with its station.
+      # Only a cgroup can do that, and the runner's own cgroup belongs to root,
+      # so the step creates one owned by the runner user and moves its shell
+      # into it before the tests start. CONDUIT_REQUIRE_CGROUP_CONTAINMENT makes
+      # the suite fail, naming the reason, instead of skipping those tests if
+      # the runner image ever stops allowing this.
       - name: Test
-        run: bun run test
+        env:
+          CONDUIT_REQUIRE_CGROUP_CONTAINMENT: '1'
+        run: |
+          cg=/sys/fs/cgroup/conduit-ci
+          sudo mkdir -p "$cg"
+          sudo chown -R "$(id -u):$(id -g)" "$cg"
+          echo $$ | sudo tee "$cg/cgroup.procs" > /dev/null
+          bun run test
 
       # Mutation check on the harness usage FOLD SITES (scripts/mutation-check.ts).
       #

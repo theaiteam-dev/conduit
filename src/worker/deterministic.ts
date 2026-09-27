@@ -14,10 +14,13 @@
  *
  * Containment (issues #10, #17): the command runs as its own process group, and
  * the runner SIGKILLs that group on timeout and again after the command exits,
- * so nothing the station started outlives it, whatever the exit reason.
+ * so nothing the station started outlives it, whatever the exit reason. Where
+ * the host allows it, the command also runs in its own cgroup, so a descendant
+ * that calls setsid() is killed too (issue #77, ./cgroup-containment.ts).
  */
 
-import { killProcessGroup, trackProcessGroup, untrackProcessGroup } from './process-group';
+import { killContained, trackProcessGroup, untrackProcessGroup } from './process-group';
+import { prepareContainedCommand, removeCgroup, resolveContainment, type Containment } from './cgroup-containment';
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -54,6 +57,11 @@ export interface LawLiteConfig {
    * byte-for-byte today's behaviour (no env option passed to the spawn at all).
    */
   env?: Record<string, string>;
+  /**
+   * The containment mechanism to use. Injected for tests; defaults to the
+   * process-wide detection in ./cgroup-containment.ts.
+   */
+  containment?: Containment;
 }
 
 export type LawLiteVerdict =
@@ -162,6 +170,24 @@ export function deterministicCardEnv(reworkCount: number, attempt: number): Reco
 // ---------------------------------------------------------------------------
 
 /**
+ * Spawn the (possibly cgroup-wrapped) command argv. Split out so the caller
+ * can remove an already-created cgroup when the spawn itself throws.
+ */
+function spawnCommand(argv: string[], cwd: string | undefined, env: Record<string, string | undefined> | undefined) {
+  return Bun.spawn(argv, {
+    stdout: 'pipe',
+    stderr: 'pipe',
+    // setsid(): the child becomes its own session/process-group leader, so
+    // `-proc.pid` addresses the whole group (grandchildren included) below.
+    // Under cgroup containment the wrapper shell execs the command, so the
+    // command keeps this pid and group.
+    detached: true,
+    ...(cwd ? { cwd } : {}),
+    ...(env !== undefined ? { env } : {}),
+  });
+}
+
+/**
  * Run a deterministic command and return its captured output.
  *
  * Calls checkCommandAllowed FIRST.  If the verdict is denied, throws before
@@ -170,10 +196,10 @@ export function deterministicCardEnv(reworkCount: number, attempt: number): Reco
  * Uses Bun.spawn with an array (no shell) so no metacharacter expansion can
  * occur at the OS level even if the guard were somehow bypassed.
  *
- * The command is spawned detached (its own process group). The group is
- * SIGKILLed when the timeout fires and again once the command has exited, so
- * a descendant it backgrounded neither keeps running nor holds the output
- * pipes open past the return.
+ * The command is spawned detached (its own process group), and in its own
+ * cgroup where the host allows it. Both are SIGKILLed when the timeout fires
+ * and again once the command has exited, so a descendant it backgrounded
+ * neither keeps running nor holds the output pipes open past the return.
  */
 export async function runDeterministic(
   cmd: DeterministicCommand,
@@ -198,18 +224,24 @@ export async function runDeterministic(
   // byte-for-byte.
   const hasEnv = config.env !== undefined && Object.keys(config.env).length > 0;
 
-  const proc = Bun.spawn([cmd.command, ...cmd.args], {
-    stdout: 'pipe',
-    stderr: 'pipe',
-    // setsid(): the child becomes its own session/process-group leader, so
-    // `-proc.pid` addresses the whole group (grandchildren included) below.
-    detached: true,
+  const env = hasEnv ? { ...process.env, ...config.env } : undefined;
+  const containment = config.containment ?? (await resolveContainment());
+  const contained = prepareContainedCommand(containment, [cmd.command, ...cmd.args], {
     ...(config.cwd ? { cwd: config.cwd } : {}),
-    ...(hasEnv ? { env: { ...process.env, ...config.env } } : {}),
+    ...(env !== undefined ? { env } : {}),
   });
+  const { cgroup } = contained;
+
+  let proc: ReturnType<typeof spawnCommand>;
+  try {
+    proc = spawnCommand(contained.argv, config.cwd, env);
+  } catch (err) {
+    if (cgroup !== undefined) await removeCgroup(cgroup);
+    throw err;
+  }
   // The detached group no longer receives the terminal's Ctrl-C, so register
   // it for the kernel's signal and exit handlers until the final kill below.
-  trackProcessGroup(proc.pid);
+  trackProcessGroup(proc.pid, cgroup);
 
   // Our own timer instead of Bun.spawn's native `timeout`, which kills only the
   // immediate child (#10). Killing the group also closes the pipes any
@@ -218,7 +250,7 @@ export async function runDeterministic(
   const timer = hasTimeout
     ? setTimeout(() => {
         timerFired = true;
-        killProcessGroup(proc.pid);
+        killContained(proc.pid, cgroup);
       }, config.timeoutMs)
     : undefined;
 
@@ -242,11 +274,18 @@ export async function runDeterministic(
     // is lost. The leader has already exited, so this does not change its exit
     // status. While any member is alive the group id cannot be reused, so the
     // signal reaches only this command's descendants; an empty group is ESRCH.
-    killProcessGroup(proc.pid);
+    // The cgroup kill reaches what left the group.
+    killContained(proc.pid, cgroup);
     untrackProcessGroup(proc.pid);
   }
 
-  const [stdout, stderr] = await drains;
+  let stdout: string;
+  let stderr: string;
+  try {
+    [stdout, stderr] = await drains;
+  } finally {
+    if (cgroup !== undefined) await removeCgroup(cgroup);
+  }
 
   // Distinguish OUR timeout-kill from a normal exit or an unrelated SIGKILL
   // (OOM-killer, a child that self-kills). Both must hold: our timer fired, and

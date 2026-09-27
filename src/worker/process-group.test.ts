@@ -11,11 +11,16 @@
  * single pids only, never a group.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
-import { mkdtempSync, realpathSync, rmSync } from 'node:fs';
+import { mkdtempSync, readdirSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { TERMINATING_SIGNALS, trackProcessGroup, untrackProcessGroup } from './process-group';
-import { expectGrandchildReaped, killRecordedGrandchild, recordedPid } from './harness-containment.conformance';
+import {
+  expectGrandchildReaped,
+  hostContainment,
+  killRecordedGrandchild,
+  recordedPid,
+} from './harness-containment.conformance';
 
 const RUNNER_SCRIPT = join(import.meta.dir, 'containment-signal-runner.ts');
 const READY_BUDGET_MS = 10_000;
@@ -122,6 +127,16 @@ describe('process-group registry: the kernel takes live station groups with it',
     expect(exited).toBe(true);
   }
 
+  /**
+   * Under cgroup containment the kernel's handlers also remove the station's
+   * cgroup on the way out (issue #77), so none named for it is left.
+   */
+  function expectNoKernelCgroupLeft(): void {
+    if (hostContainment.mechanism !== 'cgroup') return;
+    const prefix = `conduit-${kernel!.pid}-`;
+    expect(readdirSync(hostContainment.parent).filter((name) => name.startsWith(prefix))).toEqual([]);
+  }
+
   for (const signal of ['SIGINT', 'SIGTERM'] as const) {
     it(`deterministic: ${signal} to the kernel kills the station's grandchild and keeps the default outcome`, async () => {
       await startKernel('deterministic');
@@ -132,6 +147,7 @@ describe('process-group registry: the kernel takes live station groups with it',
       expect(kernel!.signalCode).toBe(signal);
       expect(await new Response(kernel!.stdout).text()).not.toContain('station returned');
       await expectGrandchildReaped(projectRoot);
+      expectNoKernelCgroupLeft();
     }, TEST_TIMEOUT_MS);
   }
 
@@ -142,6 +158,7 @@ describe('process-group registry: the kernel takes live station groups with it',
 
     expect(kernel!.signalCode).toBe('SIGINT');
     await expectGrandchildReaped(projectRoot);
+    expectNoKernelCgroupLeft();
   }, TEST_TIMEOUT_MS);
 
   it('deterministic: process.exit() mid-station kills the station grandchild', async () => {
@@ -150,5 +167,6 @@ describe('process-group registry: the kernel takes live station groups with it',
 
     expect(kernel!.exitCode).toBe(0);
     await expectGrandchildReaped(projectRoot);
+    expectNoKernelCgroupLeft();
   }, TEST_TIMEOUT_MS);
 });
