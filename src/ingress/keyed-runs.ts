@@ -422,7 +422,7 @@ export async function routeKeyedEvent(
           source: event.source,
           eventId: event.eventId,
           outcome: 'queued',
-          reason: 'all run slots busy — will spawn when a slot frees',
+          reason: 'all run slots busy: will spawn when a slot frees',
         });
       }
       return { outcome: 'queued', runId: keyed.run_id };

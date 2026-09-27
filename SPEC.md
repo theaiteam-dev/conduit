@@ -568,6 +568,40 @@ spawned per flow. Egress needs no listener — the running kernel posts directly
 **egress-first is the MVP**: manual/CLI trigger, Slack for status/HITL/delivery; add the
 ingress listener when you want hands-off triggering.
 
+**Run identity: one run per delivery, or one run per subject.** By default an ingress run
+is keyed on its event id, so every delivery is its own run, and `ingress_events` collapses
+retries of that one delivery. A webhook binding may instead declare `run_key`, the ordered
+parts (JSON paths into the body, with ordered alternatives, or headers) that name the
+external subject the event is about, such as a repository and a pull-request number. The
+run id is then derived from the flow id and the key, and each later event about the
+subject is the next **pass** of that one run, so the run's cards, journal, and budget
+hold the subject's whole history. Keying is **fail-closed**: a part that does not resolve
+to a non-empty scalar refuses the event, with no fallback key. An optional `when` list
+(ANDed `header`/`json_path` conditions testing `in`, `not_in`, or `present`) drops
+deliveries the flow does not want before they are accepted; `max_passes` bounds how many
+passes the listener admits. All three are webhook-only and validated at boot.
+
+A pass is a kernel operation, `conduit run --append-pass`: it seeds a fresh entry card
+(`entry-<run>-p<N>`, `N` derived from the cards table) into a run that **finished
+successfully** and drives it through the same engine path. A run that is running,
+parked, halted, or holding a card is refused, never reopened; a parked run is resumed by
+the parked-run machinery, not by a pass. Checkpoints, outbox keys, rework counters, and
+journal spans are all keyed per card, so a pass never replays or collides with an earlier
+pass. The run token budget is a ceiling over all passes together; the wall-clock budget
+is per pass. `max_passes` is an admission limit applied by the listener, not a fifth
+rework guard: it bounds how often the subject may re-enter the line, not how often a card
+may be reworked inside a pass.
+
+The listener routes an accepted keyed event by the state of its run (ingress/keyed-runs.ts):
+no run yet launches pass 1; a finished run takes a new pass; a pass in flight, or a parked
+run, **coalesces** the event into the run's single pending pass (the latest event wins),
+which launches when the in-flight pass exits, so N events during one pass cost one
+trailing pass rather than N; a run at `max_passes`, or halted, held, or crashed mid-pass,
+takes no pass and the channel is told once per run. Passes draw from the listener's run
+slots like any launch, under a per-run slot id, and never bypass them. Because events
+coalesce, a flow driven by a keyed binding must fetch everything outstanding at the start
+of each pass rather than assume one event is one change.
+
 ```yaml
 channels:
   ingress: { type: cli }                      # cli | slack | webhook (manual for MVP)
@@ -956,6 +990,7 @@ write-lock contention at batch scale (rev-1 M1).
 | `outbox` | effectful-side-effect intent log + idempotency keys (§5) |
 | `active_workers` | claimed slots + **heartbeat lease** (`lease_until`) (§9, rev-1 H8) |
 | `ingress_events` | ingress dedup log: `(event_id TEXT PRIMARY KEY, received_at INTEGER)` — prevents a listener restart from re-triggering billed runs (§4A) |
+| `ingress_keyed_runs` | per-run state for a `run_key` ingress binding: the subject key, `max_passes`, the pending event, and the alert-once flag, so a pending pass survives a listener restart (§4A) |
 
 **Journal DB (append-only, high-volume, separate file/WAL):**
 

@@ -6,9 +6,9 @@
  *   2. verifyAuth   — bad/missing signature → 401, log rejected_auth, no spawn
  *   3. JSON parse   — unparseable body → 400, log rejected_malformed, no spawn
  *   4. deriveEventId — require-mode with no id → 400, log rejected_malformed, no spawn
- *   4a. when filter  — binding's `when` not met → 200, log filtered, no accept (issue #36)
- *   4b. run key      — binding's `run_key` unresolved → 400, log rejected_run_key,
- *                      no accept (issue #36; same answer as a require-mode rejection)
+ *   4a. when filter: binding's `when` not met → 200, log filtered, no accept (issue #36)
+ *   4b. run key: binding's `run_key` unresolved → 400, log rejected_run_key,
+ *       no accept (issue #36; same answer as a require-mode rejection)
  *   5. runSpawnPath  — exactly-once accept-spawn path (WI-406)
  *
  * Ack on accept (the original acknowledgement-on-accept work): the response is produced as soon as the event is

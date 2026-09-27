@@ -32,6 +32,16 @@ sig = "619f4e1b2b5dbf22"
 
 [[bindings]]
 doc = "SPEC.md"
+target = "src/ingress/keyed-runs.ts#routeKeyedEvent"
+sig = "ccb471c2f64b1749"
+
+[[bindings]]
+doc = "SPEC.md"
+target = "src/ingress/run-key.ts#resolveRunKey"
+sig = "700f435d7b3eb1f7"
+
+[[bindings]]
+doc = "SPEC.md"
 target = "src/law/contract.ts"
 sig = "fd885d49d7e797aa"
 
@@ -42,6 +52,11 @@ sig = "9e1b191a9ef4e321"
 
 [[bindings]]
 doc = "SPEC.md"
+target = "src/run/run-passes.ts#checkRunAppendable"
+sig = "9f9237130e295116"
+
+[[bindings]]
+doc = "SPEC.md"
 target = "src/statemachine/transitions.ts#transition"
 sig = "42305bed0d797a53"
 
@@ -49,6 +64,11 @@ sig = "42305bed0d797a53"
 doc = "SPEC.md"
 target = "src/worker/integrity.ts#checkIntegrity"
 sig = "ec86cf6e6cd93960"
+
+[[bindings]]
+doc = "docs/ingress-listener.md"
+target = "src/ingress/binding.ts#parseIngressBinding"
+sig = "bd240b0922e20e22"
 
 [[bindings]]
 doc = "docs/installation.md"

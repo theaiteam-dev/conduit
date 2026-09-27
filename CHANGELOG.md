@@ -13,6 +13,30 @@ historical context, not public releases or public repository history.
 
 ### Added
 
+- One ingress run per external subject
+  ([#36](https://github.com/theaiteam-dev/conduit/issues/36)). A webhook
+  binding can declare `run_key`, the ordered JSON paths (with alternatives) or
+  headers that identify the subject an event is about, such as a repository
+  and a pull-request number. Every event with the same key is then a pass of
+  one run instead of a run of its own, so the run's cards, journal, and token
+  budget hold the subject's history. Keying is fail-closed: an event whose key
+  does not resolve is refused (400, `rejected_run_key`). A new kernel
+  operation, `conduit run --append-pass`, seeds the next pass
+  (`entry-<run>-p<N>`) into a run that finished successfully and refuses any
+  other run with exit 3 (75 on a lease conflict). The listener launches a
+  finished run's next pass directly, folds events that arrive during a pass
+  into one trailing pass on the latest event (`coalesced`), and refuses a run
+  that is halted or holding cards (`run_not_appendable`) or at the binding's
+  optional `max_passes` (`pass_limit`), alerting once per run. A pending pass
+  is kept in the new `ingress_keyed_runs` table (schema v11) and survives a
+  listener restart. A webhook binding can also declare `when`, ANDed
+  `header`/`json_path` conditions (`in`, `not_in`, `present`); a delivery that
+  does not match is acked and logged `filtered` without being accepted. All
+  three fields are webhook-only and validated at boot. Keyed substrates carry
+  `run_key` and `pass`; bindings without `run_key` behave exactly as before.
+  `commitFanOut` now rejects a child id the run already uses
+  (`child_id_collision`) and holds the parent, rather than throwing on insert.
+
 - Fan-out children can read their own copy of a declared input
   ([#51](https://github.com/theaiteam-dev/conduit/issues/51)). A transform or
   harness station can now list inputs under `input_scope: { owned_dir: [...] }`,
