@@ -13,6 +13,24 @@ historical context, not public releases or public repository history.
 
 ### Added
 
+- Fan-out children can read their own copy of a declared input
+  ([#51](https://github.com/theaiteam-dev/conduit/issues/51)). A transform or
+  harness station can now list inputs under `input_scope: { owned_dir: [...] }`,
+  and those names resolve from the card's `owned_paths[0]` instead of the
+  project root. Before this, `seed.json` was the only input a child could read
+  from its owned directory, so a per-child file such as a patch shard had to
+  travel JSON-escaped inside the seed. The effective card-scoped set is the
+  declared list plus `seed.json`, so existing flows are unchanged. Load rejects
+  names that are not declared inputs, rejects `feedback`, and accepts the block
+  only on transform and harness stations (`INVALID_INPUT_SCOPE`). One resolver,
+  `src/flow/resolve-input.ts`, now serves prompt rendering, both binding-stamp
+  paths, the harness input mounts, the rank ask template and the gate critic,
+  so an input cannot be rendered from one location and hashed or mounted from
+  another. Sibling children with different shards get different binding
+  stamps, and a changed per-child file re-executes that child on resume. A
+  card-scoped input that cannot be read fails the render instead of falling
+  back to the project-root file of the same name.
+
 - Journal now records the token split and provider capacity per call
   ([#5](https://github.com/theaiteam-dev/conduit/issues/5)). `output_tokens`
   was `0` on every priced row and `cache_read`/`cache_creation` had nowhere to
@@ -32,6 +50,17 @@ historical context, not public releases or public repository history.
   and run/wave budgets still count the same totals (they sum all four columns).
 
 ### Fixed
+
+- A gate critic on a child-entry station can see the child's inputs. The
+  critic prompt was rendered with no card scope, so a critic that referenced
+  `{{seed.json}}` threw at render and the card went to `hold`. `ownedPaths` and
+  `ownedDirInputs` are now required fields on `GateReworkInput` and
+  `HarnessGateConfig`, so a construction site that omits them fails to compile.
+
+- Declared input names are confined to the directory they resolve from. Inputs
+  were read with a bare `join(projectRoot, name)`, so a station declaring
+  `inputs: ['../../../etc/passwd']` read that file. Reads now get the same
+  lexical and symlink-aware escape check that output writes already had.
 
 - A provider rate limit no longer destroys a run
   ([#3](https://github.com/theaiteam-dev/conduit/issues/3)). A 429 was
