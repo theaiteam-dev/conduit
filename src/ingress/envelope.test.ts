@@ -386,6 +386,51 @@ describe('stampKeyedPass', () => {
       expect(Buffer.byteLength(stamped, 'utf8')).toBeLessThanOrEqual(MAX_STAMPED_SUBSTRATE_BYTES);
     });
 
+    it('never exceeds MAX_STAMPED_SUBSTRATE_BYTES across the boundary where a full events list stops fitting (events_truncated flips false/true)', () => {
+      // The events budget used to be sized off a skeleton that always assumed
+      // `events_truncated: true` (4 bytes), even though the final object
+      // serializes `false` (5 bytes) once every covered event fits — one byte
+      // the budget never reserved. Sweep base sizes across the exact point
+      // where a fixed events list stops fitting in full, so both outcomes
+      // (events_truncated false, then true) are exercised on either side of
+      // it, and assert the total never exceeds the cap either way.
+      const covered: PassEventInput[] = [1, 2, 3].map((n) => ({
+        eventId: `d-${n}`,
+        receivedAt: n,
+        substrateJson: JSON.stringify({ n }),
+      }));
+
+      // Bytes of the events array once every covered entry fits, assembled
+      // the same way stampKeyedPass does (JSON.stringify's byte length for a
+      // fixed set of array elements doesn't depend on their order).
+      const allEntries = covered.map((e) => ({
+        event_id: e.eventId,
+        received_at: e.receivedAt,
+        substrate: JSON.parse(e.substrateJson),
+      }));
+      const eventsArrayBytesAllFit = Buffer.byteLength(JSON.stringify(allEntries), 'utf8');
+
+      // Bytes of the empty-events skeleton for an empty blob, so blobLen's own
+      // contribution to the base substrate is exactly blobLen bytes on top of
+      // this (a plain ASCII repeat needs no JSON escaping).
+      const skeletonOverhead = Buffer.byteLength(
+        JSON.stringify({ blob: '', run_key: ['a'], pass: 2, events: [], events_truncated: true }),
+        'utf8',
+      );
+
+      // The blobLen at which the base substrate leaves exactly
+      // eventsArrayBytesAllFit of budget for the events list — the boundary
+      // where it stops fitting in full. Sweep either side of it.
+      const boundaryBlobLen = MAX_STAMPED_SUBSTRATE_BYTES - skeletonOverhead - eventsArrayBytesAllFit;
+
+      for (let delta = -20; delta <= 20; delta++) {
+        const blobLen = Math.max(0, boundaryBlobLen + delta);
+        const base = JSON.stringify({ blob: 'x'.repeat(blobLen) });
+        const stamped = stampKeyedPass(base, ['a'], 2, covered);
+        expect(Buffer.byteLength(stamped, 'utf8')).toBeLessThanOrEqual(MAX_STAMPED_SUBSTRATE_BYTES);
+      }
+    });
+
     it('emits an empty, truncated events list — never throws — when the base substrate alone exceeds the cap', () => {
       const hugeBase = JSON.stringify({ blob: 'x'.repeat(MAX_STAMPED_SUBSTRATE_BYTES + 10_000) });
 

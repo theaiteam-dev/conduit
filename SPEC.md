@@ -615,9 +615,10 @@ slots like any launch, under a per-run slot id, and never bypass them.
 A pass covers every event folded into it that no earlier pass consumed. The latest is the
 pass's top-level input; the substrate also carries `run_key`, `pass`, and `events`, the
 covered events oldest first (each with its event id, arrival time, and substrate), so a
-flow sees each change without fetching the subject's state. The list is bounded (50
-events, 64 KiB); when a bound drops the oldest events, `events_truncated` is true and the
-flow must fetch what it needs. The listener passes the covered event ids as
+flow sees each change without fetching the subject's state. The list is bounded: at most 50
+events and 64 KiB, and the whole stamped substrate, base substrate included, at most 100 KiB,
+so a large base substrate leaves less room for `events`. When a bound drops the oldest
+events, `events_truncated` is true and the flow must fetch what it needs. The listener passes the covered event ids as
 `--pass-event`, and before launching any event it checks `run_pass_events`: an event a pass
 already consumed is marked spawned and logged `already_applied`, never launched again,
 even when the listener lost that pass's exit.

@@ -15,7 +15,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import { openConduitDB, type ConduitDB } from '../persistence/db';
 import type { Card } from '../types/kernel';
-import { nextPassNumber, passEntryCardId, checkRunAppendable } from './run-passes';
+import { nextPassNumber, passEntryCardId, checkRunAppendable, remainingRunTokens, hasLaterPasses } from './run-passes';
 
 let db: ConduitDB;
 
@@ -78,6 +78,52 @@ describe('nextPassNumber', () => {
     db.insertCard(card('a_b', 'entry-a_b'));
     db.insertCard(card('axb', 'entry-axb-p5'));
     expect(nextPassNumber(db, 'a_b')).toBe(2);
+  });
+});
+
+describe('remainingRunTokens', () => {
+  it('subtracts summed prior-pass usage from the ceiling', () => {
+    // Two journal rows, as production writes them per station call — the sum
+    // getRunUsageTotals reads back covers all four token columns.
+    db.appendJournalSpan({
+      runId: 'r', cardId: 'entry-r', station: 'draft', attempt: 0, name: 'draft.transform',
+      usage: { model: 'm', inputTokens: 100, outputTokens: 50, costUsd: 0 },
+    });
+    db.appendJournalSpan({
+      runId: 'r', cardId: 'entry-r-p2', station: 'draft', attempt: 0, name: 'draft.transform',
+      usage: { model: 'm', inputTokens: 200, outputTokens: 25, costUsd: 0 },
+    });
+    // 100+50+200+25 = 375 spent.
+    expect(remainingRunTokens(db, 'r', 1_000)).toBe(625);
+  });
+
+  it('returns a negative figure once prior usage exceeds the ceiling — callers clamp, not this function', () => {
+    db.appendJournalSpan({
+      runId: 'r', cardId: 'entry-r', station: 'draft', attempt: 0, name: 'draft.transform',
+      usage: { model: 'm', inputTokens: 900, outputTokens: 200, costUsd: 0 },
+    });
+    expect(remainingRunTokens(db, 'r', 1_000)).toBe(-100);
+  });
+
+  it('is the whole ceiling for a run with no recorded usage', () => {
+    expect(remainingRunTokens(db, 'r', 1_000)).toBe(1_000);
+  });
+});
+
+describe('hasLaterPasses', () => {
+  it('is false for a run with only the pass-1 entry card', () => {
+    db.insertCard(card('r', 'entry-r'));
+    expect(hasLaterPasses(db, 'r')).toBe(false);
+  });
+
+  it('is true once entry-<runId>-p2 exists', () => {
+    db.insertCard(card('r', 'entry-r'));
+    db.insertCard(card('r', 'entry-r-p2'));
+    expect(hasLaterPasses(db, 'r')).toBe(true);
+  });
+
+  it('is false for a run with no cards at all', () => {
+    expect(hasLaterPasses(db, 'r')).toBe(false);
   });
 });
 

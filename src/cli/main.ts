@@ -849,17 +849,28 @@ function findAppliedPassEvents(
  * `--pass-event` (pass 1 of a fresh run), since the same ambiguity applies to
  * both and `run_pass_events.event_id` is a primary key with no run scoping.
  */
+/**
+ * The "already consumed … nothing to do" message printed whenever every one
+ * of a launch's `--pass-event` ids turns out to have been applied already —
+ * whether `decidePassEventAdmission`'s pre-check finds that up front, or the
+ * seed transaction's race handler discovers it only after losing a race to a
+ * concurrent launch that happened to consume all of them (below).
+ */
+function formatPassEventNothingToDoMessage(applied: Array<{ eventId: string; runId: string; pass: number }>): string {
+  const first = applied[0]!;
+  return (
+    `event ${JSON.stringify(first.eventId)} was already consumed by pass ${first.pass} of run ` +
+    `${JSON.stringify(first.runId)}; nothing to do`
+  );
+}
+
 function decidePassEventAdmission(deps: CliDeps, passEvents: readonly string[]): number | null {
   if (passEvents.length === 0) return null;
   const applied = findAppliedPassEvents(deps.db, passEvents);
   if (applied.length === 0) return null;
 
   if (applied.length === passEvents.length) {
-    const first = applied[0]!;
-    deps.io.out(
-      `event ${JSON.stringify(first.eventId)} was already consumed by pass ${first.pass} of run ` +
-        `${JSON.stringify(first.runId)}; nothing to do`,
-    );
+    deps.io.out(formatPassEventNothingToDoMessage(applied));
     return 0;
   }
 
@@ -1441,11 +1452,27 @@ async function cmdRun(argv: string[], deps: CliDeps): Promise<number> {
         // one's. Applies to the pass-event race below AND to any other throw
         // (e.g. insertCard itself failing) — restore first, then decide how
         // to report the error.
-        if (artifactName && seedTargetPath && !seedTargetPreStaged && seedPriorState) {
-          if (seedPriorState.existed) {
-            writeFileSync(seedTargetPath, seedPriorState.content);
-          } else {
-            rmSync(seedTargetPath, { force: true });
+        if (artifactName && seedTargetPath && !seedTargetPreStaged && seedPriorState && seedBuffer) {
+          // Only restore when this launch is provably the last writer: on the
+          // pass-1 path (no run lease held), a concurrent launch racing the
+          // same --pass-event id(s) can win, commit, and write its own seed
+          // to this same path before this launch's own transaction fails.
+          // Restoring unconditionally would then clobber the winner's input
+          // out from under its already-committed entry card. Re-read the
+          // file and restore only if it still byte-matches what this launch
+          // itself wrote; if something else already overwrote it, leave it.
+          let currentContent: Buffer | null = null;
+          try {
+            currentContent = existsSync(seedTargetPath) ? readFileSync(seedTargetPath) : null;
+          } catch {
+            currentContent = null;
+          }
+          if (currentContent !== null && currentContent.equals(seedBuffer)) {
+            if (seedPriorState.existed) {
+              writeFileSync(seedTargetPath, seedPriorState.content);
+            } else {
+              rmSync(seedTargetPath, { force: true });
+            }
           }
         }
         // A concurrent launch consumed one of passEvents between the
@@ -1460,20 +1487,25 @@ async function cmdRun(argv: string[], deps: CliDeps): Promise<number> {
         if (!isPassEventRaceViolation(err)) throw err;
         const applied = findAppliedPassEvents(deps.db, passEvents);
         if (applied.length === 0) throw err; // not actually about passEvents — surface the real error
-        deps.io.err(`error: refusing this launch — ${formatPassEventRaceRefusal(applied)}`);
+        // The lease taken around admitAppendPass's admission check (or, for a
+        // fresh run, the run row registerRun just created above) must not
+        // outlive this launch either way — a repeat no-op and a genuine
+        // refusal both clean up identically.
         if (appendPass) {
-          // Symmetric with every other admitAppendPass refusal: the lease
-          // taken around the admission check must not be left held.
           releaseRunLease(deps.db, effectiveRunId, process.pid);
         } else {
-          // This invocation's own registerRun call (above) just created the
-          // run row — the pre-check refusal path (decidePassEventAdmission,
-          // called before registerRun) never reaches it, so a fresh run
-          // refused here would otherwise leave a run row behind that the
-          // equivalent pre-check refusal does not. Undo it so both refusal
-          // paths leave the same "no run" state.
           deps.db.deleteRun(effectiveRunId);
         }
+        if (applied.length === passEvents.length) {
+          // The concurrent launch we lost the race to happened to consume
+          // EVERY --pass-event id this launch named — the same harmless
+          // repeat-launch case decidePassEventAdmission's pre-check exits 0
+          // on, just discovered one step later. Only a MIXED set (some
+          // consumed, some new) is genuinely ambiguous and worth refusing.
+          deps.io.out(formatPassEventNothingToDoMessage(applied));
+          return 0;
+        }
+        deps.io.err(`error: refusing this launch — ${formatPassEventRaceRefusal(applied)}`);
         return EXIT_PASS_REFUSED;
       }
     } else if (flow.happyPathNext !== undefined && entryStationId !== undefined) {

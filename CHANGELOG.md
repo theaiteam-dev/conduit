@@ -27,7 +27,8 @@ historical context, not public releases or public repository history.
   other run with exit 3 (75 on a lease conflict). The listener launches a
   finished run's next pass directly, folds events that arrive during a pass
   into one trailing pass (`coalesced`) whose substrate lists every event it
-  covers under `events` (at most 50 events and 64 KiB, oldest dropped first,
+  covers under `events` (at most 50 events and 64 KiB, with the whole stamped substrate under
+  100 KiB, oldest dropped first,
   flagged by `events_truncated`), keeps events for a
   run holding a card for a human the same way, and refuses a run stopped with
   unfinished cards (`run_not_appendable`) or at the binding's optional

@@ -406,7 +406,7 @@ latest event's, and four more fields describe the pass:
 | `run_key` | The resolved key parts |
 | `pass` | The pass number |
 | `events` | Every event the pass covers, oldest first, the latest last. Each entry is `{ event_id, received_at, substrate }` |
-| `events_truncated` | `true` when the list was cut: it holds at most 50 events and 64 KiB, and the oldest are dropped first |
+| `events_truncated` | `true` when the list was cut. It holds at most 50 events and 64 KiB, and the whole stamped substrate, including the latest event's own fields, is kept under 100 KiB, so a large substrate leaves less room for `events`. The oldest are dropped first |
 
 A flow reads `events` to act on each change. It needs to fetch the subject's
 state from its source only when `events_truncated` is true.

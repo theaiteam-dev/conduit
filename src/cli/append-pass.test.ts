@@ -422,16 +422,111 @@ describe('conduit run --pass-event: the kernel records which events a pass consu
       }) as ConduitDB;
     }
 
-    it('refuses a fresh run (pass 1) with EXIT_PASS_REFUSED, a legible message, and no run row', async () => {
+    /**
+     * Layered on top of `racedGetPassForEvent`: simulate the concurrent
+     * winner committing its own seed write to `seedPath` right in the
+     * window between this launch's own seed write and its (real,
+     * naturally-thrown) `recordPassEvents` PRIMARY KEY violation. The real
+     * `recordPassEvents` still runs afterward and still throws — this only
+     * adds the winner's file write ahead of it.
+     */
+    function winnerWritesSeedBeforeRace(base: ConduitDB, seedPath: string, winnerBytes: string): ConduitDB {
+      return new Proxy(base, {
+        get(target, prop, receiver) {
+          if (prop === 'recordPassEvents') {
+            return (...args: Parameters<ConduitDB['recordPassEvents']>) => {
+              writeFileSync(seedPath, winnerBytes, 'utf-8');
+              return target.recordPassEvents(...args);
+            };
+          }
+          const value = Reflect.get(target, prop, target);
+          return typeof value === 'function' ? value.bind(target) : value;
+        },
+      }) as ConduitDB;
+    }
+
+    it('treats a fresh run (pass 1) racing to a fully-consumed event as a no-op, exit 0, no run row', async () => {
       const flowPath = writeFlow();
       const raced = racedGetPassForEvent(db, 'ev-race');
       // A concurrent launch already recorded this event against a different
-      // run's pass, landing after this launch's own pre-check ran.
+      // run's pass, landing after this launch's own pre-check ran — and it
+      // covers every --pass-event id this launch named, so this is the same
+      // harmless repeat launch decidePassEventAdmission's pre-check would
+      // have caught, just discovered one step later.
       db.recordPassEvents('other-run', 1, ['ev-race']);
 
       const deps = makeDeps({ db: raced, runEngine: completingEngine().runEngine });
       const exitCode = await main(
         ['run', flowPath, '--run-id', RUN, '--input-inline', '{"n":1}', '--pass-event', 'ev-race'],
+        deps,
+      );
+
+      expect(exitCode).toBe(0);
+      const lines = io.lines.join('\n');
+      expect(lines).toContain('ev-race');
+      expect(lines).toContain('pass 1');
+      expect(lines).toContain('other-run');
+      expect(lines).toContain('nothing to do');
+      // No entry card was left behind by the rolled-back seed transaction...
+      expect(cardIds(RUN)).toEqual([]);
+      // ...and, like the pre-check no-op path (above), no run row either:
+      // this invocation's own registerRun call is undone on this no-op.
+      expect(db.getRun(RUN)).toBeNull();
+    });
+
+    it('leaves no seed file behind on a pass-1 race no-op of a fresh run with none pre-staged', async () => {
+      const flowPath = writeFlow();
+      const raced = racedGetPassForEvent(db, 'ev-race');
+      db.recordPassEvents('other-run', 1, ['ev-race']);
+
+      const deps = makeDeps({ db: raced, runEngine: completingEngine().runEngine });
+      const exitCode = await main(
+        ['run', flowPath, '--run-id', RUN, '--input-inline', '{"n":1}', '--pass-event', 'ev-race'],
+        deps,
+      );
+
+      expect(exitCode).toBe(0);
+      // The seed transaction rolled back with the card — the write to
+      // in.json that happened before it must be undone too, not left behind
+      // as an orphaned file for a run that no longer exists.
+      expect(existsSync(join(flowRoot, 'in.json'))).toBe(false);
+    });
+
+    it("does not clobber a concurrent winner's committed seed file on a pass-1 race", async () => {
+      const flowPath = writeFlow();
+      const seedPath = join(flowRoot, 'in.json');
+      db.recordPassEvents('other-run', 1, ['ev-race']);
+
+      const winnerBytes = '{"winner":true}';
+      const raced = winnerWritesSeedBeforeRace(racedGetPassForEvent(db, 'ev-race'), seedPath, winnerBytes);
+
+      const deps = makeDeps({ db: raced, runEngine: completingEngine().runEngine });
+      const exitCode = await main(
+        ['run', flowPath, '--run-id', RUN, '--input-inline', '{"n":1}', '--pass-event', 'ev-race'],
+        deps,
+      );
+
+      expect(exitCode).toBe(0);
+      // The winner already committed its own seed write (there is no prior
+      // pass here, so the restore-by-delete branch would otherwise have
+      // removed it): this launch's rollback must never touch bytes it did
+      // not itself write.
+      expect(readFileSync(seedPath, 'utf-8')).toBe(winnerBytes);
+    });
+
+    it('refuses when the race only covers SOME of --pass-event ids (mixed), exit EXIT_PASS_REFUSED', async () => {
+      const flowPath = writeFlow();
+      const raced = racedGetPassForEvent(db, 'ev-race');
+      // Only ev-race was consumed by a concurrent launch; ev-new was not
+      // seen by anyone, so this launch's set is a mix of consumed and new.
+      db.recordPassEvents('other-run', 1, ['ev-race']);
+
+      const deps = makeDeps({ db: raced, runEngine: completingEngine().runEngine });
+      const exitCode = await main(
+        [
+          'run', flowPath, '--run-id', RUN, '--input-inline', '{"n":1}',
+          '--pass-event', 'ev-race', '--pass-event', 'ev-new',
+        ],
         deps,
       );
 
@@ -440,32 +535,13 @@ describe('conduit run --pass-event: the kernel records which events a pass consu
       expect(errors).toContain('ev-race');
       expect(errors).toContain('pass 1');
       expect(errors).toContain('other-run');
-      // No entry card was left behind by the rolled-back seed transaction...
+      // No entry card was left behind by the rolled-back seed transaction,
+      // and no run row either — same cleanup as the fully-consumed case.
       expect(cardIds(RUN)).toEqual([]);
-      // ...and, like the pre-check refusal path (above), no run row either:
-      // this invocation's own registerRun call is undone on this refusal.
       expect(db.getRun(RUN)).toBeNull();
     });
 
-    it('leaves no seed file behind on a pass-1 race refusal of a fresh run with none pre-staged', async () => {
-      const flowPath = writeFlow();
-      const raced = racedGetPassForEvent(db, 'ev-race');
-      db.recordPassEvents('other-run', 1, ['ev-race']);
-
-      const deps = makeDeps({ db: raced, runEngine: completingEngine().runEngine });
-      const exitCode = await main(
-        ['run', flowPath, '--run-id', RUN, '--input-inline', '{"n":1}', '--pass-event', 'ev-race'],
-        deps,
-      );
-
-      expect(exitCode).toBe(EXIT_PASS_REFUSED);
-      // The seed transaction rolled back with the card — the write to
-      // in.json that happened before it must be undone too, not left behind
-      // as an orphaned file for a run that no longer exists.
-      expect(existsSync(join(flowRoot, 'in.json'))).toBe(false);
-    });
-
-    it('refuses --append-pass with EXIT_PASS_REFUSED, a legible message, no new pass card, and releases the lease', async () => {
+    it('treats a racing --append-pass to a fully-consumed event as a no-op, exit 0, releases the lease', async () => {
       const flowPath = writeFlow();
       const engine = completingEngine();
       await runPass1(flowPath, makeDeps({ runEngine: engine.runEngine }));
@@ -479,20 +555,21 @@ describe('conduit run --pass-event: the kernel records which events a pass consu
         deps,
       );
 
-      expect(exitCode).toBe(EXIT_PASS_REFUSED);
-      const errors = io.errors.join('\n');
-      expect(errors).toContain('ev-race');
-      expect(errors).toContain('pass 1');
-      expect(errors).toContain('other-run');
+      expect(exitCode).toBe(0);
+      const lines = io.lines.join('\n');
+      expect(lines).toContain('ev-race');
+      expect(lines).toContain('pass 1');
+      expect(lines).toContain('other-run');
+      expect(lines).toContain('nothing to do');
       // No pass-2 card was left behind by the rolled-back seed transaction,
       // and the run itself (which pre-existed this invocation) is untouched.
       expect(cardIds()).toEqual([`entry-${RUN}`]);
       expect(db.getRun(RUN)).not.toBeNull();
-      // The lease admitAppendPass took was released on this refusal.
+      // The lease admitAppendPass took was released on this no-op.
       expect(db.getRun(RUN)!.holder_pid ?? null).toBeNull();
     });
 
-    it("leaves the previous pass's seed file byte-identical on an append-pass race refusal", async () => {
+    it("leaves the previous pass's seed file byte-identical on an append-pass race no-op", async () => {
       const flowPath = writeFlow();
       const engine = completingEngine();
       await runPass1(flowPath, makeDeps({ runEngine: engine.runEngine }));
@@ -508,11 +585,34 @@ describe('conduit run --pass-event: the kernel records which events a pass consu
         deps,
       );
 
-      expect(exitCode).toBe(EXIT_PASS_REFUSED);
+      expect(exitCode).toBe(0);
       // The refused pass's own seed write, done before the rolled-back
       // transaction, must not stick: the file must still hold what pass 1
       // (the last pass that actually committed) consumed.
       expect(readFileSync(seedPath, 'utf-8')).toBe('{"n":1}');
+    });
+
+    it("does not clobber a concurrent winner's committed seed file on an append-pass race", async () => {
+      const flowPath = writeFlow();
+      const engine = completingEngine();
+      await runPass1(flowPath, makeDeps({ runEngine: engine.runEngine }));
+      const seedPath = join(flowRoot, 'in.json');
+
+      db.recordPassEvents('other-run', 1, ['ev-race']);
+      const winnerBytes = '{"winner":true}';
+      const raced = winnerWritesSeedBeforeRace(racedGetPassForEvent(db, 'ev-race'), seedPath, winnerBytes);
+
+      const deps = makeDeps({ db: raced, runEngine: engine.runEngine });
+      const exitCode = await main(
+        ['run', flowPath, '--run-id', RUN, '--input-inline', '{"n":2}', '--append-pass', '--pass-event', 'ev-race'],
+        deps,
+      );
+
+      expect(exitCode).toBe(0);
+      // The winner already committed its own seed write over the previous
+      // pass's file: this launch's restore-by-write-back must never
+      // overwrite bytes it did not itself write.
+      expect(readFileSync(seedPath, 'utf-8')).toBe(winnerBytes);
     });
   });
 });

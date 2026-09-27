@@ -216,13 +216,16 @@ export function stampKeyedPass(
   // What's left of the total stamped-string cap once the base substrate and
   // the run_key/pass/events_truncated stamps are accounted for (events: []
   // stands in for the list here since its real bytes are still unknown).
+  // events_truncated is fixed at `false` here rather than `true`: it
+  // serializes one byte longer ("false" vs "true"), so sizing off it never
+  // under-counts should the actual result end up untruncated.
   // MAX_PASS_EVENTS_BYTES still applies as its own ceiling on top of that.
   const stampedWithoutEvents = JSON.stringify({
     ...base,
     run_key: [...runKey],
     pass,
     events: [],
-    events_truncated: true,
+    events_truncated: false,
   });
   const baseBytes = Buffer.byteLength(stampedWithoutEvents, 'utf8');
   const eventsBudget = Math.max(0, Math.min(MAX_PASS_EVENTS_BYTES, MAX_STAMPED_SUBSTRATE_BYTES - baseBytes));
