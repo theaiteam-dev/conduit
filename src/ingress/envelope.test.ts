@@ -47,7 +47,15 @@
  * below fails to resolve and every test errors at module load.
  */
 import { describe, it, expect } from 'bun:test';
-import { buildEnvelope, projectSubstrate } from './envelope';
+import {
+  buildEnvelope,
+  projectSubstrate,
+  stampKeyedPass,
+  MAX_PASS_EVENTS,
+  MAX_PASS_EVENTS_BYTES,
+  MAX_STAMPED_SUBSTRATE_BYTES,
+  type PassEventInput,
+} from './envelope';
 
 // A representative accepted-event input. Headers carry a real secret so the
 // filter wiring (AC2/AC3) is exercised against the actual db.ts filterAttributes.
@@ -236,5 +244,222 @@ describe('projectSubstrate', () => {
 
     expect(env).not.toBeInstanceOf(Promise);
     expect(substrate).not.toBeInstanceOf(Promise);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Keyed pass stamp (issue #36)
+// ---------------------------------------------------------------------------
+
+describe('stampKeyedPass', () => {
+  const envelope = buildEnvelope({
+    source: 'pr-loop',
+    eventId: 'd-1',
+    receivedAt: 1000,
+    authVerified: true,
+    headers: {},
+    body: { action: 'submitted' },
+  });
+  const self: PassEventInput = { eventId: 'd-1', receivedAt: 1000, substrateJson: JSON.stringify(envelope) };
+
+  it('adds run_key and pass to a full envelope as top-level fields', () => {
+    const stamped = JSON.parse(stampKeyedPass(JSON.stringify(envelope), ['12345', '7'], 3, [self]));
+    expect(stamped.run_key).toEqual(['12345', '7']);
+    expect(stamped.pass).toBe(3);
+    expect(stamped.body).toEqual({ action: 'submitted' });
+    expect(stamped.event_id).toBe('d-1');
+  });
+
+  it('adds them to a projected substrate too', () => {
+    const projected = projectSubstrate(envelope, { action: '$.body.action' });
+    const json = JSON.stringify(projected);
+    const stamped = JSON.parse(stampKeyedPass(json, ['a'], 1, [{ eventId: 'd-1', receivedAt: 1000, substrateJson: json }]));
+    expect(stamped).toEqual({
+      action: 'submitted',
+      run_key: ['a'],
+      pass: 1,
+      events: [{ event_id: 'd-1', received_at: 1000, substrate: { action: 'submitted' } }],
+      events_truncated: false,
+    });
+  });
+
+  it('is deterministic', () => {
+    const json = JSON.stringify(envelope);
+    expect(stampKeyedPass(json, ['a'], 2, [self])).toBe(stampKeyedPass(json, ['a'], 2, [self]));
+  });
+
+  it('lists every covered event oldest first, the launching event last', () => {
+    const covered: PassEventInput[] = [1, 2, 3].map((n) => ({
+      eventId: `d-${n}`,
+      receivedAt: n * 100,
+      substrateJson: JSON.stringify({ round: n }),
+    }));
+    const stamped = JSON.parse(stampKeyedPass(covered[2]!.substrateJson, ['a'], 4, covered));
+    expect(stamped.round).toBe(3);
+    expect(stamped.events).toEqual([
+      { event_id: 'd-1', received_at: 100, substrate: { round: 1 } },
+      { event_id: 'd-2', received_at: 200, substrate: { round: 2 } },
+      { event_id: 'd-3', received_at: 300, substrate: { round: 3 } },
+    ]);
+    expect(stamped.events_truncated).toBe(false);
+  });
+
+  it('drops the oldest events past MAX_PASS_EVENTS and says so', () => {
+    const covered: PassEventInput[] = Array.from({ length: MAX_PASS_EVENTS + 5 }, (_, i) => ({
+      eventId: `d-${i}`,
+      receivedAt: i,
+      substrateJson: JSON.stringify({ i }),
+    }));
+    const stamped = JSON.parse(stampKeyedPass(covered.at(-1)!.substrateJson, ['a'], 2, covered));
+    expect(stamped.events).toHaveLength(MAX_PASS_EVENTS);
+    expect(stamped.events[0].event_id).toBe('d-5');
+    expect(stamped.events.at(-1).event_id).toBe(`d-${MAX_PASS_EVENTS + 4}`);
+    expect(stamped.events_truncated).toBe(true);
+  });
+
+  it('drops the oldest events past MAX_PASS_EVENTS_BYTES and says so', () => {
+    const big = 'x'.repeat(Math.floor(MAX_PASS_EVENTS_BYTES / 3));
+    const covered: PassEventInput[] = [1, 2, 3, 4].map((n) => ({
+      eventId: `d-${n}`,
+      receivedAt: n,
+      substrateJson: JSON.stringify({ n, big }),
+    }));
+    const stamped = JSON.parse(stampKeyedPass(covered[3]!.substrateJson, ['a'], 2, covered));
+    expect(stamped.events.map((e: { event_id: string }) => e.event_id)).toEqual(['d-3', 'd-4']);
+    expect(Buffer.byteLength(JSON.stringify(stamped.events), 'utf8')).toBeLessThanOrEqual(MAX_PASS_EVENTS_BYTES);
+    expect(stamped.events_truncated).toBe(true);
+  });
+
+  it('leaves an unkeyed envelope byte-identical: buildEnvelope never emits run_key or pass', () => {
+    expect('run_key' in envelope).toBe(false);
+    expect('pass' in envelope).toBe(false);
+    expect('events' in envelope).toBe(false);
+    expect('events_truncated' in envelope).toBe(false);
+  });
+
+  // MAX_PASS_EVENTS_BYTES alone bounds only the events
+  // list, not the whole argv string a large base substrate is embedded in.
+  // The events budget must shrink to keep the WHOLE stamped string under
+  // MAX_STAMPED_SUBSTRATE_BYTES, not just the events list under its own cap.
+  describe('total stamped-string cap', () => {
+    it('shrinks the events list when the base substrate alone is large', () => {
+      const covered: PassEventInput[] = [1, 2, 3].map((n) => ({
+        eventId: `d-${n}`,
+        receivedAt: n,
+        substrateJson: JSON.stringify({ n }),
+      }));
+      // One full entry (event_id/received_at/substrate for the biggest of the
+      // three, plus its separator comma) is comfortably more than 60 bytes, so
+      // sizing the blob to leave only ~40 bytes of the total cap forces at
+      // least one event out — computed from the actual empty-events skeleton
+      // rather than guessed, so this doesn't depend on JSON.stringify's exact
+      // key ordering or spacing.
+      const skeletonBytes = Buffer.byteLength(
+        JSON.stringify({ blob: '', run_key: ['a'], pass: 2, events: [], events_truncated: true }),
+        'utf8',
+      );
+      const blobLen = MAX_STAMPED_SUBSTRATE_BYTES - skeletonBytes - 40;
+      const bigBase = JSON.stringify({ blob: 'x'.repeat(blobLen) });
+
+      const stamped = stampKeyedPass(bigBase, ['a'], 2, covered);
+      const parsed = JSON.parse(stamped);
+
+      // With a small base, all 3 events would fit comfortably (well within
+      // MAX_PASS_EVENTS_BYTES) — the large base must have crowded them out.
+      expect(parsed.events.length).toBeLessThan(covered.length);
+      expect(parsed.events_truncated).toBe(true);
+      expect(Buffer.byteLength(stamped, 'utf8')).toBeLessThanOrEqual(MAX_STAMPED_SUBSTRATE_BYTES);
+    });
+
+    it('never exceeds MAX_STAMPED_SUBSTRATE_BYTES even with a full MAX_PASS_EVENTS_BYTES-sized events list', () => {
+      // A base substrate sized so that, under the OLD per-list-only cap, the
+      // events list would be allowed to use the full MAX_PASS_EVENTS_BYTES —
+      // pushing the total well past MAX_STAMPED_SUBSTRATE_BYTES.
+      const bigBase = JSON.stringify({ blob: 'x'.repeat(Math.floor(MAX_STAMPED_SUBSTRATE_BYTES * 0.8)) });
+      const covered: PassEventInput[] = Array.from({ length: 20 }, (_, i) => ({
+        eventId: `d-${i}`,
+        receivedAt: i,
+        substrateJson: JSON.stringify({ blob: 'y'.repeat(5000) }),
+      }));
+
+      const stamped = stampKeyedPass(bigBase, ['a'], 2, covered);
+      expect(Buffer.byteLength(stamped, 'utf8')).toBeLessThanOrEqual(MAX_STAMPED_SUBSTRATE_BYTES);
+    });
+
+    it('never exceeds MAX_STAMPED_SUBSTRATE_BYTES across the boundary where a full events list stops fitting (events_truncated flips false/true)', () => {
+      // The events budget used to be sized off a skeleton that always assumed
+      // `events_truncated: true` (4 bytes), even though the final object
+      // serializes `false` (5 bytes) once every covered event fits — one byte
+      // the budget never reserved. Sweep base sizes across the exact point
+      // where a fixed events list stops fitting in full, so both outcomes
+      // (events_truncated false, then true) are exercised on either side of
+      // it, and assert the total never exceeds the cap either way.
+      const covered: PassEventInput[] = [1, 2, 3].map((n) => ({
+        eventId: `d-${n}`,
+        receivedAt: n,
+        substrateJson: JSON.stringify({ n }),
+      }));
+
+      // Bytes of the events array once every covered entry fits, assembled
+      // the same way stampKeyedPass does (JSON.stringify's byte length for a
+      // fixed set of array elements doesn't depend on their order).
+      const allEntries = covered.map((e) => ({
+        event_id: e.eventId,
+        received_at: e.receivedAt,
+        substrate: JSON.parse(e.substrateJson),
+      }));
+      const eventsArrayBytesAllFit = Buffer.byteLength(JSON.stringify(allEntries), 'utf8');
+
+      // Bytes of the empty-events skeleton for an empty blob, so blobLen's own
+      // contribution to the base substrate is exactly blobLen bytes on top of
+      // this (a plain ASCII repeat needs no JSON escaping).
+      const skeletonOverhead = Buffer.byteLength(
+        JSON.stringify({ blob: '', run_key: ['a'], pass: 2, events: [], events_truncated: true }),
+        'utf8',
+      );
+
+      // The blobLen at which the base substrate leaves exactly
+      // eventsArrayBytesAllFit of budget for the events list — the boundary
+      // where it stops fitting in full. Sweep either side of it.
+      const boundaryBlobLen = MAX_STAMPED_SUBSTRATE_BYTES - skeletonOverhead - eventsArrayBytesAllFit;
+
+      for (let delta = -20; delta <= 20; delta++) {
+        const blobLen = Math.max(0, boundaryBlobLen + delta);
+        const base = JSON.stringify({ blob: 'x'.repeat(blobLen) });
+        const stamped = stampKeyedPass(base, ['a'], 2, covered);
+        expect(Buffer.byteLength(stamped, 'utf8')).toBeLessThanOrEqual(MAX_STAMPED_SUBSTRATE_BYTES);
+      }
+    });
+
+    it('emits an empty, truncated events list — never throws — when the base substrate alone exceeds the cap', () => {
+      const hugeBase = JSON.stringify({ blob: 'x'.repeat(MAX_STAMPED_SUBSTRATE_BYTES + 10_000) });
+
+      expect(() => {
+        const stamped = stampKeyedPass(hugeBase, ['a'], 1, [self]);
+        const parsed = JSON.parse(stamped);
+        expect(parsed.events).toEqual([]);
+        expect(parsed.events_truncated).toBe(true);
+      }).not.toThrow();
+    });
+  });
+
+  // a malformed folded substrateJson must not poison
+  // every future pass launch of the run; it is skipped, not thrown.
+  describe('malformed folded event', () => {
+    it('skips an entry whose substrateJson fails to parse instead of throwing', () => {
+      const covered: PassEventInput[] = [
+        { eventId: 'd-1', receivedAt: 1, substrateJson: '{not valid json' },
+        { eventId: 'd-2', receivedAt: 2, substrateJson: JSON.stringify({ n: 2 }) },
+      ];
+
+      let stamped!: string;
+      expect(() => {
+        stamped = stampKeyedPass(covered[1]!.substrateJson, ['a'], 2, covered);
+      }).not.toThrow();
+
+      const parsed = JSON.parse(stamped);
+      expect(parsed.events).toEqual([{ event_id: 'd-2', received_at: 2, substrate: { n: 2 } }]);
+      expect(parsed.events_truncated).toBe(true);
+    });
   });
 });

@@ -45,7 +45,7 @@ import {
   type RedriveAlerting,
 } from './alert-channel';
 import { startGatedResume } from './gated-resume';
-import type { RunSlots } from './run-slots';
+import { keyedRunSlotId, type RunSlots } from './run-slots';
 import type { AlertSeam, SpawnFailedAlert } from './spawn';
 
 /** ingress_log source for the sweep-driven resumes. */
@@ -249,7 +249,9 @@ export async function resumeDueParkedRuns(deps: ParkedResumeDeps): Promise<Parke
     // exits 1, and — its gate being in the past, which is why it was due —
     // reads as neither complete nor parked, so a healthy run collects a false
     // 'did not complete' alert and a burned re-drive attempt.
-    if (slots.inFlight(run.eventId)) {
+    // A keyed run's pass launch (issue #36) registers under the RUN, not the
+    // event, so it needs its own check for the same race.
+    if (slots.inFlight(run.eventId) || slots.inFlight(keyedRunSlotId(run.runId))) {
       report.deferred.push(run.runId);
       continue;
     }

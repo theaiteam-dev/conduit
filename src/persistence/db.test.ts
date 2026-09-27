@@ -27,7 +27,13 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Card } from '../types/kernel';
-import { openConduitDB, SCHEMA_VERSION, DEFAULT_RUN_ID, type ConduitDB } from './db';
+import {
+  openConduitDB,
+  SCHEMA_VERSION,
+  DEFAULT_RUN_ID,
+  COUNT_QUEUED_INGRESS_FOR_RUN_SQL,
+  type ConduitDB,
+} from './db';
 
 let dir: string;
 let stateDbPath: string;
@@ -649,6 +655,30 @@ describe('hot-path indexes (finding #10)', () => {
         .join(' | ');
       expect(plan).toContain('idx_ingress_events_redrivable');
       expect(plan).not.toContain('SCAN ingress_events');
+    } finally {
+      raw.close();
+    }
+  });
+
+  // countQueuedIngressForRun filtered on run_id
+  // alone, which does not imply idx_ingress_events_run_id's partial WHERE
+  // (flow_path IS NOT NULL) — SQLite falls back to a full table scan.
+  //
+  // This feeds the actual production SQL (exported from db.ts as
+  // COUNT_QUEUED_INGRESS_FOR_RUN_SQL) into EXPLAIN QUERY PLAN rather than a
+  // hand-copied duplicate, so a future edit that drops the flow_path filter
+  // fails this test instead of leaving it passing against a frozen copy.
+  it("countQueuedIngressForRun's query plan uses the index (no full scan of ingress_events)", () => {
+    closeConduit();
+    const raw = new Database(stateDbPath, { readonly: true });
+    try {
+      const plan = raw
+        .query(`EXPLAIN QUERY PLAN ${COUNT_QUEUED_INGRESS_FOR_RUN_SQL}`)
+        .all({ $run_id: 'run-1', $cap: 3, $before: 'ev-before' })
+        .map((r) => (r as { detail: string }).detail)
+        .join(' | ');
+      expect(plan).toContain('USING INDEX idx_ingress_events_run_id');
+      expect(plan).not.toContain('SCAN e');
     } finally {
       raw.close();
     }
@@ -1364,16 +1394,16 @@ function buildV5StateFixture(opts: {
 // AC-1: Fresh DB — all six per-run tables + runs table + run_id column + SCHEMA_VERSION = 8.
 
 describe('WI-474 AC-1: fresh DB gains run_id on all per-run tables and a runs table', () => {
-  it('SCHEMA_VERSION is 10', () => {
-    expect(SCHEMA_VERSION).toBe(10);
+  it('SCHEMA_VERSION is 11', () => {
+    expect(SCHEMA_VERSION).toBe(11);
   });
 
-  it('PRAGMA user_version is 10 on a fresh DB', () => {
+  it('PRAGMA user_version is 11 on a fresh DB', () => {
     closeConduit();
     const raw = new Database(stateDbPath, { readonly: true });
     try {
       const { user_version } = raw.query('PRAGMA user_version').get() as { user_version: number };
-      expect(user_version).toBe(10);
+      expect(user_version).toBe(11);
     } finally {
       raw.close();
     }
@@ -1729,7 +1759,7 @@ describe('WI-474 AC-6: v5→v6 migration backfills DEFAULT_RUN_ID with no data l
     const check = new Database(stateDbPath, { readonly: true });
     try {
       const { user_version } = check.query('PRAGMA user_version').get() as { user_version: number };
-      expect(user_version).toBe(10);
+      expect(user_version).toBe(11);
     } finally {
       check.close();
     }
@@ -1830,7 +1860,7 @@ describe('WI-474 AC-7: migration idempotency', () => {
     const check = new Database(stateDbPath, { readonly: true });
     try {
       const { user_version } = check.query('PRAGMA user_version').get() as { user_version: number };
-      expect(user_version).toBe(10);
+      expect(user_version).toBe(11);
     } finally {
       check.close();
     }

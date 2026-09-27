@@ -20,6 +20,10 @@
  *   MISSING_AUTH_SECRET | MISSING_EVENT_ID_SOURCE | INVALID_EVENT_ID_SOURCE |
  *   INVALID_SUBSTRATE_MAPPING | ROUTE_COLLISION | INVALID_TRANSPORT |
  *   MISSING_APP_TOKEN
+ *
+ * Subject identity (issue #36, webhook only; pinned by binding-run-key.test.ts):
+ *   INVALID_RUN_KEY | RUN_KEY_UNSUPPORTED_TYPE | INVALID_WHEN |
+ *   WHEN_UNSUPPORTED_TYPE | INVALID_MAX_PASSES | RESERVED_SUBSTRATE_FIELD
  */
 
 // ---------------------------------------------------------------------------
@@ -47,6 +51,23 @@ export interface IngressAuthConfig {
 /** Slack delivery mechanism: Events API webhooks vs. an outbound Socket Mode websocket. */
 export type SlackTransport = 'events' | 'socket';
 
+/**
+ * One part of a run key (issue #36). `json_path` lists alternatives: the first
+ * path that resolves to a scalar wins. `header` is matched case-insensitively.
+ */
+export type RunKeyPart = { json_path: string[] } | { header: string };
+
+/** What a `when` condition reads: exactly one header or one JSON path. */
+export type WhenSubject = { header: string } | { json_path: string };
+
+/**
+ * What a `when` condition tests. `in`/`not_in` values are stored as strings,
+ * since the resolved scalar is compared as a string.
+ */
+export type WhenTest = { in: string[] } | { not_in: string[] } | { present: boolean };
+
+export type WhenCondition = WhenSubject & WhenTest;
+
 export interface IngressBinding {
   type: 'webhook' | 'slack' | 'cli';
   /** Present for webhook bindings only. */
@@ -68,6 +89,19 @@ export interface IngressBinding {
    * (`xapp-…`, scope connections:write) used for apps.connections.open.
    */
   app_token_env?: string;
+  /**
+   * Webhook only (issue #36): the ordered parts that identify the external
+   * subject this event belongs to. Events with the same key are passes of one
+   * run instead of one run each. Absent keeps the per-delivery run id.
+   */
+  run_key?: RunKeyPart[];
+  /**
+   * Webhook only (issue #36): conditions, all ANDed, an event must meet to be
+   * accepted. A non-matching event is acked and logged 'filtered'.
+   */
+  when?: WhenCondition[];
+  /** Webhook only, requires run_key (issue #36): the most passes a keyed run is admitted. */
+  max_passes?: number;
 }
 
 export interface FlowIngressDeclaration {
@@ -90,6 +124,12 @@ export type ValidateIngressBindingsResult =
 const VALID_INGRESS_TYPES = ['webhook', 'slack', 'cli'] as const;
 const VALID_EVENT_ID_FROM = ['header', 'json_path', 'content_hash', 'require'] as const;
 const VALID_SLACK_TRANSPORTS = ['events', 'socket'] as const;
+
+/**
+ * Substrate fields the listener stamps onto a keyed event's substrate at
+ * launch (issue #36). A keyed binding's projection may not claim them.
+ */
+const RESERVED_KEYED_SUBSTRATE_FIELDS = ['run_key', 'pass', 'events', 'events_truncated'] as const;
 
 // ---------------------------------------------------------------------------
 // Internal helpers
@@ -202,6 +242,139 @@ function parseSubstrate(raw: unknown): SubstrateResult {
   }
 
   return { ok: true, value: r as Record<string, string> };
+}
+
+function describeType(raw: unknown): string {
+  return raw === null ? 'null' : Array.isArray(raw) ? 'array' : typeof raw;
+}
+
+function isPlainObject(raw: unknown): raw is Record<string, unknown> {
+  return typeof raw === 'object' && raw !== null && !Array.isArray(raw);
+}
+
+/** A path the shared resolver can answer: resolveJsonPath returns null for any other. */
+function isRootedJsonPath(raw: unknown): raw is string {
+  return typeof raw === 'string' && raw.startsWith('$.') && raw.length > 2;
+}
+
+function isNonEmptyString(raw: unknown): raw is string {
+  return typeof raw === 'string' && raw.trim() !== '';
+}
+
+/**
+ * Parse `run_key` (issue #36): a non-empty list of parts, each naming exactly
+ * one of `json_path` (a rooted path, or a non-empty list of rooted
+ * alternatives) or `header` (a non-empty name). Normalizes a single path to a
+ * one-element alternatives list.
+ */
+function parseRunKey(raw: unknown): RunKeyPart[] | IngressValidationError {
+  const fail = (detail: string): IngressValidationError =>
+    makeError('INVALID_RUN_KEY', `run_key ${detail}`);
+  if (!Array.isArray(raw)) return fail(`must be a list of parts, got ${describeType(raw)}`);
+  if (raw.length === 0) return fail('must name at least one part');
+
+  const parts: RunKeyPart[] = [];
+  for (const [index, part] of raw.entries()) {
+    if (!isPlainObject(part)) {
+      return fail(`part ${index} must be an object, got ${describeType(part)}`);
+    }
+    const keys = Object.keys(part);
+    const unknown = keys.filter((k) => k !== 'json_path' && k !== 'header');
+    if (unknown.length > 0) return fail(`part ${index} has unknown field(s): ${unknown.join(', ')}`);
+    if (keys.length !== 1) {
+      return fail(`part ${index} must name exactly one of 'json_path' or 'header'`);
+    }
+    if ('header' in part) {
+      if (!isNonEmptyString(part['header'])) {
+        return fail(`part ${index} 'header' must be a non-empty string`);
+      }
+      parts.push({ header: part['header'] });
+      continue;
+    }
+    const paths = Array.isArray(part['json_path']) ? part['json_path'] : [part['json_path']];
+    if (paths.length === 0) return fail(`part ${index} 'json_path' alternatives must not be empty`);
+    for (const path of paths) {
+      if (!isRootedJsonPath(path)) {
+        return fail(`part ${index} 'json_path' entries must be strings rooted at '$.', got ${JSON.stringify(path)}`);
+      }
+    }
+    parts.push({ json_path: paths as string[] });
+  }
+  return parts;
+}
+
+const WHEN_SUBJECTS = ['header', 'json_path'] as const;
+const WHEN_TESTS = ['in', 'not_in', 'present'] as const;
+
+/**
+ * Parse `when` (issue #36): a non-empty list of conditions. Each names exactly
+ * one subject (`header` or `json_path`) and exactly one test (`in`, `not_in`,
+ * or `present`). `in`/`not_in` take a non-empty list of scalars, stored as
+ * strings because the resolved value is compared as a string.
+ */
+function parseWhen(raw: unknown): WhenCondition[] | IngressValidationError {
+  const fail = (detail: string): IngressValidationError =>
+    makeError('INVALID_WHEN', `when ${detail}`);
+  if (!Array.isArray(raw)) return fail(`must be a list of conditions, got ${describeType(raw)}`);
+  if (raw.length === 0) return fail('must name at least one condition');
+
+  const conditions: WhenCondition[] = [];
+  for (const [index, cond] of raw.entries()) {
+    if (!isPlainObject(cond)) {
+      return fail(`condition ${index} must be an object, got ${describeType(cond)}`);
+    }
+    const keys = Object.keys(cond);
+    const known: readonly string[] = [...WHEN_SUBJECTS, ...WHEN_TESTS];
+    const unknown = keys.filter((k) => !known.includes(k));
+    if (unknown.length > 0) {
+      return fail(`condition ${index} has unknown field(s): ${unknown.join(', ')}`);
+    }
+    const subjects = keys.filter((k) => (WHEN_SUBJECTS as readonly string[]).includes(k));
+    const tests = keys.filter((k) => (WHEN_TESTS as readonly string[]).includes(k));
+    if (subjects.length !== 1) {
+      return fail(`condition ${index} must name exactly one of 'header' or 'json_path'`);
+    }
+    if (tests.length !== 1) {
+      return fail(`condition ${index} must name exactly one of 'in', 'not_in' or 'present'`);
+    }
+
+    let subject: WhenSubject;
+    if (subjects[0] === 'header') {
+      if (!isNonEmptyString(cond['header'])) {
+        return fail(`condition ${index} 'header' must be a non-empty string`);
+      }
+      subject = { header: cond['header'] };
+    } else {
+      if (!isRootedJsonPath(cond['json_path'])) {
+        return fail(`condition ${index} 'json_path' must be a string rooted at '$.'`);
+      }
+      subject = { json_path: cond['json_path'] };
+    }
+
+    const testName = tests[0]!;
+    let test: WhenTest;
+    if (testName === 'present') {
+      if (typeof cond['present'] !== 'boolean') {
+        return fail(`condition ${index} 'present' must be true or false`);
+      }
+      test = { present: cond['present'] };
+    } else {
+      const values = cond[testName];
+      if (!Array.isArray(values) || values.length === 0) {
+        return fail(`condition ${index} '${testName}' must be a non-empty list`);
+      }
+      const strings: string[] = [];
+      for (const value of values) {
+        if (typeof value !== 'string' && typeof value !== 'number' && typeof value !== 'boolean') {
+          return fail(`condition ${index} '${testName}' values must be strings, numbers or booleans`);
+        }
+        strings.push(String(value));
+      }
+      test = testName === 'in' ? { in: strings } : { not_in: strings };
+    }
+    conditions.push({ ...subject, ...test } as WhenCondition);
+  }
+  return conditions;
 }
 
 /**
@@ -367,6 +540,64 @@ export function parseIngressBinding(raw: unknown): ParseIngressBindingResult {
     appTokenEnv = r['app_token_env'];
   }
 
+  // Subject identity (issue #36): run_key, when and max_passes are webhook-only
+  // in this change. A slack or cli binding naming one fails with its own code
+  // rather than booting with the field silently ignored.
+  let runKey: RunKeyPart[] | undefined;
+  if (r['run_key'] !== undefined) {
+    if (validType !== 'webhook') {
+      return parseFailure(
+        'RUN_KEY_UNSUPPORTED_TYPE',
+        `'run_key' is only supported on webhook bindings, but this binding has type '${validType}'`,
+      );
+    }
+    const parsed = parseRunKey(r['run_key']);
+    if (!Array.isArray(parsed)) return { ok: false, error: parsed };
+    runKey = parsed;
+  }
+
+  let when: WhenCondition[] | undefined;
+  if (r['when'] !== undefined) {
+    if (validType !== 'webhook') {
+      return parseFailure(
+        'WHEN_UNSUPPORTED_TYPE',
+        `'when' is only supported on webhook bindings, but this binding has type '${validType}'`,
+      );
+    }
+    const parsed = parseWhen(r['when']);
+    if (!Array.isArray(parsed)) return { ok: false, error: parsed };
+    when = parsed;
+  }
+
+  let maxPasses: number | undefined;
+  if (r['max_passes'] !== undefined) {
+    const value = r['max_passes'];
+    if (validType !== 'webhook' || runKey === undefined) {
+      return parseFailure(
+        'INVALID_MAX_PASSES',
+        `'max_passes' is only legal on a webhook binding that declares 'run_key'`,
+      );
+    }
+    if (typeof value !== 'number' || !Number.isInteger(value) || value < 1) {
+      return parseFailure(
+        'INVALID_MAX_PASSES',
+        `'max_passes' must be a positive integer, got ${JSON.stringify(value)}`,
+      );
+    }
+    maxPasses = value;
+  }
+
+  if (runKey !== undefined && substrate !== undefined) {
+    const reserved = RESERVED_KEYED_SUBSTRATE_FIELDS.filter((name) => name in substrate!);
+    if (reserved.length > 0) {
+      return parseFailure(
+        'RESERVED_SUBSTRATE_FIELD',
+        `substrate field(s) ${reserved.join(', ')} are reserved on a keyed binding: ` +
+          `the listener stamps them onto every keyed pass`,
+      );
+    }
+  }
+
   // Parse optional route (permissive here — type-specific requirement enforced by validateIngressBindings)
   const route = typeof r['route'] === 'string' ? r['route'] : undefined;
 
@@ -381,6 +612,9 @@ export function parseIngressBinding(raw: unknown): ParseIngressBindingResult {
     ...(substrate !== undefined && { substrate }),
     ...(transport !== undefined && { transport }),
     ...(appTokenEnv !== undefined && { app_token_env: appTokenEnv }),
+    ...(runKey !== undefined && { run_key: runKey }),
+    ...(when !== undefined && { when }),
+    ...(maxPasses !== undefined && { max_passes: maxPasses }),
   };
 
   return { ok: true, binding };
