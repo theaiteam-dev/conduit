@@ -11,7 +11,7 @@
  * unless CONDUIT_REQUIRE_CGROUP_CONTAINMENT=1 (CI), where they run and fail.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -209,6 +209,22 @@ describe('prepareContainedCommand', () => {
       'Executable not found in $PATH: "conduit-no-such-binary"',
     );
     expect(readdirSync(scratch)).toEqual([]);
+  });
+
+  (isRoot ? it.skip : it)('throws EACCES, as Bun.spawn does, for a path that exists but is not executable', () => {
+    const script = join(scratch, 'not-executable.sh');
+    writeFileSync(script, '#!/bin/sh\n');
+    chmodSync(script, 0o644);
+    const containment: Containment = { mechanism: 'cgroup', parent: join(scratch, 'parent') };
+    mkdirSync(containment.parent);
+    let thrown: unknown;
+    try {
+      prepareContainedCommand(containment, ['./not-executable.sh'], { cwd: scratch, env: { PATH: '/usr/bin:/bin' } });
+    } catch (err) {
+      thrown = err;
+    }
+    expect((thrown as { code?: string }).code).toBe('EACCES');
+    expect(readdirSync(containment.parent)).toEqual([]);
   });
 
   it('resolves the command against the child env PATH, as Bun.spawn would', () => {

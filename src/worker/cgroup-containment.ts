@@ -29,7 +29,7 @@
  * once on stderr. `conduit doctor` reports which mechanism is in use.
  */
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmdirSync, statfsSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 
 /** statfs f_type of a cgroup v2 filesystem. */
 const CGROUP2_SUPER_MAGIC = 0x63677270;
@@ -389,6 +389,11 @@ export function prepareContainedCommand(
     ...(spawnOptions.cwd !== undefined ? { cwd: spawnOptions.cwd } : {}),
   });
   if (resolved === null) {
+    // Bun.which returns null for a path that exists but is not executable too,
+    // where Bun.spawn throws EACCES. Keep that distinction for the operator.
+    if (command.includes('/') && existsSync(resolve(spawnOptions.cwd ?? process.cwd(), command))) {
+      throw Object.assign(new Error(`Permission denied: "${command}" is not executable`), { code: 'EACCES' });
+    }
     throw Object.assign(new Error(`Executable not found in $PATH: "${command}"`), { code: 'ENOENT' });
   }
 
