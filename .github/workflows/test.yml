@@ -1,15 +1,16 @@
 # Test gate — typecheck + full unit/integration suite on every PR.
 #
-# This is the required check for merging (branch protection targets the
-# `tests` job by name). Keep it hermetic: no repo secrets, no .env — any test
+# One of the two required checks for merging (the `main` ruleset targets the
+# `tests` job by name; the other is `blackbox` in blackbox.yml). Keep it
+# hermetic: no repo secrets, no .env — any test
 # that needs gateway config must inject its own inert test values.
 # Baseline at introduction: ~2.6k tests in under a minute locally; the
 # timeout is generous headroom for slower shared runners, not an expectation.
 #
 # Run the scoped `bun run test` script (src/ only), NOT bare `bun test` —
 # bun's default test discovery walks the whole repo tree, so a bare `bun
-# test` would also pick up blackbox/ and fold that advisory-only suite into
-# this required gate, defeating its non-blocking burn-in period (DQ-3).
+# test` would also pick up blackbox/ and run that suite twice, once here and
+# once in its own `blackbox` job, which needs Linux and a longer timeout (DQ-3).
 name: Tests
 
 on:
@@ -49,7 +50,8 @@ jobs:
       # Mutation check on the harness usage FOLD SITES (scripts/mutation-check.ts).
       #
       # A step in THIS job, not an advisory job of its own, and deliberately so.
-      # blackbox.yml and docs.yml burn in advisory-first because they carry
+      # blackbox.yml and docs.yml burned in advisory-first (blackbox.yml has
+      # since been promoted to required) because they carry
       # flakiness this repo does not control — an external `drift` binary whose
       # AST fingerprints can go stale repo-wide on a version bump, and a
       # long-running journey suite. This check has neither exposure: same

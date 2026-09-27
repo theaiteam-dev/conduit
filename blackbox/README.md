@@ -22,7 +22,7 @@ user or CI consumer actually sees, not internal implementation details.
   gate (AC-1): a TypeScript-compiler-API scan that fails if any file under
   `blackbox/` imports anything resolving into `src/`.
 - `scaffold.test.ts` — pins the plumbing in this file (test-script scoping,
-  the non-required CI job, the burn-in plan).
+  the required `blackbox` CI job's name and unfiltered trigger).
 
 ## Platform requirements
 
@@ -41,10 +41,10 @@ bun run typecheck:blackbox   # tsc --noEmit against blackbox/tsconfig.json
 ```
 
 Both are **intentionally separate** from `bun run test`/`bun run typecheck`
-(scoped to `src/` only) and from the required `tests` CI gate defined in
-`.github/workflows/test.yml`. See `.github/workflows/blackbox.yml` for the CI
-wiring and the burn-in-then-promote plan (~2 weeks / ~50 PRs advisory-only
-before this suite is considered for promotion to a required check).
+(scoped to `src/` only). CI runs them in their own required job, `blackbox`,
+alongside the `tests` job in `.github/workflows/test.yml`; a PR cannot merge
+until both pass. See `.github/workflows/blackbox.yml` for the CI wiring and the
+burn-in record that preceded promotion.
 
 `blackbox/tsconfig.json` extends the root `tsconfig.json` and scopes
 `include` to this directory — it is what makes `typecheck:blackbox` a real
@@ -159,8 +159,8 @@ mid-journey. The steps:
    `runConduit` narration marker, an assertion that stops throwing).
 
 7. **Verify determinism before submitting**: run your new test file 3
-   consecutive times locally. The suite is CI-advisory during burn-in, but a
-   flaky fault variant defeats its own purpose.
+   consecutive times locally. The suite is a required CI check, so a flaky
+   fault variant blocks every PR, not just yours.
 
 ### Available fault knobs today
 
@@ -206,14 +206,14 @@ have a fault variant in this suite. Picking one up means writing a
   `src/`, you almost certainly want a public surface instead (spawn the
   binary, hit the fake server, read `runConduit`'s output) — see "How to add
   a fault variant" above.
-- **Scoped typecheck, not the required gate.** `blackbox/tsconfig.json`
-  extends the root config and scopes `include` to this directory;
-  `bun run typecheck:blackbox` runs against it. The root `bun run typecheck`
-  (the required CI gate) is untouched and stays `src/`-only — a type error
-  here must never block an unrelated merge.
-- **Non-required CI, burn-in-then-promote.** `.github/workflows/blackbox.yml`
-  runs `test:blackbox` and `typecheck:blackbox` on every PR for visibility,
-  in a job named `blackbox` (never `tests` — that name is reserved for the
-  required gate in `test.yml` and would be folded into it). Advisory-only for
-  ~2 weeks / ~50 PRs before a follow-up change considers promoting it to
-  required.
+- **Scoped typecheck.** `blackbox/tsconfig.json` extends the root config and
+  scopes `include` to this directory; `bun run typecheck:blackbox` runs
+  against it. The root `bun run typecheck` stays `src/`-only. Both block
+  merges: a type error here fails the required `blackbox` job.
+- **Required CI, after burn-in.** `.github/workflows/blackbox.yml` runs
+  `test:blackbox` and `typecheck:blackbox` on every PR in a job named
+  `blackbox`, which the `main` ruleset requires by name. Keep that name, and
+  keep `pull_request` unfiltered: a renamed or path-filtered required check
+  never reports, and every PR waits on it. Never name it `tests`, which the
+  ruleset reads as the `test.yml` gate. The suite ran advisory-only from
+  2026-08-27 until its promotion on 2026-09-26 (48/48 executed runs green).

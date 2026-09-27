@@ -2,13 +2,14 @@
  * Black-box suite scaffold smoke test (WI-675).
  *
  * Pins the plumbing that makes blackbox/ a first-class, separately-run,
- * NON-required test suite:
+ * REQUIRED test suite:
  *   - package.json exposes a `test:blackbox` script that runs this suite
  *   - the default `test` script is scoped to src/ and no longer globs blackbox/
  *   - the blackbox/ home exists (harness/ subfolder + README stub)
- *   - a dedicated .github/workflows/blackbox.yml runs on PRs but is kept OUT
- *     of the required check set (no job named `tests`, the required gate) and
- *     documents the burn-in-then-promote plan
+ *   - a dedicated .github/workflows/blackbox.yml runs on every PR in a job
+ *     named `blackbox`, the name the `main` ruleset requires. The name and
+ *     the unfiltered trigger are pinned because a required check that is
+ *     renamed or skipped by a filter never reports, and every PR waits on it
  *
  * Black-box rule: this suite reads only from disk and public deps — NO src/
  * imports. Reading package.json / workflow YAML from the filesystem keeps it
@@ -54,16 +55,15 @@ describe("blackbox/ directory layout", () => {
   });
 });
 
-describe("non-required blackbox CI workflow (DQ-3)", () => {
+describe("required blackbox CI workflow (DQ-3)", () => {
   const workflowPath = join(repoRoot, ".github/workflows/blackbox.yml");
 
   test(".github/workflows/blackbox.yml exists as a separate workflow", () => {
     expect(existsSync(workflowPath)).toBe(true);
   });
 
-  test("runs on pull_request but is kept out of the required check set", () => {
-    const raw = readFileSync(workflowPath, "utf8");
-    const wf = parse(raw);
+  test("runs on every pull_request in a job named `blackbox`", () => {
+    const wf = parse(readFileSync(workflowPath, "utf8"));
 
     // Triggers on every PR. YAML 1.1 folds a bare `on:` key to boolean `true`,
     // which becomes the string key "true" on the parsed JS object (JS object
@@ -73,16 +73,23 @@ describe("non-required blackbox CI workflow (DQ-3)", () => {
     const triggers = Array.isArray(on) ? on : Object.keys(on ?? {});
     expect(triggers).toContain("pull_request");
 
-    // The required check is the job named `tests` (in test.yml). A separate
-    // workflow that named its job `tests` too would be folded into the required
-    // gate — so blackbox must NOT define one.
-    const jobNames = Object.keys(wf.jobs ?? {});
-    expect(jobNames.length).toBeGreaterThan(0);
-    expect(jobNames).not.toContain("tests");
+    // A `paths:` or `branches:` filter would skip the workflow on some PRs,
+    // and a skipped required check never reports.
+    const pr = Array.isArray(on) ? null : (on as Record<string, unknown>)?.pull_request;
+    const prFilters = pr && typeof pr === "object" ? Object.keys(pr) : [];
+    for (const filter of ["paths", "paths-ignore", "branches", "branches-ignore"]) {
+      expect(prFilters).not.toContain(filter);
+    }
 
-    // Comments are stripped by the YAML parse, so assert the burn-in plan is
-    // documented against the raw source.
-    expect(raw).toMatch(/burn-in|burn in/i);
-    expect(raw).toMatch(/requir/i);
+    // The ruleset requires the check context `blackbox`, which GitHub takes
+    // from the job's `name:` (or its key when `name:` is absent).
+    const jobs: Record<string, { name?: string }> = wf.jobs ?? {};
+    const contexts = Object.entries(jobs).map(([key, job]) => job?.name ?? key);
+    expect(contexts).toContain("blackbox");
+
+    // `tests` is the other required context, owned by test.yml. A job here
+    // with that name would satisfy it without running the unit suite.
+    expect(Object.keys(jobs)).not.toContain("tests");
+    expect(contexts).not.toContain("tests");
   });
 });
