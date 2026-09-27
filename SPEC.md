@@ -597,8 +597,9 @@ pass at what earlier passes left and refuses one when nothing is left, and `cond
 resume` of a run that has taken more than one pass applies the same cap and refusal. The
 wall-clock budget is per pass. A pass's invocation may name the ingress events it covers
 (`--pass-event`); the kernel records them in `run_pass_events` in the same transaction
-that seeds the entry card, and an invocation naming an event already recorded exits 0
-without seeding, so a repeated launch of one event is a no-op. `max_passes` is an admission limit applied by the listener, not a fifth
+that seeds the entry card. An invocation whose events are all already recorded exits 0
+without seeding, so a repeated launch is a no-op; one that mixes recorded and new events
+exits 3 and seeds nothing. `max_passes` is an admission limit applied by the listener, not a fifth
 rework guard: it bounds how often the subject may re-enter the line, not how often a card
 may be reworked inside a pass.
 

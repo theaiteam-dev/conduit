@@ -392,10 +392,11 @@ function keyedDepsFor(deps: SpawnPathDeps, flowId: string, flow: FlowConfig): Ke
 
 /**
  * The accept path for an event whose binding declares `run_key`. Delivery
- * dedup is the same atomic accept as the unkeyed path; the keyed-run row is
- * created (or refreshed with the binding's current max_passes) in the SAME
- * transaction, so a crash can never leave an accepted keyed event whose run
- * the sweep would not recognise as keyed. Routing then belongs to
+ * dedup is the same atomic accept as the unkeyed path; each ACCEPTED event
+ * creates the keyed-run row, or refreshes it with the binding's current
+ * max_passes, in the SAME transaction, so a crash can never leave an accepted
+ * keyed event whose run the sweep would not recognise as keyed. A duplicate
+ * delivery is the same event and changes nothing. Routing then belongs to
  * keyed-runs.ts.
  */
 async function runKeyedSpawnPath(

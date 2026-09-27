@@ -191,4 +191,20 @@ describe('checkRunAppendable', () => {
     db.insertCard(card('r', 'entry-r', { lane: 'work', status: 'ready' }));
     expect(checkRunAppendable(db, 'r', 1_000)).toMatchObject({ ok: false, state: 'parked' });
   });
+
+  it('names a run still recorded running "running", not "held", even with a held card (its driver died while holding)', () => {
+    // A run whose driver crashed while a card was held stays 'running' (the
+    // CLI only records 'done'/'halted' once the engine returns). Reporting
+    // this as 'held' tells a caller to wait for a resume that is not coming;
+    // reporting it as 'running' tells the operator to `conduit resume` it.
+    run('r', 'running');
+    db.insertCard(card('r', 'entry-r', { lane: 'hold', status: 'held' }));
+    expect(checkRunAppendable(db, 'r', 1_000)).toMatchObject({ ok: false, state: 'running' });
+  });
+
+  it('still names a properly halted run with a held card "held"', () => {
+    run('r', 'halted', 'halted');
+    db.insertCard(card('r', 'entry-r', { lane: 'hold', status: 'held' }));
+    expect(checkRunAppendable(db, 'r', 1_000)).toMatchObject({ ok: false, state: 'held' });
+  });
 });

@@ -343,10 +343,12 @@ async function launchPass(
   try {
     const covered = coveredEvents(deps, keyed.run_id, event);
     // The pending event rides this pass when it is older than the launching
-    // one, so it must not also become a pass of its own.
-    if (keyed.pending_event_id !== null && covered.some((e) => e.eventId === keyed.pending_event_id)) {
-      db.setKeyedRunPending(keyed.run_id, null);
-    }
+    // one, so it must not also become a pass of its own. Cleared only once
+    // the spawn is known to have succeeded (below): a failed launch leaves
+    // the pointer intact so the next sweep can still drain it, rather than
+    // orphaning a folded event that no pass ever consumed.
+    const pendingRidesThisPass =
+      keyed.pending_event_id !== null && covered.some((e) => e.eventId === keyed.pending_event_id);
     db.incrementSpawnAttempts(event.eventId);
 
     let result: { ok: boolean; error?: string; exited?: Promise<SpawnExit> };
@@ -363,6 +365,7 @@ async function launchPass(
     }
 
     if (result.ok) {
+      if (pendingRidesThisPass) db.setKeyedRunPending(keyed.run_id, null);
       db.markIngressSpawned(event.eventId);
       db.setKeyedRunBlockedAlerted(keyed.run_id, false);
       db.appendIngressLog({

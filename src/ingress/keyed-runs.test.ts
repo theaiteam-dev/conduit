@@ -564,6 +564,27 @@ describe('a run holding a card for a human', () => {
     expect(launches).toHaveLength(2);
     listener.redrive.stop();
   });
+
+  it('refuses a new event as run_not_appendable, rather than coalescing forever, when the driver died while a card was held', async () => {
+    const listener = await boot(makeFlow(keyedIngress()));
+    await listener.handleWebhook(prEvent({ repo: 'acme/widgets', pr: 7 }));
+    await finishPass(0, 1);
+    // A later station held the card for a HITL pick, but the driver crashed
+    // before it recorded the run as halted: the row is stuck at 'running'
+    // with no live lease holder, so no resume is in flight to fold this
+    // event into.
+    db.getStateDb()
+      .prepare("UPDATE runs SET status = 'running', outcome = NULL, holder_pid = 999999999 WHERE run_id = $r")
+      .run({ $r: RUN });
+    db.getStateDb().prepare("UPDATE cards SET lane = 'hold', status = 'held' WHERE run_id = $r").run({ $r: RUN });
+
+    const res = await listener.handleWebhook(prEvent({ repo: 'acme/widgets', pr: 7, round: 'a' }));
+    await settle();
+
+    expect(JSON.parse(res.body!).outcome).toBe('run_not_appendable');
+    expect(launches).toHaveLength(1);
+    expect(db.getIngressLog({ outcome: 'run_not_appendable' })).toHaveLength(1);
+  });
 });
 
 describe('a pass whose exit the listener lost', () => {
@@ -1059,5 +1080,174 @@ describe('drainKeyedRun on a pending event the router cannot simply launch', () 
     // dropping the event with no pending pointer, no refused mark and no log.
     expect(db.getKeyedRun(RUN)!.pending_event_id).toBe('ev-pending');
     expect(db.getIngressLog({ outcome: 'pass_limit' })).toHaveLength(0);
+  });
+});
+
+describe('a failed launch leaves the pending pointer for the next sweep, not orphaned', () => {
+  function seedFinishedRun(): void {
+    db.insertRun({ run_id: RUN, flow: FLOW_PATH, input_fingerprint: 'fp', status: 'done', outcome: 'complete' });
+    db.insertCard({
+      run_id: RUN, id: `entry-${RUN}`, parent_id: null, lane: 'done', status: 'complete',
+      attempt: 0, wave: 0, owned_paths: [], rework_count: 0,
+    });
+    db.upsertKeyedRun({ runId: RUN, flowId: FLOW_ID, flowPath: FLOW_PATH, runKey: ['acme/widgets', '7'], maxPasses: undefined });
+  }
+
+  function acceptRow(eventId: string, receivedAt: number, body: Record<string, unknown>): void {
+    db.acceptIngressEvent(eventId, receivedAt, {
+      flowId: FLOW_ID,
+      flowPath: FLOW_PATH,
+      runId: RUN,
+      substrateJson: JSON.stringify({ event_id: eventId, body }),
+    });
+  }
+
+  function makeDrainDeps(spawn: SpawnSeam): KeyedRunDeps {
+    return {
+      db,
+      spawn,
+      alerts: { alert: async (a) => void alerts.push(a), channels: {}, globalAlertChannel: '#ops' },
+      slots: createRunSlots(),
+      redriveCap: 3,
+      now: () => NOW,
+      launching: new Set<string>(),
+    };
+  }
+
+  /** Refuses the very first launch (the spawn seam itself never starts the child), then launches normally. */
+  function failOnceThenSpawn(): SpawnSeam {
+    let calls = 0;
+    return async (invocation) => {
+      calls += 1;
+      if (calls === 1) return { ok: false, error: 'boom: spawn refused' };
+      return controlledSpawn(invocation);
+    };
+  }
+
+  it('keeps the pending pointer set when the launch spawn fails, so the folded event stays drainable', async () => {
+    seedFinishedRun();
+    acceptRow('ev-a', NOW - 20, { round: 'a' });
+    db.markIngressCoalesced('ev-a');
+    db.setKeyedRunPending(RUN, 'ev-a');
+    acceptRow('ev-b', NOW - 10, { round: 'b' });
+
+    const deps = makeDrainDeps(failOnceThenSpawn());
+
+    const routed = await routeKeyedEvent(
+      deps,
+      {
+        eventId: 'ev-b',
+        runId: RUN,
+        flowId: FLOW_ID,
+        flowPath: FLOW_PATH,
+        substrateJson: db.getIngressEvent('ev-b')!.substrate_json!,
+        source: 'test',
+      },
+      'sweep',
+    );
+
+    expect(routed).toEqual({ outcome: 'spawn_failed', runId: RUN });
+    // The launch never happened: the pending pointer must still name 'ev-a',
+    // never cleared, or the folded event becomes reachable from nothing
+    // (drainKeyedRuns only visits runs with a non-null pending_event_id, and
+    // the failed-row sweep only re-drives the launching event itself).
+    expect(db.getKeyedRun(RUN)!.pending_event_id).toBe('ev-a');
+    expect(db.getIngressEvent('ev-a')!.spawn_state).toBe('coalesced');
+    expect(db.getIngressEvent('ev-b')!.spawn_state).toBe('failed');
+    expect(launches).toHaveLength(0);
+
+    // The ordinary redrive-failed-rows sweep re-routes 'ev-b' (still under
+    // its attempt cap); this launch succeeds and picks the still-pending
+    // 'ev-a' back up as part of the same pass, exactly as if the first
+    // attempt had never happened.
+    const redriven = await routeKeyedEvent(
+      deps,
+      {
+        eventId: 'ev-b',
+        runId: RUN,
+        flowId: FLOW_ID,
+        flowPath: FLOW_PATH,
+        substrateJson: db.getIngressEvent('ev-b')!.substrate_json!,
+        source: 'test',
+      },
+      'sweep',
+    );
+    expect(redriven).toEqual({ outcome: 'accepted', runId: RUN, pass: 2 });
+    expect(launches).toHaveLength(1);
+    expect(launches[0]!.passEvents).toEqual(['ev-a', 'ev-b']);
+    expect(db.getKeyedRun(RUN)!.pending_event_id).toBeNull();
+
+    launches[0]!.exit(0);
+    await settle();
+  });
+
+  it('does not clear the pending pointer when the spawn call throws outright', async () => {
+    seedFinishedRun();
+    acceptRow('ev-a', NOW - 10, { round: 'a' });
+    db.markIngressCoalesced('ev-a');
+    db.setKeyedRunPending(RUN, 'ev-a');
+
+    const throwingSpawn: SpawnSeam = async () => {
+      throw new Error('boom: spawn threw');
+    };
+    const deps = makeDrainDeps(throwingSpawn);
+
+    const drained = await drainKeyedRun(deps, RUN);
+
+    expect(drained).toEqual({ outcome: 'spawn_failed', runId: RUN });
+    expect(db.getKeyedRun(RUN)!.pending_event_id).toBe('ev-a');
+    expect(db.getIngressEvent('ev-a')!.spawn_state).toBe('failed');
+  });
+
+  it('serializes a redrive of the failed launching event against a drain of the pending event: only one pass launches, and no event is covered twice', async () => {
+    seedFinishedRun();
+    acceptRow('ev-a', NOW - 20, { round: 'a' });
+    db.markIngressCoalesced('ev-a');
+    db.setKeyedRunPending(RUN, 'ev-a');
+    acceptRow('ev-b', NOW - 10, { round: 'b' });
+    // Left behind by an earlier failed launch attempt (the fix under test):
+    // re-drivable on its own, while the run's pending pointer still names 'ev-a'.
+    db.markIngressFailed('ev-b');
+
+    const deps = makeDrainDeps(controlledSpawn);
+
+    const [sweepOutcome, drainOutcome] = await Promise.all([
+      routeKeyedEvent(
+        deps,
+        {
+          eventId: 'ev-b',
+          runId: RUN,
+          flowId: FLOW_ID,
+          flowPath: FLOW_PATH,
+          substrateJson: db.getIngressEvent('ev-b')!.substrate_json!,
+          source: 'test',
+        },
+        'sweep',
+      ),
+      drainKeyedRun(deps, RUN),
+    ]);
+
+    // The run's single launch slot serializes the two callers: whichever
+    // acquires it launches (covering both events, oldest first); the other
+    // sees the run in flight and backs off rather than racing it.
+    expect(sweepOutcome).toEqual({ outcome: 'accepted', runId: RUN, pass: 2 });
+    expect(drainOutcome).toBeNull();
+    expect(launches).toHaveLength(1);
+    expect(launches[0]!.passEvents).toEqual(['ev-a', 'ev-b']);
+    expect(db.getKeyedRun(RUN)!.pending_event_id).toBeNull();
+
+    // The kernel records the one pass's coverage; both events resolve to the
+    // SAME pass, so neither is left to be covered a second time.
+    db.recordPassEvents(RUN, 2, launches[0]!.passEvents ?? []);
+    expect(db.getPassForEvent('ev-a')).toEqual({ run_id: RUN, pass: 2 });
+    expect(db.getPassForEvent('ev-b')).toEqual({ run_id: RUN, pass: 2 });
+
+    // Nothing is left pending, so a later drain finds nothing to launch again.
+    const laterDrain = await drainKeyedRun(deps, RUN);
+    expect(laterDrain).toBeNull();
+    expect(launches).toHaveLength(1);
+
+    launches[0]!.exit(0);
+    await settle();
   });
 });

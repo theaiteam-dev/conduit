@@ -98,6 +98,13 @@ const CONCLUDED_LANES: ReadonlySet<string> = new Set(['done', 'scrap']);
  * subject for good. A run the andon halted with unfinished cards, or one whose
  * driver died, is refused: it still has work that a resume can finish.
  *
+ * The running check runs BEFORE the held check: a run still recorded
+ * 'running' is reported 'running' even if one of its cards is held, since the
+ * CLI only records 'done'/'halted' once the engine returns, so 'running' with
+ * no live lease holder means the driver died while the card was held, not
+ * that a resume is in flight. Reporting that case as 'held' would tell a
+ * caller (the ingress listener) to wait for a resume that will never come.
+ *
  * The run lease is the caller's to check: the CLI takes it before asking, and
  * the listener treats a live holder as a pass in flight. `nowSeconds` is the
  * run clock; it is kept for callers that confirm a park against it.
@@ -114,6 +121,14 @@ export function checkRunAppendable(db: ConduitDB, runId: string, _nowSeconds: nu
     };
   }
 
+  if (run.status === 'running') {
+    return {
+      ok: false,
+      state: 'running',
+      detail: 'the run has not finished (resume it with conduit resume if its driver crashed)',
+    };
+  }
+
   const cards = db
     .getStateDb()
     .prepare('SELECT lane, status FROM cards WHERE run_id = $run_id')
@@ -122,13 +137,6 @@ export function checkRunAppendable(db: ConduitDB, runId: string, _nowSeconds: nu
   const held = cards.filter((c) => c.status === 'held' || c.lane === 'hold').length;
   if (held > 0) {
     return { ok: false, state: 'held', detail: `the run is holding ${held} card(s) for a human` };
-  }
-  if (run.status === 'running') {
-    return {
-      ok: false,
-      state: 'running',
-      detail: 'the run has not finished (resume it with conduit resume if its driver crashed)',
-    };
   }
   const unfinished = cards.filter((c) => !CONCLUDED_LANES.has(c.lane)).length;
   if (cards.length === 0 || unfinished > 0) {
