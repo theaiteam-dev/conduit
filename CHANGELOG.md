@@ -13,6 +13,20 @@ historical context, not public releases or public repository history.
 
 ### Added
 
+- Harness event stream ([#70](https://github.com/theaiteam-dev/conduit/issues/70)).
+  `HarnessInvocation` gains an optional `onEvent` sink beside `onProgress`,
+  and `src/worker/harness-events.ts` defines the Conduit-owned `HarnessEvent`
+  vocabulary: a vendored subset of the AI SDK `UIMessageChunk` shapes
+  (`text-delta`, `reasoning-delta`, `tool-input-start`, `tool-input-available`,
+  `tool-output-available`) plus `usage`, `rate-limit` and `lifecycle`, with no
+  dependency on `ai` or `@ai-sdk/*`. The `claude-headless` adapter maps every
+  stream-json line to events (one per whole content block) and brackets each
+  call with a `lifecycle` start and one closing phase (`end`, `timeout` or
+  `idle-timeout`). Events are numbered by `seq` from 0 within one call; a
+  consumer that throws is ignored and cannot fail the call. Retained stdout,
+  `HarnessResult` and the codex adapter are unchanged, and nothing consumes
+  events yet: `stampHarnessEvents`, which stamps `attempt` and a per-call
+  `invocationId` for the executor, is wired by the journal writer in #71.
 - One ingress run per external subject
   ([#36](https://github.com/theaiteam-dev/conduit/issues/36)). A webhook
   binding can declare `run_key`, the ordered JSON paths (with alternatives) or
