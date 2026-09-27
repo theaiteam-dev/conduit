@@ -28,6 +28,13 @@ import { validateRunId } from '../run/run-id';
 import { registerRun, computeFingerprint } from '../run/run-registry';
 import { acquireRunLease, releaseRunLease, peekRunLeaseHolder, defaultIsPidAlive } from '../run/run-lock';
 import { getRunState, getRunParkedRelease, formatParkedRun, type RunStateResult } from '../run/run-state';
+import {
+  checkRunAppendable,
+  nextPassNumber,
+  passEntryCardId,
+  EXIT_PASS_REFUSED,
+  EXIT_RUN_LEASE_CONFLICT,
+} from '../run/run-passes';
 import { getHarnessOccupancy, formatHarnessOccupancy } from '../run/harness-occupancy';
 import type { ModelAdapter, ModelCall, ModelResponse } from '../worker/adapter';
 import {
@@ -798,6 +805,76 @@ function printHaltedRunSummary(deps: CliDeps, runId: string): void {
 // Command handlers
 // ---------------------------------------------------------------------------
 
+type AppendPassAdmission =
+  | { ok: true; passNumber: number; budgetMaxTokens?: number }
+  | { ok: false; code: number };
+
+/**
+ * Admit a `--append-pass` invocation (issue #36), or say why not.
+ *
+ *   - the run must exist, recorded against this flow path and project root
+ *     (exit 1 otherwise: the invocation names the wrong run);
+ *   - the run lease must be free (EXIT_RUN_LEASE_CONFLICT); it is taken here
+ *     and held, so the state below cannot change under the pass;
+ *   - the run must have finished successfully, and must have run-token budget
+ *     left when the flow declares one (EXIT_PASS_REFUSED, lease released).
+ *
+ * The input fingerprint is deliberately not compared: every pass has new
+ * input. runs.input_fingerprint keeps the first pass's value, so re-running
+ * the run's founding command still reports the existing run rather than a
+ * conflict.
+ */
+function admitAppendPass(
+  deps: CliDeps,
+  runId: string,
+  flowPath: string,
+  projectRoot: string,
+  flow: FlowConfig,
+): AppendPassAdmission {
+  const run = deps.db.getRun(runId);
+  if (run === null) {
+    deps.io.err(`error: cannot append a pass to run ${JSON.stringify(runId)}: the run does not exist`);
+    return { ok: false, code: 1 };
+  }
+  if (run.flow !== flowPath) {
+    deps.io.err(
+      `error: cannot append a pass to run ${JSON.stringify(runId)}: it was recorded against a different flow ` +
+        `(${JSON.stringify(run.flow)})`,
+    );
+    return { ok: false, code: 1 };
+  }
+  if ((run.project_root ?? null) !== projectRoot) {
+    deps.io.err(
+      `error: cannot append a pass to run ${JSON.stringify(runId)}: it was recorded against a different project root ` +
+        `(${JSON.stringify(run.project_root)})`,
+    );
+    return { ok: false, code: 1 };
+  }
+
+  const lease = acquireRunLease(deps.db, runId, process.pid, deps.now());
+  if (!lease.acquired) {
+    deps.io.err(formatRunLeaseConflict(runId, lease.holderPid));
+    return { ok: false, code: EXIT_RUN_LEASE_CONFLICT };
+  }
+
+  const refuse = (detail: string): AppendPassAdmission => {
+    releaseRunLease(deps.db, runId, process.pid);
+    deps.io.err(`error: refusing to append a pass to run ${JSON.stringify(runId)}: ${detail}`);
+    return { ok: false, code: EXIT_PASS_REFUSED };
+  };
+
+  const appendable = checkRunAppendable(deps.db, runId, deps.now());
+  if (!appendable.ok) return refuse(appendable.detail);
+
+  const maxTokens = flow.budgets?.run?.max_tokens;
+  if (maxTokens === undefined) return { ok: true, passNumber: nextPassNumber(deps.db, runId) };
+  const remaining = maxTokens - deps.db.getRunUsageTotals(runId).tokens;
+  if (remaining <= 0) {
+    return refuse(`the run token budget (${maxTokens}) is spent by earlier passes`);
+  }
+  return { ok: true, passNumber: nextPassNumber(deps.db, runId), budgetMaxTokens: remaining };
+}
+
 /**
  * `conduit run <flow.yaml>` — seed a run (or pick up an existing one by
  * `--run-id`) and drive the engine to a terminal state.
@@ -807,6 +884,13 @@ function printHaltedRunSummary(deps: CliDeps, runId: string): void {
  * of which is parked behind a provider reset exits 1 too, and is recorded
  * `outcome='parked'` so it stays resumable. Only a genuinely halted run gets
  * the stuck-card summary; a parked one has no failed card to list.
+ *
+ * `--append-pass` (issue #36) starts the next PASS of an existing, finished
+ * run instead of a new run: it seeds `entry-<runId>-p<N>` with the new input
+ * and drives the run again. See run/run-passes.ts for the pass model; the
+ * refusals exit EXIT_PASS_REFUSED (not finished, or no token budget left) or
+ * EXIT_RUN_LEASE_CONFLICT (another live process drives the run), so the
+ * ingress listener can tell them from a failed pass.
  */
 async function cmdRun(argv: string[], deps: CliDeps): Promise<number> {
   // ── Parse flags: run <flow.yaml> [--input <file>] [--input-inline <text>] [--concurrency <n>] [--run-id <id>] [--project-root <dir>] ──
@@ -816,9 +900,12 @@ async function cmdRun(argv: string[], deps: CliDeps): Promise<number> {
   let runIdFlag: string | undefined;
   let budgetTokensFlag: number | undefined;
   let budgetWallClockFlag: number | undefined;
+  let appendPass = false;
   for (let i = 1; i < argv.length; i++) {
     const arg = argv[i]!;
-    if (arg === '--input' && i + 1 < argv.length) {
+    if (arg === '--append-pass') {
+      appendPass = true;
+    } else if (arg === '--input' && i + 1 < argv.length) {
       inputFilePath = argv[++i];
     } else if (arg === '--input-inline' && i + 1 < argv.length) {
       inputInlineText = argv[++i];
@@ -851,6 +938,16 @@ async function cmdRun(argv: string[], deps: CliDeps): Promise<number> {
 
   if (!flowPath) {
     deps.io.err('usage: conduit run <flow.yaml> [--input <file>] [--input-inline <text>] [--project-root <dir>]');
+    return 1;
+  }
+
+  // A pass extends a named run with new input; neither half is optional.
+  if (appendPass && runIdFlag === undefined) {
+    deps.io.err('error: --append-pass requires --run-id naming the run to extend');
+    return 1;
+  }
+  if (appendPass && inputFilePath === undefined && inputInlineText === undefined) {
+    deps.io.err('error: --append-pass requires --input or --input-inline carrying the new pass input');
     return 1;
   }
 
@@ -1028,7 +1125,10 @@ async function cmdRun(argv: string[], deps: CliDeps): Promise<number> {
         );
         return 1;
       }
-      if (existingBuffer !== null && !existingBuffer.equals(seedBuffer)) {
+      // A pass (issue #36) replaces the previous pass's seed by design: the file
+      // at the entry input path is the run's own earlier input, not operator
+      // data. The guard keeps protecting every run that is not a pass.
+      if (!appendPass && existingBuffer !== null && !existingBuffer.equals(seedBuffer)) {
         deps.io.err(
           `error: refusing to overwrite pre-staged entry input at ${seedTargetPath} — ` +
             `this file already exists, is non-empty, and its content differs from the ` +
@@ -1038,7 +1138,7 @@ async function cmdRun(argv: string[], deps: CliDeps): Promise<number> {
         );
         return 1;
       }
-      seedTargetPreStaged = existingBuffer !== null;
+      seedTargetPreStaged = !appendPass && existingBuffer !== null;
       // else: existing content is already byte-identical — proceed without rewriting.
     }
   }
@@ -1050,8 +1150,24 @@ async function cmdRun(argv: string[], deps: CliDeps): Promise<number> {
     {};
   const fingerprint = computeFingerprint(resolvedFlowPath, inputPayload, projectRoot);
 
+  // ── Append-pass admission (issue #36) ─────────────────────────────────────
+  // A pass extends an existing run, so it skips registration: the run must
+  // already be recorded against this flow and workspace, and must have
+  // finished. The lease is taken BEFORE the state check so no other driver can
+  // change the run between the check and the seed.
+  let passNumber: number | null = null;
+  let passBudgetMaxTokens: number | undefined;
+  if (appendPass) {
+    const admission = admitAppendPass(deps, effectiveRunId, resolvedFlowPath, projectRoot, flow);
+    if (!admission.ok) return admission.code;
+    passNumber = admission.passNumber;
+    passBudgetMaxTokens = admission.budgetMaxTokens;
+  }
+
   // Register the run. On existing → report state and exit. On conflict → error and exit.
-  const registration = registerRun(deps.db, effectiveRunId, resolvedFlowPath, fingerprint, projectRoot);
+  const registration = appendPass
+    ? ({ kind: 'created' } as const)
+    : registerRun(deps.db, effectiveRunId, resolvedFlowPath, fingerprint, projectRoot);
   if (registration.kind === 'existing') {
     // This path never drives the engine (read-only status report), so it must
     // NOT acquire the run lease — but it's still worth refusing loudly if a
@@ -1120,7 +1236,12 @@ async function cmdRun(argv: string[], deps: CliDeps): Promise<number> {
       // to `string | null`; coalesce null → undefined to exit the walk cleanly.
       cursor = st.resume_at ?? flow.happyPathNext?.[cursor] ?? undefined;
     }
-    seededCardId = effectiveRunId === DEFAULT_RUN_ID ? 'conduit-run-entry' : `entry-${effectiveRunId}`;
+    seededCardId =
+      passNumber !== null
+        ? passEntryCardId(effectiveRunId, passNumber)
+        : effectiveRunId === DEFAULT_RUN_ID
+          ? 'conduit-run-entry'
+          : `entry-${effectiveRunId}`;
     deps.db.insertCard({
       run_id: effectiveRunId,
       id: seededCardId,
@@ -1132,6 +1253,9 @@ async function cmdRun(argv: string[], deps: CliDeps): Promise<number> {
       owned_paths: rootOwnedPaths.size > 0 ? [...rootOwnedPaths] : [...(entryStation?.inputs ?? []), ...(entryStation?.outputs ?? [])],
       rework_count: 0,
     });
+    // A pass reopens a finished run: 'running' until this process records how
+    // the pass ended, exactly as a fresh registration starts.
+    if (passNumber !== null) updateRunStatus(deps.db, effectiveRunId, 'running', null);
   } else if (flow.happyPathNext !== undefined && entryStationId !== undefined) {
     // FR-9 fail-closed: applies only to flows with declared entry stations (WI-351+
     // flows that use `next` declarations). If no --input and no runnable card exists,
@@ -1179,6 +1303,12 @@ async function cmdRun(argv: string[], deps: CliDeps): Promise<number> {
     ...(budgetTokensFlag !== undefined && { budgetMaxTokens: budgetTokensFlag }),
     ...(budgetWallClockFlag !== undefined && { budgetWallClockSeconds: budgetWallClockFlag }),
   };
+  // A pass spends from the run's one token budget (issue #36): its ceiling is
+  // what earlier passes left, min()ed with any caller ceiling. Wall clock stays
+  // per invocation, since passes arrive whenever the subject changes.
+  if (passBudgetMaxTokens !== undefined) {
+    runArgs.budgetMaxTokens = Math.min(runArgs.budgetMaxTokens ?? Infinity, passBudgetMaxTokens);
+  }
   let pool: WorkerPool | undefined;
   if (concurrency > 1 && deps.makeWorkerPool) {
     pool = deps.makeWorkerPool({ flowPath: resolve(flowPath), projectRoot });

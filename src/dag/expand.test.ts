@@ -140,6 +140,55 @@ describe('commitFanOut (AC1)', () => {
 });
 
 // ===========================================================================
+// Child ids are unique within a run (issue #36: a keyed run takes several
+// passes, and a later pass's fan-out may propose the ids an earlier one used)
+// ===========================================================================
+
+describe('commitFanOut child-id collision', () => {
+  it('rejects a proposal reusing a child id another parent already owns, inserting nothing', () => {
+    db.insertCard(parentCard('entry-pass1'));
+    expectOk(
+      commitFanOut(db, DEFAULT_RUN_ID, 'entry-pass1', {
+        children: [{ id: 'c1', depends_on: [], owned_paths: ['out/c1.json'] }],
+      }, { onPathConflict: 'reject' }),
+    );
+    db.insertCard(parentCard('entry-pass2'));
+
+    const err = expectErr(
+      commitFanOut(db, DEFAULT_RUN_ID, 'entry-pass2', {
+        children: [
+          { id: 'c0', depends_on: [], owned_paths: ['out/c0.json'] },
+          { id: 'c1', depends_on: [], owned_paths: ['out/c1.json'] },
+        ],
+      }, { onPathConflict: 'reject' }),
+    );
+
+    expect(err.error).toEqual({ code: 'child_id_collision', child: 'c1', owner: 'entry-pass1' });
+    expect(db.getCard(DEFAULT_RUN_ID, 'c0')).toBeNull();
+    expect(db.getCard(DEFAULT_RUN_ID, 'c1')!.parent_id).toBe('entry-pass1');
+  });
+
+  it('rejects a child id equal to an existing root card', () => {
+    db.insertCard(parentCard('entry-pass1'));
+    db.insertCard(parentCard('entry-pass2'));
+    const err = expectErr(
+      commitFanOut(db, DEFAULT_RUN_ID, 'entry-pass2', {
+        children: [{ id: 'entry-pass1', depends_on: [], owned_paths: ['out/x.json'] }],
+      }, { onPathConflict: 'reject' }),
+    );
+    expect(err.error.code).toBe('child_id_collision');
+  });
+
+  it('allows the same child id in a different run', () => {
+    db.insertCard({ ...parentCard('p'), run_id: 'run-a' });
+    db.insertCard({ ...parentCard('p'), run_id: 'run-b' });
+    const proposal = { children: [{ id: 'c1', depends_on: [], owned_paths: ['out/c1.json'] }] };
+    expectOk(commitFanOut(db, 'run-a', 'p', proposal, { onPathConflict: 'reject' }));
+    expectOk(commitFanOut(db, 'run-b', 'p', proposal, { onPathConflict: 'reject' }));
+  });
+});
+
+// ===========================================================================
 // AC2 — cyclic proposal rejected by DFS before any child is committed
 // ===========================================================================
 
