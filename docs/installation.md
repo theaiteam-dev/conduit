@@ -549,11 +549,13 @@ Besides 0 and 1 it has two exit codes of its own: **3** when the run cannot take
 a pass (it is running, parked, holding a card, stopped with unfinished cards,
 or out of run token budget), and **75** when another live process holds the run's lease.
 `--pass-event <event-id>` (repeatable) names the ingress events the pass
-covers. They are recorded with the pass's entry card, and an invocation that
-names an event a pass already consumed exits 0 without doing anything. A run's
-token budget is shared by its passes, so `conduit resume` of a run that has
-taken more than one pass gets only what earlier invocations left, and is
-refused when nothing is left.
+covers. They are recorded with the pass's entry card. When every named event
+was already consumed by an earlier pass, the invocation is a repeat launch and
+exits 0 without doing anything. When only some were, it exits **3** and names
+the consumed events and their passes, because its input mixes a consumed event
+with new ones. A run's token budget is shared
+by its passes, so `conduit resume` of a run that has taken more than one pass
+gets only what earlier invocations left, and is refused when nothing is left.
 
 ### Alternative: run from the engine image during development
 

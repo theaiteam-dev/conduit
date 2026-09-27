@@ -119,12 +119,24 @@ export function validateExpansion(
   const { children } = proposal;
   const childIds = children.map((c) => c.id);
 
+  // ── Duplicate child id within the proposal (issue #36) ─────────────────
+  // commitFanOut checks each proposed id against existing cards, which two
+  // children sharing an id both pass; the second insert would then throw out
+  // of the tick. owner is null: no existing card owns the id.
+  const seenIds = new Set<string>();
+  for (const id of childIds) {
+    if (seenIds.has(id)) {
+      return { ok: false, error: { code: 'child_id_collision', child: id, owner: null } };
+    }
+    seenIds.add(id);
+  }
+
   // ── 0. Dangling-dependency check (config is validated, not trusted) ───────
   // The Architect proposal is untrusted: a hallucinated dep id would otherwise
   // sail past cycle detection (findCycleNodes deliberately ignores unknown
   // ids) and park the card in `waiting` forever. Every depends_on entry MUST
   // reference a known child in this proposal.
-  const childIdSet = new Set(childIds);
+  const childIdSet = seenIds;
   for (const child of children) {
     for (const dep of child.depends_on) {
       if (!childIdSet.has(dep)) {

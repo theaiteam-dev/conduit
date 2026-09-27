@@ -176,6 +176,16 @@ describe('run_pass_events', () => {
     expect(() => db.recordPassEvents(KEYED.runId, 3, ['ev-2'])).toThrow();
   });
 
+  // PR #76 review (github-actions): the insert loop is not atomic on its own —
+  // a duplicate later in the list must not leave an earlier insert recorded,
+  // since callers rely on "a row here means the pass exists".
+  it('rolls back the whole call when one event in the list is already recorded', () => {
+    const db = open();
+    db.recordPassEvents(KEYED.runId, 2, ['already-recorded']);
+    expect(() => db.recordPassEvents(KEYED.runId, 3, ['new-a', 'already-recorded'])).toThrow();
+    expect(db.getPassForEvent('new-a')).toBeNull();
+  });
+
   it('lists coalesced events no pass consumed, oldest first, up to and including the named event', () => {
     const db = open();
     for (const [ev, at] of [['ev-a', 1000], ['ev-b', 1001], ['ev-c', 1002], ['ev-d', 1003], ['ev-e', 1004]] as const) {

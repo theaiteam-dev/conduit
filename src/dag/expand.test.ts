@@ -186,6 +186,43 @@ describe('commitFanOut child-id collision', () => {
     expectOk(commitFanOut(db, 'run-a', 'p', proposal, { onPathConflict: 'reject' }));
     expectOk(commitFanOut(db, 'run-b', 'p', proposal, { onPathConflict: 'reject' }));
   });
+
+  // PR #76 review (D) — two children in the SAME proposal sharing an id both
+  // pass the per-row "does this id already own a card?" check (neither is in
+  // `cards` yet), so without a dedicated check the insert throws out of the
+  // tick instead of being rejected as a validation error.
+  it('rejects a proposal with two children sharing an id, inserting nothing', () => {
+    db.insertCard(parentCard('epic'));
+
+    const err = expectErr(
+      validateExpansion(
+        {
+          children: [
+            { id: 'c1', depends_on: [], owned_paths: ['out/c1.json'] },
+            { id: 'c1', depends_on: [], owned_paths: ['out/c1-dup.json'] },
+          ],
+        },
+        { onPathConflict: 'reject' },
+      ),
+    );
+    expect(err.error).toEqual({ code: 'child_id_collision', child: 'c1', owner: null });
+  });
+
+  it('rejects via commitFanOut too, inserting no children for the self-colliding proposal', () => {
+    db.insertCard(parentCard('epic'));
+
+    const err = expectErr(
+      commitFanOut(db, DEFAULT_RUN_ID, 'epic', {
+        children: [
+          { id: 'c1', depends_on: [], owned_paths: ['out/c1.json'] },
+          { id: 'c1', depends_on: [], owned_paths: ['out/c1-dup.json'] },
+        ],
+      }, { onPathConflict: 'reject' }),
+    );
+
+    expect(err.error).toEqual({ code: 'child_id_collision', child: 'c1', owner: null });
+    expect(db.getCard(DEFAULT_RUN_ID, 'c1')).toBeNull();
+  });
 });
 
 // ===========================================================================

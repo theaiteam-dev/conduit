@@ -37,7 +37,7 @@ import { deriveIngressRunId, deriveKeyedIngressRunId } from './run-id';
 import { EXIT_RUN_LEASE_CONFLICT } from '../run/run-passes';
 import type { SpawnExit, SpawnFailedAlert, SpawnInvocation, SpawnSeam } from './spawn';
 import { startListener, type ListenerDeps, type ListenerConfig } from './listener';
-import { routeKeyedEvent, type KeyedRunDeps } from './keyed-runs';
+import { drainKeyedRun, routeKeyedEvent, type KeyedRunDeps } from './keyed-runs';
 import { createRunSlots } from './run-slots';
 
 const NOW = 1_700_000_000_000;
@@ -744,5 +744,89 @@ describe('restart and re-drive', () => {
     expect(launches[1]!.runId).toBe(RUN);
     expect(launches[1]!.appendPass).toBeUndefined();
     listener.redrive.stop();
+  });
+});
+
+describe('drainKeyedRun on a pending event the router cannot simply launch (PR #76 review)', () => {
+  function seedFinishedRun(): void {
+    db.insertRun({ run_id: RUN, flow: FLOW_PATH, input_fingerprint: 'fp', status: 'done', outcome: 'complete' });
+    db.insertCard({
+      run_id: RUN, id: `entry-${RUN}`, parent_id: null, lane: 'done', status: 'complete',
+      attempt: 0, wave: 0, owned_paths: [], rework_count: 0,
+    });
+    db.upsertKeyedRun({ runId: RUN, flowId: FLOW_ID, flowPath: FLOW_PATH, runKey: ['acme/widgets', '7'], maxPasses: undefined });
+  }
+
+  function drainDeps(): KeyedRunDeps {
+    return {
+      db,
+      spawn: controlledSpawn,
+      alerts: { alert: async (a) => void alerts.push(a), channels: {}, globalAlertChannel: '#ops' },
+      slots: createRunSlots(),
+      redriveCap: 3,
+      now: () => NOW,
+      launching: new Set<string>(),
+    };
+  }
+
+  it('logs rejected_malformed (not silence) for a pending event whose row is entirely missing', async () => {
+    seedFinishedRun();
+    db.setKeyedRunPending(RUN, 'ghost-event');
+
+    const outcome = await drainKeyedRun(drainDeps(), RUN);
+
+    expect(outcome).toBeNull();
+    expect(db.getKeyedRun(RUN)!.pending_event_id).toBeNull();
+    const entries = db.getIngressLog({ outcome: 'rejected_malformed' });
+    expect(entries).toHaveLength(1);
+    expect(entries[0]!.eventId).toBe('ghost-event');
+    expect(entries[0]!.reason).toContain('ghost-event');
+    expect(entries[0]!.reason).toContain(RUN);
+  });
+
+  it('logs rejected_malformed naming the missing column for a pending row with no flow_path', async () => {
+    seedFinishedRun();
+    db.acceptIngressEvent('ev-incomplete', NOW - 10, {
+      flowId: FLOW_ID,
+      flowPath: FLOW_PATH,
+      runId: RUN,
+      substrateJson: JSON.stringify({ round: 1 }),
+    });
+    db.markIngressCoalesced('ev-incomplete');
+    db.setKeyedRunPending(RUN, 'ev-incomplete');
+    // A hand-edited or corrupt row: attribution partially missing.
+    db.getStateDb().prepare("UPDATE ingress_events SET flow_path = NULL WHERE event_id = 'ev-incomplete'").run();
+
+    const outcome = await drainKeyedRun(drainDeps(), RUN);
+
+    expect(outcome).toBeNull();
+    expect(db.getKeyedRun(RUN)!.pending_event_id).toBeNull();
+    const entries = db.getIngressLog({ outcome: 'rejected_malformed' });
+    expect(entries).toHaveLength(1);
+    expect(entries[0]!.eventId).toBe('ev-incomplete');
+    expect(entries[0]!.reason).toContain('flow_path');
+    expect(entries[0]!.reason).toContain(RUN);
+  });
+
+  it('settles a pending event a pass already consumed as already_applied instead of dropping it silently', async () => {
+    seedFinishedRun();
+    db.acceptIngressEvent('ev-applied', NOW - 10, {
+      flowId: FLOW_ID,
+      flowPath: FLOW_PATH,
+      runId: RUN,
+      substrateJson: JSON.stringify({ round: 1 }),
+    });
+    db.markIngressCoalesced('ev-applied');
+    db.setKeyedRunPending(RUN, 'ev-applied');
+    db.recordPassEvents(RUN, 2, ['ev-applied']);
+
+    const outcome = await drainKeyedRun(drainDeps(), RUN);
+
+    expect(outcome).toEqual({ outcome: 'already_applied', runId: RUN, pass: 2 });
+    expect(db.getKeyedRun(RUN)!.pending_event_id).toBeNull();
+    expect(db.getIngressEvent('ev-applied')!.spawn_state).toBe('spawned');
+    const entries = db.getIngressLog({ outcome: 'already_applied' });
+    expect(entries).toHaveLength(1);
+    expect(entries[0]!.reason).toContain('pass 2');
   });
 });

@@ -318,6 +318,11 @@ when:
 - For `in` and `not_in`, only a string, number, or boolean counts as
   resolved. An object, array, null, or missing value is in no list: `in`
   fails, `not_in` holds.
+- Values are compared as strings. A resolved `42` or `"42"` matches both
+  `in: [42]` and `in: ["42"]`, and `true` or `"true"` matches both
+  `in: [true]` and `in: ["true"]`. Headers are always strings, so a typed
+  comparison could not apply to every subject. `when` filters a delivery
+  that has already passed auth; it is not access control.
 
 A non-matching event is answered `200 {"outcome":"filtered"}` so the provider
 does not retry it, logged `filtered`, and never written to `ingress_events`.

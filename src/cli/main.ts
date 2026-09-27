@@ -812,18 +812,69 @@ type AppendPassAdmission =
   | { ok: false; code: number };
 
 /**
- * The pass that already consumed one of `passEvents`, if any (issue #36).
- * Launching the pass again would run those events twice.
+ * Every event in `passEvents` already consumed by some earlier pass (issue
+ * #36; PR #76 review, coderabbitai). `recordPassEvents`' `event_id` primary
+ * key means launching any of these again would either replay the event or
+ * throw a raw constraint violation, so the caller must decide up front.
  */
-function findAppliedPassEvent(
+function findAppliedPassEvents(
   db: ConduitDB,
   passEvents: readonly string[],
-): { eventId: string; runId: string; pass: number } | null {
+): Array<{ eventId: string; runId: string; pass: number }> {
+  const applied: Array<{ eventId: string; runId: string; pass: number }> = [];
   for (const eventId of passEvents) {
-    const applied = db.getPassForEvent(eventId);
-    if (applied !== null) return { eventId, runId: applied.run_id, pass: applied.pass };
+    const found = db.getPassForEvent(eventId);
+    if (found !== null) applied.push({ eventId, runId: found.run_id, pass: found.pass });
   }
-  return null;
+  return applied;
+}
+
+/**
+ * Decide what a `--pass-event` launch should do about events already
+ * consumed by an earlier pass (issue #36; PR #76 review, coderabbitai).
+ *
+ *   - none of `passEvents` consumed: nothing to decide, returns `null` and
+ *     the caller proceeds;
+ *   - every one of `passEvents` already consumed: a harmless repeat launch
+ *     (e.g. a listener that lost the first launch's exit code) — exit 0,
+ *     print which pass already covers them, seed nothing;
+ *   - only SOME of `passEvents` already consumed: the launch is ambiguous —
+ *     its input already carries a consumed event's content mixed with a new
+ *     one, and a pass runs once over one input, so honouring it would
+ *     silently drop the new event(s). Refuse loudly (EXIT_PASS_REFUSED)
+ *     naming the consumed event(s) and the pass that covers each, rather
+ *     than guessing.
+ *
+ * Shared between `admitAppendPass` (a later pass) and `cmdRun`'s plain
+ * `--pass-event` (pass 1 of a fresh run), since the same ambiguity applies to
+ * both and `run_pass_events.event_id` is a primary key with no run scoping.
+ */
+function decidePassEventAdmission(deps: CliDeps, passEvents: readonly string[]): number | null {
+  if (passEvents.length === 0) return null;
+  const applied = findAppliedPassEvents(deps.db, passEvents);
+  if (applied.length === 0) return null;
+
+  if (applied.length === passEvents.length) {
+    const first = applied[0]!;
+    deps.io.out(
+      `event ${JSON.stringify(first.eventId)} was already consumed by pass ${first.pass} of run ` +
+        `${JSON.stringify(first.runId)}; nothing to do`,
+    );
+    return 0;
+  }
+
+  const detail = applied
+    .map(
+      (a) =>
+        `event ${JSON.stringify(a.eventId)} was already consumed by pass ${a.pass} of run ${JSON.stringify(a.runId)}`,
+    )
+    .join('; ');
+  deps.io.err(
+    `error: refusing this launch — it mixes ${applied.length} already-consumed --pass-event id(s) with ` +
+      `${passEvents.length - applied.length} new one(s) (${detail}); refusing rather than silently dropping ` +
+      `the new event(s)`,
+  );
+  return EXIT_PASS_REFUSED;
 }
 
 /**
@@ -833,10 +884,16 @@ function findAppliedPassEvent(
  *     (exit 1 otherwise: the invocation names the wrong run);
  *   - the run lease must be free (EXIT_RUN_LEASE_CONFLICT); it is taken here
  *     and held, so the state below cannot change under the pass;
- *   - when an event in `passEvents` was already consumed by a pass, the
+ *   - when EVERY event in `passEvents` was already consumed by a pass, the
  *     invocation is a repeat launch of that pass: it exits 0 without seeding
  *     anything, lease released, so a listener that lost the first launch's
- *     exit can never run the same event twice;
+ *     exit can never run the same event twice. When only SOME of them were
+ *     already consumed, the launch is ambiguous (its input already carries a
+ *     consumed event's content mixed with a new one) — refuse loudly with
+ *     EXIT_PASS_REFUSED, lease released, rather than silently dropping the
+ *     new event(s) (PR #76 review, coderabbitai; the listener itself never
+ *     sends a mixed set, since it filters consumed events via
+ *     run_pass_events, so this only guards a caller outside that contract);
  *   - the run's previous pass must have concluded (run-passes.ts
  *     checkRunAppendable), and the run must have run-token budget
  *     left when the flow declares one (EXIT_PASS_REFUSED, lease released).
@@ -886,14 +943,10 @@ function admitAppendPass(
     return { ok: false, code: EXIT_PASS_REFUSED };
   };
 
-  const applied = findAppliedPassEvent(deps.db, passEvents);
-  if (applied !== null) {
+  const passEventExit = decidePassEventAdmission(deps, passEvents);
+  if (passEventExit !== null) {
     releaseRunLease(deps.db, runId, process.pid);
-    deps.io.out(
-      `event ${JSON.stringify(applied.eventId)} was already consumed by pass ${applied.pass} of run ` +
-        `${JSON.stringify(applied.runId)}; nothing to do`,
-    );
-    return { ok: false, code: 0 };
+    return { ok: false, code: passEventExit };
   }
 
   const appendable = checkRunAppendable(deps.db, runId, deps.now());
@@ -1212,6 +1265,19 @@ async function cmdRun(argv: string[], deps: CliDeps): Promise<number> {
     passBudgetMaxTokens = admission.budgetMaxTokens;
   }
 
+  // ── Pass-event admission for pass 1 of a fresh run (PR #76 review, coderabbitai) ──
+  // `--append-pass` routes through admitAppendPass above; a bare
+  // `conduit run --run-id X --pass-event ...` (pass 1) never calls it, but
+  // run_pass_events.event_id is a primary key with no run scoping, so a
+  // replayed event here would otherwise reach recordPassEvents (below, in
+  // "Card seeding") and throw a raw constraint violation instead of a clean,
+  // listener-legible exit. Checked BEFORE registerRun so a no-op or refused
+  // launch leaves no run row behind.
+  if (!appendPass && passEvents.length > 0) {
+    const passEventExit = decidePassEventAdmission(deps, passEvents);
+    if (passEventExit !== null) return passEventExit;
+  }
+
   // Register the run. On existing → report state and exit. On conflict → error and exit.
   const registration = appendPass
     ? ({ kind: 'created' } as const)
@@ -1241,134 +1307,148 @@ async function cmdRun(argv: string[], deps: CliDeps): Promise<number> {
 
   // ── Card seeding (FR-9) ───────────────────────────────────────────────────
   let seededCardId: string | null = null;
-
-  if (seedBuffer !== undefined) {
-    // Write the entry artifact to the project root, unless the pre-registration
-    // guard above already found a byte-identical pre-staged file there (an
-    // idempotent re-run) — validation (existence/content) happened above,
-    // before registerRun, so there is nothing left to check here.
-    // The parent directory is created first: a per-run workspace (the original ingress-attribution work
-    // step 2) starts empty, so a nested entry input (`work/in.json`) has no
-    // pre-existing directory to land in. No-op for shared roots that already
-    // have the directory.
-    if (artifactName && seedTargetPath && !seedTargetPreStaged) {
-      mkdirSync(dirname(seedTargetPath), { recursive: true });
-      writeFileSync(seedTargetPath, seedBuffer);
-    }
-
-    // Seed the entry card at the entry station so the engine can dispatch it.
-    // owned_paths must cover ALL stations the root card visits (not just the entry
-    // station): follow the next/resume_at chain and collect every input + output
-    // along the parent's path.  Child-lane stations (child_entry) are skipped —
-    // those get their own owned_paths from the fan-out expansion.
-    const rootOwnedPaths = new Set<string>();
-    const childEntryIds = new Set(
-      Object.values(flow.stations)
-        .map((s) => s.child_entry)
-        .filter((id): id is string => id !== undefined),
-    );
-    const terminalSet = new Set(flow.terminal_lanes ?? []);
-    // Visited-set guard: a malformed flow with a cycle in resume_at/happyPathNext
-    // would otherwise spin forever here at seed time (this runs at the config
-    // trust boundary). Stop the first time we revisit a station.
-    const visited = new Set<string>();
-    let cursor: string | undefined = entryStationId;
-    while (cursor !== undefined && !terminalSet.has(cursor) && !visited.has(cursor)) {
-      visited.add(cursor);
-      const st = flow.stations[cursor];
-      if (!st || childEntryIds.has(cursor)) break;
-      for (const p of st.inputs ?? []) rootOwnedPaths.add(p);
-      for (const p of st.outputs ?? []) rootOwnedPaths.add(p);
-      // If this station fans out, the parent card resumes at resume_at after children
-      // complete — jump there rather than following child_entry. happyPathNext maps
-      // to `string | null`; coalesce null → undefined to exit the walk cleanly.
-      cursor = st.resume_at ?? flow.happyPathNext?.[cursor] ?? undefined;
-    }
-    seededCardId =
-      passNumber !== null
-        ? passEntryCardId(effectiveRunId, passNumber)
-        : effectiveRunId === DEFAULT_RUN_ID
-          ? 'conduit-run-entry'
-          : `entry-${effectiveRunId}`;
-    const entryCard: Card = {
-      run_id: effectiveRunId,
-      id: seededCardId,
-      parent_id: null,
-      lane: entryStationId ?? 'intake',
-      status: 'ready',
-      attempt: 0,
-      wave: 0,
-      owned_paths: rootOwnedPaths.size > 0 ? [...rootOwnedPaths] : [...(entryStation?.inputs ?? []), ...(entryStation?.outputs ?? [])],
-      rework_count: 0,
-    };
-    // One transaction: the pass's entry card and the record of which ingress
-    // events it covers (issue #36) exist together or not at all, so the
-    // listener can trust run_pass_events to mean "this pass exists".
-    deps.db.getStateDb().transaction(() => {
-      deps.db.insertCard(entryCard);
-      if (passEvents.length > 0) deps.db.recordPassEvents(effectiveRunId, passNumber ?? 1, passEvents);
-      // A pass reopens a finished run: 'running' until this process records how
-      // the pass ended, exactly as a fresh registration starts.
-      if (passNumber !== null) updateRunStatus(deps.db, effectiveRunId, 'running', null);
-    })();
-  } else if (flow.happyPathNext !== undefined && entryStationId !== undefined) {
-    // FR-9 fail-closed: applies only to flows with declared entry stations (WI-351+
-    // flows that use `next` declarations). If no --input and no runnable card exists,
-    // there is nothing to seed — fail loudly rather than silently no-op.
-    const stateDb = deps.db.getStateDb();
-    // Lane names come from flow.yaml (`terminal_lanes`) with no charset
-    // restriction, so they MUST be bound as parameters — never interpolated —
-    // to keep an attacker-authored or typo'd flow from injecting SQL.
-    const terminalLanes = [...new Set(flow.terminal_lanes ?? ['done', 'scrap', 'hold'])];
-    const lanePlaceholders = terminalLanes.map(() => '?').join(', ');
-    const { n } = stateDb
-      .prepare(
-        `SELECT COUNT(*) AS n FROM cards WHERE lane NOT IN (${lanePlaceholders}) AND status NOT IN ('complete', 'scrapped', 'held')`,
-      )
-      .get(...terminalLanes) as { n: number };
-
-    if (n === 0) {
-      deps.io.err(
-        'no runnable card in DB and no --input/--input-inline provided — ' +
-          'nothing to seed for this run (use --input <file> to provide the entry data)',
-      );
-      return 1;
-    }
-  }
-
-  // ── Resolve effective concurrency cap: flag > flow default > 1 ───────────
-  const concurrency = concurrencyFromFlag ?? flow.defaults?.concurrency ?? 1;
-
-  // ── Build the worker pool for real parallelism (concurrency > 1) ───────────
-  // Only built when a pool factory is wired (production); the synchronous path
-  // (concurrency === 1) and unit-test deps without makeWorkerPool run unchanged.
-  const runArgs: RunEngineArgs = {
-    db: deps.db,
-    flow,
-    projectRoot,
-    now: deps.now,
-    adapter: deps.adapter,
-    io: deps.io,
-    concurrency,
-    runId: effectiveRunId,
-    harnessRegistry: deps.bindHarnessRegistry ? deps.bindHarnessRegistry(projectRoot) : deps.harnessRegistry,
-    // The original multi-flow engine work: subflow child runner + any caller-imposed budget ceilings
-    // (min()ed with the flow's own declarations inside runExecutor).
-    ...(deps.runSubflow !== undefined && { runSubflow: deps.runSubflow }),
-    ...(budgetTokensFlag !== undefined && { budgetMaxTokens: budgetTokensFlag }),
-    ...(budgetWallClockFlag !== undefined && { budgetWallClockSeconds: budgetWallClockFlag }),
-  };
-  // A pass spends from the run's one token budget (issue #36): its ceiling is
-  // what earlier passes left, min()ed with any caller ceiling. Wall clock stays
-  // per invocation, since passes arrive whenever the subject changes.
-  if (passBudgetMaxTokens !== undefined) {
-    runArgs.budgetMaxTokens = Math.min(runArgs.budgetMaxTokens ?? Infinity, passBudgetMaxTokens);
-  }
+  // Declared here (not inside the try below) so they stay in scope for the
+  // engine drive that follows it.
+  let concurrency: number;
+  let runArgs: RunEngineArgs;
   let pool: WorkerPool | undefined;
-  if (concurrency > 1 && deps.makeWorkerPool) {
-    pool = deps.makeWorkerPool({ flowPath: resolve(flowPath), projectRoot });
-    runArgs.spawn = pool.spawn;
-    runArgs.onMessage = pool.onMessage;
+
+  try {
+    if (seedBuffer !== undefined) {
+      // Write the entry artifact to the project root, unless the pre-registration
+      // guard above already found a byte-identical pre-staged file there (an
+      // idempotent re-run) — validation (existence/content) happened above,
+      // before registerRun, so there is nothing left to check here.
+      // The parent directory is created first: a per-run workspace (the original ingress-attribution work
+      // step 2) starts empty, so a nested entry input (`work/in.json`) has no
+      // pre-existing directory to land in. No-op for shared roots that already
+      // have the directory.
+      if (artifactName && seedTargetPath && !seedTargetPreStaged) {
+        mkdirSync(dirname(seedTargetPath), { recursive: true });
+        writeFileSync(seedTargetPath, seedBuffer);
+      }
+
+      // Seed the entry card at the entry station so the engine can dispatch it.
+      // owned_paths must cover ALL stations the root card visits (not just the entry
+      // station): follow the next/resume_at chain and collect every input + output
+      // along the parent's path.  Child-lane stations (child_entry) are skipped —
+      // those get their own owned_paths from the fan-out expansion.
+      const rootOwnedPaths = new Set<string>();
+      const childEntryIds = new Set(
+        Object.values(flow.stations)
+          .map((s) => s.child_entry)
+          .filter((id): id is string => id !== undefined),
+      );
+      const terminalSet = new Set(flow.terminal_lanes ?? []);
+      // Visited-set guard: a malformed flow with a cycle in resume_at/happyPathNext
+      // would otherwise spin forever here at seed time (this runs at the config
+      // trust boundary). Stop the first time we revisit a station.
+      const visited = new Set<string>();
+      let cursor: string | undefined = entryStationId;
+      while (cursor !== undefined && !terminalSet.has(cursor) && !visited.has(cursor)) {
+        visited.add(cursor);
+        const st = flow.stations[cursor];
+        if (!st || childEntryIds.has(cursor)) break;
+        for (const p of st.inputs ?? []) rootOwnedPaths.add(p);
+        for (const p of st.outputs ?? []) rootOwnedPaths.add(p);
+        // If this station fans out, the parent card resumes at resume_at after children
+        // complete — jump there rather than following child_entry. happyPathNext maps
+        // to `string | null`; coalesce null → undefined to exit the walk cleanly.
+        cursor = st.resume_at ?? flow.happyPathNext?.[cursor] ?? undefined;
+      }
+      seededCardId =
+        passNumber !== null
+          ? passEntryCardId(effectiveRunId, passNumber)
+          : effectiveRunId === DEFAULT_RUN_ID
+            ? 'conduit-run-entry'
+            : `entry-${effectiveRunId}`;
+      const entryCard: Card = {
+        run_id: effectiveRunId,
+        id: seededCardId,
+        parent_id: null,
+        lane: entryStationId ?? 'intake',
+        status: 'ready',
+        attempt: 0,
+        wave: 0,
+        owned_paths: rootOwnedPaths.size > 0 ? [...rootOwnedPaths] : [...(entryStation?.inputs ?? []), ...(entryStation?.outputs ?? [])],
+        rework_count: 0,
+      };
+      // One transaction: the pass's entry card and the record of which ingress
+      // events it covers (issue #36) exist together or not at all, so the
+      // listener can trust run_pass_events to mean "this pass exists".
+      deps.db.getStateDb().transaction(() => {
+        deps.db.insertCard(entryCard);
+        if (passEvents.length > 0) deps.db.recordPassEvents(effectiveRunId, passNumber ?? 1, passEvents);
+        // A pass reopens a finished run: 'running' until this process records how
+        // the pass ended, exactly as a fresh registration starts.
+        if (passNumber !== null) updateRunStatus(deps.db, effectiveRunId, 'running', null);
+      })();
+    } else if (flow.happyPathNext !== undefined && entryStationId !== undefined) {
+      // FR-9 fail-closed: applies only to flows with declared entry stations (WI-351+
+      // flows that use `next` declarations). If no --input and no runnable card exists,
+      // there is nothing to seed — fail loudly rather than silently no-op.
+      const stateDb = deps.db.getStateDb();
+      // Lane names come from flow.yaml (`terminal_lanes`) with no charset
+      // restriction, so they MUST be bound as parameters — never interpolated —
+      // to keep an attacker-authored or typo'd flow from injecting SQL.
+      const terminalLanes = [...new Set(flow.terminal_lanes ?? ['done', 'scrap', 'hold'])];
+      const lanePlaceholders = terminalLanes.map(() => '?').join(', ');
+      const { n } = stateDb
+        .prepare(
+          `SELECT COUNT(*) AS n FROM cards WHERE lane NOT IN (${lanePlaceholders}) AND status NOT IN ('complete', 'scrapped', 'held')`,
+        )
+        .get(...terminalLanes) as { n: number };
+
+      if (n === 0) {
+        deps.io.err(
+          'no runnable card in DB and no --input/--input-inline provided — ' +
+            'nothing to seed for this run (use --input <file> to provide the entry data)',
+        );
+        return 1;
+      }
+    }
+
+    // ── Resolve effective concurrency cap: flag > flow default > 1 ───────────
+    concurrency = concurrencyFromFlag ?? flow.defaults?.concurrency ?? 1;
+
+    // ── Build the worker pool for real parallelism (concurrency > 1) ───────────
+    // Only built when a pool factory is wired (production); the synchronous path
+    // (concurrency === 1) and unit-test deps without makeWorkerPool run unchanged.
+    runArgs = {
+      db: deps.db,
+      flow,
+      projectRoot,
+      now: deps.now,
+      adapter: deps.adapter,
+      io: deps.io,
+      concurrency,
+      runId: effectiveRunId,
+      harnessRegistry: deps.bindHarnessRegistry ? deps.bindHarnessRegistry(projectRoot) : deps.harnessRegistry,
+      // The original multi-flow engine work: subflow child runner + any caller-imposed budget ceilings
+      // (min()ed with the flow's own declarations inside runExecutor).
+      ...(deps.runSubflow !== undefined && { runSubflow: deps.runSubflow }),
+      ...(budgetTokensFlag !== undefined && { budgetMaxTokens: budgetTokensFlag }),
+      ...(budgetWallClockFlag !== undefined && { budgetWallClockSeconds: budgetWallClockFlag }),
+    };
+    // A pass spends from the run's one token budget (issue #36): its ceiling is
+    // what earlier passes left, min()ed with any caller ceiling. Wall clock stays
+    // per invocation, since passes arrive whenever the subject changes.
+    if (passBudgetMaxTokens !== undefined) {
+      runArgs.budgetMaxTokens = Math.min(runArgs.budgetMaxTokens ?? Infinity, passBudgetMaxTokens);
+    }
+    if (concurrency > 1 && deps.makeWorkerPool) {
+      pool = deps.makeWorkerPool({ flowPath: resolve(flowPath), projectRoot });
+      runArgs.spawn = pool.spawn;
+      runArgs.onMessage = pool.onMessage;
+    }
+  } catch (err) {
+    // The lease acquired in admitAppendPass (or none, on the non-append
+    // path) must not be left held if anything below throws before the
+    // engine-drive try/finally takes ownership of releasing it.
+    if (appendPass) {
+      releaseRunLease(deps.db, effectiveRunId, process.pid);
+    }
+    throw err;
   }
 
   // ── Acquire the per-run advisory lease (the original run-lock and busy-retry work) ──────────────────────────

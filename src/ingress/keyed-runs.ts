@@ -61,7 +61,7 @@ import {
 import { resolveAlertChannel, type RedriveAlerting } from './alert-channel';
 import { stampKeyedPass, type PassEventInput } from './envelope';
 import { inspectParkedRun, recordPark } from './parked';
-import type { RunSlots } from './run-slots';
+import { keyedRunSlotId, type RunSlots } from './run-slots';
 import type { SpawnExit, SpawnFailedAlert, SpawnSeam } from './spawn';
 
 // ---------------------------------------------------------------------------
@@ -114,11 +114,6 @@ export interface KeyedEvent {
   substrateJson: string;
   /** ingress_log source for this event's entries. */
   source: string;
-}
-
-/** Slot registration for a keyed run's pass launches. */
-export function keyedRunSlotId(runId: string): string {
-  return `keyed-run:${runId}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -546,15 +541,22 @@ export async function drainKeyedRun(deps: KeyedRunDeps, runId: string): Promise<
   const keyed = db.getKeyedRun(runId);
   if (keyed === null || keyed.pending_event_id === null) return null;
 
-  const row: IngressEventRecord | null = db.getIngressEvent(keyed.pending_event_id);
+  const pendingEventId = keyed.pending_event_id;
+  const row: IngressEventRecord | null = db.getIngressEvent(pendingEventId);
   if (row === null || row.substrate_json === null || row.flow_path === null) {
+    const missing =
+      row === null
+        ? 'its ingress_events row'
+        : [row.substrate_json === null ? 'substrate_json' : null, row.flow_path === null ? 'flow_path' : null]
+            .filter((field): field is string => field !== null)
+            .join(' and ');
     db.setKeyedRunPending(runId, null);
-    return null;
-  }
-  // Defensive: if a pass already consumed the pending event, launching it
-  // again would run it twice, so the pending slot is simply empty.
-  if (db.getPassForEvent(row.event_id) !== null) {
-    db.setKeyedRunPending(runId, null);
+    db.appendIngressLog({
+      source: DRAIN_SOURCE,
+      eventId: pendingEventId,
+      outcome: 'rejected_malformed',
+      reason: `pending event '${pendingEventId}' for keyed run '${runId}' is missing ${missing}; dropped rather than launched as a pass`,
+    });
     return null;
   }
   const event: KeyedEvent = {
@@ -565,6 +567,13 @@ export async function drainKeyedRun(deps: KeyedRunDeps, runId: string): Promise<
     substrateJson: row.substrate_json,
     source: DRAIN_SOURCE,
   };
+  // Defensive: if a pass already consumed the pending event, launching it
+  // again would run it twice, so the pending slot is simply empty.
+  const applied = db.getPassForEvent(row.event_id);
+  if (applied !== null) {
+    db.setKeyedRunPending(runId, null);
+    return settleApplied(deps, event, applied);
+  }
 
   const decision = decide(deps, keyed, null);
   switch (decision.kind) {

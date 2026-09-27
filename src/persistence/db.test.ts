@@ -653,6 +653,37 @@ describe('hot-path indexes (finding #10)', () => {
       raw.close();
     }
   });
+
+  // PR #76 review (coderabbitai): countQueuedIngressForRun filtered on run_id
+  // alone, which does not imply idx_ingress_events_run_id's partial WHERE
+  // (flow_path IS NOT NULL) — SQLite falls back to a full table scan.
+  it("countQueuedIngressForRun's query plan uses the index (no full scan of ingress_events)", () => {
+    closeConduit();
+    const raw = new Database(stateDbPath, { readonly: true });
+    try {
+      const plan = raw
+        .query(
+          `EXPLAIN QUERY PLAN
+           SELECT COUNT(*) AS n FROM ingress_events e
+            WHERE e.run_id = 'run-1'
+              AND e.flow_path IS NOT NULL
+              AND (e.spawn_state = 'accepted' OR (e.spawn_state = 'failed' AND e.spawn_attempts < 3))
+              AND ('ev-before' IS NULL OR EXISTS (
+                SELECT 1 FROM ingress_events b
+                WHERE b.event_id = 'ev-before'
+                  AND (e.received_at < b.received_at
+                       OR (e.received_at = b.received_at AND e.event_id < b.event_id))
+              ))`,
+        )
+        .all()
+        .map((r) => (r as { detail: string }).detail)
+        .join(' | ');
+      expect(plan).toContain('USING INDEX idx_ingress_events_run_id');
+      expect(plan).not.toContain('SCAN e');
+    } finally {
+      raw.close();
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -1364,11 +1395,11 @@ function buildV5StateFixture(opts: {
 // AC-1: Fresh DB — all six per-run tables + runs table + run_id column + SCHEMA_VERSION = 8.
 
 describe('WI-474 AC-1: fresh DB gains run_id on all per-run tables and a runs table', () => {
-  it('SCHEMA_VERSION is 10', () => {
+  it('SCHEMA_VERSION is 11', () => {
     expect(SCHEMA_VERSION).toBe(11);
   });
 
-  it('PRAGMA user_version is 10 on a fresh DB', () => {
+  it('PRAGMA user_version is 11 on a fresh DB', () => {
     closeConduit();
     const raw = new Database(stateDbPath, { readonly: true });
     try {

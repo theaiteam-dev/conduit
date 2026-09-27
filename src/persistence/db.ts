@@ -1329,8 +1329,12 @@ class ConduitDBImpl implements ConduitDB {
   countQueuedIngressForRun(runId: string, cap: number, beforeEventId: string | null): number {
     const row = this.stateDb
       .prepare(
+        // flow_path IS NOT NULL is redundant with the accept path (every keyed row
+        // has full attribution), but it lets SQLite match idx_ingress_events_run_id's
+        // partial WHERE, which run_id = ? alone does not imply (PR #76 review).
         `SELECT COUNT(*) AS n FROM ingress_events e
          WHERE e.run_id = $run_id
+           AND e.flow_path IS NOT NULL
            AND (e.spawn_state = 'accepted' OR (e.spawn_state = 'failed' AND e.spawn_attempts < $cap))
            AND ($before IS NULL OR EXISTS (
              SELECT 1 FROM ingress_events b
@@ -1387,7 +1391,12 @@ class ConduitDBImpl implements ConduitDB {
     const insert = this.stateDb.prepare(
       'INSERT INTO run_pass_events (event_id, run_id, pass) VALUES ($event_id, $run_id, $pass)',
     );
-    for (const eventId of eventIds) insert.run({ $event_id: eventId, $run_id: runId, $pass: pass });
+    // Atomic on its own (PR #76 review): a duplicate later in the list must not
+    // leave an earlier insert recorded. bun:sqlite nests this as a savepoint
+    // when the sole caller (src/cli/main.ts) already holds an outer transaction.
+    this.stateDb.transaction(() => {
+      for (const eventId of eventIds) insert.run({ $event_id: eventId, $run_id: runId, $pass: pass });
+    })();
   }
 
   getPassForEvent(eventId: string): { run_id: string; pass: number } | null {

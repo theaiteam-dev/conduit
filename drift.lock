@@ -73,4 +73,4 @@ sig = "bd240b0922e20e22"
 [[bindings]]
 doc = "docs/installation.md"
 target = "src/cli/main.ts"
-sig = "8f930f885644e954"
+sig = "da8e322b74a4c364"

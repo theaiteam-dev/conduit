@@ -65,6 +65,7 @@ import {
 } from './recovery';
 import type { AlertSeam, SpawnFailedAlert } from './spawn';
 import { createRunSlots } from './run-slots';
+import type { KeyedRunDeps } from './keyed-runs';
 
 const CAP = 3;
 
@@ -551,6 +552,99 @@ describe('run-slot-aware re-drive (the original listener-backpressure work)', ()
 
     await expect(redriveOnBoot({ db, respawn: throwing, cap: CAP, slots })).rejects.toThrow('seam exploded');
     expect(slots.inFlightCount()).toBe(0);
+  });
+});
+
+// ===========================================================================
+// Keyed rows go through the router, not respawn (issue #36, PR #76 review)
+// ===========================================================================
+
+describe('the keyed branch of the redrive sweep (issue #36)', () => {
+  const KEYED_FLOW_ID = 'flowK';
+  const KEYED_FLOW_PATH = '/flows/keyed.yaml';
+
+  function seedKeyedRun(runId: string, maxPasses: number | null | undefined = undefined): void {
+    db.upsertKeyedRun({ runId, flowId: KEYED_FLOW_ID, flowPath: KEYED_FLOW_PATH, runKey: ['acme/widgets', '7'], maxPasses });
+  }
+
+  function acceptKeyed(eventId: string, receivedAt: number, runId: string): void {
+    db.acceptIngressEvent(eventId, receivedAt, {
+      flowId: KEYED_FLOW_ID,
+      flowPath: KEYED_FLOW_PATH,
+      runId,
+      substrateJson: JSON.stringify({ event_id: eventId }),
+    });
+  }
+
+  function keyedDeps(over: Partial<KeyedRunDeps> = {}): KeyedRunDeps {
+    return {
+      db,
+      spawn: async () => ({ ok: true }),
+      alerts: { alert: async () => {}, channels: {}, globalAlertChannel: '#ops' },
+      slots: createRunSlots(),
+      redriveCap: CAP,
+      now: () => Date.now(),
+      launching: new Set<string>(),
+      ...over,
+    };
+  }
+
+  it('routes a keyed row through the router and reports it spawned, never through respawn', async () => {
+    seedKeyedRun('run-k1');
+    acceptKeyed('ek-1', 1000, 'run-k1');
+    const respawn: RespawnSeam = async () => {
+      throw new Error('a keyed row must never reach the unkeyed respawn seam');
+    };
+
+    const report = await redriveOnBoot({ db, respawn, cap: CAP, keyed: keyedDeps() });
+
+    expect(report.spawned).toEqual(['ek-1']);
+    expect(report.failed).toEqual([]);
+    expect(report.deferred).toEqual([]);
+    expect(db.getIngressEvent('ek-1')!.spawn_state).toBe('spawned');
+  });
+
+  it('defers every remaining row, keyed and unkeyed alike, once the router finds no free run slot, and stops the sweep', async () => {
+    seedKeyedRun('run-k1');
+    acceptKeyed('ek-1', 1000, 'run-k1'); // first, keyed: the router will report 'queued'
+    db.acceptIngressEvent('e-plain', 2000); // an ordinary unkeyed row after it
+
+    const keyedSlots = createRunSlots({ capacity: 1 });
+    keyedSlots.tryAcquire('other-run-slot'); // fills the router's only slot with unrelated work
+
+    const respawnCalls: string[] = [];
+    const respawn: RespawnSeam = async (event) => {
+      respawnCalls.push(event.event_id);
+      return 'spawned';
+    };
+
+    const report = await redriveOnBoot({ db, respawn, cap: CAP, keyed: keyedDeps({ slots: keyedSlots }) });
+
+    expect(report.deferred).toEqual(['ek-1', 'e-plain']);
+    expect(report.spawned).toEqual([]);
+    expect(report.failed).toEqual([]);
+    expect(respawnCalls).toEqual([]); // the sweep stopped before reaching e-plain
+  });
+
+  it('does not report a pass_limit refusal as spawned or failed, and excludes it from the next listRedrivable', async () => {
+    // A finished pass 1: the binding's max_passes (1) means a 2nd pass is refused.
+    seedKeyedRun('run-k1', 1);
+    db.insertRun({ run_id: 'run-k1', flow: KEYED_FLOW_PATH, input_fingerprint: 'fp', status: 'done', outcome: 'complete' });
+    db.insertCard({
+      run_id: 'run-k1', id: 'entry-run-k1', parent_id: null, lane: 'done', status: 'complete',
+      attempt: 0, wave: 0, owned_paths: [], rework_count: 0,
+    });
+    acceptKeyed('ek-2', 1000, 'run-k1');
+    const respawn: RespawnSeam = async () => {
+      throw new Error('a keyed row must never reach the unkeyed respawn seam');
+    };
+
+    const report = await redriveOnBoot({ db, respawn, cap: CAP, keyed: keyedDeps() });
+
+    expect(report.spawned).toEqual([]);
+    expect(report.failed).toEqual([]);
+    expect(db.getIngressEvent('ek-2')!.spawn_state).toBe('refused');
+    expect(db.listRedrivable(CAP).map((r) => r.event_id)).not.toContain('ek-2');
   });
 });
 

@@ -317,6 +317,80 @@ describe('conduit run --pass-event: the kernel records which events a pass consu
     expect(await main(['run', flowPath, '--input-inline', '{"n":1}', '--pass-event', 'ev-1'], makeDeps())).toBe(1);
     expect(io.errors.join('\n')).toContain('--pass-event requires --run-id');
   });
+
+  describe('a mixed set of consumed and new events (PR #76 review, coderabbitai)', () => {
+    it('refuses --append-pass rather than silently dropping the new event, and releases the lease', async () => {
+      const flowPath = writeFlow();
+      const engine = completingEngine();
+      const deps = makeDeps({ runEngine: engine.runEngine });
+      await runPass1(flowPath, deps);
+      expect(
+        await main(
+          ['run', flowPath, '--run-id', RUN, '--input-inline', '{"n":2}', '--append-pass', '--pass-event', 'ev-2', '--pass-event', 'ev-3'],
+          deps,
+        ),
+      ).toBe(0);
+      // ev-2 and ev-3 are now consumed by pass 2. A third launch names one
+      // consumed event (ev-3) alongside one new one (ev-4): ambiguous.
+      const mixed = [
+        'run', flowPath, '--run-id', RUN, '--input-inline', '{"n":3}', '--append-pass',
+        '--pass-event', 'ev-3', '--pass-event', 'ev-4',
+      ];
+
+      expect(await main(mixed, deps)).toBe(EXIT_PASS_REFUSED);
+
+      const errors = io.errors.join('\n');
+      expect(errors).toContain('ev-3');
+      expect(errors).toContain('pass 2');
+      // Nothing was seeded for the refused launch, and ev-4 was never recorded.
+      expect(cardIds()).toEqual([`entry-${RUN}`, `entry-${RUN}-p2`]);
+      expect(db.getPassForEvent('ev-4')).toBeNull();
+      // The lease was released: a corrected retry still goes through.
+      expect(
+        await main(
+          ['run', flowPath, '--run-id', RUN, '--input-inline', '{"n":3}', '--append-pass', '--pass-event', 'ev-4'],
+          deps,
+        ),
+      ).toBe(0);
+      expect(db.getPassForEvent('ev-4')).toEqual({ run_id: RUN, pass: 3 });
+    });
+
+    it('refuses a fresh run (pass 1) whose --pass-event ids mix a consumed event with a new one', async () => {
+      const flowPath = writeFlow();
+      const deps = makeDeps({ runEngine: completingEngine().runEngine });
+      // ev-1 is consumed by RUN's pass 1.
+      await main(['run', flowPath, '--run-id', RUN, '--input-inline', '{"n":1}', '--pass-event', 'ev-1'], deps);
+
+      const otherRun = 'igk-pr-loop-other';
+      expect(
+        await main(
+          ['run', flowPath, '--run-id', otherRun, '--input-inline', '{"n":1}', '--pass-event', 'ev-1', '--pass-event', 'ev-9'],
+          deps,
+        ),
+      ).toBe(EXIT_PASS_REFUSED);
+
+      const errors = io.errors.join('\n');
+      expect(errors).toContain('ev-1');
+      expect(errors).toContain('pass 1');
+      // No run was ever registered for the refused launch, and ev-9 stays unrecorded.
+      expect(db.getRun(otherRun)).toBeNull();
+      expect(db.getPassForEvent('ev-9')).toBeNull();
+    });
+
+    it('treats a fresh run (pass 1) whose only --pass-event id is fully consumed as a no-op, exit 0', async () => {
+      const flowPath = writeFlow();
+      const deps = makeDeps({ runEngine: completingEngine().runEngine });
+      await main(['run', flowPath, '--run-id', RUN, '--input-inline', '{"n":1}', '--pass-event', 'ev-1'], deps);
+
+      const otherRun = 'igk-pr-loop-other2';
+      expect(
+        await main(['run', flowPath, '--run-id', otherRun, '--input-inline', '{"n":1}', '--pass-event', 'ev-1'], deps),
+      ).toBe(0);
+
+      expect(io.lines.join('\n')).toContain('already consumed by pass 1');
+      expect(db.getRun(otherRun)).toBeNull();
+    });
+  });
 });
 
 describe('conduit resume: a run that has taken passes spends from one budget', () => {
@@ -502,6 +576,65 @@ describe('conduit run --append-pass: refusals', () => {
     db.getStateDb().prepare("UPDATE runs SET status = 'halted', outcome = 'halted' WHERE run_id = $r").run({ $r: RUN });
     await appendPass(flowPath, makeDeps({ runEngine: engine.runEngine }));
     expect(db.getRun(RUN)!.holder_pid ?? null).toBeNull();
+  });
+});
+
+describe('conduit run --append-pass: lease release on a post-admission throw (PR #76 review)', () => {
+  /** Wrap `db` so `methodName` throws, delegating everything else unchanged. */
+  function throwingDb(base: ConduitDB, methodName: keyof ConduitDB, err: Error): ConduitDB {
+    return new Proxy(base, {
+      get(target, prop, receiver) {
+        if (prop === methodName) return () => { throw err; };
+        const value = Reflect.get(target, prop, target);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    }) as ConduitDB;
+  }
+
+  it('releases the run lease when the post-admission card-seeding transaction throws', async () => {
+    const flowPath = writeFlow();
+    const engine = completingEngine();
+    await runPass1(flowPath, makeDeps({ runEngine: engine.runEngine }));
+
+    const boom = new Error('boom: insertCard failed');
+    const deps = makeDeps({ db: throwingDb(db, 'insertCard', boom), runEngine: engine.runEngine });
+
+    await expect(appendPass(flowPath, deps, '{"n":2}')).rejects.toThrow('boom: insertCard failed');
+
+    // The lease was released despite the throw: nothing but the real db was
+    // touched, so this reads the live holder_pid column. The failed insertCard
+    // rolled back inside its own transaction, so no p2 card exists either.
+    expect(db.getRun(RUN)!.holder_pid ?? null).toBeNull();
+    expect(cardIds()).toEqual([`entry-${RUN}`]);
+
+    // A second append-pass (through the real, non-throwing db) is not a lease
+    // conflict, and gets pass number 2 since the failed attempt seeded nothing.
+    expect(await appendPass(flowPath, makeDeps({ runEngine: engine.runEngine }), '{"n":3}')).toBe(0);
+    expect(cardIds()).toEqual([`entry-${RUN}`, `entry-${RUN}-p2`]);
+  });
+});
+
+describe('conduit run --append-pass: refusal ordering (PR #76 review)', () => {
+  it('leaves a pre-staged entry input file untouched when admission refuses the pass', async () => {
+    const flowPath = writeFlow();
+    const engine = completingEngine();
+    await runPass1(flowPath, makeDeps({ runEngine: engine.runEngine }));
+    // Halt the run mid-pass so admitAppendPass refuses with EXIT_PASS_REFUSED
+    // (checkRunAppendable sees an unfinished card).
+    db.getStateDb().prepare("UPDATE runs SET status = 'halted', outcome = 'halted' WHERE run_id = $r").run({ $r: RUN });
+    db.getStateDb().prepare("UPDATE cards SET lane = 'only', status = 'ready' WHERE run_id = $r").run({ $r: RUN });
+
+    // Stage a distinct file at the entry input path — the seed write happens
+    // in the "Card seeding" block, AFTER admitAppendPass runs, so a refused
+    // invocation must never reach it.
+    const stagedContent = '{"staged":"do-not-touch"}';
+    writeFileSync(join(flowRoot, 'in.json'), stagedContent);
+
+    expect(await appendPass(flowPath, makeDeps({ runEngine: engine.runEngine }), '{"n":"new-pass-input"}')).toBe(
+      EXIT_PASS_REFUSED,
+    );
+
+    expect(readFileSync(join(flowRoot, 'in.json'), 'utf-8')).toBe(stagedContent);
   });
 });
 
