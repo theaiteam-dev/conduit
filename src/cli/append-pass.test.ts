@@ -18,7 +18,12 @@
  *     and seeds `entry-<runId>-p<N>`, N from the cards table;
  *   - marks the run running and drives it through the same engine path;
  *   - caps the pass's token budget at what the run has left, since the run
- *     budget is a ceiling over every pass (refused when none is left).
+ *     budget is a ceiling over every pass (refused when none is left);
+ *   - records the ingress events named by `--pass-event` with the pass's
+ *     entry card, and exits 0 without seeding when one was already consumed.
+ *
+ * `conduit resume` of a run with more than one pass applies the same budget
+ * ceiling, and refuses when nothing is left.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import { join } from 'node:path';
@@ -260,6 +265,127 @@ describe('conduit run --append-pass: the run token budget is a ceiling over ever
     expect(cardIds()).toEqual([`entry-${RUN}`]);
     expect(engine.calls).toHaveLength(1);
     expect(io.errors.join('\n')).toContain('token budget');
+  });
+});
+
+describe('conduit run --pass-event: the kernel records which events a pass consumed', () => {
+  it('records pass 1 events with the entry card', async () => {
+    const flowPath = writeFlow();
+    const deps = makeDeps({ runEngine: completingEngine().runEngine });
+    expect(
+      await main(['run', flowPath, '--run-id', RUN, '--input-inline', '{"n":1}', '--pass-event', 'ev-1'], deps),
+    ).toBe(0);
+    expect(db.getPassForEvent('ev-1')).toEqual({ run_id: RUN, pass: 1 });
+  });
+
+  it('records every event an appended pass covers against that pass', async () => {
+    const flowPath = writeFlow();
+    const deps = makeDeps({ runEngine: completingEngine().runEngine });
+    await runPass1(flowPath, deps);
+    expect(
+      await main(
+        ['run', flowPath, '--run-id', RUN, '--input-inline', '{"n":2}', '--append-pass', '--pass-event', 'ev-2', '--pass-event', 'ev-3'],
+        deps,
+      ),
+    ).toBe(0);
+    expect(db.getPassForEvent('ev-2')).toEqual({ run_id: RUN, pass: 2 });
+    expect(db.getPassForEvent('ev-3')).toEqual({ run_id: RUN, pass: 2 });
+  });
+
+  it('treats a repeat launch of a consumed event as done: exit 0, nothing seeded or driven, lease released', async () => {
+    const flowPath = writeFlow();
+    const engine = completingEngine();
+    const deps = makeDeps({ runEngine: engine.runEngine });
+    await runPass1(flowPath, deps);
+    const pass2 = ['run', flowPath, '--run-id', RUN, '--input-inline', '{"n":2}', '--append-pass', '--pass-event', 'ev-2'];
+    expect(await main(pass2, deps)).toBe(0);
+
+    expect(await main(pass2, deps)).toBe(0);
+
+    expect(cardIds()).toEqual([`entry-${RUN}`, `entry-${RUN}-p2`]);
+    expect(engine.calls).toHaveLength(2);
+    expect(io.lines.join('\n')).toContain('already consumed by pass 2');
+    // The lease was released: a pass for a new event still goes through.
+    expect(
+      await main(['run', flowPath, '--run-id', RUN, '--input-inline', '{"n":3}', '--append-pass', '--pass-event', 'ev-3'], deps),
+    ).toBe(0);
+    expect(cardIds()).toContain(`entry-${RUN}-p3`);
+  });
+
+  it('requires a named run', async () => {
+    const flowPath = writeFlow();
+    expect(await main(['run', flowPath, '--input-inline', '{"n":1}', '--pass-event', 'ev-1'], makeDeps())).toBe(1);
+    expect(io.errors.join('\n')).toContain('--pass-event requires --run-id');
+  });
+});
+
+describe('conduit resume: a run that has taken passes spends from one budget', () => {
+  /** Leave pass 2 unfinished, as a crashed or halted driver would. */
+  async function haltedPass2(flowPath: string, deps: CliDeps): Promise<void> {
+    await runPass1(flowPath, deps);
+    await appendPass(flowPath, deps);
+    db.getStateDb()
+      .prepare("UPDATE cards SET lane = 'only', status = 'ready' WHERE run_id = $r AND id = $id")
+      .run({ $r: RUN, $id: `entry-${RUN}-p2` });
+    db.getStateDb().prepare("UPDATE runs SET status = 'halted', outcome = 'halted' WHERE run_id = $r").run({ $r: RUN });
+  }
+
+  function spend(tokens: number): void {
+    db.appendJournalSpan({
+      runId: RUN, cardId: `entry-${RUN}`, station: 'only', attempt: 0, name: 'only.transform',
+      usage: { model: 'm', inputTokens: tokens, outputTokens: 0, costUsd: 0 },
+    });
+  }
+
+  it('caps the resume at what every earlier invocation left', async () => {
+    const flowPath = writeFlow(1_000);
+    const engine = completingEngine();
+    const deps = makeDeps({ runEngine: engine.runEngine });
+    await haltedPass2(flowPath, deps);
+    spend(700);
+
+    expect(await main(['resume', '--run', RUN, flowPath], deps)).toBe(0);
+
+    expect(engine.calls).toHaveLength(3);
+    expect(engine.calls[2]!.budgetMaxTokens).toBe(300);
+  });
+
+  it('leaves a single-pass run with its per-invocation budget', async () => {
+    const flowPath = writeFlow(1_000);
+    const engine = completingEngine();
+    const deps = makeDeps({ runEngine: engine.runEngine });
+    await runPass1(flowPath, deps);
+    db.getStateDb().prepare("UPDATE cards SET lane = 'only', status = 'ready' WHERE run_id = $r").run({ $r: RUN });
+    spend(700);
+
+    expect(await main(['resume', '--run', RUN, flowPath], deps)).toBe(0);
+
+    expect(engine.calls[1]!.budgetMaxTokens).toBeUndefined();
+  });
+
+  it('refuses to resume, without calling the model, when earlier passes spent the whole budget', async () => {
+    const flowPath = writeFlow(1_000);
+    let calls = 0;
+    const adapter: ModelAdapter = {
+      async call() {
+        calls++;
+        return { text: '{"text":"x"}', inputTokens: 1, outputTokens: 1, costUsd: 0 };
+      },
+    };
+    const deps = makeDeps({ adapter, runEngine: runExecutor });
+    await haltedPass2(flowPath, deps);
+    // Pass 2's station has to run again: without its checkpoint, resume
+    // cannot skip it.
+    db.getStateDb().prepare('DELETE FROM checkpoints WHERE run_id = $r AND card = $c').run({ $r: RUN, $c: `entry-${RUN}-p2` });
+    const callsBefore = calls;
+    spend(1_000);
+
+    expect(await main(['resume', '--run', RUN, flowPath], deps)).toBe(1);
+
+    expect(calls).toBe(callsBefore);
+    expect(db.getCard(RUN, `entry-${RUN}-p2`)!.lane).toBe('only');
+    expect(io.errors.join('\n')).toContain('spent the run token budget');
+    expect(db.getRun(RUN)!.holder_pid ?? null).toBeNull();
   });
 });
 

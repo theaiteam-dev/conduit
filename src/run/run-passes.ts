@@ -63,6 +63,22 @@ export function nextPassNumber(db: ConduitDB, runId: string): number {
   return highest + 1;
 }
 
+/**
+ * Tokens left under a run ceiling of `maxTokens` once every earlier
+ * invocation of runId is counted (issue #36). The run budget of a run that
+ * takes passes is one ceiling across all of them, so both `--append-pass` and
+ * `conduit resume` of such a run cap the invocation at this figure. May be
+ * zero or negative; callers clamp.
+ */
+export function remainingRunTokens(db: ConduitDB, runId: string, maxTokens: number): number {
+  return maxTokens - db.getRunUsageTotals(runId).tokens;
+}
+
+/** Has runId taken a pass beyond its first (issue #36)? */
+export function hasLaterPasses(db: ConduitDB, runId: string): boolean {
+  return nextPassNumber(db, runId) > 2;
+}
+
 /** Why a run cannot take a pass. */
 export type RunNotAppendableState = 'not_found' | 'running' | 'parked' | 'held' | 'unfinished';
 

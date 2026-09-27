@@ -129,22 +129,77 @@ export function projectSubstrate(
 // stampKeyedPass (issue #36)
 // ---------------------------------------------------------------------------
 
+/** One ingress event a keyed pass covers, as stored on its ingress_events row. */
+export interface PassEventInput {
+  eventId: string;
+  /** Unix milliseconds, as stored. */
+  receivedAt: number;
+  /** Unstamped substrate JSON. */
+  substrateJson: string;
+}
+
+/** Most events one pass's `events` list carries. */
+export const MAX_PASS_EVENTS = 50;
+
 /**
- * Stamp a keyed event's substrate with its run key and pass number, as
- * top-level `run_key` and `pass` fields, so a flow can branch on which pass it
- * is running and which subject it belongs to.
+ * Most bytes of JSON one pass's `events` list may take. The stamped substrate
+ * reaches the kernel as ONE argv string, and Linux caps a single argument at
+ * 128 KiB (MAX_ARG_STRLEN), so the list gets half of that.
+ */
+export const MAX_PASS_EVENTS_BYTES = 64 * 1024;
+
+/**
+ * Stamp a keyed event's substrate with its run key, pass number and the
+ * events the pass covers, as top-level `run_key`, `pass`, `events` and
+ * `events_truncated` fields.
+ *
+ * `run_key` and `pass` let a flow branch on which subject it belongs to and
+ * which pass it is running. `events` lists every event folded into this pass,
+ * oldest first, each as `{ event_id, received_at, substrate }`; the launching
+ * event is the last entry and its substrate's fields are also the top-level
+ * ones, as before. When several events arrive during one pass they all become
+ * the next pass, so a flow reads `events` to see each of them instead of
+ * fetching the subject's state from its source.
+ *
+ * The list is bounded by MAX_PASS_EVENTS and MAX_PASS_EVENTS_BYTES. When
+ * either cuts it, the OLDEST events are dropped and `events_truncated` is true:
+ * the flow must then fetch what it needs itself.
  *
  * Applied at LAUNCH, not at accept: an event folded into a pending pass does
  * not know its pass number until the pass starts, so the stored substrate
  * stays unstamped and every launch (hot path, re-drive, pending drain) stamps
  * it from the run's key and the pass the kernel will seed. Unkeyed events are
- * never stamped, so their substrates stay byte-identical. The two names are
+ * never stamped, so their substrates stay byte-identical. The four names are
  * reserved on keyed bindings at boot (binding.ts), so the stamp cannot shadow
  * a projected field. A substrate that is not a JSON object is returned as is;
  * the envelope and every projection are objects, so that is unreachable.
  */
-export function stampKeyedPass(substrateJson: string, runKey: readonly string[], pass: number): string {
+export function stampKeyedPass(
+  substrateJson: string,
+  runKey: readonly string[],
+  pass: number,
+  covered: readonly PassEventInput[],
+): string {
   const parsed: unknown = JSON.parse(substrateJson);
   if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return substrateJson;
-  return JSON.stringify({ ...(parsed as Record<string, unknown>), run_key: [...runKey], pass });
+
+  // Pack newest first, so a cut drops the oldest events.
+  const kept: unknown[] = [];
+  let bytes = 2; // the enclosing []
+  for (let i = covered.length - 1; i >= 0 && kept.length < MAX_PASS_EVENTS; i--) {
+    const event = covered[i]!;
+    const entry = { event_id: event.eventId, received_at: event.receivedAt, substrate: JSON.parse(event.substrateJson) };
+    const size = Buffer.byteLength(JSON.stringify(entry), 'utf8') + (kept.length > 0 ? 1 : 0);
+    if (bytes + size > MAX_PASS_EVENTS_BYTES) break;
+    kept.push(entry);
+    bytes += size;
+  }
+
+  return JSON.stringify({
+    ...(parsed as Record<string, unknown>),
+    run_key: [...runKey],
+    pass,
+    events: kept.reverse(),
+    events_truncated: kept.length < covered.length,
+  });
 }

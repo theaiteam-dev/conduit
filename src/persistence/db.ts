@@ -280,6 +280,18 @@ CREATE TABLE IF NOT EXISTS ingress_keyed_runs (
   pending_event_id TEXT,
   blocked_alerted  INTEGER NOT NULL DEFAULT 0
 );
+
+-- v11 (issue #36): which ingress events each pass of a run consumed. Written
+-- by the kernel in the same transaction that seeds the pass's entry card
+-- (conduit run --pass-event), so a row here means the pass exists. The
+-- listener reads it to avoid launching an event twice, and to hand a pass
+-- every event folded into it, not only the latest.
+CREATE TABLE IF NOT EXISTS run_pass_events (
+  event_id TEXT PRIMARY KEY,
+  run_id   TEXT NOT NULL,
+  pass     INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_run_pass_events_run ON run_pass_events(run_id, pass);
 `;
 
 const JOURNAL_DDL = `
@@ -642,7 +654,11 @@ export type IngressOutcome =
   // are all in done or scrap, the run is not parked). The event stays
   // 'spawned', since it is not a launch failure to re-drive; the channel is
   // alerted and the run takes its next pass as usual.
-  | 'pass_failed';
+  | 'pass_failed'
+  // 'already_applied': a re-drive found that a pass had already consumed the
+  // event (run_pass_events), so it was marked spawned rather than launched a
+  // second time.
+  | 'already_applied';
 
 export interface IngressLogInput {
   source: string;
@@ -699,6 +715,7 @@ const VALID_INGRESS_OUTCOMES: ReadonlySet<string> = new Set<IngressOutcome>([
   'pass_limit',
   'run_not_appendable',
   'pass_failed',
+  'already_applied',
 ]);
 
 // ---------------------------------------------------------------------------
@@ -961,6 +978,20 @@ export interface ConduitDB {
   setKeyedRunBlockedAlerted(runId: string, alerted: boolean): void;
   /** Every keyed run with a pending event, oldest run id first. */
   listKeyedRunsWithPending(): KeyedRunRecord[];
+  /**
+   * Record that pass `pass` of runId consumed these ingress events (issue
+   * #36). The kernel calls it in the transaction that seeds the pass's entry
+   * card. Throws if an event is already recorded against any pass.
+   */
+  recordPassEvents(runId: string, pass: number, eventIds: readonly string[]): void;
+  /** The pass that consumed eventId, or null when no pass has (issue #36). */
+  getPassForEvent(eventId: string): { run_id: string; pass: number } | null;
+  /**
+   * Events folded into runId's pending pass that no pass has consumed yet,
+   * ordered by (received_at, event_id) and not later than `uptoEventId`
+   * (issue #36). These, plus the launching event, are what the next pass covers.
+   */
+  listUnappliedCoalesced(runId: string, uptoEventId: string): IngressEventRecord[];
   /**
    * Append a span to the journal. Sensitive attributes are filtered first.
    * Uses the journal connection — never blocks on the state write-lock.
@@ -1350,6 +1381,37 @@ class ConduitDBImpl implements ConduitDB {
     this.stateDb
       .prepare(`UPDATE ingress_keyed_runs SET blocked_alerted = $alerted WHERE run_id = $run_id`)
       .run({ $alerted: alerted ? 1 : 0, $run_id: runId });
+  }
+
+  recordPassEvents(runId: string, pass: number, eventIds: readonly string[]): void {
+    const insert = this.stateDb.prepare(
+      'INSERT INTO run_pass_events (event_id, run_id, pass) VALUES ($event_id, $run_id, $pass)',
+    );
+    for (const eventId of eventIds) insert.run({ $event_id: eventId, $run_id: runId, $pass: pass });
+  }
+
+  getPassForEvent(eventId: string): { run_id: string; pass: number } | null {
+    return this.stateDb
+      .prepare('SELECT run_id, pass FROM run_pass_events WHERE event_id = $event_id')
+      .get({ $event_id: eventId }) as { run_id: string; pass: number } | null;
+  }
+
+  listUnappliedCoalesced(runId: string, uptoEventId: string): IngressEventRecord[] {
+    const rows = this.stateDb
+      .prepare(
+        `SELECT e.event_id, e.received_at, e.spawn_state, e.spawn_attempts,
+                e.flow_id, e.flow_path, e.run_id, e.substrate_json
+         FROM ingress_events e, ingress_events u
+         WHERE u.event_id = $upto
+           AND e.run_id = $run_id
+           AND e.spawn_state = 'coalesced'
+           AND NOT EXISTS (SELECT 1 FROM run_pass_events p WHERE p.event_id = e.event_id)
+           AND (e.received_at < u.received_at
+                OR (e.received_at = u.received_at AND e.event_id <= u.event_id))
+         ORDER BY e.received_at, e.event_id`,
+      )
+      .all({ $run_id: runId, $upto: uptoEventId }) as RawIngressEventRow[];
+    return rows.map(toIngressEventRecord);
   }
 
   listKeyedRunsWithPending(): KeyedRunRecord[] {
@@ -2516,7 +2578,13 @@ export function openConduitDB({
         max_passes       INTEGER,
         pending_event_id TEXT,
         blocked_alerted  INTEGER NOT NULL DEFAULT 0
-      )
+      );
+      CREATE TABLE IF NOT EXISTS run_pass_events (
+        event_id TEXT PRIMARY KEY,
+        run_id   TEXT NOT NULL,
+        pass     INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_run_pass_events_run ON run_pass_events(run_id, pass);
     `);
     stateDb.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
   }

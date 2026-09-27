@@ -129,7 +129,7 @@ const VALID_SLACK_TRANSPORTS = ['events', 'socket'] as const;
  * Substrate fields the listener stamps onto a keyed event's substrate at
  * launch (issue #36). A keyed binding's projection may not claim them.
  */
-const RESERVED_KEYED_SUBSTRATE_FIELDS = ['run_key', 'pass'] as const;
+const RESERVED_KEYED_SUBSTRATE_FIELDS = ['run_key', 'pass', 'events', 'events_truncated'] as const;
 
 // ---------------------------------------------------------------------------
 // Internal helpers

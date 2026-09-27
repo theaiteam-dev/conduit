@@ -47,7 +47,14 @@
  * below fails to resolve and every test errors at module load.
  */
 import { describe, it, expect } from 'bun:test';
-import { buildEnvelope, projectSubstrate, stampKeyedPass } from './envelope';
+import {
+  buildEnvelope,
+  projectSubstrate,
+  stampKeyedPass,
+  MAX_PASS_EVENTS,
+  MAX_PASS_EVENTS_BYTES,
+  type PassEventInput,
+} from './envelope';
 
 // A representative accepted-event input. Headers carry a real secret so the
 // filter wiring (AC2/AC3) is exercised against the actual db.ts filterAttributes.
@@ -252,9 +259,10 @@ describe('stampKeyedPass', () => {
     headers: {},
     body: { action: 'submitted' },
   });
+  const self: PassEventInput = { eventId: 'd-1', receivedAt: 1000, substrateJson: JSON.stringify(envelope) };
 
   it('adds run_key and pass to a full envelope as top-level fields', () => {
-    const stamped = JSON.parse(stampKeyedPass(JSON.stringify(envelope), ['12345', '7'], 3));
+    const stamped = JSON.parse(stampKeyedPass(JSON.stringify(envelope), ['12345', '7'], 3, [self]));
     expect(stamped.run_key).toEqual(['12345', '7']);
     expect(stamped.pass).toBe(3);
     expect(stamped.body).toEqual({ action: 'submitted' });
@@ -263,17 +271,68 @@ describe('stampKeyedPass', () => {
 
   it('adds them to a projected substrate too', () => {
     const projected = projectSubstrate(envelope, { action: '$.body.action' });
-    const stamped = JSON.parse(stampKeyedPass(JSON.stringify(projected), ['a'], 1));
-    expect(stamped).toEqual({ action: 'submitted', run_key: ['a'], pass: 1 });
+    const json = JSON.stringify(projected);
+    const stamped = JSON.parse(stampKeyedPass(json, ['a'], 1, [{ eventId: 'd-1', receivedAt: 1000, substrateJson: json }]));
+    expect(stamped).toEqual({
+      action: 'submitted',
+      run_key: ['a'],
+      pass: 1,
+      events: [{ event_id: 'd-1', received_at: 1000, substrate: { action: 'submitted' } }],
+      events_truncated: false,
+    });
   });
 
   it('is deterministic', () => {
     const json = JSON.stringify(envelope);
-    expect(stampKeyedPass(json, ['a'], 2)).toBe(stampKeyedPass(json, ['a'], 2));
+    expect(stampKeyedPass(json, ['a'], 2, [self])).toBe(stampKeyedPass(json, ['a'], 2, [self]));
+  });
+
+  it('lists every covered event oldest first, the launching event last', () => {
+    const covered: PassEventInput[] = [1, 2, 3].map((n) => ({
+      eventId: `d-${n}`,
+      receivedAt: n * 100,
+      substrateJson: JSON.stringify({ round: n }),
+    }));
+    const stamped = JSON.parse(stampKeyedPass(covered[2]!.substrateJson, ['a'], 4, covered));
+    expect(stamped.round).toBe(3);
+    expect(stamped.events).toEqual([
+      { event_id: 'd-1', received_at: 100, substrate: { round: 1 } },
+      { event_id: 'd-2', received_at: 200, substrate: { round: 2 } },
+      { event_id: 'd-3', received_at: 300, substrate: { round: 3 } },
+    ]);
+    expect(stamped.events_truncated).toBe(false);
+  });
+
+  it('drops the oldest events past MAX_PASS_EVENTS and says so', () => {
+    const covered: PassEventInput[] = Array.from({ length: MAX_PASS_EVENTS + 5 }, (_, i) => ({
+      eventId: `d-${i}`,
+      receivedAt: i,
+      substrateJson: JSON.stringify({ i }),
+    }));
+    const stamped = JSON.parse(stampKeyedPass(covered.at(-1)!.substrateJson, ['a'], 2, covered));
+    expect(stamped.events).toHaveLength(MAX_PASS_EVENTS);
+    expect(stamped.events[0].event_id).toBe('d-5');
+    expect(stamped.events.at(-1).event_id).toBe(`d-${MAX_PASS_EVENTS + 4}`);
+    expect(stamped.events_truncated).toBe(true);
+  });
+
+  it('drops the oldest events past MAX_PASS_EVENTS_BYTES and says so', () => {
+    const big = 'x'.repeat(Math.floor(MAX_PASS_EVENTS_BYTES / 3));
+    const covered: PassEventInput[] = [1, 2, 3, 4].map((n) => ({
+      eventId: `d-${n}`,
+      receivedAt: n,
+      substrateJson: JSON.stringify({ n, big }),
+    }));
+    const stamped = JSON.parse(stampKeyedPass(covered[3]!.substrateJson, ['a'], 2, covered));
+    expect(stamped.events.map((e: { event_id: string }) => e.event_id)).toEqual(['d-3', 'd-4']);
+    expect(Buffer.byteLength(JSON.stringify(stamped.events), 'utf8')).toBeLessThanOrEqual(MAX_PASS_EVENTS_BYTES);
+    expect(stamped.events_truncated).toBe(true);
   });
 
   it('leaves an unkeyed envelope byte-identical: buildEnvelope never emits run_key or pass', () => {
     expect('run_key' in envelope).toBe(false);
     expect('pass' in envelope).toBe(false);
+    expect('events' in envelope).toBe(false);
+    expect('events_truncated' in envelope).toBe(false);
   });
 });

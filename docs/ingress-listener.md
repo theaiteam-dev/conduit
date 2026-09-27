@@ -361,9 +361,9 @@ channels:
 - `run_key`, `when`, and `max_passes` are webhook-only. On a slack or cli
   binding they fail boot (`RUN_KEY_UNSUPPORTED_TYPE`, `WHEN_UNSUPPORTED_TYPE`,
   `INVALID_MAX_PASSES`). `max_passes` also requires `run_key`.
-- A keyed binding's `substrate` may not name `run_key` or `pass`
-  (`RESERVED_SUBSTRATE_FIELD`): the listener stamps both onto every keyed
-  pass's substrate, so a flow can branch on them. Unkeyed substrates are
+- A keyed binding's `substrate` may not name `run_key`, `pass`, `events` or
+  `events_truncated` (`RESERVED_SUBSTRATE_FIELD`): the listener stamps all
+  four onto every keyed pass's substrate (see below). Unkeyed substrates are
   unchanged.
 
 Delivery dedup is unchanged: a retried delivery is still a `duplicate`. What
@@ -372,11 +372,12 @@ an accepted keyed event does depends on its run:
 | Run state | What happens | Logged |
 |-----------|--------------|--------|
 | No run yet | Launch pass 1 (`conduit run --run-id <keyed id>`) | `accepted` |
-| A pass is in flight (launching, running, resuming, queued behind busy slots) or the run is parked | The event becomes the run's **pending** pass. Only the latest pending event is kept | `coalesced` |
+| A pass is in flight (launching, running, resuming, queued behind busy slots) or the run is parked | The event is folded into the run's **pending** pass | `coalesced` |
 | Holding a card for a human (HITL pick, integrity hard-pause) | The event becomes the pending pass; the channel is told once that events are waiting | `coalesced` |
 | Previous pass concluded: every card in `done` or `scrap`, none held | Launch the next pass (`conduit run --append-pass`) | `accepted` |
 | Concluded, `max_passes` reached | Nothing launched | `pass_limit` |
 | Stopped with unfinished cards (the andon halted it mid-pass) or crashed mid-pass | Nothing launched | `run_not_appendable` |
+| A pass already consumed this event (a re-drive of a launch whose exit was lost) | Nothing launched; the event is marked `spawned` | `already_applied` |
 
 A pass that scrapped has concluded, so the subject keeps taking passes: an
 unattended loop treats a scrapped pass as a bad outcome, not a stuck run. When
@@ -388,9 +389,28 @@ a non-zero exit that leaves the run unable to take a pass marks the event
 
 When a pass's child exits, the pending event (if any) launches as exactly one
 more pass: six review comments posted during one pass produce one trailing
-pass, run on the latest event. The flow should therefore fetch everything
-outstanding at the start of a pass rather than trust that one event is one
-change. The periodic sweep also drains pending passes, which is how a pending
+pass. That pass covers all six. Its substrate's top-level fields are the
+latest event's, and four more fields describe the pass:
+
+| Field | Value |
+|-------|-------|
+| `run_key` | The resolved key parts |
+| `pass` | The pass number |
+| `events` | Every event the pass covers, oldest first, the latest last. Each entry is `{ event_id, received_at, substrate }` |
+| `events_truncated` | `true` when the list was cut: it holds at most 50 events and 64 KiB, and the oldest are dropped first |
+
+A flow reads `events` to act on each change. It needs to fetch the subject's
+state from its source only when `events_truncated` is true.
+
+The kernel records which events each pass consumed. The listener passes the
+covered event ids to `conduit run` as `--pass-event`, and the kernel writes
+them to `run_pass_events` in the same transaction that seeds the pass's entry
+card. Before launching an event, the listener checks that table. If the
+listener lost a pass's exit (the child's handle was lost, or the listener
+restarted) and the sweep picks the event up again, the event is marked
+`spawned` and logged `already_applied` instead of running a second time.
+
+The periodic sweep also drains pending passes, which is how a pending
 pass survives a listener restart and follows a parked-run or HITL resume. A
 pass that loses the run lease to another driver (exit 75) becomes pending
 rather than failed.
@@ -406,12 +426,14 @@ Passes take a run slot like any launch and never bypass `max_concurrent_runs`.
 Their slot is registered per run, so two launches for one run never overlap.
 The run's token budget (`budgets.run.max_tokens`) is a ceiling over all its
 passes: each pass may spend only what earlier passes left, and a run with none
-left refuses the next pass. The wall-clock budget applies to each pass on its
+left refuses the next pass. `conduit resume` of a run that has taken more than
+one pass applies the same ceiling, and refuses the resume when nothing is left. The wall-clock budget applies to each pass on its
 own. Card, checkpoint, and journal state are per card, so a pass never replays
 an earlier pass's work; a fan-out in a later pass must propose child ids the
 run has not used (a reused id holds the parent with `child_id_collision`).
 Per-run keyed state (key, `max_passes`, pending event, alert flag) is kept in
-the `ingress_keyed_runs` table.
+the `ingress_keyed_runs` table, and which pass consumed each event in
+`run_pass_events`.
 
 ## The durability ledger
 
@@ -566,6 +588,7 @@ Append-only journal of all event outcomes. Columns:
   - `'pass_limit'`: A keyed run already had `max_passes` passes
   - `'run_not_appendable'`: A keyed run stopped with unfinished cards, or crashed mid-pass
   - `'pass_failed'`: A keyed pass ran and concluded unsuccessfully (its cards are in `done` or `scrap`); the event stays `spawned` and the run takes its next pass
+  - `'already_applied'`: A re-drive found that a pass already consumed the event (`run_pass_events`); the event is marked `spawned` and not launched again
 - `reason` (TEXT, nullable): Human-readable reason
 - `attributes_json` (TEXT, nullable): Event attributes (secret-filtered)
 
@@ -680,6 +703,8 @@ The ingress listener adds:
 - `ingress_keyed_runs` table (schema v11): per-run state for `run_key` bindings.
   Keyed events also use two further `spawn_state` values, `coalesced` and
   `refused`, neither of which is re-driven
+- `run_pass_events` table (schema v11): which pass of a run consumed each
+  ingress event, written by the kernel with the pass's entry card
 
 Migrations are idempotent and additive:
 

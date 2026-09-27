@@ -26,17 +26,24 @@ historical context, not public releases or public repository history.
   `done` or `scrap`, none held, including a pass that scrapped) and refuses any
   other run with exit 3 (75 on a lease conflict). The listener launches a
   finished run's next pass directly, folds events that arrive during a pass
-  into one trailing pass on the latest event (`coalesced`), keeps events for a
+  into one trailing pass (`coalesced`) whose substrate lists every event it
+  covers under `events` (at most 50 events and 64 KiB, oldest dropped first,
+  flagged by `events_truncated`), keeps events for a
   run holding a card for a human the same way, and refuses a run stopped with
   unfinished cards (`run_not_appendable`) or at the binding's optional
   `max_passes` (`pass_limit`), alerting once per run. A pass that ran and
   scrapped is logged `pass_failed` and alerted, and is not re-driven. A pending pass
   is kept in the new `ingress_keyed_runs` table (schema v11) and survives a
-  listener restart. A webhook binding can also declare `when`, ANDed
+  listener restart. The kernel records which events each pass consumed in the
+  new `run_pass_events` table, from `conduit run --pass-event`, in the same
+  transaction as the pass's entry card; the listener never launches a
+  consumed event again (`already_applied`), even after losing a pass's exit.
+  `conduit resume` of a run with more than one pass is capped at the run
+  token budget earlier invocations left. A webhook binding can also declare `when`, ANDed
   `header`/`json_path` conditions (`in`, `not_in`, `present`); a delivery that
   does not match is acked and logged `filtered` without being accepted. All
   three fields are webhook-only and validated at boot. Keyed substrates carry
-  `run_key` and `pass`; bindings without `run_key` behave exactly as before.
+  `run_key`, `pass`, `events` and `events_truncated`; bindings without `run_key` behave exactly as before.
   `commitFanOut` now rejects a child id the run already uses
   (`child_id_collision`) and holds the parent, rather than throwing on insert.
 

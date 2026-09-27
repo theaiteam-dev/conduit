@@ -10,11 +10,11 @@
  *
  *   - no run yet                  → launch pass 1 (`conduit run --run-id`).
  *   - a pass is in flight         → fold the event into the run's PENDING pass
- *     (a launch or resume holds    ('coalesced'). Only the latest folded event
- *     one of the run's slots, a    is kept: it becomes the next pass's input,
- *     live process holds the run   so six events during one pass produce ONE
- *     lease, an older event for    trailing pass, not six.
- *     the run is still queued, the
+ *     (a launch or resume holds    ('coalesced'). Six events during one pass
+ *     one of the run's slots, a    produce ONE trailing pass, not six. The
+ *     live process holds the run   latest is its top-level input, and all six
+ *     lease, an older event for    are listed in its `events` field
+ *     the run is still queued, the (stampKeyedPass).
  *     run is parked, or it holds
  *     a card for a human)
  *   - previous pass concluded     → launch the next pass with
@@ -29,6 +29,12 @@
  * events waiting on a held run; the flag is cleared when a pass launches, so a
  * run that is fixed and blocks again is reported again. Every refusal is still
  * logged.
+ *
+ * Which events each pass consumed is recorded by the kernel, in the
+ * transaction that seeds the pass's entry card (run_pass_events, written from
+ * the `--pass-event` arguments). The router checks it before launching, so an
+ * event whose pass exists is never launched a second time, even when the
+ * listener lost that pass's exit or restarted mid-launch ('already_applied').
  *
  * When a pass's child exits, the run's pending event (if any) is launched as
  * exactly one more pass. The periodic sweep drains pending events too, which
@@ -53,7 +59,7 @@ import {
   EXIT_RUN_LEASE_CONFLICT,
 } from '../run/run-passes';
 import { resolveAlertChannel, type RedriveAlerting } from './alert-channel';
-import { stampKeyedPass } from './envelope';
+import { stampKeyedPass, type PassEventInput } from './envelope';
 import { inspectParkedRun, recordPark } from './parked';
 import type { RunSlots } from './run-slots';
 import type { SpawnExit, SpawnFailedAlert, SpawnSeam } from './spawn';
@@ -94,7 +100,9 @@ export type KeyedRouteOutcome =
   | { outcome: 'run_not_appendable'; runId: string }
   | { outcome: 'spawn_failed'; runId: string }
   /** The sweep left the row alone: its launch is already in progress. */
-  | { outcome: 'deferred'; runId: string };
+  | { outcome: 'deferred'; runId: string }
+  /** A pass already consumed this event (run_pass_events): nothing to launch. */
+  | { outcome: 'already_applied'; runId: string; pass: number };
 
 /** One keyed event as the router needs it. */
 export interface KeyedEvent {
@@ -176,8 +184,9 @@ function decide(deps: KeyedRunDeps, keyed: KeyedRunRecord, beforeEventId: string
 
 /**
  * Fold an event into its run's pending pass. The pending slot keeps the
- * LATEST event (by received_at), whose substrate the trailing pass runs on;
- * an older folded event stays 'coalesced' and is superseded.
+ * LATEST event (by received_at), whose substrate is the trailing pass's
+ * top-level input. An older folded event stays 'coalesced' and rides the same
+ * pass in its `events` list (coveredEvents).
  */
 function coalesce(deps: KeyedRunDeps, keyed: KeyedRunRecord, event: KeyedEvent, why: string): KeyedRouteOutcome {
   const { db } = deps;
@@ -197,6 +206,45 @@ function coalesce(deps: KeyedRunDeps, keyed: KeyedRunRecord, event: KeyedEvent, 
     reason: `${why}: folded into the next pass of run '${keyed.run_id}'`,
   });
   return { outcome: 'coalesced', runId: keyed.run_id };
+}
+
+/**
+ * Settle an event that a pass already consumed. The kernel records the events
+ * a pass covers in the transaction that seeds it, so a row here means the
+ * pass exists even when the listener never saw its launch finish (a lost exit,
+ * a crash between spawn and mark). Launching the event again would run it
+ * twice, so the row is marked spawned and left alone.
+ */
+function settleApplied(
+  deps: KeyedRunDeps,
+  event: KeyedEvent,
+  applied: { run_id: string; pass: number },
+): KeyedRouteOutcome {
+  deps.db.markIngressSpawned(event.eventId);
+  deps.db.appendIngressLog({
+    source: event.source,
+    eventId: event.eventId,
+    outcome: 'already_applied',
+    reason: `pass ${applied.pass} of run '${applied.run_id}' already consumed this event`,
+  });
+  return { outcome: 'already_applied', runId: applied.run_id, pass: applied.pass };
+}
+
+/**
+ * The events a pass launched from `event` covers: every event folded into the
+ * run that no pass has consumed yet, up to and including `event`, oldest
+ * first. The launching event is always last.
+ */
+function coveredEvents(deps: KeyedRunDeps, runId: string, event: KeyedEvent): PassEventInput[] {
+  const folded = deps.db
+    .listUnappliedCoalesced(runId, event.eventId)
+    .filter((row) => row.event_id !== event.eventId && row.substrate_json !== null)
+    .map((row) => ({ eventId: row.event_id, receivedAt: row.received_at, substrateJson: row.substrate_json! }));
+  const own = deps.db.getIngressEvent(event.eventId);
+  return [
+    ...folded,
+    { eventId: event.eventId, receivedAt: own?.received_at ?? deps.now(), substrateJson: event.substrateJson },
+  ];
 }
 
 /** Best-effort alert that never rejects on its caller. */
@@ -280,16 +328,22 @@ async function launchPass(
   deps.launching.add(event.eventId);
   let slotHandedOff = false;
   try {
-    if (keyed.pending_event_id === event.eventId) db.setKeyedRunPending(keyed.run_id, null);
+    const covered = coveredEvents(deps, keyed.run_id, event);
+    // The pending event rides this pass when it is older than the launching
+    // one, so it must not also become a pass of its own.
+    if (keyed.pending_event_id !== null && covered.some((e) => e.eventId === keyed.pending_event_id)) {
+      db.setKeyedRunPending(keyed.run_id, null);
+    }
     db.incrementSpawnAttempts(event.eventId);
 
     let result: { ok: boolean; error?: string; exited?: Promise<SpawnExit> };
     try {
       result = await deps.spawn({
         flowPath: event.flowPath,
-        inputInline: stampKeyedPass(event.substrateJson, keyed.run_key, pass),
+        inputInline: stampKeyedPass(event.substrateJson, keyed.run_key, pass, covered),
         runId: keyed.run_id,
         ...(pass > 1 && { appendPass: true }),
+        passEvents: covered.map((e) => e.eventId),
       });
     } catch (err) {
       result = { ok: false, error: err instanceof Error ? err.message : String(err) };
@@ -302,7 +356,7 @@ async function launchPass(
         source: event.source,
         eventId: event.eventId,
         outcome: mode === 'sweep' ? 'redriven' : 'accepted',
-        reason: `pass ${pass} of keyed run '${keyed.run_id}'`,
+        reason: `pass ${pass} of keyed run '${keyed.run_id}', covering ${covered.length} event(s)`,
       });
       if (result.exited !== undefined) {
         slotHandedOff = true;
@@ -433,6 +487,9 @@ export async function routeKeyedEvent(
   const { db } = deps;
   if (deps.launching.has(event.eventId)) return { outcome: 'deferred', runId: event.runId };
 
+  const applied = db.getPassForEvent(event.eventId);
+  if (applied !== null) return settleApplied(deps, event, applied);
+
   const keyed = db.getKeyedRun(event.runId);
   if (keyed === null) {
     // Unreachable through the accept path; a hand-edited or corrupt DB. The
@@ -491,6 +548,12 @@ export async function drainKeyedRun(deps: KeyedRunDeps, runId: string): Promise<
 
   const row: IngressEventRecord | null = db.getIngressEvent(keyed.pending_event_id);
   if (row === null || row.substrate_json === null || row.flow_path === null) {
+    db.setKeyedRunPending(runId, null);
+    return null;
+  }
+  // Defensive: if a pass already consumed the pending event, launching it
+  // again would run it twice, so the pending slot is simply empty.
+  if (db.getPassForEvent(row.event_id) !== null) {
     db.setKeyedRunPending(runId, null);
     return null;
   }

@@ -592,23 +592,35 @@ run the andon halted with unfinished cards, a run whose driver died, a run holdi
 for a human, and a parked run are refused, never reopened; each still has work a resume
 finishes, and a parked run is resumed by the parked-run machinery, not by a pass. Checkpoints, outbox keys, rework counters, and
 journal spans are all keyed per card, so a pass never replays or collides with an earlier
-pass. The run token budget is a ceiling over all passes together; the wall-clock budget
-is per pass. `max_passes` is an admission limit applied by the listener, not a fifth
+pass. The run token budget is a ceiling over all passes together: `--append-pass` caps a
+pass at what earlier passes left and refuses one when nothing is left, and `conduit
+resume` of a run that has taken more than one pass applies the same cap and refusal. The
+wall-clock budget is per pass. A pass's invocation may name the ingress events it covers
+(`--pass-event`); the kernel records them in `run_pass_events` in the same transaction
+that seeds the entry card, and an invocation naming an event already recorded exits 0
+without seeding, so a repeated launch of one event is a no-op. `max_passes` is an admission limit applied by the listener, not a fifth
 rework guard: it bounds how often the subject may re-enter the line, not how often a card
 may be reworked inside a pass.
 
 The listener routes an accepted keyed event by the state of its run (ingress/keyed-runs.ts):
 no run yet launches pass 1; a concluded run takes a new pass; a pass in flight, a parked
 run, or a run holding a card for a human **coalesces** the event into the run's single
-pending pass (the latest event wins), which launches once the run is free (the in-flight
-pass exits, or the resume finishes), so N events during one pass cost one trailing pass
-rather than N; a run at `max_passes`, stopped with unfinished cards, or crashed mid-pass
+pending pass, which launches once the run is free (the in-flight pass exits, or the
+resume finishes), so N events during one pass cost one trailing pass rather than N; a run at `max_passes`, stopped with unfinished cards, or crashed mid-pass
 takes no pass. A pass that ran and concluded unsuccessfully is logged `pass_failed` and
 alerted, and its event is not re-driven: it was not a launch failure. The channel hears
 about a refusal, or about events waiting on a held run, once per run. Passes draw from the listener's run
-slots like any launch, under a per-run slot id, and never bypass them. Because events
-coalesce, a flow driven by a keyed binding must fetch everything outstanding at the start
-of each pass rather than assume one event is one change.
+slots like any launch, under a per-run slot id, and never bypass them.
+
+A pass covers every event folded into it that no earlier pass consumed. The latest is the
+pass's top-level input; the substrate also carries `run_key`, `pass`, and `events`, the
+covered events oldest first (each with its event id, arrival time, and substrate), so a
+flow sees each change without fetching the subject's state. The list is bounded (50
+events, 64 KiB); when a bound drops the oldest events, `events_truncated` is true and the
+flow must fetch what it needs. The listener passes the covered event ids as
+`--pass-event`, and before launching any event it checks `run_pass_events`: an event a pass
+already consumed is marked spawned and logged `already_applied`, never launched again,
+even when the listener lost that pass's exit.
 
 ```yaml
 channels:
@@ -999,6 +1011,7 @@ write-lock contention at batch scale (rev-1 M1).
 | `active_workers` | claimed slots + **heartbeat lease** (`lease_until`) (§9, rev-1 H8) |
 | `ingress_events` | ingress dedup log: `(event_id TEXT PRIMARY KEY, received_at INTEGER)` — prevents a listener restart from re-triggering billed runs (§4A) |
 | `ingress_keyed_runs` | per-run state for a `run_key` ingress binding: the subject key, `max_passes`, the pending event, and the alert-once flag, so a pending pass survives a listener restart (§4A) |
+| `run_pass_events` | which pass of a run consumed each ingress event, written by the kernel with the pass's entry card, so no event is launched twice and a pass lists every event it covers (§4A) |
 
 **Journal DB (append-only, high-volume, separate file/WAL):**
 

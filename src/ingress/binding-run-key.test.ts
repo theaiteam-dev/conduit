@@ -13,7 +13,8 @@
  *   INVALID_MAX_PASSES         not a positive integer, or declared without run_key,
  *                              or on a non-webhook binding
  *   RESERVED_SUBSTRATE_FIELD   a keyed binding's substrate mapping names
- *                              `run_key` or `pass`, which the listener stamps
+ *                              `run_key`, `pass`, `events` or
+ *                              `events_truncated`, which the listener stamps
  */
 import { describe, it, expect } from 'bun:test';
 import { parseIngressBinding, validateIngressBindings } from './binding';
@@ -121,6 +122,15 @@ describe('run_key', () => {
         substrate: { run_key: '$.body.key' },
       }),
     ).toBe('RESERVED_SUBSTRATE_FIELD');
+    for (const name of ['events', 'events_truncated']) {
+      expect(
+        parseErrorCode({
+          ...webhookBase,
+          run_key: [{ json_path: '$.id' }],
+          substrate: { [name]: '$.body.x' },
+        }),
+      ).toBe('RESERVED_SUBSTRATE_FIELD');
+    }
   });
 
   it('leaves those names free on an unkeyed binding', () => {

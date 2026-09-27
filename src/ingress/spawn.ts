@@ -67,6 +67,12 @@ export interface SpawnInvocation {
    * unkeyed launch and for a keyed run's first pass.
    */
   appendPass?: boolean;
+  /**
+   * Issue #36: the ingress events this keyed pass covers, passed as
+   * `--pass-event` so the kernel records them with the pass's entry card.
+   * Absent for every unkeyed launch.
+   */
+  passEvents?: string[];
 }
 
 /** Terminal state of a launched `conduit run` child (the original acknowledgement-on-accept work). */
@@ -428,6 +434,10 @@ async function runKeyedSpawnPath(
       return { outcome: 'queued', runId };
     case 'accepted':
       return { outcome: 'accepted', runId };
+    case 'already_applied':
+      // Unreachable on the hot path too: a pass can only have consumed an
+      // event that was accepted before this call.
+      return { outcome: 'duplicate' };
     default:
       return { outcome: routed.outcome, runId };
   }

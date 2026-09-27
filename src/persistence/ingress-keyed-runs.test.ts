@@ -11,7 +11,11 @@
  * Two new ingress_events spawn states: 'coalesced' (the event was folded into
  * the run's pending pass) and 'refused' (the keyed router declined it). Neither
  * is re-drivable. New ingress_log outcomes: filtered, rejected_run_key,
- * coalesced, pass_limit, run_not_appendable.
+ * coalesced, pass_limit, run_not_appendable, pass_failed, already_applied.
+ *
+ * `run_pass_events` records which pass consumed each event. The kernel writes
+ * it with the pass's entry card; the listener reads it so it never launches an
+ * event twice and so a pass lists every event folded into it.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import { Database } from 'bun:sqlite';
@@ -160,8 +164,37 @@ describe('queued ingress rows for a run', () => {
   });
 });
 
+describe('run_pass_events', () => {
+  const attr = (ev: string) => ({ flowId: 'f', flowPath: '/f.yaml', runId: KEYED.runId, substrateJson: `{"e":"${ev}"}` });
+
+  it('records which pass consumed each event, and refuses to record an event twice', () => {
+    const db = open();
+    expect(db.getPassForEvent('ev-1')).toBeNull();
+    db.recordPassEvents(KEYED.runId, 2, ['ev-1', 'ev-2']);
+    expect(db.getPassForEvent('ev-1')).toEqual({ run_id: KEYED.runId, pass: 2 });
+    expect(db.getPassForEvent('ev-2')).toEqual({ run_id: KEYED.runId, pass: 2 });
+    expect(() => db.recordPassEvents(KEYED.runId, 3, ['ev-2'])).toThrow();
+  });
+
+  it('lists coalesced events no pass consumed, oldest first, up to and including the named event', () => {
+    const db = open();
+    for (const [ev, at] of [['ev-a', 1000], ['ev-b', 1001], ['ev-c', 1002], ['ev-d', 1003], ['ev-e', 1004]] as const) {
+      db.acceptIngressEvent(ev, at, attr(ev));
+      db.markIngressCoalesced(ev);
+    }
+    db.recordPassEvents(KEYED.runId, 2, ['ev-a']); // consumed
+    db.markIngressRefused('ev-c'); // no longer coalesced
+    db.acceptIngressEvent('ev-other', 1001, { ...attr('ev-other'), runId: 'igk-other' });
+    db.markIngressCoalesced('ev-other');
+
+    expect(db.listUnappliedCoalesced(KEYED.runId, 'ev-d').map((r) => r.event_id)).toEqual(['ev-b', 'ev-d']);
+    expect(db.listUnappliedCoalesced(KEYED.runId, 'ev-e').map((r) => r.event_id)).toEqual(['ev-b', 'ev-d', 'ev-e']);
+    expect(db.listUnappliedCoalesced(KEYED.runId, 'ev-missing')).toEqual([]);
+  });
+});
+
 describe('new ingress_log outcomes', () => {
-  it.each(['filtered', 'rejected_run_key', 'coalesced', 'pass_limit', 'run_not_appendable', 'pass_failed'] as const)(
+  it.each(['filtered', 'rejected_run_key', 'coalesced', 'pass_limit', 'run_not_appendable', 'pass_failed', 'already_applied'] as const)(
     'accepts %s',
     (outcome) => {
       const db = open();
@@ -183,17 +216,20 @@ function buildV10StateDb(): void {
   db.close();
   const raw = new Database(stateDbPath);
   raw.exec('DROP TABLE IF EXISTS ingress_keyed_runs');
+  raw.exec('DROP TABLE IF EXISTS run_pass_events');
   raw.exec('PRAGMA user_version = 10');
   raw.close();
 }
 
 describe('v10→v11 migration', () => {
-  it('creates ingress_keyed_runs, keeps existing rows, and stamps the version', () => {
+  it('creates ingress_keyed_runs and run_pass_events, keeps existing rows, and stamps the version', () => {
     buildV10StateDb();
     const db = open();
     expect(db.getIngressEvent('pre-v11-event')!.spawn_state).toBe('accepted');
     db.upsertKeyedRun(KEYED);
     expect(db.getKeyedRun(KEYED.runId)!.flow_id).toBe('pr-loop');
+    db.recordPassEvents(KEYED.runId, 1, ['pre-v11-event']);
+    expect(db.getPassForEvent('pre-v11-event')).toEqual({ run_id: KEYED.runId, pass: 1 });
     db.close();
     const check = new Database(stateDbPath, { readonly: true });
     try {

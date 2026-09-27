@@ -37,6 +37,8 @@ import { deriveIngressRunId, deriveKeyedIngressRunId } from './run-id';
 import { EXIT_RUN_LEASE_CONFLICT } from '../run/run-passes';
 import type { SpawnExit, SpawnFailedAlert, SpawnInvocation, SpawnSeam } from './spawn';
 import { startListener, type ListenerDeps, type ListenerConfig } from './listener';
+import { routeKeyedEvent, type KeyedRunDeps } from './keyed-runs';
+import { createRunSlots } from './run-slots';
 
 const NOW = 1_700_000_000_000;
 const FLOW_PATH = '/flows/pr-loop.yaml';
@@ -44,7 +46,7 @@ const FLOW_ID = 'prLoop';
 
 let dir: string;
 let db: ConduitDB;
-let launches: Array<SpawnInvocation & { exit: (code: number) => void }>;
+let launches: Array<SpawnInvocation & { exit: (code: number) => void; lose: (why: string) => void }>;
 let alerts: SpawnFailedAlert[];
 
 beforeEach(() => {
@@ -66,10 +68,12 @@ afterEach(() => {
 /** Every launch stays live until the test resolves its exit. */
 const controlledSpawn: SpawnSeam = async (invocation) => {
   let resolveExit!: (exit: SpawnExit) => void;
-  const exited = new Promise<SpawnExit>((resolve) => {
+  let rejectExit!: (err: Error) => void;
+  const exited = new Promise<SpawnExit>((resolve, reject) => {
     resolveExit = resolve;
+    rejectExit = reject;
   });
-  launches.push({ ...invocation, exit: (code) => resolveExit({ code }) });
+  launches.push({ ...invocation, exit: (code) => resolveExit({ code }), lose: (why) => rejectExit(new Error(why)) });
   return { ok: true, exited };
 };
 
@@ -148,9 +152,18 @@ async function settle(): Promise<void> {
   for (let i = 0; i < 5; i++) await new Promise((resolve) => setTimeout(resolve, 0));
 }
 
+/**
+ * Play the kernel's seeding step: record the events the launch covers against
+ * its pass, as `conduit run --pass-event` does with the entry card.
+ */
+function seedPassEvents(index: number, pass: number): void {
+  db.recordPassEvents(launches[index]!.runId, pass, launches[index]!.passEvents ?? []);
+}
+
 /** Play the child: record what a completed pass leaves in the DB, then exit 0. */
 async function finishPass(index: number, pass: number): Promise<void> {
   const runId = launches[index]!.runId;
+  seedPassEvents(index, pass);
   if (db.getRun(runId) === null) {
     db.insertRun({ run_id: runId, flow: FLOW_PATH, input_fingerprint: 'fp', status: 'done', outcome: 'complete' });
   } else {
@@ -272,14 +285,21 @@ describe('run key resolution', () => {
 });
 
 describe('passes of one run', () => {
-  it('coalesces six events during a pass into one trailing pass on the latest event', async () => {
+  it('coalesces six events during a pass into one trailing pass on the latest event, listing all six', async () => {
     const listener = await boot(makeFlow(keyedIngress()));
-    await listener.handleWebhook(prEvent({ repo: 'acme/widgets', pr: 7, seq: 0 }));
+    const first = prEvent({ repo: 'acme/widgets', pr: 7, seq: 0 });
+    await listener.handleWebhook(first);
+    const folded: string[] = [];
     for (let seq = 1; seq <= 6; seq++) {
-      const res = await listener.handleWebhook(prEvent({ repo: 'acme/widgets', pr: 7, seq }));
+      const req = prEvent({ repo: 'acme/widgets', pr: 7, seq });
+      folded.push(req.headers['x-delivery']!);
+      const res = await listener.handleWebhook(req);
       expect(res.status).toBe(202);
       expect(JSON.parse(res.body!).outcome).toBe('coalesced');
     }
+    expect(launches[0]!.passEvents).toEqual([first.headers['x-delivery']!]);
+    expect(stampedInput(0)).toMatchObject({ pass: 1, events_truncated: false });
+    expect((stampedInput(0).events as unknown[]).length).toBe(1);
     expect(launches).toHaveLength(1);
     expect(db.getIngressLog({ outcome: 'coalesced' })).toHaveLength(6);
 
@@ -287,11 +307,16 @@ describe('passes of one run', () => {
 
     expect(launches).toHaveLength(2);
     expect(launches[1]!.appendPass).toBe(true);
-    expect(stampedInput(1)).toMatchObject({ pass: 2, body: { seq: 6 } });
+    expect(stampedInput(1)).toMatchObject({ pass: 2, body: { seq: 6 }, events_truncated: false });
+    const events = stampedInput(1).events as Array<{ event_id: string; substrate: { body: { seq: number } } }>;
+    expect(events.map((e) => e.event_id)).toEqual(folded);
+    expect(events.map((e) => e.substrate.body.seq)).toEqual([1, 2, 3, 4, 5, 6]);
+    expect(launches[1]!.passEvents).toEqual(folded);
     expect(db.getKeyedRun(RUN)!.pending_event_id).toBeNull();
 
     await finishPass(1, 2);
     expect(launches).toHaveLength(2);
+    for (const eventId of folded) expect(db.getPassForEvent(eventId)).toEqual({ run_id: RUN, pass: 2 });
   });
 
   it('launches the next event on a finished run as an append-pass right away', async () => {
@@ -500,6 +525,57 @@ describe('a run holding a card for a human', () => {
   });
 });
 
+describe('a pass whose exit the listener lost', () => {
+  it('is never launched again: the re-drive finds the pass the kernel recorded', async () => {
+    let tick: () => void = () => {};
+    const listener = await boot(makeFlow(keyedIngress()), {
+      redriveSchedule: (fn) => {
+        tick = fn;
+        return { cancel() {} };
+      },
+    });
+    listener.redrive.start();
+    await listener.handleWebhook(prEvent({ repo: 'acme/widgets', pr: 7 }));
+    await finishPass(0, 1);
+    const req = prEvent({ repo: 'acme/widgets', pr: 7, round: 2 });
+    await listener.handleWebhook(req);
+    expect(launches).toHaveLength(2);
+
+    // The kernel seeded pass 2 and its process still holds the run lease when
+    // the listener loses the child's exit. Before run_pass_events, the
+    // re-drive folded the event into the pending pass while the lease was
+    // held, and the drain after the run finished ran it again as pass 3.
+    seedPassEvents(1, 2);
+    db.insertCard({
+      run_id: RUN, id: `entry-${RUN}-p2`, parent_id: null, lane: 'work', status: 'working',
+      attempt: 0, wave: 0, owned_paths: [], rework_count: 0,
+    });
+    db.getStateDb()
+      .prepare("UPDATE runs SET status = 'running', outcome = NULL, holder_pid = $p WHERE run_id = $r")
+      .run({ $p: process.pid, $r: RUN });
+    launches[1]!.lose('lost the child handle');
+    await settle();
+    tick();
+    await settle();
+
+    const eventId = req.headers['x-delivery']!;
+    expect(db.getIngressEvent(eventId)!.spawn_state).toBe('spawned');
+    expect(db.getKeyedRun(RUN)!.pending_event_id).toBeNull();
+    const [entry] = db.getIngressLog({ outcome: 'already_applied' });
+    expect(entry!.reason).toContain('pass 2');
+
+    // The pass finishes and the lease is released; later sweeps launch nothing.
+    db.getStateDb().prepare("UPDATE cards SET lane = 'done', status = 'complete' WHERE run_id = $r").run({ $r: RUN });
+    db.getStateDb()
+      .prepare("UPDATE runs SET status = 'done', outcome = 'complete', holder_pid = NULL WHERE run_id = $r")
+      .run({ $r: RUN });
+    tick();
+    await settle();
+    expect(launches).toHaveLength(2);
+    listener.redrive.stop();
+  });
+});
+
 describe('restart and re-drive', () => {
   function seedFinishedRun(): void {
     db.insertRun({ run_id: RUN, flow: FLOW_PATH, input_fingerprint: 'fp', status: 'done', outcome: 'complete' });
@@ -518,6 +594,43 @@ describe('restart and re-drive', () => {
       substrateJson: JSON.stringify({ event_id: eventId, body }),
     });
   }
+
+  it('covers an older pending event in a launch from a newer one, so it never becomes a pass of its own', async () => {
+    seedFinishedRun();
+    acceptRow('ev-a', NOW - 20, { round: 'a' });
+    db.markIngressCoalesced('ev-a');
+    db.setKeyedRunPending(RUN, 'ev-a');
+    acceptRow('ev-b', NOW - 10, { round: 'b' });
+    const deps: KeyedRunDeps = {
+      db,
+      spawn: controlledSpawn,
+      alerts: { alert: async (a) => void alerts.push(a), channels: {}, globalAlertChannel: '#ops' },
+      slots: createRunSlots(),
+      redriveCap: 3,
+      now: () => NOW,
+      launching: new Set<string>(),
+    };
+
+    const routed = await routeKeyedEvent(
+      deps,
+      {
+        eventId: 'ev-b',
+        runId: RUN,
+        flowId: FLOW_ID,
+        flowPath: FLOW_PATH,
+        substrateJson: db.getIngressEvent('ev-b')!.substrate_json!,
+        source: 'test',
+      },
+      'sweep',
+    );
+
+    expect(routed).toEqual({ outcome: 'accepted', runId: RUN, pass: 2 });
+    expect(launches[0]!.passEvents).toEqual(['ev-a', 'ev-b']);
+    expect((stampedInput(0).events as Array<{ event_id: string }>).map((e) => e.event_id)).toEqual(['ev-a', 'ev-b']);
+    expect(db.getKeyedRun(RUN)!.pending_event_id).toBeNull();
+    await finishPass(0, 2);
+    expect(launches).toHaveLength(1);
+  });
 
   it('launches a pending pass recorded before a listener restart', async () => {
     seedFinishedRun();

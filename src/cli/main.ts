@@ -18,7 +18,7 @@ import { readFileSync, writeFileSync, rmSync, existsSync, statSync, mkdirSync } 
 import { join, dirname, resolve, isAbsolute } from 'node:path';
 import { createHmac, timingSafeEqual } from 'node:crypto';
 import { Database } from 'bun:sqlite';
-import type { FlowConfig } from '../types/kernel';
+import type { Card, FlowConfig } from '../types/kernel';
 import type { ConduitDB } from '../persistence/db';
 import type { WorkerMessage } from '../worker/ipc-protocol';
 import { parseWorkerMessage, serializeWorkerMessage } from '../worker/ipc-protocol';
@@ -30,8 +30,10 @@ import { acquireRunLease, releaseRunLease, peekRunLeaseHolder, defaultIsPidAlive
 import { getRunState, getRunParkedRelease, formatParkedRun, type RunStateResult } from '../run/run-state';
 import {
   checkRunAppendable,
+  hasLaterPasses,
   nextPassNumber,
   passEntryCardId,
+  remainingRunTokens,
   EXIT_PASS_REFUSED,
   EXIT_RUN_LEASE_CONFLICT,
 } from '../run/run-passes';
@@ -810,12 +812,31 @@ type AppendPassAdmission =
   | { ok: false; code: number };
 
 /**
+ * The pass that already consumed one of `passEvents`, if any (issue #36).
+ * Launching the pass again would run those events twice.
+ */
+function findAppliedPassEvent(
+  db: ConduitDB,
+  passEvents: readonly string[],
+): { eventId: string; runId: string; pass: number } | null {
+  for (const eventId of passEvents) {
+    const applied = db.getPassForEvent(eventId);
+    if (applied !== null) return { eventId, runId: applied.run_id, pass: applied.pass };
+  }
+  return null;
+}
+
+/**
  * Admit a `--append-pass` invocation (issue #36), or say why not.
  *
  *   - the run must exist, recorded against this flow path and project root
  *     (exit 1 otherwise: the invocation names the wrong run);
  *   - the run lease must be free (EXIT_RUN_LEASE_CONFLICT); it is taken here
  *     and held, so the state below cannot change under the pass;
+ *   - when an event in `passEvents` was already consumed by a pass, the
+ *     invocation is a repeat launch of that pass: it exits 0 without seeding
+ *     anything, lease released, so a listener that lost the first launch's
+ *     exit can never run the same event twice;
  *   - the run's previous pass must have concluded (run-passes.ts
  *     checkRunAppendable), and the run must have run-token budget
  *     left when the flow declares one (EXIT_PASS_REFUSED, lease released).
@@ -831,6 +852,7 @@ function admitAppendPass(
   flowPath: string,
   projectRoot: string,
   flow: FlowConfig,
+  passEvents: readonly string[],
 ): AppendPassAdmission {
   const run = deps.db.getRun(runId);
   if (run === null) {
@@ -864,12 +886,22 @@ function admitAppendPass(
     return { ok: false, code: EXIT_PASS_REFUSED };
   };
 
+  const applied = findAppliedPassEvent(deps.db, passEvents);
+  if (applied !== null) {
+    releaseRunLease(deps.db, runId, process.pid);
+    deps.io.out(
+      `event ${JSON.stringify(applied.eventId)} was already consumed by pass ${applied.pass} of run ` +
+        `${JSON.stringify(applied.runId)}; nothing to do`,
+    );
+    return { ok: false, code: 0 };
+  }
+
   const appendable = checkRunAppendable(deps.db, runId, deps.now());
   if (!appendable.ok) return refuse(appendable.detail);
 
   const maxTokens = flow.budgets?.run?.max_tokens;
   if (maxTokens === undefined) return { ok: true, passNumber: nextPassNumber(deps.db, runId) };
-  const remaining = maxTokens - deps.db.getRunUsageTotals(runId).tokens;
+  const remaining = remainingRunTokens(deps.db, runId, maxTokens);
   if (remaining <= 0) {
     return refuse(`the run token budget (${maxTokens}) is spent by earlier passes`);
   }
@@ -902,10 +934,13 @@ async function cmdRun(argv: string[], deps: CliDeps): Promise<number> {
   let budgetTokensFlag: number | undefined;
   let budgetWallClockFlag: number | undefined;
   let appendPass = false;
+  const passEvents: string[] = [];
   for (let i = 1; i < argv.length; i++) {
     const arg = argv[i]!;
     if (arg === '--append-pass') {
       appendPass = true;
+    } else if (arg === '--pass-event' && i + 1 < argv.length) {
+      passEvents.push(argv[++i]!);
     } else if (arg === '--input' && i + 1 < argv.length) {
       inputFilePath = argv[++i];
     } else if (arg === '--input-inline' && i + 1 < argv.length) {
@@ -951,6 +986,16 @@ async function cmdRun(argv: string[], deps: CliDeps): Promise<number> {
   }
   if (appendPass && inputFilePath === undefined && inputInlineText === undefined) {
     deps.io.err('error: --append-pass requires --input or --input-inline carrying the new pass input');
+    return 1;
+  }
+  // --pass-event names the ingress events a pass covers (issue #36); they are
+  // recorded against the pass, which needs a named run and an input to seed.
+  if (passEvents.length > 0 && (runIdFlag === undefined || runIdFlag === DEFAULT_RUN_ID)) {
+    deps.io.err('error: --pass-event requires --run-id naming the run (not the default run)');
+    return 1;
+  }
+  if (passEvents.length > 0 && inputFilePath === undefined && inputInlineText === undefined) {
+    deps.io.err('error: --pass-event requires --input or --input-inline carrying the pass input');
     return 1;
   }
 
@@ -1161,7 +1206,7 @@ async function cmdRun(argv: string[], deps: CliDeps): Promise<number> {
   let passNumber: number | null = null;
   let passBudgetMaxTokens: number | undefined;
   if (appendPass) {
-    const admission = admitAppendPass(deps, effectiveRunId, resolvedFlowPath, projectRoot, flow);
+    const admission = admitAppendPass(deps, effectiveRunId, resolvedFlowPath, projectRoot, flow, passEvents);
     if (!admission.ok) return admission.code;
     passNumber = admission.passNumber;
     passBudgetMaxTokens = admission.budgetMaxTokens;
@@ -1245,7 +1290,7 @@ async function cmdRun(argv: string[], deps: CliDeps): Promise<number> {
         : effectiveRunId === DEFAULT_RUN_ID
           ? 'conduit-run-entry'
           : `entry-${effectiveRunId}`;
-    deps.db.insertCard({
+    const entryCard: Card = {
       run_id: effectiveRunId,
       id: seededCardId,
       parent_id: null,
@@ -1255,10 +1300,17 @@ async function cmdRun(argv: string[], deps: CliDeps): Promise<number> {
       wave: 0,
       owned_paths: rootOwnedPaths.size > 0 ? [...rootOwnedPaths] : [...(entryStation?.inputs ?? []), ...(entryStation?.outputs ?? [])],
       rework_count: 0,
-    });
-    // A pass reopens a finished run: 'running' until this process records how
-    // the pass ended, exactly as a fresh registration starts.
-    if (passNumber !== null) updateRunStatus(deps.db, effectiveRunId, 'running', null);
+    };
+    // One transaction: the pass's entry card and the record of which ingress
+    // events it covers (issue #36) exist together or not at all, so the
+    // listener can trust run_pass_events to mean "this pass exists".
+    deps.db.getStateDb().transaction(() => {
+      deps.db.insertCard(entryCard);
+      if (passEvents.length > 0) deps.db.recordPassEvents(effectiveRunId, passNumber ?? 1, passEvents);
+      // A pass reopens a finished run: 'running' until this process records how
+      // the pass ended, exactly as a fresh registration starts.
+      if (passNumber !== null) updateRunStatus(deps.db, effectiveRunId, 'running', null);
+    })();
   } else if (flow.happyPathNext !== undefined && entryStationId !== undefined) {
     // FR-9 fail-closed: applies only to flows with declared entry stations (WI-351+
     // flows that use `next` declarations). If no --input and no runnable card exists,
@@ -1552,6 +1604,26 @@ async function cmdResume(argv: string[], deps: CliDeps): Promise<number> {
       return 1;
     }
 
+    // A run that has taken passes (issue #36) has ONE token budget across all
+    // of them, so its resume gets only what every earlier invocation left, as
+    // --append-pass does, and is refused when nothing is left: the engine
+    // checks the andon after a dispatch, so a zero ceiling would still buy one
+    // model call. A single-pass run keeps the per-invocation budget it always had.
+    let passBudgetMaxTokens: number | undefined;
+    const runMaxTokens = result.flow.budgets?.run?.max_tokens;
+    if (runMaxTokens !== undefined && hasLaterPasses(deps.db, runId)) {
+      passBudgetMaxTokens = remainingRunTokens(deps.db, runId, runMaxTokens);
+      if (passBudgetMaxTokens <= 0) {
+        releaseRunLease(deps.db, runId, process.pid);
+        deps.io.err(
+          `error: refusing to resume run ${JSON.stringify(runId)}: its passes have spent the run token budget ` +
+            `(${runMaxTokens})`,
+        );
+        if (scopedRunId !== undefined) return 1;
+        continue;
+      }
+    }
+
     // Reclaim orphaned in-flight workers for this run → interrupted.
     // Resume runs in a FRESH process: any card left 'claimed'/'working' by the
     // crashed run is orphaned regardless of its (long) lease, so we reclaim
@@ -1585,6 +1657,7 @@ async function cmdResume(argv: string[], deps: CliDeps): Promise<number> {
         ? deps.bindHarnessRegistry(resumeProjectRoot)
         : deps.harnessRegistry,
     };
+    if (passBudgetMaxTokens !== undefined) resumeArgs.budgetMaxTokens = passBudgetMaxTokens;
     let resumePool: WorkerPool | undefined;
     if (resumeConcurrency > 1 && deps.makeWorkerPool) {
       resumePool = deps.makeWorkerPool({ flowPath: resolve(flowPath), projectRoot: resumeProjectRoot });
@@ -2676,6 +2749,7 @@ export function buildProductionDeps(): CliDeps {
               invocation.runId,
               // Issue #36: the next pass of an existing keyed run.
               ...(invocation.appendPass === true ? ['--append-pass'] : []),
+              ...(invocation.passEvents ?? []).flatMap((eventId) => ['--pass-event', eventId]),
             ]),
           }),
           // The original HITL reply-and-resume work: HITL replies relaunch the parked run via `conduit resume`.
