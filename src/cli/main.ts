@@ -2671,6 +2671,8 @@ export function buildProductionDeps(): CliDeps {
               invocation.inputInline,
               '--run-id',
               invocation.runId,
+              // Issue #36: the next pass of an existing keyed run.
+              ...(invocation.appendPass === true ? ['--append-pass'] : []),
             ]),
           }),
           // The original HITL reply-and-resume work: HITL replies relaunch the parked run via `conduit resume`.

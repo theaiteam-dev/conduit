@@ -936,10 +936,12 @@ export interface ConduitDB {
   markIngressRefused(eventId: string): void;
   /**
    * Count ingress rows for runId that a sweep would still launch: 'accepted',
-   * or 'failed' under the attempt cap. `excludeEventId` leaves one row out (the
-   * row being routed). Issue #36: a queued launch is a pass in flight.
+   * or 'failed' under the attempt cap. With `beforeEventId`, only rows ordered
+   * before that event (received_at, then event_id) count, so a queued burst
+   * for one keyed run launches its oldest event and folds the rest into it.
+   * Issue #36: a queued launch is a pass in flight.
    */
-  countQueuedIngressForRun(runId: string, cap: number, excludeEventId: string | null): number;
+  countQueuedIngressForRun(runId: string, cap: number, beforeEventId: string | null): number;
   /** Keyed-run state for runId, or null when the run is not keyed (issue #36). */
   getKeyedRun(runId: string): KeyedRunRecord | null;
   /**
@@ -1287,15 +1289,20 @@ class ConduitDBImpl implements ConduitDB {
       .run({ $event_id: eventId });
   }
 
-  countQueuedIngressForRun(runId: string, cap: number, excludeEventId: string | null): number {
+  countQueuedIngressForRun(runId: string, cap: number, beforeEventId: string | null): number {
     const row = this.stateDb
       .prepare(
-        `SELECT COUNT(*) AS n FROM ingress_events
-         WHERE run_id = $run_id
-           AND (spawn_state = 'accepted' OR (spawn_state = 'failed' AND spawn_attempts < $cap))
-           AND ($exclude IS NULL OR event_id <> $exclude)`,
+        `SELECT COUNT(*) AS n FROM ingress_events e
+         WHERE e.run_id = $run_id
+           AND (e.spawn_state = 'accepted' OR (e.spawn_state = 'failed' AND e.spawn_attempts < $cap))
+           AND ($before IS NULL OR EXISTS (
+             SELECT 1 FROM ingress_events b
+             WHERE b.event_id = $before
+               AND (e.received_at < b.received_at
+                    OR (e.received_at = b.received_at AND e.event_id < b.event_id))
+           ))`,
       )
-      .get({ $run_id: runId, $cap: cap, $exclude: excludeEventId }) as { n: number };
+      .get({ $run_id: runId, $cap: cap, $before: beforeEventId }) as { n: number };
     return row.n;
   }
 

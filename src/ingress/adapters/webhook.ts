@@ -6,6 +6,9 @@
  *   2. verifyAuth   — bad/missing signature → 401, log rejected_auth, no spawn
  *   3. JSON parse   — unparseable body → 400, log rejected_malformed, no spawn
  *   4. deriveEventId — require-mode with no id → 400, log rejected_malformed, no spawn
+ *   4a. when filter  — binding's `when` not met → 200, log filtered, no accept (issue #36)
+ *   4b. run key      — binding's `run_key` unresolved → 400, log rejected_run_key,
+ *                      no accept (issue #36; same answer as a require-mode rejection)
  *   5. runSpawnPath  — exactly-once accept-spawn path (WI-406)
  *
  * Ack on accept (the original acknowledgement-on-accept work): the response is produced as soon as the event is
@@ -21,6 +24,7 @@
  * The shared secret flows through but is never written to any log or substrate.
  */
 import { deriveEventId } from '../event-id';
+import { matchesWhen, resolveRunKey } from '../run-key';
 import { runSpawnPath, type SpawnPathDeps } from '../spawn';
 import type { IngressBinding } from '../binding';
 import type { FlowConfig } from '../../types/kernel';
@@ -152,6 +156,41 @@ export async function handleWebhookRequest(
     return { status: 400 };
   }
 
+  const { binding } = resolution;
+
+  // ── Step 4a: Event filter (issue #36) ────────────────────────────────────
+  // A delivery the binding does not want (a GitHub `push` on a review loop)
+  // is acked 2xx so the provider does not retry it, and never reaches
+  // ingress_events: filtering is not an accept.
+  if (binding.when !== undefined && !matchesWhen(binding.when, { headers: req.headers, body })) {
+    db.appendIngressLog({
+      source: resolution.flowId,
+      eventId: idResult.eventId,
+      outcome: 'filtered',
+      reason: 'event did not match the binding when conditions',
+    });
+    return { status: 200, body: JSON.stringify({ outcome: 'filtered' }) };
+  }
+
+  // ── Step 4b: Run key (issue #36) ─────────────────────────────────────────
+  // Fail closed: an event the binding cannot key is refused like a
+  // require-mode event with no id. There is no fallback key, because a
+  // fallback would silently give the event a run of its own.
+  let runKey: { parts: string[]; maxPasses?: number } | undefined;
+  if (binding.run_key !== undefined) {
+    const keyResult = resolveRunKey(binding.run_key, { headers: req.headers, body });
+    if (!keyResult.ok) {
+      db.appendIngressLog({
+        source: resolution.flowId,
+        eventId: idResult.eventId,
+        outcome: 'rejected_run_key',
+        reason: keyResult.reason,
+      });
+      return { status: 400 };
+    }
+    runKey = { parts: keyResult.parts, ...(binding.max_passes !== undefined && { maxPasses: binding.max_passes }) };
+  }
+
   // ── Step 5: Accept-spawn path (WI-406) ───────────────────────────────────
   // From here the secret is no longer referenced — substrate envelope
   // construction (WI-403/buildEnvelope) runs filterAttributes on headers so
@@ -167,6 +206,7 @@ export async function handleWebhookRequest(
     flowPath: resolution.flowPath,
     flow: resolution.flow,
     substrateMapping: resolution.binding.substrate,
+    ...(runKey !== undefined && { runKey }),
   });
 
   // ── Step 6: Ack the outcome (the original acknowledgement-on-accept work) ─────────────────────────────────
@@ -174,8 +214,13 @@ export async function handleWebhookRequest(
   // behind busy run slots); 200 for a delivery that changed nothing — an
   // already-handled duplicate, or a launch that failed and is now the re-drive
   // sweep's problem. Every outcome stays 2xx, as before: a provider retry adds
-  // nothing the bounded re-drive is not already doing.
-  const accepted = spawnResult.outcome === 'accepted' || spawnResult.outcome === 'queued';
+  // nothing the bounded re-drive is not already doing. A keyed event folded
+  // into its run's pending pass (issue #36) is work put in motion too; one the
+  // keyed run refused (pass_limit, run_not_appendable) changed nothing.
+  const accepted =
+    spawnResult.outcome === 'accepted' ||
+    spawnResult.outcome === 'queued' ||
+    spawnResult.outcome === 'coalesced';
   return {
     status: accepted ? 202 : 200,
     body: JSON.stringify({

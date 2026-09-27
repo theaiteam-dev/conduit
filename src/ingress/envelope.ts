@@ -124,3 +124,27 @@ export function projectSubstrate(
   }
   return result;
 }
+
+// ---------------------------------------------------------------------------
+// stampKeyedPass (issue #36)
+// ---------------------------------------------------------------------------
+
+/**
+ * Stamp a keyed event's substrate with its run key and pass number, as
+ * top-level `run_key` and `pass` fields, so a flow can branch on which pass it
+ * is running and which subject it belongs to.
+ *
+ * Applied at LAUNCH, not at accept: an event folded into a pending pass does
+ * not know its pass number until the pass starts, so the stored substrate
+ * stays unstamped and every launch (hot path, re-drive, pending drain) stamps
+ * it from the run's key and the pass the kernel will seed. Unkeyed events are
+ * never stamped, so their substrates stay byte-identical. The two names are
+ * reserved on keyed bindings at boot (binding.ts), so the stamp cannot shadow
+ * a projected field. A substrate that is not a JSON object is returned as is;
+ * the envelope and every projection are objects, so that is unreachable.
+ */
+export function stampKeyedPass(substrateJson: string, runKey: readonly string[], pass: number): string {
+  const parsed: unknown = JSON.parse(substrateJson);
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return substrateJson;
+  return JSON.stringify({ ...(parsed as Record<string, unknown>), run_key: [...runKey], pass });
+}

@@ -16,7 +16,8 @@
  *      unset app token or a missing socket seam is a boot error.
  *   5. Run redriveOnBoot (WI-407) — completes BEFORE the listener is returned —
  *      then resume any parked ingress run whose gate has passed (issue #7,
- *      ./parked.ts); the periodic sweep repeats both.
+ *      ./parked.ts), then launch any keyed run's pending pass (issue #36,
+ *      ./keyed-runs.ts); the periodic sweep repeats all three.
  *      Both re-drive paths (boot + periodic sweep) get the alert seam and the
  *      per-flow channels resolved in step 3, so a re-driven failure alerts the
  *      way a hot-path failure does (#8).
@@ -66,6 +67,7 @@ import type { SpawnPathDeps, SpawnSeam, AlertSeam } from './spawn';
 import { createRunSlots } from './run-slots';
 import { runGatedHitlResume } from './gated-resume';
 import { resumeDueParkedRuns } from './parked';
+import { drainKeyedRuns, type KeyedRunDeps } from './keyed-runs';
 import type { ConduitDB } from '../persistence/db';
 import type { LoadFlowResult } from '../flow/load';
 import type { FlowConfig } from '../types/kernel';
@@ -420,6 +422,23 @@ export async function startListener(
   // own egress channel first; globalAlertChannel is the cross-flow fallback
   // (guaranteed to exist if we reached this point — every no-egress flow passed
   // the alert-channel check above because globalAlertChannel is set).
+  //
+  // Keyed-run routing (issue #36) is built once and shared by the hot path,
+  // both re-drive paths, and the pending drain: one in-progress launch set,
+  // one slot pool, and the per-flow alert channels resolved in phase 3.
+  const keyedDeps: KeyedRunDeps = {
+    db: deps.db,
+    spawn: deps.spawn,
+    alerts: {
+      alert: deps.alert,
+      channels: alertChannels,
+      globalAlertChannel: config.globalAlertChannel ?? '',
+    },
+    slots: runSlots,
+    redriveCap: deps.redriveCap,
+    now: deps.now,
+    launching: new Set<string>(),
+  };
   const sharedSpawnDeps: SpawnPathDeps = {
     db: deps.db,
     spawn: deps.spawn,
@@ -428,6 +447,7 @@ export async function startListener(
     redriveCap: deps.redriveCap,
     slots: runSlots,
     now: deps.now,
+    keyed: keyedDeps,
   };
 
   // ── Phase 4a: Resolve socket-transport requirements per flow ─────────────
@@ -561,6 +581,7 @@ export async function startListener(
     slots: runSlots,
     alerts: redriveAlerts,
     now: deps.now,
+    keyed: keyedDeps,
   });
 
   // Parked-run resume (issue #7): a run halted behind a provider rate limit is
@@ -581,6 +602,16 @@ export async function startListener(
           })
       : undefined;
   await resumeParked?.();
+
+  // Keyed runs (issue #36): a pending pass recorded before a restart (or left
+  // by a resume this process did not launch) launches once its run is free.
+  // Repeated after every periodic sweep, after the parked resume.
+  const drainKeyed = () => drainKeyedRuns(keyedDeps);
+  await drainKeyed();
+  const afterSweep = async () => {
+    await resumeParked?.();
+    await drainKeyed();
+  };
 
   // ── Phase 6: Build and return the wired listener ─────────────────────────
   const webhookAdapterDeps: WebhookAdapterDeps = {
@@ -659,10 +690,11 @@ export async function startListener(
           slots: runSlots,
           alerts: redriveAlerts,
           now: deps.now,
+          keyed: keyedDeps,
           intervalMs: deps.redriveIntervalMs ?? 60_000,
           ...(deps.redriveSchedule !== undefined && { schedule: deps.redriveSchedule }),
           ...(deps.onRedriveSweep !== undefined && { onSweep: deps.onRedriveSweep }),
-          ...(resumeParked !== undefined && { afterSweep: resumeParked }),
+          afterSweep,
         });
       },
       stop: () => {

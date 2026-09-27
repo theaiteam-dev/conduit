@@ -47,7 +47,7 @@
  * below fails to resolve and every test errors at module load.
  */
 import { describe, it, expect } from 'bun:test';
-import { buildEnvelope, projectSubstrate } from './envelope';
+import { buildEnvelope, projectSubstrate, stampKeyedPass } from './envelope';
 
 // A representative accepted-event input. Headers carry a real secret so the
 // filter wiring (AC2/AC3) is exercised against the actual db.ts filterAttributes.
@@ -236,5 +236,44 @@ describe('projectSubstrate', () => {
 
     expect(env).not.toBeInstanceOf(Promise);
     expect(substrate).not.toBeInstanceOf(Promise);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Keyed pass stamp (issue #36)
+// ---------------------------------------------------------------------------
+
+describe('stampKeyedPass', () => {
+  const envelope = buildEnvelope({
+    source: 'pr-loop',
+    eventId: 'd-1',
+    receivedAt: 1000,
+    authVerified: true,
+    headers: {},
+    body: { action: 'submitted' },
+  });
+
+  it('adds run_key and pass to a full envelope as top-level fields', () => {
+    const stamped = JSON.parse(stampKeyedPass(JSON.stringify(envelope), ['12345', '7'], 3));
+    expect(stamped.run_key).toEqual(['12345', '7']);
+    expect(stamped.pass).toBe(3);
+    expect(stamped.body).toEqual({ action: 'submitted' });
+    expect(stamped.event_id).toBe('d-1');
+  });
+
+  it('adds them to a projected substrate too', () => {
+    const projected = projectSubstrate(envelope, { action: '$.body.action' });
+    const stamped = JSON.parse(stampKeyedPass(JSON.stringify(projected), ['a'], 1));
+    expect(stamped).toEqual({ action: 'submitted', run_key: ['a'], pass: 1 });
+  });
+
+  it('is deterministic', () => {
+    const json = JSON.stringify(envelope);
+    expect(stampKeyedPass(json, ['a'], 2)).toBe(stampKeyedPass(json, ['a'], 2));
+  });
+
+  it('leaves an unkeyed envelope byte-identical: buildEnvelope never emits run_key or pass', () => {
+    expect('run_key' in envelope).toBe(false);
+    expect('pass' in envelope).toBe(false);
   });
 });

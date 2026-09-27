@@ -249,7 +249,9 @@ export async function resumeDueParkedRuns(deps: ParkedResumeDeps): Promise<Parke
     // exits 1, and — its gate being in the past, which is why it was due —
     // reads as neither complete nor parked, so a healthy run collects a false
     // 'did not complete' alert and a burned re-drive attempt.
-    if (slots.inFlight(run.eventId)) {
+    // A keyed run's pass launch (issue #36) registers under the RUN, not the
+    // event, so it needs its own check for the same race.
+    if (slots.inFlight(run.eventId) || slots.inFlight(`keyed-run:${run.runId}`)) {
       report.deferred.push(run.runId);
       continue;
     }

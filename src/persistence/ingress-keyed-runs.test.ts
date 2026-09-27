@@ -139,7 +139,7 @@ describe('coalesced and refused spawn states', () => {
 });
 
 describe('queued ingress rows for a run', () => {
-  it('counts accepted rows and failed rows under the cap, excluding the named event', () => {
+  it('counts accepted rows and failed rows under the cap, only those ordered before the named event', () => {
     const db = open();
     const attr = (ev: string) => ({ flowId: 'f', flowPath: '/f.yaml', runId: KEYED.runId, substrateJson: `{"e":"${ev}"}` });
     db.acceptIngressEvent('ev-accepted', 1000, attr('ev-accepted'));
@@ -153,7 +153,9 @@ describe('queued ingress rows for a run', () => {
     db.markIngressSpawned('ev-spawned');
 
     expect(db.countQueuedIngressForRun(KEYED.runId, 3, null)).toBe(2);
-    expect(db.countQueuedIngressForRun(KEYED.runId, 3, 'ev-accepted')).toBe(1);
+    expect(db.countQueuedIngressForRun(KEYED.runId, 3, 'ev-accepted')).toBe(0);
+    expect(db.countQueuedIngressForRun(KEYED.runId, 3, 'ev-failed')).toBe(1);
+    expect(db.countQueuedIngressForRun(KEYED.runId, 3, 'ev-spawned')).toBe(2);
     expect(db.countQueuedIngressForRun('igk-other', 3, null)).toBe(0);
   });
 });

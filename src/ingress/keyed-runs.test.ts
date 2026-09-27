@@ -1,0 +1,541 @@
+/**
+ * Keyed ingress runs through the real listener (issue #36).
+ *
+ * Drives startListener + handleWebhook against a real sqlite state DB, seaming
+ * only the spawn and alert I/O as the other listener tests do. The spawn seam
+ * hands back a controllable exit; `finishPass` plays the child's part by
+ * writing what a completed `conduit run` (pass 1) or `conduit run
+ * --append-pass` (pass N) leaves behind (the runs row and the pass entry card)
+ * before resolving the exit.
+ *
+ * Pinned here:
+ *   - an unkeyed binding is byte-identical to before: per-delivery run id,
+ *     unstamped substrate, no append-pass;
+ *   - `when` filters before accept (2xx, logged 'filtered', no row, no spawn);
+ *   - an unresolvable run key is refused (400, 'rejected_run_key', no row);
+ *   - alternative key paths land on the same run;
+ *   - events during a pass coalesce into ONE trailing pass, run on the latest
+ *     event's substrate;
+ *   - a finished run takes the next event as an append-pass;
+ *   - max_passes and a halted run refuse, alerting once per run;
+ *   - a parked run folds the event into its pending pass;
+ *   - a lease-conflict exit becomes pending, not spawn_failed;
+ *   - a pending pass survives a listener restart;
+ *   - the boot re-drive launches a queued keyed event correctly (append-pass
+ *     when the run exists), and the release kick launches one queued behind a
+ *     busy slot.
+ */
+import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { openConduitDB, type ConduitDB } from '../persistence/db';
+import type { FlowConfig, FlowChannels, FlowEgressChannel } from '../types/kernel';
+import type { LoadFlowResult } from '../flow/load';
+import { buildEnvelope } from './envelope';
+import { deriveIngressRunId, deriveKeyedIngressRunId } from './run-id';
+import { EXIT_RUN_LEASE_CONFLICT } from '../run/run-passes';
+import type { SpawnExit, SpawnFailedAlert, SpawnInvocation, SpawnSeam } from './spawn';
+import { startListener, type ListenerDeps, type ListenerConfig } from './listener';
+
+const NOW = 1_700_000_000_000;
+const FLOW_PATH = '/flows/pr-loop.yaml';
+const FLOW_ID = 'prLoop';
+
+let dir: string;
+let db: ConduitDB;
+let launches: Array<SpawnInvocation & { exit: (code: number) => void }>;
+let alerts: SpawnFailedAlert[];
+
+beforeEach(() => {
+  dir = mkdtempSync(join(tmpdir(), 'conduit-keyed-'));
+  db = openConduitDB({ stateDbPath: join(dir, 'state.sqlite'), journalDbPath: join(dir, 'journal.sqlite') });
+  launches = [];
+  alerts = [];
+});
+
+afterEach(() => {
+  try {
+    db.close();
+  } catch {
+    // already closed
+  }
+  rmSync(dir, { recursive: true, force: true });
+});
+
+/** Every launch stays live until the test resolves its exit. */
+const controlledSpawn: SpawnSeam = async (invocation) => {
+  let resolveExit!: (exit: SpawnExit) => void;
+  const exited = new Promise<SpawnExit>((resolve) => {
+    resolveExit = resolve;
+  });
+  launches.push({ ...invocation, exit: (code) => resolveExit({ code }) });
+  return { ok: true, exited };
+};
+
+function keyedIngress(over: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    type: 'webhook',
+    route: '/hooks/pr',
+    auth: { type: 'hmac', secret_env: 'WH_SECRET' },
+    event_id: { from: 'header', name: 'x-delivery' },
+    run_key: [{ json_path: '$.repo' }, { json_path: ['$.pr', '$.issue'] }],
+    ...over,
+  };
+}
+
+function makeFlow(ingress: Record<string, unknown>): FlowConfig {
+  const channels: FlowChannels = {
+    ingress: ingress as unknown as FlowChannels['ingress'],
+    egress: [{ type: 'slack', target: '#pr-loop' } as FlowEgressChannel],
+  };
+  return { version: 1, stations: {}, channels };
+}
+
+function loadFlowFrom(flow: FlowConfig): (path: string) => LoadFlowResult {
+  return (path) =>
+    path === FLOW_PATH ? { ok: true, flow } : { ok: false, errors: [{ code: 'FILE_NOT_FOUND', message: path }] };
+}
+
+function makeDeps(flow: FlowConfig, over: Partial<ListenerDeps> = {}): ListenerDeps {
+  return {
+    db,
+    spawn: controlledSpawn,
+    alert: async (a) => {
+      alerts.push(a);
+    },
+    loadFlow: loadFlowFrom(flow),
+    verifyWebhookAuth: () => true,
+    verifySlackAuth: () => true,
+    respawn: async () => {
+      throw new Error('a keyed row must never reach the unkeyed respawn seam');
+    },
+    redriveCap: 3,
+    now: () => NOW,
+    ...over,
+  };
+}
+
+function config(over: Partial<ListenerConfig> = {}): ListenerConfig {
+  return {
+    allowlist: { [FLOW_ID]: FLOW_PATH },
+    globalAlertChannel: '#ops',
+    secrets: { WH_SECRET: 'shh' },
+    ...over,
+  };
+}
+
+async function boot(flow: FlowConfig, over: Partial<ListenerDeps> = {}, cfg: Partial<ListenerConfig> = {}) {
+  const result = await startListener(makeDeps(flow, over), config(cfg));
+  if (!result.ok) throw new Error(`listener refused to start: ${JSON.stringify(result.errors)}`);
+  return result.listener;
+}
+
+let deliverySeq = 0;
+function prEvent(body: Record<string, unknown>, headers: Record<string, string> = {}) {
+  deliverySeq += 1;
+  return {
+    route: '/hooks/pr',
+    headers: { 'x-delivery': `d-${deliverySeq}-${Math.random()}`, 'X-GitHub-Event': 'pull_request_review', ...headers },
+    rawBody: JSON.stringify(body),
+  };
+}
+
+const RUN = deriveKeyedIngressRunId(FLOW_ID, ['acme/widgets', '7']);
+
+/** Let detached watchers and drains run. */
+async function settle(): Promise<void> {
+  for (let i = 0; i < 5; i++) await new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+/** Play the child: record what a completed pass leaves in the DB, then exit 0. */
+async function finishPass(index: number, pass: number): Promise<void> {
+  const runId = launches[index]!.runId;
+  if (db.getRun(runId) === null) {
+    db.insertRun({ run_id: runId, flow: FLOW_PATH, input_fingerprint: 'fp', status: 'done', outcome: 'complete' });
+  } else {
+    db.getStateDb().prepare("UPDATE runs SET status = 'done', outcome = 'complete' WHERE run_id = $r").run({ $r: runId });
+  }
+  db.insertCard({
+    run_id: runId,
+    id: pass === 1 ? `entry-${runId}` : `entry-${runId}-p${pass}`,
+    parent_id: null,
+    lane: 'done',
+    status: 'complete',
+    attempt: 0,
+    wave: 0,
+    owned_paths: [],
+    rework_count: 0,
+  });
+  launches[index]!.exit(0);
+  await settle();
+}
+
+function stampedInput(index: number): Record<string, unknown> {
+  return JSON.parse(launches[index]!.inputInline) as Record<string, unknown>;
+}
+
+// ---------------------------------------------------------------------------
+
+describe('an unkeyed binding is unchanged', () => {
+  it('derives the per-delivery run id and passes the plain envelope, never an append-pass', async () => {
+    const ingress = keyedIngress();
+    delete ingress['run_key'];
+    const listener = await boot(makeFlow(ingress));
+    const req = prEvent({ repo: 'acme/widgets', pr: 7 });
+
+    const res = await listener.handleWebhook(req);
+
+    expect(res.status).toBe(202);
+    expect(launches).toHaveLength(1);
+    const eventId = req.headers['x-delivery']!;
+    expect(launches[0]!.runId).toBe(deriveIngressRunId(eventId));
+    expect(launches[0]!.appendPass).toBeUndefined();
+    const expected = buildEnvelope({
+      source: FLOW_ID,
+      eventId,
+      receivedAt: NOW,
+      authVerified: true,
+      headers: req.headers,
+      body: { repo: 'acme/widgets', pr: 7 },
+    });
+    expect(launches[0]!.inputInline).toBe(JSON.stringify(expected));
+    expect(db.getKeyedRun(launches[0]!.runId)).toBeNull();
+  });
+});
+
+describe('when filter', () => {
+  const flow = () =>
+    makeFlow(keyedIngress({ when: [{ header: 'X-GitHub-Event', in: ['pull_request_review', 'issue_comment'] }] }));
+
+  it('acks and logs a non-matching event without accepting or spawning it', async () => {
+    const listener = await boot(flow());
+    const req = prEvent({ repo: 'acme/widgets', pr: 7 }, { 'X-GitHub-Event': 'push' });
+
+    const res = await listener.handleWebhook(req);
+
+    expect(res.status).toBe(200);
+    expect(JSON.parse(res.body!)).toEqual({ outcome: 'filtered' });
+    expect(launches).toHaveLength(0);
+    expect(db.getIngressEvent(req.headers['x-delivery']!)).toBeNull();
+    expect(db.getIngressLog({ outcome: 'filtered' })).toHaveLength(1);
+  });
+
+  it('accepts a matching event', async () => {
+    const listener = await boot(flow());
+    expect((await listener.handleWebhook(prEvent({ repo: 'acme/widgets', pr: 7 }))).status).toBe(202);
+    expect(launches).toHaveLength(1);
+  });
+
+  it('filters an unkeyed binding too', async () => {
+    const ingress = keyedIngress({ when: [{ json_path: '$.action', in: ['submitted'] }] });
+    delete ingress['run_key'];
+    const listener = await boot(makeFlow(ingress));
+    expect((await listener.handleWebhook(prEvent({ action: 'edited' }))).status).toBe(200);
+    expect(launches).toHaveLength(0);
+  });
+});
+
+describe('run key resolution', () => {
+  it('refuses an event whose key does not resolve: 400, logged, never accepted', async () => {
+    const listener = await boot(makeFlow(keyedIngress()));
+    const req = prEvent({ repo: 'acme/widgets' }); // neither pr nor issue
+
+    const res = await listener.handleWebhook(req);
+
+    expect(res.status).toBe(400);
+    expect(launches).toHaveLength(0);
+    expect(db.getIngressEvent(req.headers['x-delivery']!)).toBeNull();
+    const [entry] = db.getIngressLog({ outcome: 'rejected_run_key' });
+    expect(entry!.reason).toContain('part 1');
+  });
+
+  it('launches pass 1 under the keyed run id, stamped with run_key and pass', async () => {
+    const listener = await boot(makeFlow(keyedIngress()));
+    const res = await listener.handleWebhook(prEvent({ repo: 'acme/widgets', pr: 7 }));
+
+    expect(res.status).toBe(202);
+    expect(JSON.parse(res.body!)).toEqual({ outcome: 'accepted', run_id: RUN });
+    expect(launches[0]!.runId).toBe(RUN);
+    expect(launches[0]!.appendPass).toBeUndefined();
+    expect(stampedInput(0)).toMatchObject({ run_key: ['acme/widgets', '7'], pass: 1 });
+  });
+
+  it('maps an alternative path onto the same run', async () => {
+    const listener = await boot(makeFlow(keyedIngress()));
+    await listener.handleWebhook(prEvent({ repo: 'acme/widgets', pr: 7 }));
+    await finishPass(0, 1);
+    await listener.handleWebhook(prEvent({ repo: 'acme/widgets', issue: 7 }));
+    expect(launches[1]!.runId).toBe(RUN);
+    expect(launches[1]!.appendPass).toBe(true);
+  });
+});
+
+describe('passes of one run', () => {
+  it('coalesces six events during a pass into one trailing pass on the latest event', async () => {
+    const listener = await boot(makeFlow(keyedIngress()));
+    await listener.handleWebhook(prEvent({ repo: 'acme/widgets', pr: 7, seq: 0 }));
+    for (let seq = 1; seq <= 6; seq++) {
+      const res = await listener.handleWebhook(prEvent({ repo: 'acme/widgets', pr: 7, seq }));
+      expect(res.status).toBe(202);
+      expect(JSON.parse(res.body!).outcome).toBe('coalesced');
+    }
+    expect(launches).toHaveLength(1);
+    expect(db.getIngressLog({ outcome: 'coalesced' })).toHaveLength(6);
+
+    await finishPass(0, 1);
+
+    expect(launches).toHaveLength(2);
+    expect(launches[1]!.appendPass).toBe(true);
+    expect(stampedInput(1)).toMatchObject({ pass: 2, body: { seq: 6 } });
+    expect(db.getKeyedRun(RUN)!.pending_event_id).toBeNull();
+
+    await finishPass(1, 2);
+    expect(launches).toHaveLength(2);
+  });
+
+  it('launches the next event on a finished run as an append-pass right away', async () => {
+    const listener = await boot(makeFlow(keyedIngress()));
+    await listener.handleWebhook(prEvent({ repo: 'acme/widgets', pr: 7 }));
+    await finishPass(0, 1);
+
+    const res = await listener.handleWebhook(prEvent({ repo: 'acme/widgets', pr: 7, round: 2 }));
+
+    expect(JSON.parse(res.body!).outcome).toBe('accepted');
+    expect(launches[1]!.appendPass).toBe(true);
+    expect(stampedInput(1)).toMatchObject({ pass: 2, body: { round: 2 } });
+  });
+
+  it('keeps separate subjects in separate runs that run concurrently', async () => {
+    const listener = await boot(makeFlow(keyedIngress()));
+    await listener.handleWebhook(prEvent({ repo: 'acme/widgets', pr: 7 }));
+    await listener.handleWebhook(prEvent({ repo: 'acme/widgets', pr: 8 }));
+    expect(launches.map((l) => l.runId)).toEqual([RUN, deriveKeyedIngressRunId(FLOW_ID, ['acme/widgets', '8'])]);
+  });
+
+  it('refuses past max_passes, alerting once per run', async () => {
+    const listener = await boot(makeFlow(keyedIngress({ max_passes: 2 })));
+    await listener.handleWebhook(prEvent({ repo: 'acme/widgets', pr: 7 }));
+    await finishPass(0, 1);
+    await listener.handleWebhook(prEvent({ repo: 'acme/widgets', pr: 7 }));
+    await finishPass(1, 2);
+
+    const first = prEvent({ repo: 'acme/widgets', pr: 7 });
+    const res = await listener.handleWebhook(first);
+    await listener.handleWebhook(prEvent({ repo: 'acme/widgets', pr: 7 }));
+    await settle();
+
+    expect(res.status).toBe(200);
+    expect(JSON.parse(res.body!).outcome).toBe('pass_limit');
+    expect(launches).toHaveLength(2);
+    expect(db.getIngressLog({ outcome: 'pass_limit' })).toHaveLength(2);
+    expect(alerts).toHaveLength(1);
+    expect(alerts[0]!.channel).toBe('#pr-loop');
+    expect(alerts[0]!.reason).toContain('max_passes');
+    expect(db.getIngressEvent(first.headers['x-delivery']!)!.spawn_state).toBe('refused');
+  });
+
+  it('refuses a halted run, alerting once per run', async () => {
+    const listener = await boot(makeFlow(keyedIngress()));
+    await listener.handleWebhook(prEvent({ repo: 'acme/widgets', pr: 7 }));
+    await finishPass(0, 1);
+    db.getStateDb().prepare("UPDATE runs SET status = 'halted', outcome = 'halted' WHERE run_id = $r").run({ $r: RUN });
+
+    await listener.handleWebhook(prEvent({ repo: 'acme/widgets', pr: 7 }));
+    await listener.handleWebhook(prEvent({ repo: 'acme/widgets', pr: 7 }));
+    await settle();
+
+    expect(launches).toHaveLength(1);
+    expect(db.getIngressLog({ outcome: 'run_not_appendable' })).toHaveLength(2);
+    expect(alerts).toHaveLength(1);
+  });
+
+  it('folds an event for a parked run into its pending pass without launching', async () => {
+    const listener = await boot(makeFlow(keyedIngress()));
+    await listener.handleWebhook(prEvent({ repo: 'acme/widgets', pr: 7 }));
+    await finishPass(0, 1);
+    db.getStateDb().prepare("UPDATE runs SET status = 'halted', outcome = 'parked' WHERE run_id = $r").run({ $r: RUN });
+
+    const req = prEvent({ repo: 'acme/widgets', pr: 7 });
+    const res = await listener.handleWebhook(req);
+
+    expect(JSON.parse(res.body!).outcome).toBe('coalesced');
+    expect(launches).toHaveLength(1);
+    expect(db.getKeyedRun(RUN)!.pending_event_id).toBe(req.headers['x-delivery']!);
+  });
+
+  it('turns a lease-conflict exit into a pending pass, not a failure, and launches it once the run is free', async () => {
+    const listener = await boot(makeFlow(keyedIngress()));
+    await listener.handleWebhook(prEvent({ repo: 'acme/widgets', pr: 7 }));
+    await finishPass(0, 1);
+    const req = prEvent({ repo: 'acme/widgets', pr: 7, round: 2 });
+    await listener.handleWebhook(req);
+    expect(launches).toHaveLength(2);
+
+    // Another live driver took the run between the check and the launch; while
+    // it holds the lease, the drain after the exit waits.
+    db.getStateDb().prepare('UPDATE runs SET holder_pid = $p WHERE run_id = $r').run({ $p: process.pid, $r: RUN });
+    launches[1]!.exit(EXIT_RUN_LEASE_CONFLICT);
+    await settle();
+
+    const eventId = req.headers['x-delivery']!;
+    expect(db.getIngressEvent(eventId)!.spawn_state).toBe('coalesced');
+    expect(db.getKeyedRun(RUN)!.pending_event_id).toBe(eventId);
+    expect(db.getIngressLog({ outcome: 'spawn_failed' })).toHaveLength(0);
+    expect(alerts).toHaveLength(0);
+    expect(launches).toHaveLength(2);
+
+    // The other driver finishes; the next drain launches the pending pass.
+    db.getStateDb().prepare('UPDATE runs SET holder_pid = NULL WHERE run_id = $r').run({ $r: RUN });
+    await boot(makeFlow(keyedIngress())); // a fresh listener drains at boot
+    expect(launches).toHaveLength(3);
+    expect(launches[2]!.appendPass).toBe(true);
+    expect(stampedInput(2)).toMatchObject({ pass: 2, body: { round: 2 } });
+  });
+
+  it('reports a failed pass like any failed launch', async () => {
+    const listener = await boot(makeFlow(keyedIngress()));
+    const req = prEvent({ repo: 'acme/widgets', pr: 7 });
+    await listener.handleWebhook(req);
+    db.insertRun({ run_id: RUN, flow: FLOW_PATH, input_fingerprint: 'fp', status: 'halted', outcome: 'halted' });
+    launches[0]!.exit(1);
+    await settle();
+    expect(db.getIngressEvent(req.headers['x-delivery']!)!.spawn_state).toBe('failed');
+    expect(db.getIngressLog({ outcome: 'spawn_failed' })).toHaveLength(1);
+    expect(alerts).toHaveLength(1);
+  });
+});
+
+describe('restart and re-drive', () => {
+  function seedFinishedRun(): void {
+    db.insertRun({ run_id: RUN, flow: FLOW_PATH, input_fingerprint: 'fp', status: 'done', outcome: 'complete' });
+    db.insertCard({
+      run_id: RUN, id: `entry-${RUN}`, parent_id: null, lane: 'done', status: 'complete',
+      attempt: 0, wave: 0, owned_paths: [], rework_count: 0,
+    });
+    db.upsertKeyedRun({ runId: RUN, flowId: FLOW_ID, flowPath: FLOW_PATH, runKey: ['acme/widgets', '7'], maxPasses: undefined });
+  }
+
+  function acceptRow(eventId: string, receivedAt: number, body: Record<string, unknown>): void {
+    db.acceptIngressEvent(eventId, receivedAt, {
+      flowId: FLOW_ID,
+      flowPath: FLOW_PATH,
+      runId: RUN,
+      substrateJson: JSON.stringify({ event_id: eventId, body }),
+    });
+  }
+
+  it('launches a pending pass recorded before a listener restart', async () => {
+    seedFinishedRun();
+    acceptRow('ev-pending', NOW - 10, { round: 2 });
+    db.markIngressCoalesced('ev-pending');
+    db.setKeyedRunPending(RUN, 'ev-pending');
+
+    await boot(makeFlow(keyedIngress()));
+
+    expect(launches).toHaveLength(1);
+    expect(launches[0]!.appendPass).toBe(true);
+    expect(stampedInput(0)).toMatchObject({ event_id: 'ev-pending', pass: 2, run_key: ['acme/widgets', '7'] });
+    expect(db.getKeyedRun(RUN)!.pending_event_id).toBeNull();
+    expect(db.getIngressEvent('ev-pending')!.spawn_state).toBe('spawned');
+  });
+
+  it('keeps the pending pass while the run is still being driven after a restart', async () => {
+    seedFinishedRun();
+    db.getStateDb().prepare("UPDATE runs SET status = 'running', holder_pid = $p WHERE run_id = $r").run({ $p: process.pid, $r: RUN });
+    acceptRow('ev-pending', NOW - 10, { round: 2 });
+    db.markIngressCoalesced('ev-pending');
+    db.setKeyedRunPending(RUN, 'ev-pending');
+
+    await boot(makeFlow(keyedIngress()));
+
+    expect(launches).toHaveLength(0);
+    expect(db.getKeyedRun(RUN)!.pending_event_id).toBe('ev-pending');
+  });
+
+  it('re-drives a queued keyed event on an existing run as an append-pass, folding later ones into it', async () => {
+    seedFinishedRun();
+    acceptRow('ev-a', NOW - 20, { round: 'a' });
+    acceptRow('ev-b', NOW - 10, { round: 'b' });
+
+    await boot(makeFlow(keyedIngress()));
+
+    expect(launches).toHaveLength(1);
+    expect(launches[0]!.appendPass).toBe(true);
+    expect(stampedInput(0)).toMatchObject({ pass: 2, body: { round: 'a' } });
+    expect(db.getIngressEvent('ev-b')!.spawn_state).toBe('coalesced');
+    expect(db.getKeyedRun(RUN)!.pending_event_id).toBe('ev-b');
+
+    await finishPass(0, 2);
+    expect(launches).toHaveLength(2);
+    expect(stampedInput(1)).toMatchObject({ pass: 3, body: { round: 'b' } });
+  });
+
+  it('re-drives a queued first event as pass 1 when the run does not exist yet', async () => {
+    db.upsertKeyedRun({ runId: RUN, flowId: FLOW_ID, flowPath: FLOW_PATH, runKey: ['acme/widgets', '7'], maxPasses: undefined });
+    acceptRow('ev-first', NOW - 10, { round: 1 });
+
+    await boot(makeFlow(keyedIngress()));
+
+    expect(launches).toHaveLength(1);
+    expect(launches[0]!.appendPass).toBeUndefined();
+    expect(stampedInput(0)).toMatchObject({ pass: 1 });
+  });
+
+  it('folds a second event for a run whose first event is still queued, instead of queueing both', async () => {
+    const listener = await boot(
+      makeFlow(keyedIngress()),
+      { redriveSchedule: () => ({ cancel() {} }) },
+      { maxConcurrentRuns: 1 },
+    );
+    listener.redrive.start();
+    await listener.handleWebhook(prEvent({ repo: 'acme/widgets', pr: 8 }));
+    await listener.handleWebhook(prEvent({ repo: 'acme/widgets', pr: 7, round: 'a' }));
+    const second = await listener.handleWebhook(prEvent({ repo: 'acme/widgets', pr: 7, round: 'b' }));
+    expect(JSON.parse(second.body!).outcome).toBe('coalesced');
+
+    await finishPass(0, 1); // frees the slot: the queued pass 1 of RUN launches
+    expect(launches).toHaveLength(2);
+    expect(stampedInput(1)).toMatchObject({ pass: 1, body: { round: 'a' } });
+
+    await finishPass(1, 1); // pass 1 of RUN done: the folded event is pass 2
+    expect(launches).toHaveLength(3);
+    expect(stampedInput(2)).toMatchObject({ pass: 2, body: { round: 'b' } });
+    listener.redrive.stop();
+  });
+
+  it('keeps the latest event pending when an older one is folded after it', async () => {
+    seedFinishedRun();
+    db.getStateDb().prepare("UPDATE runs SET status = 'running', holder_pid = $p WHERE run_id = $r").run({ $p: process.pid, $r: RUN });
+    acceptRow('ev-new', NOW - 5, { round: 'new' });
+    db.markIngressCoalesced('ev-new');
+    db.setKeyedRunPending(RUN, 'ev-new');
+    acceptRow('ev-old', NOW - 20, { round: 'old' }); // queued, older, re-driven at boot
+
+    await boot(makeFlow(keyedIngress()));
+
+    expect(launches).toHaveLength(0);
+    expect(db.getIngressEvent('ev-old')!.spawn_state).toBe('coalesced');
+    expect(db.getKeyedRun(RUN)!.pending_event_id).toBe('ev-new');
+  });
+
+  it('launches a keyed event queued behind a busy slot when the slot frees', async () => {
+    const listener = await boot(
+      makeFlow(keyedIngress()),
+      { redriveSchedule: () => ({ cancel() {} }) },
+      { maxConcurrentRuns: 1 },
+    );
+    listener.redrive.start();
+    await listener.handleWebhook(prEvent({ repo: 'acme/widgets', pr: 8 }));
+    const queued = await listener.handleWebhook(prEvent({ repo: 'acme/widgets', pr: 7 }));
+    expect(JSON.parse(queued.body!).outcome).toBe('queued');
+    expect(launches).toHaveLength(1);
+
+    await finishPass(0, 1);
+
+    expect(launches).toHaveLength(2);
+    expect(launches[1]!.runId).toBe(RUN);
+    expect(launches[1]!.appendPass).toBeUndefined();
+    listener.redrive.stop();
+  });
+});

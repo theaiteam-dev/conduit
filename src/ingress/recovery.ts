@@ -42,6 +42,7 @@ import {
   UNATTRIBUTED_FLOW_ID,
   type RedriveAlerting,
 } from './alert-channel';
+import { routeKeyedEvent, type KeyedRunDeps } from './keyed-runs';
 import { inspectParkedRun, recordPark } from './parked';
 import type { RunSlots } from './run-slots';
 import type { SpawnExit } from './spawn';
@@ -116,6 +117,15 @@ export interface RedriveDeps {
    * confirm a parked run against its cards. Defaults to Date.now.
    */
   now?: () => number;
+  /**
+   * Keyed-run routing (issue #36). A row whose run is keyed is not relaunched
+   * through `respawn`: a plain `conduit run --run-id <existing>` is a no-op
+   * for a run that already exists, so the row goes through the keyed router,
+   * which launches it as the next pass (`--append-pass`), folds it into a
+   * pass in flight, or refuses it. The router does its own bookkeeping.
+   * Absent: keyed rows take the unkeyed path (unit-level drivers only).
+   */
+  keyed?: KeyedRunDeps;
 }
 
 export interface RedriveReport {
@@ -157,6 +167,34 @@ export async function redriveOnBoot(deps: RedriveDeps): Promise<RedriveReport> {
   const redrivable = db.listRedrivable(cap);
 
   for (const [index, event] of redrivable.entries()) {
+    // ── Keyed rows (issue #36) ────────────────────────────────────────────
+    // Routed, not respawned: see RedriveDeps.keyed. A keyed row is not
+    // reported as spawned/failed unless the router launched it; one it folded
+    // or refused is recorded in ingress_log.
+    if (deps.keyed !== undefined && isKeyedRow(db, event)) {
+      const routed = await routeKeyedEvent(
+        deps.keyed,
+        {
+          eventId: event.event_id,
+          runId: event.run_id!,
+          flowId: event.flow_id!,
+          flowPath: event.flow_path!,
+          substrateJson: event.substrate_json!,
+          source,
+        },
+        'sweep',
+      );
+      if (routed.outcome === 'accepted') report.spawned.push(event.event_id);
+      else if (routed.outcome === 'spawn_failed') report.failed.push(event.event_id);
+      else if (routed.outcome === 'deferred') report.deferred.push(event.event_id);
+      else if (routed.outcome === 'queued') {
+        // No free slot: like the unkeyed gate, everything later waits.
+        report.deferred.push(...redrivable.slice(index).map((e) => e.event_id));
+        break;
+      }
+      continue;
+    }
+
     // ── Run-slot gate (the original listener-backpressure work) ───────────────────────────────────────────
     const acquisition = slots?.tryAcquire(event.event_id) ?? 'acquired';
     if (acquisition === 'duplicate') {
@@ -231,6 +269,21 @@ export async function redriveOnBoot(deps: RedriveDeps): Promise<RedriveReport> {
   }
 
   return report;
+}
+
+/**
+ * Is this row a keyed-run event (issue #36)? Attribution must be complete and
+ * the run must have keyed-run state, which the accept path writes in the same
+ * transaction as the accept.
+ */
+function isKeyedRow(db: ConduitDB, event: IngressEventRecord): boolean {
+  return (
+    event.run_id !== null &&
+    event.flow_id !== null &&
+    event.flow_path !== null &&
+    event.substrate_json !== null &&
+    db.getKeyedRun(event.run_id) !== null
+  );
 }
 
 /** Accept both seam shapes: a bare result, or a launch that reports its exit. */
@@ -380,7 +433,7 @@ export interface PeriodicRedriveDeps extends Omit<RedriveDeps, 'source'> {
  * skipped — attempts stay bounded even when a sweep outlives the interval.
  */
 export function startPeriodicRedrive(deps: PeriodicRedriveDeps): PeriodicRedrive {
-  const { db, respawn, cap, intervalMs, onSweep, afterSweep, slots, alerts, now } = deps;
+  const { db, respawn, cap, intervalMs, onSweep, afterSweep, slots, alerts, now, keyed } = deps;
   const schedule =
     deps.schedule ??
     ((tick: () => void, ms: number) => {
@@ -403,6 +456,7 @@ export function startPeriodicRedrive(deps: PeriodicRedriveDeps): PeriodicRedrive
       ...(slots !== undefined && { slots }),
       ...(alerts !== undefined && { alerts }),
       ...(now !== undefined && { now }),
+      ...(keyed !== undefined && { keyed }),
     })
       .then(async (report) => {
         if (stopped) return;
