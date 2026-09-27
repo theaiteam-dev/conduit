@@ -604,6 +604,27 @@ describe('the keyed branch of the redrive sweep (issue #36)', () => {
     expect(db.getIngressEvent('ek-1')!.spawn_state).toBe('spawned');
   });
 
+  it('routes only the keyed row through the router; an ordinary unkeyed row still takes the respawn seam', async () => {
+    seedKeyedRun('run-k1');
+    acceptKeyed('ek-1', 1000, 'run-k1'); // keyed: must go through the router
+    db.acceptIngressEvent('e-plain', 2000); // unkeyed: must go through respawn
+
+    const respawnCalls: string[] = [];
+    const respawn: RespawnSeam = async (event) => {
+      respawnCalls.push(event.event_id);
+      return 'spawned';
+    };
+
+    const report = await redriveOnBoot({ db, respawn, cap: CAP, keyed: keyedDeps() });
+
+    expect(respawnCalls).toEqual(['e-plain']);
+    expect(report.spawned).toEqual(['ek-1', 'e-plain']);
+    expect(report.failed).toEqual([]);
+    expect(report.deferred).toEqual([]);
+    expect(db.getIngressEvent('ek-1')!.spawn_state).toBe('spawned');
+    expect(db.getIngressEvent('e-plain')!.spawn_state).toBe('spawned');
+  });
+
   it('defers every remaining row, keyed and unkeyed alike, once the router finds no free run slot, and stops the sweep', async () => {
     seedKeyedRun('run-k1');
     acceptKeyed('ek-1', 1000, 'run-k1'); // first, keyed: the router will report 'queued'

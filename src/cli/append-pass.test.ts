@@ -27,7 +27,7 @@
  */
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import { join } from 'node:path';
-import { mkdtempSync, writeFileSync, readFileSync, rmSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync, rmSync, mkdirSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { openConduitDB, type ConduitDB } from '../persistence/db';
 import type { ModelAdapter, ModelCall } from '../worker/adapter';
@@ -447,6 +447,24 @@ describe('conduit run --pass-event: the kernel records which events a pass consu
       expect(db.getRun(RUN)).toBeNull();
     });
 
+    it('leaves no seed file behind on a pass-1 race refusal of a fresh run with none pre-staged', async () => {
+      const flowPath = writeFlow();
+      const raced = racedGetPassForEvent(db, 'ev-race');
+      db.recordPassEvents('other-run', 1, ['ev-race']);
+
+      const deps = makeDeps({ db: raced, runEngine: completingEngine().runEngine });
+      const exitCode = await main(
+        ['run', flowPath, '--run-id', RUN, '--input-inline', '{"n":1}', '--pass-event', 'ev-race'],
+        deps,
+      );
+
+      expect(exitCode).toBe(EXIT_PASS_REFUSED);
+      // The seed transaction rolled back with the card — the write to
+      // in.json that happened before it must be undone too, not left behind
+      // as an orphaned file for a run that no longer exists.
+      expect(existsSync(join(flowRoot, 'in.json'))).toBe(false);
+    });
+
     it('refuses --append-pass with EXIT_PASS_REFUSED, a legible message, no new pass card, and releases the lease', async () => {
       const flowPath = writeFlow();
       const engine = completingEngine();
@@ -472,6 +490,29 @@ describe('conduit run --pass-event: the kernel records which events a pass consu
       expect(db.getRun(RUN)).not.toBeNull();
       // The lease admitAppendPass took was released on this refusal.
       expect(db.getRun(RUN)!.holder_pid ?? null).toBeNull();
+    });
+
+    it("leaves the previous pass's seed file byte-identical on an append-pass race refusal", async () => {
+      const flowPath = writeFlow();
+      const engine = completingEngine();
+      await runPass1(flowPath, makeDeps({ runEngine: engine.runEngine }));
+      const seedPath = join(flowRoot, 'in.json');
+      expect(readFileSync(seedPath, 'utf-8')).toBe('{"n":1}');
+
+      const raced = racedGetPassForEvent(db, 'ev-race');
+      db.recordPassEvents('other-run', 1, ['ev-race']);
+
+      const deps = makeDeps({ db: raced, runEngine: engine.runEngine });
+      const exitCode = await main(
+        ['run', flowPath, '--run-id', RUN, '--input-inline', '{"n":2}', '--append-pass', '--pass-event', 'ev-race'],
+        deps,
+      );
+
+      expect(exitCode).toBe(EXIT_PASS_REFUSED);
+      // The refused pass's own seed write, done before the rolled-back
+      // transaction, must not stick: the file must still hold what pass 1
+      // (the last pass that actually committed) consumed.
+      expect(readFileSync(seedPath, 'utf-8')).toBe('{"n":1}');
     });
   });
 });
@@ -694,6 +735,24 @@ describe('conduit run --append-pass: lease release on a post-admission throw', (
     // conflict, and gets pass number 2 since the failed attempt seeded nothing.
     expect(await appendPass(flowPath, makeDeps({ runEngine: engine.runEngine }), '{"n":3}')).toBe(0);
     expect(cardIds()).toEqual([`entry-${RUN}`, `entry-${RUN}-p2`]);
+  });
+
+  it("restores the previous pass's seed file when the seed transaction throws", async () => {
+    const flowPath = writeFlow();
+    const engine = completingEngine();
+    await runPass1(flowPath, makeDeps({ runEngine: engine.runEngine }));
+    const seedPath = join(flowRoot, 'in.json');
+    expect(readFileSync(seedPath, 'utf-8')).toBe('{"n":1}');
+
+    const boom = new Error('boom: insertCard failed');
+    const deps = makeDeps({ db: throwingDb(db, 'insertCard', boom), runEngine: engine.runEngine });
+
+    await expect(appendPass(flowPath, deps, '{"n":2}')).rejects.toThrow('boom: insertCard failed');
+
+    // insertCard threw before the transaction committed, but the seed write
+    // to in.json happens before the transaction — it must be undone too, or
+    // a later resume/retry reads pass 2's input as if it were pass 1's.
+    expect(readFileSync(seedPath, 'utf-8')).toBe('{"n":1}');
   });
 });
 

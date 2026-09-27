@@ -319,6 +319,47 @@ describe('passes of one run', () => {
     for (const eventId of folded) expect(db.getPassForEvent(eventId)).toEqual({ run_id: RUN, pass: 2 });
   });
 
+  it('refuses a coalesced event whose substrate_json goes missing before its pass launches, logging it once', async () => {
+    const listener = await boot(makeFlow(keyedIngress()));
+    await listener.handleWebhook(prEvent({ repo: 'acme/widgets', pr: 7, seq: 0 })); // launches pass 1
+
+    const eventA = prEvent({ repo: 'acme/widgets', pr: 7, seq: 1 });
+    const idA = eventA.headers['x-delivery']!;
+    await listener.handleWebhook(eventA);
+    const eventB = prEvent({ repo: 'acme/widgets', pr: 7, seq: 2 });
+    const idB = eventB.headers['x-delivery']!;
+    await listener.handleWebhook(eventB);
+
+    // Both folded events are 'coalesced'; only one is the run's pending
+    // pointer. Corrupt the OTHER one, whichever it turns out to be.
+    const pendingId = db.getKeyedRun(RUN)!.pending_event_id!;
+    const staleId = pendingId === idA ? idB : idA;
+    db.getStateDb()
+      .prepare('UPDATE ingress_events SET substrate_json = NULL WHERE event_id = $id')
+      .run({ $id: staleId });
+
+    await finishPass(0, 1); // pass 1 exits; the drain launches the pending event as pass 2
+
+    expect(launches).toHaveLength(2);
+    const events = stampedInput(1).events as Array<{ event_id: string }>;
+    expect(events.map((e) => e.event_id)).not.toContain(staleId);
+    expect(launches[1]!.passEvents).not.toContain(staleId);
+
+    const malformed = db.getIngressLog({ outcome: 'rejected_malformed' });
+    expect(malformed).toHaveLength(1);
+    expect(malformed[0]!.eventId).toBe(staleId);
+    expect(malformed[0]!.reason).toContain(RUN);
+    expect(malformed[0]!.reason).toContain('substrate_json');
+    // No longer 'coalesced': a later pass must not pick it up or re-log it.
+    expect(db.getIngressEvent(staleId)!.spawn_state).not.toBe('coalesced');
+
+    await finishPass(1, 2);
+    await listener.handleWebhook(prEvent({ repo: 'acme/widgets', pr: 7, seq: 3 }));
+
+    expect(launches).toHaveLength(3);
+    expect(db.getIngressLog({ outcome: 'rejected_malformed' })).toHaveLength(1);
+  });
+
   it('launches the next event on a finished run as an append-pass right away', async () => {
     const listener = await boot(makeFlow(keyedIngress()));
     await listener.handleWebhook(prEvent({ repo: 'acme/widgets', pr: 7 }));

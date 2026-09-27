@@ -229,13 +229,31 @@ function settleApplied(
  * The events a pass launched from `event` covers: every event folded into the
  * run that no pass has consumed yet, up to and including `event`, oldest
  * first. The launching event is always last.
+ *
+ * A folded row with no substrate_json (a hand-edited or corrupt row) cannot
+ * be covered: rather than silently vanishing from `covered` with only its
+ * 'coalesced' log row as a trace, it is refused here, the same outcome the
+ * drain path gives a malformed pending row. Refusing it (not just logging)
+ * takes it out of 'coalesced', so it is never logged twice.
  */
 function coveredEvents(deps: KeyedRunDeps, runId: string, event: KeyedEvent): PassEventInput[] {
-  const folded = deps.db
-    .listUnappliedCoalesced(runId, event.eventId)
-    .filter((row) => row.event_id !== event.eventId && row.substrate_json !== null)
-    .map((row) => ({ eventId: row.event_id, receivedAt: row.received_at, substrateJson: row.substrate_json! }));
-  const own = deps.db.getIngressEvent(event.eventId);
+  const { db } = deps;
+  const folded: PassEventInput[] = [];
+  for (const row of db.listUnappliedCoalesced(runId, event.eventId)) {
+    if (row.event_id === event.eventId) continue;
+    if (row.substrate_json === null) {
+      db.appendIngressLog({
+        source: event.source,
+        eventId: row.event_id,
+        outcome: 'rejected_malformed',
+        reason: `folded event '${row.event_id}' for keyed run '${runId}' is missing substrate_json; dropped from this pass's coverage`,
+      });
+      db.markIngressRefused(row.event_id);
+      continue;
+    }
+    folded.push({ eventId: row.event_id, receivedAt: row.received_at, substrateJson: row.substrate_json });
+  }
+  const own = db.getIngressEvent(event.eventId);
   return [
     ...folded,
     { eventId: event.eventId, receivedAt: own?.received_at ?? deps.now(), substrateJson: event.substrateJson },

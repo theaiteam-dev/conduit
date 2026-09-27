@@ -1216,6 +1216,12 @@ async function cmdRun(argv: string[], deps: CliDeps): Promise<number> {
   let seedBuffer: Buffer | undefined;
   let seedTargetPath: string | undefined;
   let seedTargetPreStaged = false;
+  // What was at seedTargetPath before this launch wrote to it, so a refused or
+  // lost-race seed transaction (below, in "Card seeding") can put it back
+  // rather than leaving the refused pass's input in place. `existed: false`
+  // means restore-by-delete; `existed: true` means restore-by-write, even
+  // when `content` is empty.
+  let seedPriorState: { existed: boolean; content: Buffer } | undefined;
   const artifactName = entryStation?.inputs?.[0];
   if (inputFilePath !== undefined || inputInlineText !== undefined) {
     // Compare raw bytes, never UTF-8-decoded strings: two different invalid-
@@ -1241,8 +1247,10 @@ async function cmdRun(argv: string[], deps: CliDeps): Promise<number> {
       // as a clean refusal, never surface as an unhandled crash: "escalate
       // ambiguity, never guess".
       let existingBuffer: Buffer | null = null;
+      let existedBefore = false;
       try {
         if (existsSync(seedTargetPath)) {
+          existedBefore = true;
           const stat = statSync(seedTargetPath);
           if (!stat.isFile()) {
             deps.io.err(
@@ -1280,6 +1288,7 @@ async function cmdRun(argv: string[], deps: CliDeps): Promise<number> {
       }
       seedTargetPreStaged = !appendPass && existingBuffer !== null;
       // else: existing content is already byte-identical — proceed without rewriting.
+      seedPriorState = { existed: existedBefore, content: existingBuffer ?? Buffer.alloc(0) };
     }
   }
 
@@ -1424,6 +1433,21 @@ async function cmdRun(argv: string[], deps: CliDeps): Promise<number> {
           if (passNumber !== null) updateRunStatus(deps.db, effectiveRunId, 'running', null);
         })();
       } catch (err) {
+        // The seed transaction above did not commit — whatever branch got us
+        // here, undo the writeFileSync a few lines up so a refused or
+        // lost-race launch does not silently leave its own (unrecorded)
+        // input sitting at the entry input path: a later resume/retry must
+        // read what the last pass that actually committed consumed, not this
+        // one's. Applies to the pass-event race below AND to any other throw
+        // (e.g. insertCard itself failing) — restore first, then decide how
+        // to report the error.
+        if (artifactName && seedTargetPath && !seedTargetPreStaged && seedPriorState) {
+          if (seedPriorState.existed) {
+            writeFileSync(seedTargetPath, seedPriorState.content);
+          } else {
+            rmSync(seedTargetPath, { force: true });
+          }
+        }
         // A concurrent launch consumed one of passEvents between the
         // admission pre-check and this transaction:
         // recordPassEvents' own PRIMARY KEY on
