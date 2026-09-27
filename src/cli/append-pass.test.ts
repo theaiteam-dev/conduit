@@ -265,6 +265,12 @@ describe('conduit run --append-pass: refusals', () => {
     expect(io.errors.join('\n')).toContain('--append-pass requires --run-id');
   });
 
+  it('refuses the default run, whose entry card is outside the pass naming scheme', async () => {
+    const flowPath = writeFlow();
+    expect(await main(['run', flowPath, '--run-id', 'default', '--input-inline', '{}', '--append-pass'], makeDeps())).toBe(1);
+    expect(io.errors.join('\n')).toContain('not the default run');
+  });
+
   it('requires an input', async () => {
     const { flowPath, engine } = await finishedRun();
     expect(await main(['run', flowPath, '--run-id', RUN, '--append-pass'], makeDeps({ runEngine: engine.runEngine }))).toBe(1);

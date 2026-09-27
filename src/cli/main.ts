@@ -942,8 +942,10 @@ async function cmdRun(argv: string[], deps: CliDeps): Promise<number> {
   }
 
   // A pass extends a named run with new input; neither half is optional.
-  if (appendPass && runIdFlag === undefined) {
-    deps.io.err('error: --append-pass requires --run-id naming the run to extend');
+  if (appendPass && (runIdFlag === undefined || runIdFlag === DEFAULT_RUN_ID)) {
+    // The default run's entry card is 'conduit-run-entry', outside the pass
+    // naming scheme, so it cannot take passes.
+    deps.io.err('error: --append-pass requires --run-id naming the run to extend (not the default run)');
     return 1;
   }
   if (appendPass && inputFilePath === undefined && inputInlineText === undefined) {
