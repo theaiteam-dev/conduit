@@ -667,6 +667,62 @@ describe('the keyed branch of the redrive sweep (issue #36)', () => {
     expect(db.getIngressEvent('ek-2')!.spawn_state).toBe('refused');
     expect(db.listRedrivable(CAP).map((r) => r.event_id)).not.toContain('ek-2');
   });
+
+  it('reports a keyed row whose spawn seam fails as failed, still redrivable under the cap', async () => {
+    seedKeyedRun('run-k1');
+    acceptKeyed('ek-fail', 1000, 'run-k1');
+    const respawn: RespawnSeam = async () => {
+      throw new Error('a keyed row must never reach the unkeyed respawn seam');
+    };
+
+    const report = await redriveOnBoot({
+      db,
+      respawn,
+      cap: CAP,
+      keyed: keyedDeps({ spawn: async () => ({ ok: false, error: 'spawn seam exploded' }) }),
+    });
+
+    expect(report.failed).toEqual(['ek-fail']);
+    expect(report.spawned).toEqual([]);
+    expect(report.deferred).toEqual([]);
+    const row = db.getIngressEvent('ek-fail')!;
+    expect(row.spawn_state).toBe('failed');
+    expect(row.spawn_attempts).toBe(1); // incremented once, before the failing spawn attempt
+    // Still under the cap: a later sweep must be able to try again.
+    expect(db.listRedrivable(CAP).map((r) => r.event_id)).toContain('ek-fail');
+  });
+
+  it('defers a keyed row whose launch is already in progress, without calling spawn or touching its spawn state', async () => {
+    seedKeyedRun('run-k1');
+    acceptKeyed('ek-inflight', 1000, 'run-k1');
+    let spawnCalls = 0;
+    const respawn: RespawnSeam = async () => {
+      throw new Error('a keyed row must never reach the unkeyed respawn seam');
+    };
+
+    const report = await redriveOnBoot({
+      db,
+      respawn,
+      cap: CAP,
+      keyed: keyedDeps({
+        // Simulate a launch for this event already in flight (hot path or an
+        // earlier sweep iteration), the same guard routeKeyedEvent checks first.
+        launching: new Set<string>(['ek-inflight']),
+        spawn: async () => {
+          spawnCalls++;
+          return { ok: true };
+        },
+      }),
+    });
+
+    expect(report.deferred).toEqual(['ek-inflight']);
+    expect(report.spawned).toEqual([]);
+    expect(report.failed).toEqual([]);
+    expect(spawnCalls).toBe(0);
+    const row = db.getIngressEvent('ek-inflight')!;
+    expect(row.spawn_state).toBe('accepted'); // unchanged from acceptKeyed
+    expect(row.spawn_attempts).toBe(0);
+  });
 });
 
 describe('periodic re-drive kick (the original listener-backpressure work)', () => {

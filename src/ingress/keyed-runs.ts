@@ -574,6 +574,11 @@ export async function drainKeyedRun(deps: KeyedRunDeps, runId: string): Promise<
       outcome: 'rejected_malformed',
       reason: `pending event '${pendingEventId}' for keyed run '${runId}' is missing ${missing}; dropped rather than launched as a pass`,
     });
+    // A row that exists but is malformed stays 'coalesced' otherwise, so
+    // listUnappliedCoalesced would hand it back to coveredEvents on the next
+    // pass launch for this run (a second rejected_malformed log for a null
+    // substrate_json, or a silent fold-in for a null flow_path).
+    if (row !== null) db.markIngressRefused(pendingEventId);
     db.setKeyedRunPending(runId, null);
     return null;
   }
@@ -603,12 +608,19 @@ export async function drainKeyedRun(deps: KeyedRunDeps, runId: string): Promise<
     case 'parked':
     case 'held':
       return null;
-    case 'pass_limit':
+    case 'pass_limit': {
+      // refuse() writes the durable mark and log before the pending pointer
+      // is cleared, so a throw from it leaves the pointer intact rather than
+      // dropping the event with no pending pointer, no refused mark and no log.
+      const outcome = refuse(deps, keyed, event, 'pass_limit', decision.detail);
       db.setKeyedRunPending(runId, null);
-      return refuse(deps, keyed, event, 'pass_limit', decision.detail);
-    case 'not_appendable':
+      return outcome;
+    }
+    case 'not_appendable': {
+      const outcome = refuse(deps, keyed, event, 'run_not_appendable', decision.detail);
       db.setKeyedRunPending(runId, null);
-      return refuse(deps, keyed, event, 'run_not_appendable', decision.detail);
+      return outcome;
+    }
     case 'launch': {
       const launched = await launchPass(deps, keyed, event, decision.pass, 'drain');
       return launched.outcome === 'full' ? null : launched;

@@ -849,6 +849,90 @@ describe('drainKeyedRun on a pending event the router cannot simply launch', () 
     expect(entries[0]!.reason).toContain(RUN);
   });
 
+  it('marks a malformed pending row (missing flow_path) refused so a later pass never folds it back in', async () => {
+    seedFinishedRun();
+    db.acceptIngressEvent('ev-incomplete', NOW - 10, {
+      flowId: FLOW_ID,
+      flowPath: FLOW_PATH,
+      runId: RUN,
+      substrateJson: JSON.stringify({ round: 1 }),
+    });
+    db.markIngressCoalesced('ev-incomplete');
+    db.setKeyedRunPending(RUN, 'ev-incomplete');
+    db.getStateDb().prepare("UPDATE ingress_events SET flow_path = NULL WHERE event_id = 'ev-incomplete'").run();
+
+    const drained = await drainKeyedRun(drainDeps(), RUN);
+    expect(drained).toBeNull();
+    expect(db.getIngressEvent('ev-incomplete')!.spawn_state).toBe('refused');
+
+    // A later event arrives and launches the next pass. Left 'coalesced', the
+    // stale row (valid substrate_json) would be folded back into this pass by
+    // coveredEvents, consuming an event the log already recorded as dropped.
+    db.acceptIngressEvent('ev-next', NOW, {
+      flowId: FLOW_ID,
+      flowPath: FLOW_PATH,
+      runId: RUN,
+      substrateJson: JSON.stringify({ round: 2 }),
+    });
+    const routed = await routeKeyedEvent(
+      drainDeps(),
+      {
+        eventId: 'ev-next',
+        runId: RUN,
+        flowId: FLOW_ID,
+        flowPath: FLOW_PATH,
+        substrateJson: db.getIngressEvent('ev-next')!.substrate_json!,
+        source: 'test',
+      },
+      'sweep',
+    );
+
+    expect(routed).toEqual({ outcome: 'accepted', runId: RUN, pass: 2 });
+    expect(launches[0]!.passEvents).toEqual(['ev-next']);
+  });
+
+  it('marks a malformed pending row (missing substrate_json) refused, logging rejected_malformed only once', async () => {
+    seedFinishedRun();
+    db.acceptIngressEvent('ev-corrupt', NOW - 10, {
+      flowId: FLOW_ID,
+      flowPath: FLOW_PATH,
+      runId: RUN,
+      substrateJson: JSON.stringify({ round: 1 }),
+    });
+    db.markIngressCoalesced('ev-corrupt');
+    db.setKeyedRunPending(RUN, 'ev-corrupt');
+    db.getStateDb().prepare("UPDATE ingress_events SET substrate_json = NULL WHERE event_id = 'ev-corrupt'").run();
+
+    const drained = await drainKeyedRun(drainDeps(), RUN);
+    expect(drained).toBeNull();
+    expect(db.getIngressEvent('ev-corrupt')!.spawn_state).toBe('refused');
+    expect(db.getIngressLog({ outcome: 'rejected_malformed' })).toHaveLength(1);
+
+    // Left 'coalesced', coveredEvents' own malformed-fold guard would log
+    // rejected_malformed a second time for the same event on this later pass.
+    db.acceptIngressEvent('ev-next', NOW, {
+      flowId: FLOW_ID,
+      flowPath: FLOW_PATH,
+      runId: RUN,
+      substrateJson: JSON.stringify({ round: 2 }),
+    });
+    const routed = await routeKeyedEvent(
+      drainDeps(),
+      {
+        eventId: 'ev-next',
+        runId: RUN,
+        flowId: FLOW_ID,
+        flowPath: FLOW_PATH,
+        substrateJson: db.getIngressEvent('ev-next')!.substrate_json!,
+        source: 'test',
+      },
+      'sweep',
+    );
+
+    expect(routed).toEqual({ outcome: 'accepted', runId: RUN, pass: 2 });
+    expect(db.getIngressLog({ outcome: 'rejected_malformed' })).toHaveLength(1);
+  });
+
   it('keeps the pending pointer set when appendIngressLog throws for a malformed pending row (issue: log-before-clear ordering)', async () => {
     seedFinishedRun();
     db.setKeyedRunPending(RUN, 'ghost-event');
@@ -936,5 +1020,44 @@ describe('drainKeyedRun on a pending event the router cannot simply launch', () 
     // still be set: settleApplied's log write happens before it is cleared.
     expect(db.getKeyedRun(RUN)!.pending_event_id).toBe('ev-applied');
     expect(db.getIngressLog({ outcome: 'already_applied' })).toHaveLength(0);
+  });
+
+  it('keeps the pending pointer set when appendIngressLog throws refusing a pending event at max_passes', async () => {
+    db.insertRun({ run_id: RUN, flow: FLOW_PATH, input_fingerprint: 'fp', status: 'done', outcome: 'complete' });
+    db.insertCard({
+      run_id: RUN, id: `entry-${RUN}`, parent_id: null, lane: 'done', status: 'complete',
+      attempt: 0, wave: 0, owned_paths: [], rework_count: 0,
+    });
+    db.upsertKeyedRun({ runId: RUN, flowId: FLOW_ID, flowPath: FLOW_PATH, runKey: ['acme/widgets', '7'], maxPasses: 1 });
+    db.acceptIngressEvent('ev-pending', NOW - 10, {
+      flowId: FLOW_ID,
+      flowPath: FLOW_PATH,
+      runId: RUN,
+      substrateJson: JSON.stringify({ round: 1 }),
+    });
+    db.markIngressCoalesced('ev-pending');
+    db.setKeyedRunPending(RUN, 'ev-pending');
+
+    let calls = 0;
+    const throwingDb = new Proxy(db, {
+      get(target, prop, receiver) {
+        if (prop === 'appendIngressLog') {
+          return (entry: Parameters<ConduitDB['appendIngressLog']>[0]) => {
+            calls += 1;
+            if (calls === 1) throw new Error('boom: log sink unavailable');
+            return target.appendIngressLog(entry);
+          };
+        }
+        return Reflect.get(target, prop, receiver);
+      },
+    }) as ConduitDB;
+
+    await expect(drainKeyedRun({ ...drainDeps(), db: throwingDb }, RUN)).rejects.toThrow('boom: log sink unavailable');
+
+    // refuse() writes the durable record before the pending pointer is
+    // cleared, so a throw from it must leave the pointer intact rather than
+    // dropping the event with no pending pointer, no refused mark and no log.
+    expect(db.getKeyedRun(RUN)!.pending_event_id).toBe('ev-pending');
+    expect(db.getIngressLog({ outcome: 'pass_limit' })).toHaveLength(0);
   });
 });

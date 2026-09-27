@@ -1009,7 +1009,7 @@ write-lock contention at batch scale (rev-1 M1).
 | `station_outputs` | checkpointed typed output per `(card, station, attempt)` + **binding stamp** (§5) |
 | `outbox` | effectful-side-effect intent log + idempotency keys (§5) |
 | `active_workers` | claimed slots + **heartbeat lease** (`lease_until`) (§9, rev-1 H8) |
-| `ingress_events` | ingress dedup log: `(event_id TEXT PRIMARY KEY, received_at INTEGER)` — prevents a listener restart from re-triggering billed runs (§4A) |
+| `ingress_events` | ingress dedup log and launch ledger, keyed on `event_id` — prevents a listener restart from re-triggering billed runs (§4A). Each row also carries `spawn_state` (`accepted`, `spawned`, `failed`; for keyed runs, `coalesced` into a pending pass or `refused`), `spawn_attempts`, and the attribution the re-drive relaunches from (`flow_id`, `flow_path`, `run_id`, `substrate_json`). Only `accepted` and `failed` rows under the attempt cap are re-driven |
 | `ingress_keyed_runs` | per-run state for a `run_key` ingress binding: the subject key, `max_passes`, the pending event, and the alert-once flag, so a pending pass survives a listener restart (§4A) |
 | `run_pass_events` | which pass of a run consumed each ingress event, written by the kernel with the pass's entry card, so no event is launched twice and a pass lists every event it covers (§4A) |
 
