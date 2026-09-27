@@ -3,10 +3,12 @@
  *
  * A process-group kill (./process-group.ts) reaches only descendants that stay
  * in the group. Claude Code's Bash tool runs every command in a new session,
- * so those commands escape it. A cgroup is a boundary an unprivileged child
- * cannot leave: every descendant stays in the cgroup it was born in, whatever
- * session or group it creates, and writing `1` to `cgroup.kill` (Linux 5.14+)
- * SIGKILLs all of them.
+ * so those commands escape it. A new session or group does not move a process
+ * out of its cgroup: every descendant stays in the cgroup it was born in unless
+ * it writes itself into another, and writing `1` to `cgroup.kill` (Linux 5.14+)
+ * SIGKILLs all of them. Descendants run as the kernel's user, who can write the
+ * parent cgroup, so a command that deliberately moves itself there escapes; see
+ * docs/harness-containment.md.
  *
  * Mechanism, per spawn:
  *

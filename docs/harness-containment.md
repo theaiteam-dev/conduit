@@ -111,13 +111,21 @@ use two mechanisms together.
 runs in its own cgroup, `conduit-<kernel pid>-<n>`, created under the cgroup the kernel
 itself runs in. The child joins it before it runs: the runner spawns
 `/bin/sh -c 'echo $$ > <cgroup>/cgroup.procs && exec <command>'`, so the command is in the
-cgroup before it can fork. No descendant can leave a cgroup without write access to the
-cgroup tree, whatever session or process group it creates. On every path that kills the
+cgroup before it can fork. Creating a new session or process group (`setsid`, `nohup`, a
+daemonizing fork) does not move a process out of its cgroup, so every descendant started
+that way stays in it. On every path that kills the
 process group (wall-clock timeout, idle timeout, the post-exit reap, and the kernel's
 signal and exit handlers), the runner also writes `1` to the cgroup's `cgroup.kill`, which
 SIGKILLs every process in it, and then removes the cgroup. A kernel that is SIGKILLed
 leaves its cgroups behind; the next kernel started in the same cgroup kills whatever is
 still in them and removes them.
+
+The cgroup does not contain a command that moves itself out on purpose. Descendants run as
+the kernel's user, and that user can write the parent cgroup's `cgroup.procs` (the
+requirement below), so a command that writes its own pid there leaves the invocation's
+cgroup and survives `cgroup.kill`. The mechanism covers commands that detach the ordinary
+ways, which is what Claude Code's Bash tool and backgrounded shell jobs do. It is not a
+boundary against a harness that sets out to evade it; the container is that boundary.
 
 This requires:
 
