@@ -67,7 +67,8 @@ hold it together:
   when the kernel receives SIGINT, SIGTERM or SIGHUP, or exits; a SIGKILLed kernel cannot do
   this, which is why the container boundary below still matters.
   Deployment guidance additionally recommends running the container as a dedicated non-root
-  user for agentic/harness flows.
+  user for agentic/harness flows. [`deployment-hardening.md`](deployment-hardening.md) is
+  that guidance in full.
 - **Optional idle timeout.** `timeout_seconds` bounds the whole invocation, so a harness
   stuck on a hung tool call runs until that bound. `idle_timeout_seconds` adds a second
   bound, reset by every stdout line: if no line arrives for that long, the runner kills the
