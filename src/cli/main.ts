@@ -816,7 +816,8 @@ type AppendPassAdmission =
  *     (exit 1 otherwise: the invocation names the wrong run);
  *   - the run lease must be free (EXIT_RUN_LEASE_CONFLICT); it is taken here
  *     and held, so the state below cannot change under the pass;
- *   - the run must have finished successfully, and must have run-token budget
+ *   - the run's previous pass must have concluded (run-passes.ts
+ *     checkRunAppendable), and the run must have run-token budget
  *     left when the flow declares one (EXIT_PASS_REFUSED, lease released).
  *
  * The input fingerprint is deliberately not compared: every pass has new

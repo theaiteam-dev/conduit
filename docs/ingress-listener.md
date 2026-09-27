@@ -310,9 +310,14 @@ when:
 
 - `in` / `not_in` compare the resolved value as a string against a non-empty
   list (numbers and booleans in the list are written as their string form).
-- `present: true|false` asks whether the subject resolves.
-- Only a string, number, or boolean counts as resolved. An object, array,
-  null, or missing value is unresolved: `in` fails, `not_in` holds.
+- `present: true|false` asks whether the subject exists and is not null,
+  whatever its type. An object counts: GitHub marks an `issue_comment` on a
+  pull request with an object at `$.issue.pull_request`, so
+  `{ json_path: $.issue.pull_request, present: true }` keeps PR comments and
+  drops comments on plain issues.
+- For `in` and `not_in`, only a string, number, or boolean counts as
+  resolved. An object, array, null, or missing value is in no list: `in`
+  fails, `not_in` holds.
 
 A non-matching event is answered `200 {"outcome":"filtered"}` so the provider
 does not retry it, logged `filtered`, and never written to `ingress_events`.
@@ -368,9 +373,18 @@ an accepted keyed event does depends on its run:
 |-----------|--------------|--------|
 | No run yet | Launch pass 1 (`conduit run --run-id <keyed id>`) | `accepted` |
 | A pass is in flight (launching, running, resuming, queued behind busy slots) or the run is parked | The event becomes the run's **pending** pass. Only the latest pending event is kept | `coalesced` |
-| Finished | Launch the next pass (`conduit run --append-pass`) | `accepted` |
-| Finished, `max_passes` reached | Nothing launched | `pass_limit` |
-| Halted, holding a card, or crashed mid-pass | Nothing launched | `run_not_appendable` |
+| Holding a card for a human (HITL pick, integrity hard-pause) | The event becomes the pending pass; the channel is told once that events are waiting | `coalesced` |
+| Previous pass concluded: every card in `done` or `scrap`, none held | Launch the next pass (`conduit run --append-pass`) | `accepted` |
+| Concluded, `max_passes` reached | Nothing launched | `pass_limit` |
+| Stopped with unfinished cards (the andon halted it mid-pass) or crashed mid-pass | Nothing launched | `run_not_appendable` |
+
+A pass that scrapped has concluded, so the subject keeps taking passes: an
+unattended loop treats a scrapped pass as a bad outcome, not a stuck run. When
+a pass exits non-zero after concluding that way, its event stays `spawned` (it
+is not re-driven as a fresh pass), the log records `pass_failed` with the
+reason, the channel is alerted, and the pending event launches as usual. Only
+a non-zero exit that leaves the run unable to take a pass marks the event
+`failed` for the re-drive sweep.
 
 When a pass's child exits, the pending event (if any) launches as exactly one
 more pass: six review comments posted during one pass produce one trailing
@@ -381,11 +395,12 @@ pass survives a listener restart and follows a parked-run or HITL resume. A
 pass that loses the run lease to another driver (exit 75) becomes pending
 rather than failed.
 
-A `pass_limit` or `run_not_appendable` refusal alerts the channel **once per
-run**, not once per event; every refusal is still logged. The flag clears when
-a pass launches, so a run that is repaired and blocks again is reported again.
-Resume a halted or crashed run with `conduit resume` to let it take passes
-again.
+A `pass_limit` or `run_not_appendable` refusal, and events waiting on a held
+run, alert the channel **once per run**, not once per event; every event is
+still logged. The flag clears when a pass launches, so a run that is repaired
+and blocks again is reported again. Resume a run with unfinished cards, or a
+crashed one, with `conduit resume` to let it take passes again. A held run
+needs no such step: the human's reply resumes it, and its pending pass follows.
 
 Passes take a run slot like any launch and never bypass `max_concurrent_runs`.
 Their slot is registered per run, so two launches for one run never overlap.
@@ -549,7 +564,8 @@ Append-only journal of all event outcomes. Columns:
   - `'rejected_run_key'`: The binding declares `run_key` and a part did not resolve; refused with 400
   - `'coalesced'`: A keyed event folded into its run's pending pass
   - `'pass_limit'`: A keyed run already had `max_passes` passes
-  - `'run_not_appendable'`: A keyed run is halted, holding a card, or crashed mid-pass
+  - `'run_not_appendable'`: A keyed run stopped with unfinished cards, or crashed mid-pass
+  - `'pass_failed'`: A keyed pass ran and concluded unsuccessfully (its cards are in `done` or `scrap`); the event stays `spawned` and the run takes its next pass
 - `reason` (TEXT, nullable): Human-readable reason
 - `attributes_json` (TEXT, nullable): Event attributes (secret-filtered)
 

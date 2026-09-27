@@ -161,7 +161,7 @@ describe('queued ingress rows for a run', () => {
 });
 
 describe('new ingress_log outcomes', () => {
-  it.each(['filtered', 'rejected_run_key', 'coalesced', 'pass_limit', 'run_not_appendable'] as const)(
+  it.each(['filtered', 'rejected_run_key', 'coalesced', 'pass_limit', 'run_not_appendable', 'pass_failed'] as const)(
     'accepts %s',
     (outcome) => {
       const db = open();

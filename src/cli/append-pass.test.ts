@@ -9,8 +9,9 @@
  *   - requires an existing run with the same flow path and project root
  *     (else exit 1); the input fingerprint is NOT compared, and
  *     runs.input_fingerprint keeps the FIRST pass's value;
- *   - requires the run to have finished successfully; a running, parked,
- *     halted, or card-holding run is refused with EXIT_PASS_REFUSED (3);
+ *   - requires the run's previous pass to have concluded (every card in done
+ *     or scrap, none held; a scrapped pass counts); a running, parked,
+ *     card-holding, or unfinished run is refused with EXIT_PASS_REFUSED (3);
  *   - takes the run lease like any driving run; a live holder is
  *     EXIT_RUN_LEASE_CONFLICT (75);
  *   - rewrites the entry seed (the pre-staged-overwrite guard does not apply)
@@ -156,6 +157,23 @@ describe('conduit run --append-pass: happy path', () => {
     await runPass1(flowPath, deps);
     await appendPass(flowPath, deps);
     expect(db.getCard(RUN, `entry-${RUN}-p2`)!.owned_paths).toEqual(db.getCard(RUN, `entry-${RUN}`)!.owned_paths);
+  });
+
+  it('appends a pass to a run whose previous pass scrapped', async () => {
+    const flowPath = writeFlow();
+    const engine = completingEngine();
+    await runPass1(flowPath, makeDeps({ runEngine: engine.runEngine }));
+    const scrapping = async (args: RunEngineArgs) => {
+      args.db.getStateDb().prepare("UPDATE cards SET lane = 'scrap', status = 'scrapped' WHERE run_id = $r AND status = 'ready'").run({ $r: args.runId ?? '' });
+    };
+    expect(await appendPass(flowPath, makeDeps({ runEngine: scrapping }), '{"n":2}')).toBe(1);
+    expect(db.getRun(RUN)!.status).toBe('halted');
+
+    expect(await appendPass(flowPath, makeDeps({ runEngine: engine.runEngine }), '{"n":3}')).toBe(0);
+    expect(cardIds()).toEqual([`entry-${RUN}`, `entry-${RUN}-p2`, `entry-${RUN}-p3`]);
+    expect(db.getCard(RUN, `entry-${RUN}-p2`)!.lane).toBe('scrap');
+    expect(db.getCard(RUN, `entry-${RUN}-p3`)!.lane).toBe('done');
+    expect(db.getRun(RUN)!.status).toBe('done');
   });
 
   it('exits 1 when the pass card does not reach done, recording the run halted', async () => {
@@ -310,11 +328,12 @@ describe('conduit run --append-pass: refusals', () => {
     }
   });
 
-  it('refuses a halted run with EXIT_PASS_REFUSED', async () => {
+  it('refuses a run the andon halted with an unfinished card, with EXIT_PASS_REFUSED', async () => {
     const { flowPath, engine } = await finishedRun();
     db.getStateDb().prepare("UPDATE runs SET status = 'halted', outcome = 'halted' WHERE run_id = $r").run({ $r: RUN });
+    db.getStateDb().prepare("UPDATE cards SET lane = 'only', status = 'ready' WHERE run_id = $r").run({ $r: RUN });
     expect(await appendPass(flowPath, makeDeps({ runEngine: engine.runEngine }))).toBe(EXIT_PASS_REFUSED);
-    expect(io.errors.join('\n')).toContain('not complete');
+    expect(io.errors.join('\n')).toContain('unfinished');
     expectNothingSeeded(engine);
     expect(db.getRun(RUN)!.status).toBe('halted');
   });

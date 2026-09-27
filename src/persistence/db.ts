@@ -637,7 +637,12 @@ export type IngressOutcome =
   | 'rejected_run_key'
   | 'coalesced'
   | 'pass_limit'
-  | 'run_not_appendable';
+  | 'run_not_appendable'
+  // 'pass_failed': a keyed pass ran and concluded unsuccessfully (its cards
+  // are all in done or scrap, the run is not parked). The event stays
+  // 'spawned', since it is not a launch failure to re-drive; the channel is
+  // alerted and the run takes its next pass as usual.
+  | 'pass_failed';
 
 export interface IngressLogInput {
   source: string;
@@ -693,6 +698,7 @@ const VALID_INGRESS_OUTCOMES: ReadonlySet<string> = new Set<IngressOutcome>([
   'coalesced',
   'pass_limit',
   'run_not_appendable',
+  'pass_failed',
 ]);
 
 // ---------------------------------------------------------------------------

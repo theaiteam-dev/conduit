@@ -335,11 +335,12 @@ describe('passes of one run', () => {
     expect(db.getIngressEvent(first.headers['x-delivery']!)!.spawn_state).toBe('refused');
   });
 
-  it('refuses a halted run, alerting once per run', async () => {
+  it('refuses a run the andon halted mid-pass, alerting once per run', async () => {
     const listener = await boot(makeFlow(keyedIngress()));
     await listener.handleWebhook(prEvent({ repo: 'acme/widgets', pr: 7 }));
     await finishPass(0, 1);
     db.getStateDb().prepare("UPDATE runs SET status = 'halted', outcome = 'halted' WHERE run_id = $r").run({ $r: RUN });
+    db.getStateDb().prepare("UPDATE cards SET lane = 'work', status = 'ready' WHERE run_id = $r").run({ $r: RUN });
 
     await listener.handleWebhook(prEvent({ repo: 'acme/widgets', pr: 7 }));
     await listener.handleWebhook(prEvent({ repo: 'acme/widgets', pr: 7 }));
@@ -393,7 +394,7 @@ describe('passes of one run', () => {
     expect(stampedInput(2)).toMatchObject({ pass: 2, body: { round: 2 } });
   });
 
-  it('reports a failed pass like any failed launch', async () => {
+  it('reports a non-zero exit that left no appendable run as a failed launch', async () => {
     const listener = await boot(makeFlow(keyedIngress()));
     const req = prEvent({ repo: 'acme/widgets', pr: 7 });
     await listener.handleWebhook(req);
@@ -403,6 +404,99 @@ describe('passes of one run', () => {
     expect(db.getIngressEvent(req.headers['x-delivery']!)!.spawn_state).toBe('failed');
     expect(db.getIngressLog({ outcome: 'spawn_failed' })).toHaveLength(1);
     expect(alerts).toHaveLength(1);
+  });
+});
+
+describe('a pass that concluded unsuccessfully', () => {
+  it('stays spawned, is logged pass_failed and alerted, and the pending event still becomes the next pass', async () => {
+    const listener = await boot(makeFlow(keyedIngress()));
+    const first = prEvent({ repo: 'acme/widgets', pr: 7, round: 1 });
+    await listener.handleWebhook(first);
+    await listener.handleWebhook(prEvent({ repo: 'acme/widgets', pr: 7, round: 2 }));
+
+    // The child ran the pass and its entry card scrapped: the kernel records
+    // the run halted and exits 1.
+    db.insertRun({ run_id: RUN, flow: FLOW_PATH, input_fingerprint: 'fp', status: 'halted', outcome: 'halted' });
+    db.insertCard({
+      run_id: RUN, id: `entry-${RUN}`, parent_id: null, lane: 'scrap', status: 'scrapped',
+      attempt: 1, wave: 0, owned_paths: [], rework_count: 0,
+    });
+    launches[0]!.exit(1);
+    await settle();
+
+    expect(db.getIngressEvent(first.headers['x-delivery']!)!.spawn_state).toBe('spawned');
+    expect(db.getIngressLog({ outcome: 'pass_failed' })).toHaveLength(1);
+    expect(db.getIngressLog({ outcome: 'spawn_failed' })).toHaveLength(0);
+    expect(alerts).toHaveLength(1);
+    expect(alerts[0]!.reason).toContain('pass_failed');
+    expect(launches).toHaveLength(2);
+    expect(launches[1]!.appendPass).toBe(true);
+    expect(stampedInput(1)).toMatchObject({ pass: 2, body: { round: 2 } });
+  });
+
+  it('takes the next event as a pass after a scrapped pass, rather than refusing the subject', async () => {
+    const listener = await boot(makeFlow(keyedIngress()));
+    await listener.handleWebhook(prEvent({ repo: 'acme/widgets', pr: 7 }));
+    db.insertRun({ run_id: RUN, flow: FLOW_PATH, input_fingerprint: 'fp', status: 'halted', outcome: 'halted' });
+    db.insertCard({
+      run_id: RUN, id: `entry-${RUN}`, parent_id: null, lane: 'scrap', status: 'scrapped',
+      attempt: 1, wave: 0, owned_paths: [], rework_count: 0,
+    });
+    launches[0]!.exit(1);
+    await settle();
+
+    const res = await listener.handleWebhook(prEvent({ repo: 'acme/widgets', pr: 7, round: 2 }));
+    expect(JSON.parse(res.body!).outcome).toBe('accepted');
+    expect(launches[1]!.appendPass).toBe(true);
+    expect(db.getIngressLog({ outcome: 'run_not_appendable' })).toHaveLength(0);
+  });
+});
+
+describe('a run holding a card for a human', () => {
+  it('folds events into its pending pass, alerts once, and launches one pass from the latest after the resume', async () => {
+    let tick: () => void = () => {};
+    const listener = await boot(makeFlow(keyedIngress()), {
+      redriveSchedule: (fn) => {
+        tick = fn;
+        return { cancel() {} };
+      },
+    });
+    listener.redrive.start();
+    await listener.handleWebhook(prEvent({ repo: 'acme/widgets', pr: 7 }));
+    await finishPass(0, 1);
+    // A later station held the card for a HITL pick: the run exited halted.
+    db.getStateDb().prepare("UPDATE runs SET status = 'halted', outcome = 'halted' WHERE run_id = $r").run({ $r: RUN });
+    db.getStateDb().prepare("UPDATE cards SET lane = 'hold', status = 'held' WHERE run_id = $r").run({ $r: RUN });
+
+    const a = await listener.handleWebhook(prEvent({ repo: 'acme/widgets', pr: 7, round: 'a' }));
+    const b = await listener.handleWebhook(prEvent({ repo: 'acme/widgets', pr: 7, round: 'b' }));
+    await settle();
+
+    expect(JSON.parse(a.body!).outcome).toBe('coalesced');
+    expect(JSON.parse(b.body!).outcome).toBe('coalesced');
+    expect(launches).toHaveLength(1);
+    expect(db.getIngressLog({ outcome: 'run_not_appendable' })).toHaveLength(0);
+    expect(alerts).toHaveLength(1);
+    expect(alerts[0]!.reason).toContain('held');
+
+    // A sweep while still held launches nothing.
+    tick();
+    await settle();
+    expect(launches).toHaveLength(1);
+
+    // The human replied and the resume drove the run to done.
+    db.getStateDb().prepare("UPDATE cards SET lane = 'done', status = 'complete' WHERE run_id = $r").run({ $r: RUN });
+    db.getStateDb().prepare("UPDATE runs SET status = 'done', outcome = 'complete' WHERE run_id = $r").run({ $r: RUN });
+    tick();
+    await settle();
+
+    expect(launches).toHaveLength(2);
+    expect(launches[1]!.appendPass).toBe(true);
+    expect(stampedInput(1)).toMatchObject({ pass: 2, body: { round: 'b' } });
+    tick();
+    await settle();
+    expect(launches).toHaveLength(2);
+    listener.redrive.stop();
   });
 });
 

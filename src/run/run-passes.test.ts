@@ -7,9 +7,10 @@
  * never from a counter held in memory, so the kernel and the listener (which
  * share the state DB) always agree on it.
  *
- * A pass may only be appended to a run that finished successfully:
- * runs.status 'done' with every card terminal and none held. A parked run is
- * resumed by the parked-run machinery, never given a pass.
+ * A pass may only be appended to a run whose previous pass concluded: not
+ * parked, not recorded running, and every card in the done or scrap lane with
+ * none held. A scrapped pass concluded. A parked run is resumed by the
+ * parked-run machinery, never given a pass.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import { openConduitDB, type ConduitDB } from '../persistence/db';
@@ -92,10 +93,38 @@ describe('checkRunAppendable', () => {
     expect(checkRunAppendable(db, 'nope', 1_000)).toMatchObject({ ok: false, state: 'not_found' });
   });
 
-  it('refuses a halted run', () => {
+  it('accepts a halted run whose last pass scrapped: every card is in done or scrap', () => {
+    // A scrapped pass is a normal bad outcome for an unattended loop, and
+    // conduit resume cannot bring a scrapped card to done, so refusing here
+    // would block the subject forever.
+    run('r', 'halted', 'halted');
+    db.insertCard(card('r', 'entry-r'));
+    db.insertCard(card('r', 'entry-r-p2', { lane: 'scrap', status: 'scrapped' }));
+    expect(checkRunAppendable(db, 'r', 1_000)).toEqual({ ok: true });
+  });
+
+  it('refuses a halted run with an unfinished card (the andon stopped it mid-pass)', () => {
+    run('r', 'halted', 'halted');
+    db.insertCard(card('r', 'entry-r', { lane: 'work', status: 'ready' }));
+    expect(checkRunAppendable(db, 'r', 1_000)).toMatchObject({ ok: false, state: 'unfinished' });
+  });
+
+  it('refuses a halted run with a waiting child under a scrapped parent', () => {
     run('r', 'halted', 'halted');
     db.insertCard(card('r', 'entry-r', { lane: 'scrap', status: 'scrapped' }));
-    expect(checkRunAppendable(db, 'r', 1_000)).toMatchObject({ ok: false, state: 'halted' });
+    db.insertCard(card('r', 'c1', { parent_id: 'entry-r', lane: 'intake', status: 'waiting' }));
+    expect(checkRunAppendable(db, 'r', 1_000)).toMatchObject({ ok: false, state: 'unfinished' });
+  });
+
+  it('refuses a run with no cards at all', () => {
+    run('r', 'halted', 'halted');
+    expect(checkRunAppendable(db, 'r', 1_000)).toMatchObject({ ok: false, state: 'unfinished' });
+  });
+
+  it('refuses a run still recorded running even when its cards are terminal (its driver died before recording the exit)', () => {
+    run('r', 'running');
+    db.insertCard(card('r', 'entry-r'));
+    expect(checkRunAppendable(db, 'r', 1_000)).toMatchObject({ ok: false, state: 'running' });
   });
 
   it('refuses a run holding a card, even one recorded done', () => {

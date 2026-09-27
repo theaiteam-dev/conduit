@@ -3,16 +3,20 @@
  *
  * Both read the same two surfaces of an inbound event, a header (matched
  * case-insensitively) or a '$.'-rooted JSON path through the shared
- * resolveJsonPath dialect, and both count only SCALAR values: a string,
- * number, or boolean, compared and recorded as a string. An object, array,
- * null, or missing value is unresolved.
+ * resolveJsonPath dialect. Key parts and `in`/`not_in` count only SCALAR
+ * values: a string, number, or boolean, compared and recorded as a string.
+ * An object, array, null, or missing value is unresolved for them. `present`
+ * asks a different question, whether the value exists and is not null, so it
+ * sees objects and arrays too: GitHub marks an issue comment on a pull request
+ * with an OBJECT at `issue.pull_request`.
  *
  *   - resolveRunKey fails closed: one unresolved part rejects the whole key.
  *     There is deliberately no content-hash fallback, because a fallback key
  *     would give every unkeyable event its own run, which is the per-delivery
  *     behaviour the key exists to replace, reached silently.
  *   - matchesWhen ANDs the binding's conditions. An unresolved subject is in
- *     no list, so `in` fails and `not_in` holds.
+ *     no list, so `in` fails and `not_in` holds; `present` holds for any
+ *     non-null value.
  *
  * Every value here comes from an untrusted payload. Nothing is interpolated
  * into SQL or a shell; a part longer than MAX_RUN_KEY_PART_LENGTH is rejected
@@ -50,12 +54,16 @@ function headerValue(headers: Record<string, unknown>, name: string): unknown {
   return undefined;
 }
 
+/** The raw value a subject resolves to; undefined or null when absent. */
+function resolveRaw(subject: { header: string } | { json_path: string }, event: KeyedEventSurface): unknown {
+  return 'header' in subject ? headerValue(event.headers, subject.header) : resolveJsonPath(event.body, subject.json_path);
+}
+
 function resolveSubject(
   subject: { header: string } | { json_path: string },
   event: KeyedEventSurface,
 ): string | null {
-  const raw = 'header' in subject ? headerValue(event.headers, subject.header) : resolveJsonPath(event.body, subject.json_path);
-  return scalarString(raw);
+  return scalarString(resolveRaw(subject, event));
 }
 
 /**
@@ -94,8 +102,11 @@ export function resolveRunKey(parts: readonly RunKeyPart[], event: KeyedEventSur
 /** Does the event meet every `when` condition? */
 export function matchesWhen(conditions: readonly WhenCondition[], event: KeyedEventSurface): boolean {
   return conditions.every((condition) => {
+    if ('present' in condition) {
+      const raw = resolveRaw(condition, event);
+      return (raw !== null && raw !== undefined) === condition.present;
+    }
     const value = resolveSubject(condition, event);
-    if ('present' in condition) return (value !== null) === condition.present;
     if ('in' in condition) return value !== null && condition.in.includes(value);
     return value === null || !condition.not_in.includes(value);
   });

@@ -14,19 +14,21 @@
  *     one of the run's slots, a    is kept: it becomes the next pass's input,
  *     live process holds the run   so six events during one pass produce ONE
  *     lease, an older event for    trailing pass, not six.
- *     the run is still queued, or
- *     the run is parked)
- *   - run finished                → launch the next pass with
- *                                   `conduit run --append-pass`, unless the
- *                                   binding's max_passes is reached
- *                                   ('pass_limit').
- *   - run halted, held, or        → do not launch ('run_not_appendable').
- *     crashed mid-pass
+ *     the run is still queued, the
+ *     run is parked, or it holds
+ *     a card for a human)
+ *   - previous pass concluded     → launch the next pass with
+ *     (every card in done or       `conduit run --append-pass`, unless the
+ *     scrap)                       binding's max_passes is reached
+ *                                  ('pass_limit').
+ *   - run stopped with unfinished → do not launch ('run_not_appendable').
+ *     cards, or crashed mid-pass
  *
- * The channel hears about a pass_limit or run_not_appendable refusal ONCE per
- * run (ingress_keyed_runs.blocked_alerted), not once per event; the flag is
- * cleared when a pass launches, so a run that is fixed and blocks again is
- * reported again. Every refusal is still logged.
+ * The channel hears ONCE per run (ingress_keyed_runs.blocked_alerted), not
+ * once per event, about a pass_limit or run_not_appendable refusal and about
+ * events waiting on a held run; the flag is cleared when a pass launches, so a
+ * run that is fixed and blocks again is reported again. Every refusal is still
+ * logged.
  *
  * When a pass's child exits, the run's pending event (if any) is launched as
  * exactly one more pass. The periodic sweep drains pending events too, which
@@ -119,6 +121,7 @@ type Decision =
   | { kind: 'launch'; pass: number }
   | { kind: 'in_flight'; why: string }
   | { kind: 'parked' }
+  | { kind: 'held'; detail: string }
   | { kind: 'pass_limit'; detail: string }
   | { kind: 'not_appendable'; detail: string };
 
@@ -153,7 +156,12 @@ function decide(deps: KeyedRunDeps, keyed: KeyedRunRecord, beforeEventId: string
   if (run.status === 'halted' && run.outcome === 'parked') return { kind: 'parked' };
 
   const appendable = checkRunAppendable(db, keyed.run_id, Math.floor(deps.now() / 1000));
-  if (!appendable.ok) return { kind: 'not_appendable', detail: appendable.detail };
+  if (!appendable.ok) {
+    // A held card waits for a human, whose reply resumes the run: events keep
+    // for the pass after it, rather than being refused and dropped.
+    if (appendable.state === 'held') return { kind: 'held', detail: appendable.detail };
+    return { kind: 'not_appendable', detail: appendable.detail };
+  }
 
   const pass = nextPassNumber(db, keyed.run_id);
   if (keyed.max_passes !== null && pass > keyed.max_passes) {
@@ -200,6 +208,34 @@ async function fireAlert(alerts: RedriveAlerting, notice: SpawnFailedAlert): Pro
   }
 }
 
+/** Tell the channel about a blocked run, once per run until a pass launches. */
+function alertBlockedOnce(deps: KeyedRunDeps, keyed: KeyedRunRecord, eventId: string, reason: string): void {
+  if (keyed.blocked_alerted) return;
+  deps.db.setKeyedRunBlockedAlerted(keyed.run_id, true);
+  void fireAlert(deps.alerts, {
+    flowId: keyed.flow_id,
+    channel: resolveAlertChannel(deps.alerts, keyed.flow_id),
+    eventId,
+    reason,
+  });
+}
+
+/**
+ * Fold an event for a run that holds a card for a human, and tell the channel
+ * once that events are waiting on it.
+ */
+function coalesceHeld(deps: KeyedRunDeps, keyed: KeyedRunRecord, event: KeyedEvent, detail: string): KeyedRouteOutcome {
+  const outcome = coalesce(deps, keyed, event, `the run is held (${detail})`);
+  alertBlockedOnce(
+    deps,
+    keyed,
+    event.eventId,
+    `held: run '${keyed.run_id}' is waiting on a human and events for it are waiting too; ` +
+      `the latest becomes its next pass once the run is resumed. Later events are logged, not alerted.`,
+  );
+  return outcome;
+}
+
 /** Refuse an event: mark it, log it, and tell the channel once per run. */
 function refuse(
   deps: KeyedRunDeps,
@@ -208,19 +244,11 @@ function refuse(
   outcome: 'pass_limit' | 'run_not_appendable',
   detail: string,
 ): KeyedRouteOutcome {
-  const { db, alerts } = deps;
+  const { db } = deps;
   db.markIngressRefused(event.eventId);
   const reason = `run '${keyed.run_id}' takes no new pass: ${detail}`;
   db.appendIngressLog({ source: event.source, eventId: event.eventId, outcome, reason });
-  if (!keyed.blocked_alerted) {
-    db.setKeyedRunBlockedAlerted(keyed.run_id, true);
-    void fireAlert(alerts, {
-      flowId: keyed.flow_id,
-      channel: resolveAlertChannel(alerts, keyed.flow_id),
-      eventId: event.eventId,
-      reason: `${outcome}: ${reason}. Later events for this run are logged, not alerted.`,
-    });
-  }
+  alertBlockedOnce(deps, keyed, event.eventId, `${outcome}: ${reason}. Later events for this run are logged, not alerted.`);
   return { outcome, runId: keyed.run_id };
 }
 
@@ -311,6 +339,12 @@ async function launchPass(
  *                                 refused, alerted once.
  *   - parked                      recorded like any parked launch; the parked
  *                                 sweep resumes the run.
+ *   - the pass concluded badly    every card is in done or scrap: the pass ran
+ *                                 and failed, which is not a launch failure.
+ *                                 The row stays 'spawned' (so the sweep does
+ *                                 not re-drive it as a fresh pass), the log
+ *                                 says 'pass_failed', and the channel is
+ *                                 alerted; the run takes its next pass.
  *   - anything else               failed, alerted, logged 'spawn_failed',
  *                                 exactly as an unkeyed launch.
  */
@@ -347,6 +381,15 @@ async function watchPassExit(
             channel: resolveAlertChannel(alerts, keyed.flow_id),
             runId: keyed.run_id,
             releaseAt: parked.releaseAt,
+          });
+        } else if (checkRunAppendable(db, keyed.run_id, Math.floor(deps.now() / 1000)).ok) {
+          const failure = `pass of run '${keyed.run_id}' concluded unsuccessfully (${reason}); the run takes its next pass as usual`;
+          db.appendIngressLog({ source: event.source, eventId: event.eventId, outcome: 'pass_failed', reason: failure });
+          void fireAlert(alerts, {
+            flowId: keyed.flow_id,
+            channel: resolveAlertChannel(alerts, keyed.flow_id),
+            eventId: event.eventId,
+            reason: `pass_failed: ${failure}`,
           });
         } else {
           db.markIngressFailed(event.eventId);
@@ -410,6 +453,8 @@ export async function routeKeyedEvent(
       return coalesce(deps, keyed, event, decision.why);
     case 'parked':
       return coalesce(deps, keyed, event, 'the run is parked and resumes on its own');
+    case 'held':
+      return coalesceHeld(deps, keyed, event, decision.detail);
     case 'pass_limit':
       return refuse(deps, keyed, event, 'pass_limit', decision.detail);
     case 'not_appendable':
@@ -462,6 +507,7 @@ export async function drainKeyedRun(deps: KeyedRunDeps, runId: string): Promise<
   switch (decision.kind) {
     case 'in_flight':
     case 'parked':
+    case 'held':
       return null;
     case 'pass_limit':
       db.setKeyedRunPending(runId, null);

@@ -582,10 +582,15 @@ deliveries the flow does not want before they are accepted; `max_passes` bounds 
 passes the listener admits. All three are webhook-only and validated at boot.
 
 A pass is a kernel operation, `conduit run --append-pass`: it seeds a fresh entry card
-(`entry-<run>-p<N>`, `N` derived from the cards table) into a run that **finished
-successfully** and drives it through the same engine path. A run that is running,
-parked, halted, or holding a card is refused, never reopened; a parked run is resumed by
-the parked-run machinery, not by a pass. Checkpoints, outbox keys, rework counters, and
+(`entry-<run>-p<N>`, `N` derived from the cards table) into a run whose previous pass
+**concluded**, and drives it through the same engine path. Concluded means: the run is
+not parked, no live process holds its lease, it is not recorded `running`, and every one
+of its cards rests in the `done` or `scrap` lane with none held. A pass that scrapped
+concluded: for an unattended loop that is an ordinary bad outcome, and `conduit resume`
+cannot bring a scrapped card to `done`, so refusing would block the subject for good. A
+run the andon halted with unfinished cards, a run whose driver died, a run holding a card
+for a human, and a parked run are refused, never reopened; each still has work a resume
+finishes, and a parked run is resumed by the parked-run machinery, not by a pass. Checkpoints, outbox keys, rework counters, and
 journal spans are all keyed per card, so a pass never replays or collides with an earlier
 pass. The run token budget is a ceiling over all passes together; the wall-clock budget
 is per pass. `max_passes` is an admission limit applied by the listener, not a fifth
@@ -593,11 +598,14 @@ rework guard: it bounds how often the subject may re-enter the line, not how oft
 may be reworked inside a pass.
 
 The listener routes an accepted keyed event by the state of its run (ingress/keyed-runs.ts):
-no run yet launches pass 1; a finished run takes a new pass; a pass in flight, or a parked
-run, **coalesces** the event into the run's single pending pass (the latest event wins),
-which launches when the in-flight pass exits, so N events during one pass cost one
-trailing pass rather than N; a run at `max_passes`, or halted, held, or crashed mid-pass,
-takes no pass and the channel is told once per run. Passes draw from the listener's run
+no run yet launches pass 1; a concluded run takes a new pass; a pass in flight, a parked
+run, or a run holding a card for a human **coalesces** the event into the run's single
+pending pass (the latest event wins), which launches once the run is free (the in-flight
+pass exits, or the resume finishes), so N events during one pass cost one trailing pass
+rather than N; a run at `max_passes`, stopped with unfinished cards, or crashed mid-pass
+takes no pass. A pass that ran and concluded unsuccessfully is logged `pass_failed` and
+alerted, and its event is not re-driven: it was not a launch failure. The channel hears
+about a refusal, or about events waiting on a held run, once per run. Passes draw from the listener's run
 slots like any launch, under a per-run slot id, and never bypass them. Because events
 coalesce, a flow driven by a keyed binding must fetch everything outstanding at the start
 of each pass rather than assume one event is one change.

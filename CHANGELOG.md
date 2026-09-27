@@ -22,12 +22,15 @@ historical context, not public releases or public repository history.
   budget hold the subject's history. Keying is fail-closed: an event whose key
   does not resolve is refused (400, `rejected_run_key`). A new kernel
   operation, `conduit run --append-pass`, seeds the next pass
-  (`entry-<run>-p<N>`) into a run that finished successfully and refuses any
+  (`entry-<run>-p<N>`) into a run whose previous pass concluded (every card in
+  `done` or `scrap`, none held, including a pass that scrapped) and refuses any
   other run with exit 3 (75 on a lease conflict). The listener launches a
   finished run's next pass directly, folds events that arrive during a pass
-  into one trailing pass on the latest event (`coalesced`), and refuses a run
-  that is halted or holding cards (`run_not_appendable`) or at the binding's
-  optional `max_passes` (`pass_limit`), alerting once per run. A pending pass
+  into one trailing pass on the latest event (`coalesced`), keeps events for a
+  run holding a card for a human the same way, and refuses a run stopped with
+  unfinished cards (`run_not_appendable`) or at the binding's optional
+  `max_passes` (`pass_limit`), alerting once per run. A pass that ran and
+  scrapped is logged `pass_failed` and alerted, and is not re-driven. A pending pass
   is kept in the new `ingress_keyed_runs` table (schema v11) and survives a
   listener restart. A webhook binding can also declare `when`, ANDed
   `header`/`json_path` conditions (`in`, `not_in`, `present`); a delivery that

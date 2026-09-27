@@ -136,10 +136,53 @@ describe('matchesWhen', () => {
     expect(matchesWhen([{ json_path: '$.missing', not_in: ['x'] }], prEvent)).toBe(true);
   });
 
-  it('treats a non-scalar value as unresolved', () => {
-    expect(matchesWhen([{ json_path: '$.repository', present: true }], prEvent)).toBe(false);
-    expect(matchesWhen([{ json_path: '$.repository', present: false }], prEvent)).toBe(true);
+  it('treats a non-scalar value as unresolved for in and not_in', () => {
+    expect(matchesWhen([{ json_path: '$.repository', in: ['[object Object]'] }], prEvent)).toBe(false);
+    expect(matchesWhen([{ json_path: '$.labels', not_in: ['bug'] }], prEvent)).toBe(true);
+  });
+
+  it('reads present as "exists and is not null", whatever the type', () => {
+    expect(matchesWhen([{ json_path: '$.repository', present: true }], prEvent)).toBe(true);
+    expect(matchesWhen([{ json_path: '$.labels', present: true }], prEvent)).toBe(true);
+    expect(matchesWhen([{ json_path: '$.pull_request.draft', present: true }], prEvent)).toBe(true);
     expect(matchesWhen([{ json_path: '$.nothing', present: true }], prEvent)).toBe(false);
+    expect(matchesWhen([{ json_path: '$.nothing', present: false }], prEvent)).toBe(true);
+    expect(matchesWhen([{ json_path: '$.missing', present: false }], prEvent)).toBe(true);
+  });
+
+  it('tells a GitHub issue_comment on a pull request from one on a plain issue', () => {
+    // GitHub marks a PR conversation comment with an OBJECT at issue.pull_request.
+    const onPr = {
+      headers: { 'X-GitHub-Event': 'issue_comment' },
+      body: {
+        action: 'created',
+        issue: {
+          number: 42,
+          pull_request: {
+            url: 'https://api.github.com/repos/acme/widgets/pulls/42',
+            html_url: 'https://github.com/acme/widgets/pull/42',
+            merged_at: null,
+          },
+        },
+        comment: { id: 9001, body: 'nit: rename this' },
+        repository: { id: 12345 },
+      },
+    };
+    const onIssue = {
+      headers: { 'X-GitHub-Event': 'issue_comment' },
+      body: {
+        action: 'created',
+        issue: { number: 43 },
+        comment: { id: 9002, body: 'same here' },
+        repository: { id: 12345 },
+      },
+    };
+    const when = [
+      { header: 'X-GitHub-Event', in: ['issue_comment'] },
+      { json_path: '$.issue.pull_request', present: true },
+    ];
+    expect(matchesWhen(when, onPr)).toBe(true);
+    expect(matchesWhen(when, onIssue)).toBe(false);
   });
 
   it('evaluates present on headers', () => {

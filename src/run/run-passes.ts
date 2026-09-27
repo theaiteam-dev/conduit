@@ -17,7 +17,6 @@
  * state.
  */
 import type { ConduitDB } from '../persistence/db';
-import { getRunState } from './run-state';
 
 /**
  * Exit code of `conduit run --append-pass` when the run exists but is not in a
@@ -65,18 +64,29 @@ export function nextPassNumber(db: ConduitDB, runId: string): number {
 }
 
 /** Why a run cannot take a pass. */
-export type RunNotAppendableState = 'not_found' | 'running' | 'parked' | 'held' | 'halted';
+export type RunNotAppendableState = 'not_found' | 'running' | 'parked' | 'held' | 'unfinished';
 
 export type RunAppendableResult =
   | { ok: true }
   | { ok: false; state: RunNotAppendableState; detail: string };
 
+/** Lanes a card can rest in once its work has concluded, well or badly. */
+const CONCLUDED_LANES: ReadonlySet<string> = new Set(['done', 'scrap']);
+
 /**
- * May a new pass be appended to `runId`? Only a run that finished
- * successfully: runs.status 'done', with every card terminal and none held.
- * `nowSeconds` is the run clock, used to confirm a recorded park.
+ * May a new pass be appended to `runId`? Only a run whose previous pass
+ * CONCLUDED: not parked, not recorded running, and every card in the done or
+ * scrap lane with none held. A pass that scrapped counts as concluded: for an
+ * unattended loop a scrapped pass is an ordinary bad outcome, and `conduit
+ * resume` cannot bring a scrapped card to done, so refusing would block the
+ * subject for good. A run the andon halted with unfinished cards, or one whose
+ * driver died, is refused: it still has work that a resume can finish.
+ *
+ * The run lease is the caller's to check: the CLI takes it before asking, and
+ * the listener treats a live holder as a pass in flight. `nowSeconds` is the
+ * run clock; it is kept for callers that confirm a park against it.
  */
-export function checkRunAppendable(db: ConduitDB, runId: string, nowSeconds: number): RunAppendableResult {
+export function checkRunAppendable(db: ConduitDB, runId: string, _nowSeconds: number): RunAppendableResult {
   const run = db.getRun(runId);
   if (run === null) return { ok: false, state: 'not_found', detail: 'the run does not exist' };
 
@@ -88,19 +98,32 @@ export function checkRunAppendable(db: ConduitDB, runId: string, nowSeconds: num
     };
   }
 
-  const state = getRunState(db, runId, nowSeconds);
-  if (state.status === 'held') {
-    return { ok: false, state: 'held', detail: `the run is holding ${state.heldCards.length} card(s) for a human` };
+  const cards = db
+    .getStateDb()
+    .prepare('SELECT lane, status FROM cards WHERE run_id = $run_id')
+    .all({ $run_id: runId }) as Array<{ lane: string; status: string }>;
+
+  const held = cards.filter((c) => c.status === 'held' || c.lane === 'hold').length;
+  if (held > 0) {
+    return { ok: false, state: 'held', detail: `the run is holding ${held} card(s) for a human` };
   }
-  if (state.status === 'running' || run.status === 'running') {
+  if (run.status === 'running') {
     return {
       ok: false,
       state: 'running',
       detail: 'the run has not finished (resume it with conduit resume if its driver crashed)',
     };
   }
-  if (run.status !== 'done') {
-    return { ok: false, state: 'halted', detail: `the run ended ${run.outcome ?? run.status}, not complete` };
+  const unfinished = cards.filter((c) => !CONCLUDED_LANES.has(c.lane)).length;
+  if (cards.length === 0 || unfinished > 0) {
+    return {
+      ok: false,
+      state: 'unfinished',
+      detail:
+        cards.length === 0
+          ? 'the run has no cards'
+          : `the run stopped with ${unfinished} unfinished card(s); resume it with conduit resume`,
+    };
   }
   return { ok: true };
 }

@@ -540,13 +540,14 @@ with no progress the card is hard-paused to the `hold` lane, so the run stops
 being auto-resumed and surfaces as a halt for a human to look at.
 
 `conduit run --append-pass --run-id <id> --input-inline <json>` starts the next
-**pass** of a run that already finished: it seeds a fresh entry card
+**pass** of a run whose previous pass concluded (every card in `done` or
+`scrap`, including a pass that scrapped): it seeds a fresh entry card
 (`entry-<id>-p<N>`) with the new input and drives the same run again. The
 listener uses it for webhook bindings that declare `run_key` (see
 [`ingress-listener.md`](./ingress-listener.md#one-run-per-subject-run_key)).
 Besides 0 and 1 it has two exit codes of its own: **3** when the run cannot take
-a pass (it is running, parked, halted, holding a card, or out of run token
-budget), and **75** when another live process holds the run's lease.
+a pass (it is running, parked, holding a card, stopped with unfinished cards,
+or out of run token budget), and **75** when another live process holds the run's lease.
 
 ### Alternative: run from the engine image during development
 
