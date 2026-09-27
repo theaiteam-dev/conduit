@@ -1365,7 +1365,7 @@ function buildV5StateFixture(opts: {
 
 describe('WI-474 AC-1: fresh DB gains run_id on all per-run tables and a runs table', () => {
   it('SCHEMA_VERSION is 10', () => {
-    expect(SCHEMA_VERSION).toBe(10);
+    expect(SCHEMA_VERSION).toBe(11);
   });
 
   it('PRAGMA user_version is 10 on a fresh DB', () => {
@@ -1373,7 +1373,7 @@ describe('WI-474 AC-1: fresh DB gains run_id on all per-run tables and a runs ta
     const raw = new Database(stateDbPath, { readonly: true });
     try {
       const { user_version } = raw.query('PRAGMA user_version').get() as { user_version: number };
-      expect(user_version).toBe(10);
+      expect(user_version).toBe(11);
     } finally {
       raw.close();
     }
@@ -1729,7 +1729,7 @@ describe('WI-474 AC-6: v5→v6 migration backfills DEFAULT_RUN_ID with no data l
     const check = new Database(stateDbPath, { readonly: true });
     try {
       const { user_version } = check.query('PRAGMA user_version').get() as { user_version: number };
-      expect(user_version).toBe(10);
+      expect(user_version).toBe(11);
     } finally {
       check.close();
     }
@@ -1830,7 +1830,7 @@ describe('WI-474 AC-7: migration idempotency', () => {
     const check = new Database(stateDbPath, { readonly: true });
     try {
       const { user_version } = check.query('PRAGMA user_version').get() as { user_version: number };
-      expect(user_version).toBe(10);
+      expect(user_version).toBe(11);
     } finally {
       check.close();
     }
