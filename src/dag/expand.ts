@@ -57,7 +57,14 @@ export type ExpansionError =
   | { code: 'dependency_cycle'; cycle: string[] }
   | { code: 'overlapping_owned_paths'; stations: [string, string]; path: string }
   | { code: 'unknown_dependency'; child: string; dependency: string }
-  | { code: 'seed_path_out_of_bounds'; child: string; path: string };
+  | { code: 'seed_path_out_of_bounds'; child: string; path: string }
+  /**
+   * A proposed child id is already a card in this run under another parent
+   * (issue #36). Card ids are unique per run, and a keyed run's later pass may
+   * propose the ids an earlier pass used; rejecting holds the parent instead
+   * of letting the insert throw out of the tick.
+   */
+  | { code: 'child_id_collision'; child: string; owner: string | null };
 
 export type ExpansionResult =
   | { ok: true; children: ValidatedChild[]; forcedEdges: Array<{ from: string; to: string }> }
@@ -112,12 +119,24 @@ export function validateExpansion(
   const { children } = proposal;
   const childIds = children.map((c) => c.id);
 
+  // ── Duplicate child id within the proposal (issue #36) ─────────────────
+  // commitFanOut checks each proposed id against existing cards, which two
+  // children sharing an id both pass; the second insert would then throw out
+  // of the tick. owner is null: no existing card owns the id.
+  const seenIds = new Set<string>();
+  for (const id of childIds) {
+    if (seenIds.has(id)) {
+      return { ok: false, error: { code: 'child_id_collision', child: id, owner: null } };
+    }
+    seenIds.add(id);
+  }
+
   // ── 0. Dangling-dependency check (config is validated, not trusted) ───────
   // The Architect proposal is untrusted: a hallucinated dep id would otherwise
   // sail past cycle detection (findCycleNodes deliberately ignores unknown
   // ids) and park the card in `waiting` forever. Every depends_on entry MUST
   // reference a known child in this proposal.
-  const childIdSet = new Set(childIds);
+  const childIdSet = seenIds;
   for (const child of children) {
     for (const dep of child.depends_on) {
       if (!childIdSet.has(dep)) {
@@ -259,6 +278,19 @@ export function commitFanOut(
       .get({ $parentRunId: parentRunId, $parentId: parentId }) as { n: number }
   ).n;
   if (existingCount > 0) return result;
+
+  // Child ids are unique per run, not per parent (issue #36). A proposal that
+  // reuses an id owned by another card would throw on insert; report it as a
+  // rejected proposal instead, so the caller holds the parent.
+  const findCard = stateDb.prepare(
+    'SELECT parent_id FROM cards WHERE run_id = $parentRunId AND id = $id',
+  );
+  for (const child of proposal.children) {
+    const owner = findCard.get({ $parentRunId: parentRunId, $id: child.id }) as { parent_id: string | null } | null;
+    if (owner !== null) {
+      return { ok: false, error: { code: 'child_id_collision', child: child.id, owner: owner.parent_id } };
+    }
+  }
 
   // Build a map from child id → seed file path for each seeded child.
   // Validate out-of-bounds seed paths before touching the filesystem or DB:

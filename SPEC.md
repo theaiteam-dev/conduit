@@ -568,6 +568,62 @@ spawned per flow. Egress needs no listener — the running kernel posts directly
 **egress-first is the MVP**: manual/CLI trigger, Slack for status/HITL/delivery; add the
 ingress listener when you want hands-off triggering.
 
+**Run identity: one run per delivery, or one run per subject.** By default an ingress run
+is keyed on its event id, so every delivery is its own run, and `ingress_events` collapses
+retries of that one delivery. A webhook binding may instead declare `run_key`, the ordered
+parts (JSON paths into the body, with ordered alternatives, or headers) that name the
+external subject the event is about, such as a repository and a pull-request number. The
+run id is then derived from the flow id and the key, and each later event about the
+subject is the next **pass** of that one run, so the run's cards, journal, and budget
+hold the subject's whole history. Keying is **fail-closed**: a part that does not resolve
+to a non-empty scalar refuses the event, with no fallback key. An optional `when` list
+(ANDed `header`/`json_path` conditions testing `in`, `not_in`, or `present`) drops
+deliveries the flow does not want before they are accepted; `max_passes` bounds how many
+passes the listener admits. All three are webhook-only and validated at boot.
+
+A pass is a kernel operation, `conduit run --append-pass`: it seeds a fresh entry card
+(`entry-<run>-p<N>`, `N` derived from the cards table) into a run whose previous pass
+**concluded**, and drives it through the same engine path. Concluded means: the run is
+not parked, no live process holds its lease, it is not recorded `running`, and every one
+of its cards rests in the `done` or `scrap` lane with none held. A pass that scrapped
+concluded: for an unattended loop that is an ordinary bad outcome, and `conduit resume`
+cannot bring a scrapped card to `done`, so refusing would block the subject for good. A
+run the andon halted with unfinished cards, a run whose driver died, a run holding a card
+for a human, and a parked run are refused, never reopened; each still has work a resume
+finishes, and a parked run is resumed by the parked-run machinery, not by a pass. Checkpoints, outbox keys, rework counters, and
+journal spans are all keyed per card, so a pass never replays or collides with an earlier
+pass. The run token budget is a ceiling over all passes together: `--append-pass` caps a
+pass at what earlier passes left and refuses one when nothing is left, and `conduit
+resume` of a run that has taken more than one pass applies the same cap and refusal. The
+wall-clock budget is per pass. A pass's invocation may name the ingress events it covers
+(`--pass-event`); the kernel records them in `run_pass_events` in the same transaction
+that seeds the entry card. An invocation whose events are all already recorded exits 0
+without seeding, so a repeated launch is a no-op; one that mixes recorded and new events
+exits 3 and seeds nothing. `max_passes` is an admission limit applied by the listener, not a fifth
+rework guard: it bounds how often the subject may re-enter the line, not how often a card
+may be reworked inside a pass.
+
+The listener routes an accepted keyed event by the state of its run (ingress/keyed-runs.ts):
+no run yet launches pass 1; a concluded run takes a new pass; a pass in flight, a parked
+run, or a run holding a card for a human **coalesces** the event into the run's single
+pending pass, which launches once the run is free (the in-flight pass exits, or the
+resume finishes), so N events during one pass cost one trailing pass rather than N; a run at `max_passes`, stopped with unfinished cards, or crashed mid-pass
+takes no pass. A pass that ran and concluded unsuccessfully is logged `pass_failed` and
+alerted, and its event is not re-driven: it was not a launch failure. The channel hears
+about a refusal, or about events waiting on a held run, once per run. Passes draw from the listener's run
+slots like any launch, under a per-run slot id, and never bypass them.
+
+A pass covers every event folded into it that no earlier pass consumed. The latest is the
+pass's top-level input; the substrate also carries `run_key`, `pass`, and `events`, the
+covered events oldest first (each with its event id, arrival time, and substrate), so a
+flow sees each change without fetching the subject's state. The list is bounded: at most 50
+events and 64 KiB, and the whole stamped substrate, base substrate included, at most 100 KiB,
+so a large base substrate leaves less room for `events`. When a bound drops the oldest
+events, `events_truncated` is true and the flow must fetch what it needs. The listener passes the covered event ids as
+`--pass-event`, and before launching any event it checks `run_pass_events`: an event a pass
+already consumed is marked spawned and logged `already_applied`, never launched again,
+even when the listener lost that pass's exit.
+
 ```yaml
 channels:
   ingress: { type: cli }                      # cli | slack | webhook (manual for MVP)
@@ -955,7 +1011,9 @@ write-lock contention at batch scale (rev-1 M1).
 | `station_outputs` | checkpointed typed output per `(card, station, attempt)` + **binding stamp** (§5) |
 | `outbox` | effectful-side-effect intent log + idempotency keys (§5) |
 | `active_workers` | claimed slots + **heartbeat lease** (`lease_until`) (§9, rev-1 H8) |
-| `ingress_events` | ingress dedup log: `(event_id TEXT PRIMARY KEY, received_at INTEGER)` — prevents a listener restart from re-triggering billed runs (§4A) |
+| `ingress_events` | ingress dedup log and launch ledger, keyed on `event_id` — prevents a listener restart from re-triggering billed runs (§4A). Each row also carries `spawn_state` (`accepted`, `spawned`, `failed`; for keyed runs, `coalesced` into a pending pass or `refused`), `spawn_attempts`, and the attribution the re-drive relaunches from (`flow_id`, `flow_path`, `run_id`, `substrate_json`). Only `accepted` and `failed` rows under the attempt cap are re-driven |
+| `ingress_keyed_runs` | per-run state for a `run_key` ingress binding: the subject key, `max_passes`, the pending event, and the alert-once flag, so a pending pass survives a listener restart (§4A) |
+| `run_pass_events` | which pass of a run consumed each ingress event, written by the kernel with the pass's entry card, so no event is launched twice and a pass lists every event it covers (§4A) |
 
 **Journal DB (append-only, high-volume, separate file/WAL):**
 

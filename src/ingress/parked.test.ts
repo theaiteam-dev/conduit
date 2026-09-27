@@ -14,7 +14,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { openConduitDB, type ConduitDB } from '../persistence/db';
-import { createRunSlots } from './run-slots';
+import { createRunSlots, keyedRunSlotId } from './run-slots';
 import type { SpawnFailedAlert } from './spawn';
 import type { HitlResumeSpawn } from './adapters/slack-events';
 import {
@@ -372,6 +372,31 @@ describe('resumeDueParkedRuns', () => {
 
     // Once that child is done, the next sweep resumes normally.
     slots.release('e1');
+    await resumeDueParkedRuns(d);
+    expect(resume.calls.map((c) => c.runId)).toEqual(['run-1']);
+  });
+
+  it("skips a run whose KEYED PASS launch is already in flight (issue #36) — registered under the RUN id, which the event-id guard above cannot see", async () => {
+    // routeKeyedEvent registers a pass launch under keyedRunSlotId(runId), not
+    // the event id, so it needs its own guard here (see keyedRunSlotId in
+    // ./run-slots.ts, shared by keyed-runs.ts and parked.ts). Unguarded, the
+    // resume would race that launch for the run lease.
+    seedIngressRun('e1', 'run-1');
+    parkRun('run-1', NOW_S - 10);
+    const slots = createRunSlots({ capacity: 4 });
+    expect(slots.tryAcquire(keyedRunSlotId('run-1'))).toBe('acquired');
+    const { deps: d, resume } = deps({ slots });
+
+    const report = await resumeDueParkedRuns(d);
+
+    expect(resume.calls).toHaveLength(0);
+    expect(report.resumed).toEqual([]);
+    expect(report.deferred).toEqual(['run-1']);
+    expect(db.getIngressEvent('e1')).toMatchObject({ spawn_state: 'spawned', spawn_attempts: 1 });
+    expect(db.getIngressLog({ outcome: 'spawn_failed' })).toHaveLength(0);
+
+    // Once that launch is done, the next sweep resumes normally.
+    slots.release(keyedRunSlotId('run-1'));
     await resumeDueParkedRuns(d);
     expect(resume.calls.map((c) => c.runId)).toEqual(['run-1']);
   });

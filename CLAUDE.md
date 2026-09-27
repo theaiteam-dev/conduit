@@ -7,7 +7,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 **MVP kernel + harness precursor tier shipped with Phase 1 exit criterion met (v0.3.1).** Build-order steps 1–7 (deterministic substrate:
 transform + deterministic stations, atomic claim, tick planner, checkpoint binding stamps, exactly-once
 recovery), 7.6 (multimodal image inputs), 7.7 (Docker packaging), 8.1 (deterministic fan-out/fan-in +
-rank/HITL), 8.2 (ingress listener), **9c (harness precursor tier: `kind: harness` station wrapping
+rank/HITL), 8.2 (ingress listener, including one run per subject for a webhook `run_key`: events
+become passes of that run via `conduit run --append-pass`, routed by `src/ingress/keyed-runs.ts`), **9c (harness precursor tier: `kind: harness` station wrapping
 external headless agent CLIs)**, and **engine-config adapter registration (per-run projectRoot binding)**
 are complete and driven by `runExecutor`. The owned-paths integrity gate, checkpoint cascade invalidation,
 the per-wave subtree budget, and the harness adapter registry (environment-config populated at boot) are

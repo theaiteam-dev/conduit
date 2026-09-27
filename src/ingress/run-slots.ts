@@ -59,6 +59,11 @@ export interface RunSlots {
   inFlightCount(): number;
 }
 
+/** Slot registration for a keyed run's pass launches (issue #36). */
+export function keyedRunSlotId(runId: string): string {
+  return `keyed-run:${runId}`;
+}
+
 export interface RunSlotsOptions {
   /**
    * Maximum concurrent runs. Omitted/undefined → Infinity (no capacity limit;

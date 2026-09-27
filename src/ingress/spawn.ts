@@ -41,8 +41,9 @@
  */
 import { buildEnvelope, projectSubstrate } from './envelope';
 import { inspectParkedRun, recordPark } from './parked';
-import { deriveIngressRunId } from './run-id';
-import type { RunSlots } from './run-slots';
+import { routeKeyedEvent, type KeyedRunDeps } from './keyed-runs';
+import { deriveIngressRunId, deriveKeyedIngressRunId } from './run-id';
+import { createRunSlots, type RunSlots } from './run-slots';
 import type { ConduitDB } from '../persistence/db';
 import type { FlowConfig } from '../types/kernel';
 
@@ -56,9 +57,22 @@ export interface SpawnInvocation {
   /**
    * Run id derived from the event id (the original ingress-attribution work) — passed as `--run-id` so
    * concurrent events never collide on the default run, and a re-drive of the
-   * same event resumes its own run instead of forking a duplicate.
+   * same event resumes its own run instead of forking a duplicate. For a
+   * binding with `run_key` (issue #36) it is the keyed run id instead.
    */
   runId: string;
+  /**
+   * Issue #36: launch the next pass of an existing keyed run
+   * (`conduit run --append-pass`) rather than a new run. Absent for every
+   * unkeyed launch and for a keyed run's first pass.
+   */
+  appendPass?: boolean;
+  /**
+   * Issue #36: the ingress events this keyed pass covers, passed as
+   * `--pass-event` so the kernel records them with the pass's entry card.
+   * Absent for every unkeyed launch.
+   */
+  passEvents?: string[];
 }
 
 /** Terminal state of a launched `conduit run` child (the original acknowledgement-on-accept work). */
@@ -119,6 +133,20 @@ export interface SpawnPathDeps {
    * confirm a parked run against its cards. Defaults to Date.now.
    */
   now?: () => number;
+  /**
+   * Keyed-run routing (issue #36), shared with the re-drive sweeps. The
+   * listener always wires it; when absent (unit-level callers) a keyed event
+   * gets one built from these deps, with the flow's own alert channel.
+   */
+  keyed?: KeyedRunDeps;
+}
+
+/** A keyed event's resolved subject (issue #36). */
+export interface SpawnRunKey {
+  /** Ordered resolved key parts (resolveRunKey). */
+  parts: string[];
+  /** The binding's pass ceiling; absent = unlimited. */
+  maxPasses?: number;
 }
 
 export interface SpawnPathInput {
@@ -134,6 +162,12 @@ export interface SpawnPathInput {
   flow: FlowConfig;
   /** Binding's JSON-path projection (WI-402). When absent, the full envelope is passed. */
   substrateMapping?: Record<string, string>;
+  /**
+   * Issue #36: the event's subject, when its binding declares `run_key`. The
+   * run id is then keyed on flow + subject, and routing goes through
+   * keyed-runs.ts. Absent keeps the per-delivery path byte-identical.
+   */
+  runKey?: SpawnRunKey;
 }
 
 export type SpawnPathResult =
@@ -142,7 +176,13 @@ export type SpawnPathResult =
   | { outcome: 'duplicate' }
   | { outcome: 'spawn_failed' }
   /** Accepted and recorded, but all run slots are busy — spawns via the sweep. */
-  | { outcome: 'queued'; runId: string };
+  | { outcome: 'queued'; runId: string }
+  /** Issue #36: folded into the keyed run's pending pass. */
+  | { outcome: 'coalesced'; runId: string }
+  /** Issue #36: the keyed run already had max_passes passes. */
+  | { outcome: 'pass_limit'; runId: string }
+  /** Issue #36: the keyed run is halted, held, or crashed mid-pass. */
+  | { outcome: 'run_not_appendable'; runId: string };
 
 // ---------------------------------------------------------------------------
 // Core path
@@ -173,6 +213,7 @@ export async function runSpawnPath(
     flowPath,
     flow,
     substrateMapping,
+    runKey,
   } = input;
 
   // ── Step 0: Cap the live re-drive path (The original input-validation work) ───────────────────────
@@ -203,7 +244,12 @@ export async function runSpawnPath(
   const envelope = buildEnvelope({ source, eventId, receivedAt, authVerified, headers, body, attachments });
   const substrate = projectSubstrate(envelope, substrateMapping);
   const inputInline = JSON.stringify(substrate);
-  const runId = deriveIngressRunId(eventId);
+  const runId =
+    runKey !== undefined ? deriveKeyedIngressRunId(flowId, runKey.parts) : deriveIngressRunId(eventId);
+
+  if (runKey !== undefined) {
+    return runKeyedSpawnPath(deps, input, runKey, runId, inputInline);
+  }
 
   // ── Step 2: Atomic accept-before-spawn (NFR-2) ──────────────────────────
   // Attribution (owning flow, payload, derived run id) rides the same atomic
@@ -315,6 +361,86 @@ export async function runSpawnPath(
     // sees a freed slot alongside a still-'accepted' row for a finished launch.
     // A handed-off slot stays held: its child is still running.
     if (!slotHandedOff) slots?.release(eventId);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Keyed accept path (issue #36)
+// ---------------------------------------------------------------------------
+
+/** Per-deps fallback keyed routing for callers that do not wire `deps.keyed`. */
+const fallbackKeyedDeps = new WeakMap<SpawnPathDeps, KeyedRunDeps>();
+
+function keyedDepsFor(deps: SpawnPathDeps, flowId: string, flow: FlowConfig): KeyedRunDeps {
+  if (deps.keyed !== undefined) return deps.keyed;
+  let built = fallbackKeyedDeps.get(deps);
+  if (built === undefined) {
+    built = {
+      db: deps.db,
+      spawn: deps.spawn,
+      alerts: { alert: deps.alert, channels: {}, globalAlertChannel: deps.globalAlertChannel },
+      slots: deps.slots ?? createRunSlots(),
+      redriveCap: deps.redriveCap,
+      now: deps.now ?? Date.now,
+      launching: new Set<string>(),
+    };
+    fallbackKeyedDeps.set(deps, built);
+  }
+  built.alerts.channels[flowId] ??= flow.channels?.egress?.[0]?.target ?? deps.globalAlertChannel;
+  return built;
+}
+
+/**
+ * The accept path for an event whose binding declares `run_key`. Delivery
+ * dedup is the same atomic accept as the unkeyed path; each ACCEPTED event
+ * creates the keyed-run row, or refreshes it with the binding's current
+ * max_passes, in the SAME transaction, so a crash can never leave an accepted
+ * keyed event whose run the sweep would not recognise as keyed. A duplicate
+ * delivery is the same event and changes nothing. Routing then belongs to
+ * keyed-runs.ts.
+ */
+async function runKeyedSpawnPath(
+  deps: SpawnPathDeps,
+  input: SpawnPathInput,
+  runKey: SpawnRunKey,
+  runId: string,
+  inputInline: string,
+): Promise<SpawnPathResult> {
+  const { db } = deps;
+  const { source, eventId, receivedAt, flowId, flowPath, flow } = input;
+
+  const accepted = db.getStateDb().transaction(() => {
+    const result = db.acceptIngressEvent(eventId, receivedAt, { flowId, flowPath, runId, substrateJson: inputInline });
+    if (result.accepted) {
+      db.upsertKeyedRun({ runId, flowId, flowPath, runKey: runKey.parts, maxPasses: runKey.maxPasses });
+    }
+    return result.accepted;
+  })();
+  if (!accepted) {
+    db.appendIngressLog({ source, eventId, outcome: 'duplicate' });
+    return { outcome: 'duplicate' };
+  }
+
+  const routed = await routeKeyedEvent(
+    keyedDepsFor(deps, flowId, flow),
+    { eventId, runId, flowId, flowPath, substrateJson: inputInline, source },
+    'hot',
+  );
+  switch (routed.outcome) {
+    case 'spawn_failed':
+      return { outcome: 'spawn_failed' };
+    case 'deferred':
+      // Unreachable on the hot path: this call just won the accept, so no
+      // launch of this event can already be in progress.
+      return { outcome: 'queued', runId };
+    case 'accepted':
+      return { outcome: 'accepted', runId };
+    case 'already_applied':
+      // Unreachable on the hot path too: a pass can only have consumed an
+      // event that was accepted before this call.
+      return { outcome: 'duplicate' };
+    default:
+      return { outcome: routed.outcome, runId };
   }
 }
 

@@ -81,7 +81,7 @@ export function parseColumn(cardId: string, column: string, raw: string): unknow
 // Schema version — stored as PRAGMA user_version on the state DB.
 // ---------------------------------------------------------------------------
 
-export const SCHEMA_VERSION = 10;
+export const SCHEMA_VERSION = 11;
 
 export const DEFAULT_RUN_ID = 'default';
 
@@ -264,6 +264,34 @@ CREATE INDEX IF NOT EXISTS idx_ingress_events_run_id
 -- boot re-drive and every periodic sweep skip the full-table scan + sort.
 CREATE INDEX IF NOT EXISTS idx_ingress_events_redrivable
   ON ingress_events(spawn_state, received_at) WHERE spawn_state IN ('accepted', 'failed');
+
+-- v11 (issue #36): per-run state for ingress runs keyed on an external
+-- subject (a binding's run_key). One row per keyed run. The run id already
+-- hashes the flow id, so it is the key. pending_event_id names the latest
+-- event folded into the run's next pass while a pass was in flight;
+-- blocked_alerted records that the channel was told the run cannot take more
+-- passes, so it hears that once per run rather than once per event.
+CREATE TABLE IF NOT EXISTS ingress_keyed_runs (
+  run_id           TEXT PRIMARY KEY,
+  flow_id          TEXT NOT NULL,
+  flow_path        TEXT NOT NULL,
+  run_key_json     TEXT NOT NULL,
+  max_passes       INTEGER,
+  pending_event_id TEXT,
+  blocked_alerted  INTEGER NOT NULL DEFAULT 0
+);
+
+-- v11 (issue #36): which ingress events each pass of a run consumed. Written
+-- by the kernel in the same transaction that seeds the pass's entry card
+-- (conduit run --pass-event), so a row here means the pass exists. The
+-- listener reads it to avoid launching an event twice, and to hand a pass
+-- every event folded into it, not only the latest.
+CREATE TABLE IF NOT EXISTS run_pass_events (
+  event_id TEXT PRIMARY KEY,
+  run_id   TEXT NOT NULL,
+  pass     INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_run_pass_events_run ON run_pass_events(run_id, pass);
 `;
 
 const JOURNAL_DDL = `
@@ -608,7 +636,29 @@ export type IngressOutcome =
   | 'parked'
   // The original listener-backpressure work: accepted but no run slot free — the row stays 'accepted' in
   // ingress_events and the re-drive sweep launches it as slots free.
-  | 'queued';
+  | 'queued'
+  // Issue #36 (webhook subject identity). 'filtered': the binding's `when`
+  // conditions did not match, so the event was acked and dropped before accept.
+  // 'rejected_run_key': the binding declares run_key and a part did not
+  // resolve, so the event was refused (fail closed). 'coalesced': a pass of the
+  // event's keyed run was in flight, so the event became the run's pending
+  // pass. 'pass_limit': the keyed run already had max_passes passes.
+  // 'run_not_appendable': the keyed run is halted, failed, or holding cards, so
+  // a new pass was not launched.
+  | 'filtered'
+  | 'rejected_run_key'
+  | 'coalesced'
+  | 'pass_limit'
+  | 'run_not_appendable'
+  // 'pass_failed': a keyed pass ran and concluded unsuccessfully (its cards
+  // are all in done or scrap, the run is not parked). The event stays
+  // 'spawned', since it is not a launch failure to re-drive; the channel is
+  // alerted and the run takes its next pass as usual.
+  | 'pass_failed'
+  // 'already_applied': a re-drive found that a pass had already consumed the
+  // event (run_pass_events), so it was marked spawned rather than launched a
+  // second time.
+  | 'already_applied';
 
 export interface IngressLogInput {
   source: string;
@@ -659,13 +709,48 @@ const VALID_INGRESS_OUTCOMES: ReadonlySet<string> = new Set<IngressOutcome>([
   'redriven',
   'parked',
   'queued',
+  'filtered',
+  'rejected_run_key',
+  'coalesced',
+  'pass_limit',
+  'run_not_appendable',
+  'pass_failed',
+  'already_applied',
 ]);
 
 // ---------------------------------------------------------------------------
 // Ingress event types (WI-401)
 // ---------------------------------------------------------------------------
 
-export type IngressSpawnState = 'accepted' | 'spawned' | 'failed';
+/**
+ * 'coalesced' and 'refused' (issue #36) belong to keyed-run events: folded into
+ * the run's pending pass, or declined by the keyed router. Neither is
+ * re-drivable, and a redelivery of either is a duplicate.
+ */
+export type IngressSpawnState = 'accepted' | 'spawned' | 'failed' | 'coalesced' | 'refused';
+
+/** Per-run state for an ingress run keyed on an external subject (issue #36). */
+export interface KeyedRunRecord {
+  run_id: string;
+  flow_id: string;
+  flow_path: string;
+  /** The ordered resolved key parts the run is keyed on. */
+  run_key: string[];
+  /** The binding's pass ceiling as of the latest accepted event; null = unlimited. */
+  max_passes: number | null;
+  /** The latest event waiting to become the run's next pass, if any. */
+  pending_event_id: string | null;
+  /** The channel was already told this run cannot take more passes. */
+  blocked_alerted: boolean;
+}
+
+export interface KeyedRunUpsert {
+  runId: string;
+  flowId: string;
+  flowPath: string;
+  runKey: string[];
+  maxPasses: number | null | undefined;
+}
 
 /** snake_case fields mirroring the Card record returned by getCard. */
 export interface IngressEventRecord {
@@ -736,6 +821,33 @@ interface RawIngressEventRow {
   flow_path: string | null;
   run_id: string | null;
   substrate_json: string | null;
+}
+
+/** Raw ingress_keyed_runs row shape as returned by bun:sqlite. */
+interface RawKeyedRunRow {
+  run_id: string;
+  flow_id: string;
+  flow_path: string;
+  run_key_json: string;
+  max_passes: number | null;
+  pending_event_id: string | null;
+  blocked_alerted: number;
+}
+
+function toKeyedRunRecord(row: RawKeyedRunRow): KeyedRunRecord {
+  const parsed = parseColumn(row.run_id, 'run_key_json', row.run_key_json);
+  if (!Array.isArray(parsed) || !parsed.every((p) => typeof p === 'string')) {
+    throw new Error(`corrupt ingress_keyed_runs row '${row.run_id}': run_key_json is not a string array`);
+  }
+  return {
+    run_id: row.run_id,
+    flow_id: row.flow_id,
+    flow_path: row.flow_path,
+    run_key: parsed,
+    max_passes: row.max_passes,
+    pending_event_id: row.pending_event_id,
+    blocked_alerted: row.blocked_alerted !== 0,
+  };
 }
 
 /**
@@ -841,6 +953,45 @@ export interface ConduitDB {
    * periodic re-drive sweep.
    */
   listRedrivable(cap: number): IngressEventRecord[];
+  /** Mark an ingress event folded into its keyed run's pending pass (issue #36). */
+  markIngressCoalesced(eventId: string): void;
+  /** Mark an ingress event declined by the keyed router (issue #36). */
+  markIngressRefused(eventId: string): void;
+  /**
+   * Count ingress rows for runId that a sweep would still launch: 'accepted',
+   * or 'failed' under the attempt cap. With `beforeEventId`, only rows ordered
+   * before that event (received_at, then event_id) count, so a queued burst
+   * for one keyed run launches its oldest event and folds the rest into it.
+   * Issue #36: a queued launch is a pass in flight.
+   */
+  countQueuedIngressForRun(runId: string, cap: number, beforeEventId: string | null): number;
+  /** Keyed-run state for runId, or null when the run is not keyed (issue #36). */
+  getKeyedRun(runId: string): KeyedRunRecord | null;
+  /**
+   * Create the keyed-run row, or refresh its flow path and max_passes from the
+   * latest accepted event. The key and the pending/alert state are kept.
+   */
+  upsertKeyedRun(input: KeyedRunUpsert): void;
+  /** Set (or clear, with null) the event waiting to become the next pass. */
+  setKeyedRunPending(runId: string, eventId: string | null): void;
+  /** Record whether the channel was told the run cannot take more passes. */
+  setKeyedRunBlockedAlerted(runId: string, alerted: boolean): void;
+  /** Every keyed run with a pending event, oldest run id first. */
+  listKeyedRunsWithPending(): KeyedRunRecord[];
+  /**
+   * Record that pass `pass` of runId consumed these ingress events (issue
+   * #36). The kernel calls it in the transaction that seeds the pass's entry
+   * card. Throws if an event is already recorded against any pass.
+   */
+  recordPassEvents(runId: string, pass: number, eventIds: readonly string[]): void;
+  /** The pass that consumed eventId, or null when no pass has (issue #36). */
+  getPassForEvent(eventId: string): { run_id: string; pass: number } | null;
+  /**
+   * Events folded into runId's pending pass that no pass has consumed yet,
+   * ordered by (received_at, event_id) and not later than `uptoEventId`
+   * (issue #36). These, plus the launching event, are what the next pass covers.
+   */
+  listUnappliedCoalesced(runId: string, uptoEventId: string): IngressEventRecord[];
   /**
    * Append a span to the journal. Sensitive attributes are filtered first.
    * Uses the journal connection — never blocks on the state write-lock.
@@ -958,6 +1109,26 @@ export interface ConduitDB {
   /** Close both database connections. */
   close(): void;
 }
+
+/**
+ * SQL for countQueuedIngressForRun, hoisted so its query-plan test exercises
+ * the exact string the production query runs rather than a hand-copied
+ * duplicate that can drift out of sync.
+ *
+ * flow_path IS NOT NULL is redundant with the accept path (every keyed row
+ * has full attribution), but it lets SQLite match idx_ingress_events_run_id's
+ * partial WHERE, which run_id = ? alone does not imply.
+ */
+export const COUNT_QUEUED_INGRESS_FOR_RUN_SQL = `SELECT COUNT(*) AS n FROM ingress_events e
+         WHERE e.run_id = $run_id
+           AND e.flow_path IS NOT NULL
+           AND (e.spawn_state = 'accepted' OR (e.spawn_state = 'failed' AND e.spawn_attempts < $cap))
+           AND ($before IS NULL OR EXISTS (
+             SELECT 1 FROM ingress_events b
+             WHERE b.event_id = $before
+               AND (e.received_at < b.received_at
+                    OR (e.received_at = b.received_at AND e.event_id < b.event_id))
+           ))`;
 
 // ---------------------------------------------------------------------------
 // Implementation
@@ -1161,6 +1332,111 @@ class ConduitDBImpl implements ConduitDB {
       .all({ $cap: cap }) as RawIngressEventRow[];
 
     return rows.map(toIngressEventRecord);
+  }
+
+  markIngressCoalesced(eventId: string): void {
+    this.stateDb
+      .prepare(`UPDATE ingress_events SET spawn_state = 'coalesced' WHERE event_id = $event_id`)
+      .run({ $event_id: eventId });
+  }
+
+  markIngressRefused(eventId: string): void {
+    this.stateDb
+      .prepare(`UPDATE ingress_events SET spawn_state = 'refused' WHERE event_id = $event_id`)
+      .run({ $event_id: eventId });
+  }
+
+  countQueuedIngressForRun(runId: string, cap: number, beforeEventId: string | null): number {
+    const row = this.stateDb
+      .prepare(COUNT_QUEUED_INGRESS_FOR_RUN_SQL)
+      .get({ $run_id: runId, $cap: cap, $before: beforeEventId }) as { n: number };
+    return row.n;
+  }
+
+  getKeyedRun(runId: string): KeyedRunRecord | null {
+    const row = this.stateDb
+      .prepare(
+        `SELECT run_id, flow_id, flow_path, run_key_json, max_passes, pending_event_id, blocked_alerted
+         FROM ingress_keyed_runs WHERE run_id = $run_id`,
+      )
+      .get({ $run_id: runId }) as RawKeyedRunRow | null;
+    return row === null ? null : toKeyedRunRecord(row);
+  }
+
+  upsertKeyedRun(input: KeyedRunUpsert): void {
+    this.stateDb
+      .prepare(
+        `INSERT INTO ingress_keyed_runs (run_id, flow_id, flow_path, run_key_json, max_passes)
+         VALUES ($run_id, $flow_id, $flow_path, $run_key_json, $max_passes)
+         ON CONFLICT(run_id) DO UPDATE SET
+           flow_path = excluded.flow_path,
+           max_passes = excluded.max_passes`,
+      )
+      .run({
+        $run_id: input.runId,
+        $flow_id: input.flowId,
+        $flow_path: input.flowPath,
+        $run_key_json: JSON.stringify(input.runKey),
+        $max_passes: input.maxPasses ?? null,
+      });
+  }
+
+  setKeyedRunPending(runId: string, eventId: string | null): void {
+    this.stateDb
+      .prepare(`UPDATE ingress_keyed_runs SET pending_event_id = $event_id WHERE run_id = $run_id`)
+      .run({ $event_id: eventId, $run_id: runId });
+  }
+
+  setKeyedRunBlockedAlerted(runId: string, alerted: boolean): void {
+    this.stateDb
+      .prepare(`UPDATE ingress_keyed_runs SET blocked_alerted = $alerted WHERE run_id = $run_id`)
+      .run({ $alerted: alerted ? 1 : 0, $run_id: runId });
+  }
+
+  recordPassEvents(runId: string, pass: number, eventIds: readonly string[]): void {
+    const insert = this.stateDb.prepare(
+      'INSERT INTO run_pass_events (event_id, run_id, pass) VALUES ($event_id, $run_id, $pass)',
+    );
+    // Atomic on its own: a duplicate later in the list must not
+    // leave an earlier insert recorded. bun:sqlite nests this as a savepoint
+    // when the sole caller (src/cli/main.ts) already holds an outer transaction.
+    this.stateDb.transaction(() => {
+      for (const eventId of eventIds) insert.run({ $event_id: eventId, $run_id: runId, $pass: pass });
+    })();
+  }
+
+  getPassForEvent(eventId: string): { run_id: string; pass: number } | null {
+    return this.stateDb
+      .prepare('SELECT run_id, pass FROM run_pass_events WHERE event_id = $event_id')
+      .get({ $event_id: eventId }) as { run_id: string; pass: number } | null;
+  }
+
+  listUnappliedCoalesced(runId: string, uptoEventId: string): IngressEventRecord[] {
+    const rows = this.stateDb
+      .prepare(
+        `SELECT e.event_id, e.received_at, e.spawn_state, e.spawn_attempts,
+                e.flow_id, e.flow_path, e.run_id, e.substrate_json
+         FROM ingress_events e, ingress_events u
+         WHERE u.event_id = $upto
+           AND e.run_id = $run_id
+           AND e.spawn_state = 'coalesced'
+           AND NOT EXISTS (SELECT 1 FROM run_pass_events p WHERE p.event_id = e.event_id)
+           AND (e.received_at < u.received_at
+                OR (e.received_at = u.received_at AND e.event_id <= u.event_id))
+         ORDER BY e.received_at, e.event_id`,
+      )
+      .all({ $run_id: runId, $upto: uptoEventId }) as RawIngressEventRow[];
+    return rows.map(toIngressEventRecord);
+  }
+
+  listKeyedRunsWithPending(): KeyedRunRecord[] {
+    const rows = this.stateDb
+      .prepare(
+        `SELECT run_id, flow_id, flow_path, run_key_json, max_passes, pending_event_id, blocked_alerted
+         FROM ingress_keyed_runs WHERE pending_event_id IS NOT NULL ORDER BY run_id`,
+      )
+      .all() as RawKeyedRunRow[];
+    return rows.map(toKeyedRunRecord);
   }
 
   appendJournalSpan(span: JournalSpanInput): void {
@@ -1965,6 +2241,7 @@ export function openConduitDB({
   let needsV7ToV8Migration = false;
   let needsV8ToV9Migration = false;
   let needsV9ToV10Migration = false;
+  let needsV10ToV11Migration = false;
 
   const tableExists = (name: string): boolean => {
     const row = stateDb
@@ -2000,6 +2277,7 @@ export function openConduitDB({
     needsV7ToV8Migration = true;
     needsV8ToV9Migration = true;
     needsV9ToV10Migration = true;
+    needsV10ToV11Migration = true;
   } else if (user_version === 3) {
     needsV3ToV4Migration = true;
     needsV4ToV5Migration = true;
@@ -2008,6 +2286,7 @@ export function openConduitDB({
     needsV7ToV8Migration = true;
     needsV8ToV9Migration = true;
     needsV9ToV10Migration = true;
+    needsV10ToV11Migration = true;
   } else if (user_version === 4) {
     needsV4ToV5Migration = true;
     needsV5ToV6Migration = true;
@@ -2015,26 +2294,34 @@ export function openConduitDB({
     needsV7ToV8Migration = true;
     needsV8ToV9Migration = true;
     needsV9ToV10Migration = true;
+    needsV10ToV11Migration = true;
   } else if (user_version === 5) {
     needsV5ToV6Migration = true;
     needsV6ToV7Migration = true;
     needsV7ToV8Migration = true;
     needsV8ToV9Migration = true;
     needsV9ToV10Migration = true;
+    needsV10ToV11Migration = true;
   } else if (user_version === 6) {
     needsV6ToV7Migration = true;
     needsV7ToV8Migration = true;
     needsV8ToV9Migration = true;
     needsV9ToV10Migration = true;
+    needsV10ToV11Migration = true;
   } else if (user_version === 7) {
     needsV7ToV8Migration = true;
     needsV8ToV9Migration = true;
     needsV9ToV10Migration = true;
+    needsV10ToV11Migration = true;
   } else if (user_version === 8) {
     needsV8ToV9Migration = true;
     needsV9ToV10Migration = true;
+    needsV10ToV11Migration = true;
   } else if (user_version === 9) {
     needsV9ToV10Migration = true;
+    needsV10ToV11Migration = true;
+  } else if (user_version === 10) {
+    needsV10ToV11Migration = true;
   } else if (user_version !== SCHEMA_VERSION) {
     stateDb.close();
     throw new Error(
@@ -2291,6 +2578,29 @@ export function openConduitDB({
       const msg = err instanceof Error ? err.message : String(err);
       if (!msg.includes('no such table')) throw err;
     }
+    stateDb.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+  }
+
+  if (needsV10ToV11Migration) {
+    // Additive v10→v11 migration (issue #36): the keyed-run state table. A new
+    // table rather than new columns, so IF NOT EXISTS makes it idempotent.
+    stateDb.exec(`
+      CREATE TABLE IF NOT EXISTS ingress_keyed_runs (
+        run_id           TEXT PRIMARY KEY,
+        flow_id          TEXT NOT NULL,
+        flow_path        TEXT NOT NULL,
+        run_key_json     TEXT NOT NULL,
+        max_passes       INTEGER,
+        pending_event_id TEXT,
+        blocked_alerted  INTEGER NOT NULL DEFAULT 0
+      );
+      CREATE TABLE IF NOT EXISTS run_pass_events (
+        event_id TEXT PRIMARY KEY,
+        run_id   TEXT NOT NULL,
+        pass     INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_run_pass_events_run ON run_pass_events(run_id, pass);
+    `);
     stateDb.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
   }
 

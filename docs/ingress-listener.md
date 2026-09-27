@@ -294,6 +294,156 @@ field present with value `null`. The same dialect applies to
 request **body** directly, not the envelope, so drop the `$.body` prefix
 (`$.event.files.0.id`, not `$.body.event.files.0.id`).
 
+### Event filter (`when`)
+
+A webhook binding may declare `when`: a list of conditions, all of which an
+event must meet to be accepted. Each condition names one subject, a `header`
+(matched case-insensitively) or a `json_path` into the request body, and one
+test:
+
+```yaml
+when:
+  - { header: X-GitHub-Event, in: [pull_request_review, issue_comment] }
+  - { json_path: $.action, not_in: [deleted] }
+  - { json_path: $.pull_request.number, present: true }
+```
+
+- `in` / `not_in` compare the resolved value as a string against a non-empty
+  list (numbers and booleans in the list are written as their string form).
+- `present: true|false` asks whether the subject exists and is not null,
+  whatever its type. An object counts: GitHub marks an `issue_comment` on a
+  pull request with an object at `$.issue.pull_request`, so
+  `{ json_path: $.issue.pull_request, present: true }` keeps PR comments and
+  drops comments on plain issues.
+- For `in` and `not_in`, only a string, number, or boolean counts as
+  resolved. An object, array, null, or missing value is in no list: `in`
+  fails, `not_in` holds.
+- Values are compared as strings. A resolved `42` or `"42"` matches both
+  `in: [42]` and `in: ["42"]`, and `true` or `"true"` matches both
+  `in: [true]` and `in: ["true"]`. Headers are always strings, so a typed
+  comparison could not apply to every subject. `when` filters a delivery
+  that has already passed auth; it is not access control.
+
+A non-matching event is answered `200 {"outcome":"filtered"}` so the provider
+does not retry it, logged `filtered`, and never written to `ingress_events`.
+`when` works with or without `run_key`. Boot rejects a malformed condition
+(`INVALID_WHEN`) and `when` on a slack or cli binding (`WHEN_UNSUPPORTED_TYPE`).
+
+### One run per subject (`run_key`)
+
+By default every delivery starts its own run (the run id is derived from the
+event id). A webhook binding may instead declare `run_key`: the ordered parts
+that identify the external subject an event is about. Every event with the
+same key belongs to ONE run, and each event after the first becomes the next
+**pass** of that run.
+
+```yaml
+channels:
+  ingress:
+    type: webhook
+    route: /hooks/pr-review
+    auth: { type: hmac, secret_env: GITHUB_WEBHOOK_SECRET }
+    event_id: { from: header, name: x-github-delivery }   # delivery dedup, unchanged
+    when:
+      - { header: X-GitHub-Event, in: [pull_request_review, issue_comment] }
+    run_key:
+      - { json_path: "$.repository.id" }
+      - { json_path: ["$.pull_request.number", "$.issue.number"] }
+    max_passes: 10          # optional; absent = unlimited
+```
+
+- Each part is `{ json_path: <path> }`, `{ json_path: [<path>, ...] }`
+  (alternatives: the first that resolves to a non-empty scalar within the
+  512-character limit wins; an alternative over that limit is skipped like an
+  unresolved one, so a later, shorter alternative can still resolve the part),
+  or `{ header: <name> }`. Paths use the same `$.` dialect as `substrate`,
+  rooted at the request body.
+- Only non-empty scalar values count. If any part does not resolve, the event
+  is refused: `400`, logged `rejected_run_key`, never accepted. There is no
+  content-hash fallback, since a fallback key would quietly give the event a
+  run of its own. A part is refused the same way when every alternative is
+  either unresolved or over 512 characters.
+- The run id is `igk-<flow>-<hash>`, where the hash covers the flow id and the
+  ordered parts, so two flows keyed on the same subject never share a run.
+  Leave out anything that changes as the flow works (a head SHA, for a flow
+  that pushes).
+- `run_key`, `when`, and `max_passes` are webhook-only. On a slack or cli
+  binding they fail boot (`RUN_KEY_UNSUPPORTED_TYPE`, `WHEN_UNSUPPORTED_TYPE`,
+  `INVALID_MAX_PASSES`). `max_passes` also requires `run_key`.
+- A keyed binding's `substrate` may not name `run_key`, `pass`, `events` or
+  `events_truncated` (`RESERVED_SUBSTRATE_FIELD`): the listener stamps all
+  four onto every keyed pass's substrate (see below). Unkeyed substrates are
+  unchanged.
+
+Delivery dedup is unchanged: a retried delivery is still a `duplicate`. What
+an accepted keyed event does depends on its run:
+
+| Run state | What happens | Logged |
+|-----------|--------------|--------|
+| No run yet | Launch pass 1 (`conduit run --run-id <keyed id>`) | `accepted` |
+| A pass is in flight (launching, running, resuming, queued behind busy slots) or the run is parked | The event is folded into the run's **pending** pass | `coalesced` |
+| Holding a card for a human (HITL pick, integrity hard-pause) | The event becomes the pending pass; the channel is told once that events are waiting | `coalesced` |
+| Previous pass concluded: every card in `done` or `scrap`, none held | Launch the next pass (`conduit run --append-pass`) | `accepted` |
+| Concluded, `max_passes` reached | Nothing launched | `pass_limit` |
+| Stopped with unfinished cards (the andon halted it mid-pass) or crashed mid-pass | Nothing launched | `run_not_appendable` |
+| A pass already consumed this event (a re-drive of a launch whose exit was lost) | Nothing launched; the event is marked `spawned` | `already_applied` |
+
+A pass that scrapped has concluded, so the subject keeps taking passes: an
+unattended loop treats a scrapped pass as a bad outcome, not a stuck run. When
+a pass exits non-zero after concluding that way, its event stays `spawned` (it
+is not re-driven as a fresh pass), the log records `pass_failed` with the
+reason, the channel is alerted, and the pending event launches as usual. Only
+a non-zero exit that leaves the run unable to take a pass marks the event
+`failed` for the re-drive sweep.
+
+When a pass's child exits, the pending event (if any) launches as exactly one
+more pass: six review comments posted during one pass produce one trailing
+pass. That pass covers all six. Its substrate's top-level fields are the
+latest event's, and four more fields describe the pass:
+
+| Field | Value |
+|-------|-------|
+| `run_key` | The resolved key parts |
+| `pass` | The pass number |
+| `events` | Every event the pass covers, oldest first, the latest last. Each entry is `{ event_id, received_at, substrate }` |
+| `events_truncated` | `true` when the list was cut. It holds at most 50 events and 64 KiB, and the whole stamped substrate, including the latest event's own fields, is kept under 100 KiB, so a large substrate leaves less room for `events`. The oldest are dropped first |
+
+A flow reads `events` to act on each change. It needs to fetch the subject's
+state from its source only when `events_truncated` is true.
+
+The kernel records which events each pass consumed. The listener passes the
+covered event ids to `conduit run` as `--pass-event`, and the kernel writes
+them to `run_pass_events` in the same transaction that seeds the pass's entry
+card. Before launching an event, the listener checks that table. If the
+listener lost a pass's exit (the child's handle was lost, or the listener
+restarted) and the sweep picks the event up again, the event is marked
+`spawned` and logged `already_applied` instead of running a second time.
+
+The periodic sweep also drains pending passes, which is how a pending
+pass survives a listener restart and follows a parked-run or HITL resume. A
+pass that loses the run lease to another driver (exit 75) becomes pending
+rather than failed.
+
+A `pass_limit` or `run_not_appendable` refusal, and events waiting on a held
+run, alert the channel **once per run**, not once per event; every event is
+still logged. The flag clears when a pass launches, so a run that is repaired
+and blocks again is reported again. Resume a run with unfinished cards, or a
+crashed one, with `conduit resume` to let it take passes again. A held run
+needs no such step: the human's reply resumes it, and its pending pass follows.
+
+Passes take a run slot like any launch and never bypass `max_concurrent_runs`.
+Their slot is registered per run, so two launches for one run never overlap.
+The run's token budget (`budgets.run.max_tokens`) is a ceiling over all its
+passes: each pass may spend only what earlier passes left, and a run with none
+left refuses the next pass. `conduit resume` of a run that has taken more than
+one pass applies the same ceiling, and refuses the resume when nothing is left. The wall-clock budget applies to each pass on its
+own. Card, checkpoint, and journal state are per card, so a pass never replays
+an earlier pass's work; a fan-out in a later pass must propose child ids the
+run has not used (a reused id holds the parent with `child_id_collision`).
+Per-run keyed state (key, `max_passes`, pending event, alert flag) is kept in
+the `ingress_keyed_runs` table, and which pass consumed each event in
+`run_pass_events`.
+
 ## The durability ledger
 
 ### ingress_events table
@@ -441,6 +591,13 @@ Append-only journal of all event outcomes. Columns:
   - `'redriven'` — Re-drive attempt on restart
   - `'parked'` — The launched run halted parked behind a provider rate limit (`runs.outcome='parked'`); the row stays `spawned` and the sweep resumes it once its gate passes. Written on every park; the reason names the run id and the gate as ISO-8601 UTC
   - `'queued'` — Accepted, but all run slots busy (`max_concurrent_runs`); launches via the re-drive sweep as slots free
+  - `'filtered'`: The binding's `when` conditions did not match; acked, never accepted
+  - `'rejected_run_key'`: The binding declares `run_key` and a part did not resolve; refused with 400
+  - `'coalesced'`: A keyed event folded into its run's pending pass
+  - `'pass_limit'`: A keyed run already had `max_passes` passes
+  - `'run_not_appendable'`: A keyed run stopped with unfinished cards, or crashed mid-pass
+  - `'pass_failed'`: A keyed pass ran and concluded unsuccessfully (its cards are in `done` or `scrap`); the event stays `spawned` and the run takes its next pass
+  - `'already_applied'`: A re-drive found that a pass already consumed the event (`run_pass_events`); the event is marked `spawned` and not launched again
 - `reason` (TEXT, nullable): Human-readable reason
 - `attributes_json` (TEXT, nullable): Event attributes (secret-filtered)
 
@@ -552,6 +709,11 @@ The ingress listener adds:
 
 - `ingress_events` table (new columns: `spawn_state`, `spawn_attempts`)
 - `ingress_log` table (new, journal connection)
+- `ingress_keyed_runs` table (schema v11): per-run state for `run_key` bindings.
+  Keyed events also use two further `spawn_state` values, `coalesced` and
+  `refused`, neither of which is re-driven
+- `run_pass_events` table (schema v11): which pass of a run consumed each
+  ingress event, written by the kernel with the pass's entry card
 
 Migrations are idempotent and additive:
 
