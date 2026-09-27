@@ -89,7 +89,8 @@ export function isCardScoped(name: string, ownedDirInputs?: readonly string[]): 
  * @param ownedPaths     - The card's owned paths; `[0]` is the child dir,
  *                         resolved against `projectRoot` when relative.
  * @param ownedDirInputs - The station's `input_scope.owned_dir` list.
- * @throws If `name` is card-scoped but `ownedPaths` is empty/absent.
+ * @throws If `name` is card-scoped but `ownedPaths` is absent/empty, or its
+ *         first entry is empty/whitespace-only.
  */
 export function resolveInputPath(
   name: string,
@@ -99,7 +100,7 @@ export function resolveInputPath(
 ): string {
   if (isCardScoped(name, ownedDirInputs)) {
     const ownedDir = ownedPaths?.[0];
-    if (ownedDir === undefined) {
+    if (ownedDir === undefined || ownedDir.trim() === '') {
       throw new Error(
         `Card-scoped input "${name}" cannot be resolved: no owned_paths scope was supplied for this card. ` +
           `Refusing to fall back to the project-root artifact of the same name.`,

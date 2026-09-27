@@ -17,7 +17,7 @@ import { join } from 'node:path';
 import type { Lane, StationOutput } from '../types/kernel';
 import { DEFAULT_RUN_ID, type ConduitDB } from '../persistence/db';
 import type { ModelAdapter } from '../worker/adapter';
-import { resolveInputPath } from '../flow/resolve-input';
+import { resolveInputPath, SEED_INPUT } from '../flow/resolve-input';
 import { runTransformStation, coerciveParse, type OutputSchema } from '../worker/transform';
 import type { HarnessAdapter, HarnessResult, MountedInput, UsageReport } from '../worker/harness-adapter';
 import { usageFromThrow } from '../worker/harness-adapter';
@@ -344,7 +344,7 @@ export async function runHarnessGateCheck(config: HarnessGateConfig): Promise<Ga
   // own (WI-565) — and, like the maker, resolve card-scoped names from the
   // card's owned dir rather than projectRoot (issue #51).
   const mountedInputs: MountedInput[] = config.criticInputScope
-    .filter((name) => name !== 'feedback' && name !== 'seed.json')
+    .filter((name) => name !== 'feedback' && name !== SEED_INPUT)
     .map((name) => ({
       name,
       path: resolveInputPath(name, config.projectRoot, config.ownedPaths, config.ownedDirInputs),

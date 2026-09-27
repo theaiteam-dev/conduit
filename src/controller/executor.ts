@@ -52,7 +52,7 @@ import { harnessRetryDelayMs } from '../worker/harness-retry';
 import { loadImageInput, hashImageInputs, assertImagePayloadWithinLimits } from '../worker/image-input';
 import type { ImageInput } from '../worker/image-input';
 import { renderPrompt } from '../flow/render';
-import { resolveInputPath } from '../flow/resolve-input';
+import { resolveInputPath, SEED_INPUT } from '../flow/resolve-input';
 import { buildOutputSchema } from '../flow/schema';
 import { runGateRework } from './gate-rework';
 import {
@@ -3819,7 +3819,7 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
       // while its prompt quotes the per-child one — two different files under one
       // name, the worst version of this bug to debug.
       mountedInputs = stationConfig.inputs
-        .filter((name) => name !== 'feedback' && name !== 'seed.json')
+        .filter((name) => name !== 'feedback' && name !== SEED_INPUT)
         .map((name) => ({
           name,
           path: resolveInputPath(name, projectRoot, card.owned_paths, stationConfig.input_scope?.owned_dir),

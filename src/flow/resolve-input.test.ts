@@ -87,6 +87,22 @@ describe('resolveInputPath — card scope wins over projectRoot (issue #51)', ()
     );
   });
 
+  it('THROWS rather than resolving to projectRoot when ownedPaths[0] is empty/whitespace', () => {
+    // Review finding: resolve(projectRoot, '') === projectRoot, so an empty
+    // string in owned_paths[0] passed the `undefined` check and silently
+    // resolved the card-scoped name to <projectRoot>/<name> — the exact
+    // shared-artifact fallback this module exists to prevent.
+    expect(() => resolveInputPath('patch.txt', ROOT, [''], ['patch.txt'])).toThrow(
+      /Card-scoped input "patch\.txt" cannot be resolved/,
+    );
+    expect(() => resolveInputPath('seed.json', ROOT, [''], undefined)).toThrow(
+      /Card-scoped input "seed\.json" cannot be resolved/,
+    );
+    expect(() => resolveInputPath('patch.txt', ROOT, ['   '], ['patch.txt'])).toThrow(
+      /Card-scoped input "patch\.txt" cannot be resolved/,
+    );
+  });
+
   it('still resolves an UNSCOPED name from projectRoot on a card with no owned dir', () => {
     // The throw is scoped to card-scoped names only — a station that declares
     // no input_scope keeps resolving every input from the project root, which is
@@ -95,6 +111,15 @@ describe('resolveInputPath — card scope wins over projectRoot (issue #51)', ()
       join(ROOT, 'style-guide.md'),
     );
     expect(resolveInputPath('style-guide.md', ROOT, undefined, undefined)).toBe(
+      join(ROOT, 'style-guide.md'),
+    );
+  });
+
+  it('still resolves an UNSCOPED name from projectRoot when ownedPaths[0] is an empty string', () => {
+    // Unchanged behavior: the empty-string guard above applies only to
+    // card-scoped names. A non-card-scoped name never reads ownedPaths at all,
+    // so resolve(projectRoot, '') === projectRoot is irrelevant to it.
+    expect(resolveInputPath('style-guide.md', ROOT, [''], ['patch.txt'])).toBe(
       join(ROOT, 'style-guide.md'),
     );
   });
