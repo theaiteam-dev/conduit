@@ -321,7 +321,29 @@ export interface StationConfig {
    * at load as a non-negative integer, only on a fan-out station.
    */
   child_stagger_seconds?: number;
+  /**
+   * Issue #32: kernel-evaluated pass-through. When the predicate matches, a
+   * card that becomes ready at this station moves to the station's `next`
+   * through the FSM's SKIP event without the station running, and no
+   * checkpoint is written. Validated at load: the station declares `next`, no
+   * other station reads its outputs, and no gate's on_reject targets it.
+   */
+  skip_when?: SkipWhenConfig;
 }
+
+/** A scalar a `skip_when` predicate compares against (equality only). */
+export type SkipWhenScalar = string | number | boolean;
+
+/**
+ * Where a `skip_when` predicate reads its value (issue #32):
+ *   - `seed`: a top-level field of the card's `seed.json` in `owned_paths[0]`
+ *     (written by fan-out, see dag/expand.ts).
+ *   - `output`: a top-level field of the payload an upstream `transform`
+ *     station produced for the same card, read from its latest checkpoint.
+ */
+export type SkipWhenConfig =
+  | { source: 'seed'; field: string; equals: SkipWhenScalar }
+  | { source: 'output'; station: string; field: string; equals: SkipWhenScalar };
 
 /**
  * Resolved station-level `deliver` block (WI-596). Declares which produced

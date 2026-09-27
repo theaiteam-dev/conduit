@@ -38,9 +38,10 @@ import { deriveSubflowRunId } from '../run/run-id';
 import type { StartWorkMessage } from '../worker/ipc-protocol';
 import { sanitizeStderrTail } from '../worker/ipc-protocol';
 import type { ModelAdapter } from '../worker/adapter';
-import { DEFAULT_RUN_ID, type ConduitDB, type JournalSpanInput, type JournalProvenance } from '../persistence/db';
+import { DEFAULT_RUN_ID, parseColumn, type ConduitDB, type JournalSpanInput, type JournalProvenance } from '../persistence/db';
 import type { FlowConfig, StationConfig, FanInPolicyConfig, StationOutput, Card } from '../types/kernel';
 import { planTick } from './tick';
+import { evaluateSkipWhen, describeSkipWhen } from './skip-when';
 import { attemptClaim, beginWork, renewLease, reconcile } from '../dispatch/claim';
 import { checkCommandAllowed, runDeterministic, deterministicCardEnv } from '../worker/deterministic';
 import { runTransformStation, coerciveParse, computeFindingsHash } from '../worker/transform';
@@ -404,6 +405,9 @@ export async function runExecutor(args: RunEngineArgs): Promise<void> {
   let lastAdapterActivityAt = runStartedAt;
   let halted = false;
   let andonTripped = false;
+  // skip_when (issue #32): 'run' decisions memoized for the lifetime of this
+  // runExecutor call, keyed by (card, lane, attempt) — see applySkipWhen.
+  const skipWhenRunMemo = new Set<string>();
 
   // Pool mode: real out-of-process workers report MARK_DONE asynchronously over
   // IPC (vs. the synchronous in-process path). Both seams must be wired.
@@ -712,6 +716,18 @@ export async function runExecutor(args: RunEngineArgs): Promise<void> {
     stateDb
       .prepare(`UPDATE cards SET status = 'ready' WHERE run_id = $runId AND status IN ('waiting', 'interrupted') AND lane NOT IN (${terminalPlaceholders})`)
       .run({ $runId: runId, ...terminalParams });
+
+    // ── skip_when (issue #32) ──────────────────────────────────────────────
+    // A ready card at a station that declares skip_when is evaluated before
+    // planTick sees it: a match moves it on through the FSM's SKIP event, an
+    // unreadable predicate holds it. Either way the card left 'ready', so
+    // re-enter the loop: the promote step readies a skipped card at its next
+    // lane, and planning now would find nothing to dispatch for it and read
+    // the run as stalled.
+    if (applySkipWhen({ db, stateDb, runId, flow, happyPathNext, terminalLanes, maxExecutionAttempts, now: currentNow, err: io.err, runMemo: skipWhenRunMemo })) {
+      lastLaneChangeAt = currentNow;
+      continue;
+    }
 
     // ── Count active workers ──────────────────────────────────────────────
     const { n: activeCount } = stateDb
@@ -4863,6 +4879,254 @@ function consumptionHaltMessage(reason: ConsumptionAndon['reason'], rateLimitRel
     `soonest release_at=${rateLimitReleaseAt} (${formatReleaseAt(rateLimitReleaseAt)}) — ` +
     `cards are untouched and the run is resumable after that time`
   );
+}
+
+// ---------------------------------------------------------------------------
+// skip_when (issue #32)
+// ---------------------------------------------------------------------------
+
+interface ApplySkipWhenArgs {
+  db: ConduitDB;
+  stateDb: Database;
+  runId: string;
+  flow: FlowConfig;
+  happyPathNext: Record<string, string | null>;
+  terminalLanes: Set<string>;
+  maxExecutionAttempts: number;
+  now: number;
+  err: (msg: string) => void;
+  /**
+   * 'run' decisions memoized for the lifetime of the runExecutor call, keyed
+   * by `${cardId}\0${lane}\0${attempt}` (issue #32). A card whose predicate
+   * evaluated to 'run' but that planTick could not dispatch this tick (WIP
+   * cap, busy station) would otherwise re-read seed.json or re-query the
+   * upstream checkpoint on every later tick until it is finally claimed. Only
+   * 'run' is memoized: 'skip' and 'hold' both move the card out of 'ready',
+   * so neither can recur for the same key. A new execution attempt (rework)
+   * or a new lane is a fresh key, so it gets a fresh evaluation.
+   */
+  runMemo: Set<string>;
+}
+
+function skipWhenMemoKey(cardId: string, lane: string, attempt: number): string {
+  return `${cardId}\u0000${lane}\u0000${attempt}`;
+}
+
+/**
+ * Take the state-db write lock and run `fn` only if `cardId` is still
+ * `ready` on `expected.lane` at `expected.attempt` (issue #32). Shared by
+ * every terminal outcome of a skip_when candidate row — the skip commit and
+ * both hold branches — so a candidate that lost a race against a concurrent
+ * writer (a claim, an unrelated hold, a rework) gets identical treatment
+ * regardless of which outcome applySkipWhen computed for it: the `BEGIN
+ * IMMEDIATE` transaction serializes against that writer, and re-reading
+ * status/lane/attempt inside it catches the change before anything is
+ * written, rather than journaling ahead of a guarded UPDATE that then
+ * silently affects zero rows (skip) or, worse, an unguarded one that
+ * overwrites the writer's row (hold — escalateToHold's own UPDATE carries no
+ * status/lane guard, since it is also called from contexts that already hold
+ * a verified row).
+ *
+ * Returns whether `fn` ran, so a caller sets `changed = true` only on a
+ * verified transition, never on a lost race.
+ */
+function withVerifiedReadyCard(
+  stateDb: Database,
+  runId: string,
+  cardId: string,
+  expected: { lane: string; attempt: number },
+  fn: () => void,
+): boolean {
+  let ran = false;
+  stateDb
+    .transaction(() => {
+      const current = stateDb
+        .prepare("SELECT status, lane, attempt FROM cards WHERE run_id = $runId AND id = $id")
+        .get({ $runId: runId, $id: cardId }) as { status: string; lane: string; attempt: number } | undefined;
+      if (
+        current === undefined ||
+        current.status !== 'ready' ||
+        current.lane !== expected.lane ||
+        current.attempt !== expected.attempt
+      ) {
+        return; // lost the race — no-op, no journal
+      }
+      fn();
+      ran = true;
+    })
+    .immediate();
+  return ran;
+}
+
+/**
+ * Evaluate skip_when for every dispatchable card at a station that declares
+ * it (SPEC §3/§4). Dispatchable means what planTick means: status 'ready' and
+ * no future release_at. For each card:
+ *
+ *   - skip: fire SKIP through the FSM and move the card to the station's next.
+ *     The station never runs, so there is no claim, no worker, no checkpoint,
+ *     and no counter change. The card_log gets an entered_lane row
+ *     (reasonClass 'skip') and a 'skip' row naming the predicate and value.
+ *   - run:  leave the card for planTick to dispatch. Memoized in `runMemo` so
+ *     a card waiting several ticks for dispatch is evaluated once, not once
+ *     per tick.
+ *   - hold: hold the card in place with a terminal reason (escalate ambiguity).
+ *
+ * Returns true when any card actually changed state (transitioned or held) —
+ * a card whose predicate lost a race against a concurrent state change (see
+ * the write-lock re-check below) does not count.
+ */
+function applySkipWhen(args: ApplySkipWhenArgs): boolean {
+  const { db, stateDb, runId, flow, happyPathNext, terminalLanes, maxExecutionAttempts, now, err, runMemo } = args;
+  const skipStations = Object.keys(flow.stations).filter((id) => flow.stations[id]!.skip_when !== undefined);
+  if (skipStations.length === 0) return false;
+
+  const lanePlaceholders = skipStations.map((_, i) => `$s${i}`).join(', ');
+  const laneParams = Object.fromEntries(skipStations.map((id, i) => [`$s${i}`, id]));
+  // Fetch every column the loop (or escalateToHold) needs
+  // right here, instead of a per-card db.getCard(runId, id) re-read below —
+  // that turned one query into N+1 for a station with many ready candidates.
+  // `lane` is included so it can be used AS stationId: it is
+  // guaranteed to be one of `skipStations` by the WHERE clause below, whereas
+  // a getCard re-read could return a lane a concurrent writer had already
+  // moved the card to — one without skip_when, or a terminal lane not in
+  // flow.stations at all — and crash on `flow.stations[stationId]!.skip_when!`.
+  const rows = stateDb
+    .prepare(
+      `SELECT id, lane, attempt, owned_paths FROM cards
+       WHERE run_id = $runId AND status = 'ready' AND lane IN (${lanePlaceholders})
+         AND (release_at IS NULL OR release_at <= $now)
+       ORDER BY id ASC`,
+    )
+    .all({ $runId: runId, $now: now, ...laneParams }) as Array<{
+      id: string;
+      lane: string;
+      attempt: number;
+      owned_paths: string;
+    }>;
+
+  let changed = false;
+  for (const row of rows) {
+    const { id, attempt } = row;
+    const stationId = row.lane;
+    // Reuse getCard's own owned_paths parsing (persistence/db.ts parseColumn)
+    // rather than duplicating the JSON.parse/error-wrapping here. parseColumn
+    // rethrows SyntaxError on malformed JSON, and a corrupt owned_paths column
+    // must not propagate out of applySkipWhen and abort the whole tick loop —
+    // it holds this one card the same way an unreadable predicate does, below.
+    let ownedPaths: string[];
+    try {
+      ownedPaths = parseColumn(id, 'owned_paths', row.owned_paths) as string[];
+    } catch (parseErr) {
+      const detail = parseErr instanceof Error ? parseErr.message : String(parseErr);
+      const held = withVerifiedReadyCard(stateDb, runId, id, { lane: stationId, attempt }, () => {
+        escalateToHold(stateDb, db, id, stationId, { lane: stationId, attempt },
+          `skip_when at station '${stationId}': owned_paths could not be parsed: ${detail}`, err, runId);
+      });
+      if (held) changed = true;
+      continue;
+    }
+
+    // A corrupt row is never memoized: it cannot reach the 'run' branch below,
+    // so it can never populate `runMemo` — the ordering here (parse before the
+    // memo check) is unaffected by the try/catch above.
+    //
+    // A card whose predicate already evaluated to 'run' is left
+    // alone until it either dispatches (leaving 'ready', which drops it from
+    // `rows` above) or reworks/moves to a new lane (a new memo key). No
+    // re-read of seed.json or the upstream checkpoint on the ticks in between.
+    const memoKey = skipWhenMemoKey(id, stationId, attempt);
+    if (runMemo.has(memoKey)) continue;
+
+    const pred = flow.stations[stationId]!.skip_when!;
+    const predicate = describeSkipWhen(pred);
+    const decision = evaluateSkipWhen(pred, {
+      stateDb,
+      runId,
+      flowVersion: String(flow.version),
+      card: { id, owned_paths: ownedPaths },
+    });
+
+    if (decision.action === 'run') {
+      runMemo.add(memoKey);
+      continue;
+    }
+
+    if (decision.action === 'hold') {
+      const held = withVerifiedReadyCard(stateDb, runId, id, { lane: stationId, attempt }, () => {
+        escalateToHold(stateDb, db, id, stationId, { lane: stationId, attempt },
+          `skip_when ${predicate} could not be evaluated: ${decision.reason}`, err, runId);
+      });
+      if (held) changed = true;
+      continue;
+    }
+
+    const ctx = buildTransitionContext(stationId, flow, happyPathNext, terminalLanes, maxExecutionAttempts);
+    const result = transition(
+      { lane: stationId, status: 'ready', executionAttempt: attempt, reworkCount: REWORK_COUNT_UNREAD },
+      { type: 'SKIP' },
+      ctx,
+    );
+    if (!result.ok) {
+      const held = withVerifiedReadyCard(stateDb, runId, id, { lane: stationId, attempt }, () => {
+        escalateToHold(stateDb, db, id, stationId, { lane: stationId, attempt }, `FSM illegal_transition on SKIP for station '${stationId}'`, err, runId);
+      });
+      if (held) changed = true;
+      continue;
+    }
+    const nextLane = result.next.lane;
+    const nextStatus = terminalLanes.has(nextLane) ? 'complete' : result.next.status;
+
+    // Take the state-db write lock BEFORE journaling, via the same
+    // withVerifiedReadyCard the hold branches above use. The `BEGIN
+    // IMMEDIATE` transaction serializes against any other writer targeting
+    // this row, and re-reading status/lane/attempt inside it catches a
+    // concurrent change (another writer claimed/held/moved/reworked the card
+    // between the SELECT at the top of this function and here) before
+    // anything is written — a lost race now leaves no card_log trace of a
+    // lane move that never happened, instead of journaling one ahead of a
+    // guarded UPDATE that then silently affects zero rows. Checking `lane`
+    // here is what makes the stale-lane race safe without a getCard re-read:
+    // a writer that moved the card off `stationId` fails the re-check and the
+    // guarded UPDATE below, rather than being overwritten by a SKIP computed
+    // against a lane the card is no longer on. The card_log's own append
+    // stays journal-first relative to the state commit (as advanceCard
+    // documents: a crash between the two leaves a phantom entry INSERT OR
+    // IGNORE deduplicates on replay); the journal DB is a separate SQLite
+    // file, so this transaction's lock only covers the state DB, which is
+    // exactly the resource the race is over.
+    const committed = withVerifiedReadyCard(stateDb, runId, id, { lane: stationId, attempt }, () => {
+      db.appendCardLog({
+        runId,
+        kind: 'entered_lane',
+        cardId: id,
+        station: stationId,
+        attempt,
+        sourceLane: stationId,
+        destLane: nextLane,
+        reasonClass: 'skip',
+      });
+      db.appendCardLog({
+        runId,
+        kind: 'skip',
+        cardId: id,
+        station: stationId,
+        attempt,
+        reason: `skip_when ${predicate} matched (read ${JSON.stringify(decision.value)})`,
+      });
+      // attempt and rework_count are deliberately not written: SKIP moves
+      // neither counter. The status/lane guards on this UPDATE are redundant
+      // with withVerifiedReadyCard's own re-check (both run inside the same
+      // BEGIN IMMEDIATE) but kept as defense in depth.
+      stateDb
+        .prepare(
+          "UPDATE cards SET lane = $lane, status = $status WHERE run_id = $runId AND id = $id AND status = 'ready' AND lane = $stationId",
+        )
+        .run({ $lane: nextLane, $status: nextStatus, $runId: runId, $id: id, $stationId: stationId });
+    });
+    if (committed) changed = true;
+  }
+  return changed;
 }
 
 // ---------------------------------------------------------------------------

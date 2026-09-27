@@ -177,6 +177,30 @@ describe('journal inspect — renders every card_log kind in order (AC1)', () =>
 });
 
 // ===========================================================================
+// Issue #32 — a skip_when pass-through prints the lane move and the predicate.
+// ===========================================================================
+
+describe('journal inspect — renders skip_when rows (issue #32)', () => {
+  it('prints the skip lane move and the skip reason naming the predicate and value', async () => {
+    const cardId = 'c-skip';
+    db.appendCardLog({
+      runId: DEFAULT_RUN_ID, kind: 'entered_lane', cardId, station: 'write_tests', attempt: 0,
+      sourceLane: 'write_tests', destLane: 'implement', reasonClass: 'skip',
+    });
+    db.appendCardLog({
+      runId: DEFAULT_RUN_ID, kind: 'skip', cardId, station: 'write_tests', attempt: 0,
+      reason: 'skip_when seed.no_test_needed == true matched (read true)',
+    });
+
+    const code = await main(['journal', 'inspect', cardId], makeDeps());
+
+    expect(code).toBe(0);
+    expect(output()).toContain('write_tests → implement (skip)');
+    expect(output()).toContain('skip: write_tests: skip_when seed.no_test_needed == true matched (read true)');
+  });
+});
+
+// ===========================================================================
 // AC2 — a reworked-then-scrapped card prints a coherent history.
 // ===========================================================================
 
