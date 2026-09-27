@@ -111,16 +111,38 @@ function isPopulated(dir: string): boolean {
   }
 }
 
+/** Cgroup dirs `killCgroup` has already warned about a non-ENOENT write failure for. */
+const warnedKillFailures = new Set<string>();
+
 /**
- * SIGKILL every process in the cgroup at `dir`, descendants included. Errors
- * are ignored: an already-removed cgroup has nothing left to kill. Synchronous,
- * so the kernel's exit handler can call it.
+ * SIGKILL every process in the cgroup at `dir`, descendants included. ENOENT
+ * is silent: an already-removed cgroup, or one that was never populated, has
+ * nothing left to kill. Any other error (EACCES, EPERM, EIO, a read-only
+ * filesystem) means the write did NOT happen, so containment for this
+ * invocation silently fell back to the escapable process-group kill; that is
+ * worth a warning. Warn at most once per `dir`, because `removeCgroup` calls
+ * this every 10ms in its retry loop and a per-call warning would spam.
+ * Synchronous, so the kernel's exit handler can call it, and it never throws.
  */
-export function killCgroup(dir: string): void {
+export function killCgroup(
+  dir: string,
+  warn: (message: string) => void = (message) => process.stderr.write(message + '\n'),
+): void {
   try {
     writeFileSync(join(dir, 'cgroup.kill'), '1');
-  } catch {
-    /* removed already, or never populated */
+  } catch (err) {
+    const code = (err as { code?: string }).code;
+    if (code === 'ENOENT') return;
+    if (warnedKillFailures.has(dir)) return;
+    warnedKillFailures.add(dir);
+    try {
+      warn(
+        `conduit: warning: could not kill containment cgroup ${dir} (${errorText(err)}). ` +
+          'Containment for this invocation fell back to the process-group kill.',
+      );
+    } catch {
+      /* a broken warn sink must not make killCgroup throw */
+    }
   }
 }
 

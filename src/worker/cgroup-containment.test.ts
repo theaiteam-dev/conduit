@@ -20,6 +20,7 @@ import {
   createContainmentResolver,
   describeContainment,
   detectContainment,
+  killCgroup,
   prepareContainedCommand,
   removeCgroup,
   type Containment,
@@ -253,6 +254,93 @@ describe('prepareContainedCommand', () => {
       expect(await new Response(proc.stderr).text()).toContain('could not join containment cgroup');
       expect(existsSync(marker)).toBe(false);
       chmodSync(prepared.cgroup!, 0o755);
+    },
+  );
+});
+
+describe('killCgroup', () => {
+  it('stays silent on ENOENT: an already-removed cgroup, or one never populated', () => {
+    const dir = join(scratch, 'never-existed');
+    const warnings: string[] = [];
+    killCgroup(dir, (m) => warnings.push(m));
+    expect(warnings).toEqual([]);
+  });
+
+  it('warns once, naming the cgroup and the error code, on a non-ENOENT failure, and does not throw', () => {
+    // A real directory in place of the cgroup.kill file: the write is an
+    // EISDIR, not ENOENT, so the kill did not happen and containment fell
+    // back to the process-group kill for this invocation.
+    const dir = join(scratch, 'fake-cgroup');
+    mkdirSync(dir);
+    mkdirSync(join(dir, 'cgroup.kill'));
+
+    const warnings: string[] = [];
+    expect(() => killCgroup(dir, (m) => warnings.push(m))).not.toThrow();
+    expect(warnings.length).toBe(1);
+    expect(warnings[0]).toContain(dir);
+    expect(warnings[0]).toContain('EISDIR');
+    expect(warnings[0]).toContain('process-group');
+
+    // removeCgroup's retry loop calls killCgroup every 10ms; a repeat failure
+    // on the same dir must not warn again.
+    killCgroup(dir, (m) => warnings.push(m));
+    killCgroup(dir, (m) => warnings.push(m));
+    expect(warnings.length).toBe(1);
+  });
+
+  it('never throws even when the warn sink itself throws', () => {
+    const dir = join(scratch, 'fake-cgroup-2');
+    mkdirSync(dir);
+    mkdirSync(join(dir, 'cgroup.kill'));
+    expect(() =>
+      killCgroup(dir, () => {
+        throw new Error('sink is broken');
+      }),
+    ).not.toThrow();
+  });
+});
+
+describe('prepareContainedCommand: the spawn wrapper does not interpolate argv into the shell string', () => {
+  // Metacharacters that a shell would treat as command separators or command
+  // substitution if the wrapper ever folded argv into its `-c` string.
+  const dangerousArgs = ['; touch pwned', '$(touch pwned2)', '`touch pwned3`'];
+
+  it('carries each dangerous arg as its own literal argv element, not shell text (any host)', () => {
+    // A fake cgroup containment: prepareContainedCommand only mkdirSyncs the
+    // invocation cgroup, which works against a plain temp dir with no real
+    // cgroup v2 support.
+    const containment: Containment = { mechanism: 'cgroup', parent: scratch };
+    const prepared = prepareContainedCommand(containment, ['/bin/echo', ...dangerousArgs], {});
+
+    expect(prepared.argv[0]).toBe('/bin/sh');
+    expect(prepared.argv[1]).toBe('-c');
+    // argv[2] is the wrapper script text itself: it must not contain any of
+    // the dangerous args, which proves they were not folded into it.
+    for (const arg of dangerousArgs) expect(prepared.argv[2]).not.toContain(arg);
+    // The dangerous args land as their own trailing argv elements, untouched.
+    expect(prepared.argv.slice(-dangerousArgs.length)).toEqual(dangerousArgs);
+
+    expect(readdirSync(scratch).some((name) => name.startsWith('conduit-'))).toBe(true);
+  });
+
+  itWithCgroup(
+    'never executes shell metacharacters in argv when the wrapper is actually spawned under cgroup containment',
+    async () => {
+      if (hostContainment.mechanism !== 'cgroup') throw new Error('unreachable');
+      const prepared = prepareContainedCommand(hostContainment, ['/bin/echo', ...dangerousArgs], {});
+      try {
+        const proc = Bun.spawn(prepared.argv, { cwd: scratch, stdout: 'pipe', stderr: 'pipe' });
+        const [stdout, exitCode] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+        expect(exitCode).toBe(0);
+        // echo prints its argv back literally: no substitution, no split on ';'.
+        expect(stdout.trim()).toBe(dangerousArgs.join(' '));
+        expect(existsSync(join(scratch, 'pwned'))).toBe(false);
+        expect(existsSync(join(scratch, 'pwned2'))).toBe(false);
+        expect(existsSync(join(scratch, 'pwned3'))).toBe(false);
+      } finally {
+        killCgroup(prepared.cgroup!);
+        await removeCgroup(prepared.cgroup!, 1_000);
+      }
     },
   );
 });

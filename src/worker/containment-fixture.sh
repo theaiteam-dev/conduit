@@ -24,6 +24,13 @@
 # still not outlive it. Only spawn paths that pass the suite's `fixtureArgs`
 # through use this mode.
 #
+# That wait is bounded to about 5 seconds. If a grandchild's sentinel never
+# appears, most likely because `setsid -f sh -c ...` failed to launch the
+# setsid grandchild, the fixture gives up rather than spinning until the
+# invocation's own timeout, names the sentinel that never showed up on
+# stderr, and exits 99, so a fixture-launch failure surfaces as its own
+# error instead of a confusing timeout assertion failure.
+#
 # The grandchildren's stdio goes to /dev/null so they do not hold the spawn
 # path's stdout/stderr pipes open. A path that fails to reap them then returns
 # at its timeout and fails the suite's assertions, instead of hanging.
@@ -58,7 +65,21 @@ if command -v setsid >/dev/null 2>&1; then
 fi
 
 if [ "$1" = "--exit" ]; then
+  # 100 iterations * 0.05s = ~5s. Bounded so a grandchild that never starts
+  # (e.g. the setsid launch above failed) surfaces as a fixture error instead
+  # of spinning until the invocation's own timeout.
+  wait_iterations=0
+  max_wait_iterations=100
   while [ ! -f containment.sentinel ] || { [ -n "$has_setsid" ] && [ ! -f containment.setsid.sentinel ]; }; do
+    wait_iterations=$((wait_iterations + 1))
+    if [ "$wait_iterations" -ge "$max_wait_iterations" ]; then
+      if [ ! -f containment.sentinel ]; then
+        echo "containment-fixture.sh: containment.sentinel never appeared (backgrounded grandchild failed to start)" >&2
+      else
+        echo "containment-fixture.sh: containment.setsid.sentinel never appeared (setsid grandchild failed to start)" >&2
+      fi
+      exit 99
+    fi
     sleep 0.05
   done
   exit "${2:-0}"

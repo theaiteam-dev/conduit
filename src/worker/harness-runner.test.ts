@@ -21,13 +21,14 @@
  *      before the exit, not at timeoutMs.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
-import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync, realpathSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, readdirSync, readFileSync, writeFileSync, realpathSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   runHarnessProcess,
   type HarnessRunnerConfig,
 } from './harness-runner';
+import type { Containment } from './cgroup-containment';
 import {
   describeContainmentConformance,
   CONTAINMENT_FIXTURE,
@@ -673,5 +674,42 @@ describe('runHarnessProcess: a throwing stdoutLineFilter does not produce an unh
     } finally {
       process.off('unhandledRejection', onUnhandledRejection);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// PR review item 14 (harness-runner.ts line 274): a cgroup is created by
+// prepareContainedCommand, but the spawn itself then throws (e.g. a bad cwd).
+// The catch in runHarnessProcess must remove the just-created cgroup before
+// rethrowing, so a spawn failure never leaks a `conduit-*` directory.
+//
+// resolveConfinedCwd only requires `projectRoot` itself to exist; it never
+// checks that the resolved cwd exists, only that it resolves inside the
+// root. So a cwd that is a non-existent subdirectory of `projectRoot` passes
+// that confinement check, lets prepareContainedCommand's Bun.which resolve
+// the command (which does not require the cwd to exist either) and create
+// the cgroup, and only THEN makes Bun.spawn itself throw ENOENT.
+//
+// `containment` here is `{ mechanism: 'cgroup', parent: projectRoot }`: on
+// this mechanism prepareContainedCommand only resolves the command and
+// `mkdirSync`s a plain directory under `parent` — no real cgroup v2
+// filesystem is required, so this reproduces on any host, cgroups or not.
+// ---------------------------------------------------------------------------
+
+describe('runHarnessProcess: cgroup cleanup when the spawn itself throws (review item 14)', () => {
+  it('removes the cgroup and rethrows the original spawn error, leaving no conduit-* directory behind', async () => {
+    const missingCwd = join(projectRoot, 'does-not-exist');
+    const containment: Containment = { mechanism: 'cgroup', parent: projectRoot };
+
+    let thrown: unknown;
+    try {
+      await runHarnessProcess({ command: 'true', args: [] }, config({ cwd: missingCwd, containment }));
+    } catch (err) {
+      thrown = err;
+    }
+
+    expect(thrown).toBeInstanceOf(Error);
+    expect((thrown as { code?: string }).code).toBe('ENOENT');
+    expect(readdirSync(projectRoot).filter((name) => name.startsWith('conduit-'))).toEqual([]);
   });
 });

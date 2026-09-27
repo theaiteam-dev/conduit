@@ -213,15 +213,43 @@ function sessionId(pid: number): number | undefined {
   }
 }
 
+/** What `watchSentinelAdvance` observed while the invocation was still running. */
+interface SentinelWatch {
+  /**
+   * Every required grandchild's sentinel mtime advanced at least once,
+   * proving each grandchild was alive and touching it. False if the
+   * invocation settled first without every advance being seen.
+   */
+  advanced: boolean;
+  /**
+   * The setsid grandchild's session id, read from /proc the first time it
+   * came back defined during the loop, i.e. while the grandchild was
+   * confirmed still running (before any kill the spawn path issues on its
+   * way to settling `invocation`). Undefined if it was never readable during
+   * the loop, or read but never resolved to a defined sid.
+   */
+  setsidSidWhileRunning: number | undefined;
+  /**
+   * Whether the setsid grandchild's pid file was readable at least once
+   * during the loop. False only means the invocation settled before the
+   * loop's first poll, so nothing about the grandchild was observed while it
+   * ran; that is the one case genuinely ambiguous about its session, as
+   * opposed to a pid that was readable but never yielded a sid.
+   */
+  setsidPidReadableWhileRunning: boolean;
+}
+
 /**
- * Watch every grandchild's sentinel while the invocation runs and resolve true
- * once each mtime has advanced, proving each grandchild was alive and touching
- * it. Resolves false if the invocation settles first without every advance
- * being seen.
+ * Watch every grandchild's sentinel while the invocation runs, and along the
+ * way sample the setsid grandchild's session id so the anti-drift check below
+ * reads it while the process is known to still be alive rather than after the
+ * spawn path may already have killed it.
  */
-async function watchSentinelAdvance(projectRoot: string, settled: () => boolean): Promise<boolean> {
+async function watchSentinelAdvance(projectRoot: string, settled: () => boolean): Promise<SentinelWatch> {
   const first = new Map<string, number>();
   const advanced = new Set<string>();
+  let setsidSidWhileRunning: number | undefined;
+  let setsidPidReadableWhileRunning = false;
   while (!settled()) {
     for (const { sentinel } of REQUIRED_GRANDCHILDREN) {
       const now = sentinelMtime(projectRoot, sentinel);
@@ -230,10 +258,19 @@ async function watchSentinelAdvance(projectRoot: string, settled: () => boolean)
       if (seen === undefined) first.set(sentinel, now);
       else if (now !== seen) advanced.add(sentinel);
     }
-    if (advanced.size === REQUIRED_GRANDCHILDREN.length) return true;
+    if (setsidSidWhileRunning === undefined) {
+      const pid = recordedSetsidPid(projectRoot);
+      if (pid !== undefined) {
+        setsidPidReadableWhileRunning = true;
+        setsidSidWhileRunning = sessionId(pid);
+      }
+    }
+    if (advanced.size === REQUIRED_GRANDCHILDREN.length) {
+      return { advanced: true, setsidSidWhileRunning, setsidPidReadableWhileRunning };
+    }
     await sleep(20);
   }
-  return false;
+  return { advanced: false, setsidSidWhileRunning, setsidPidReadableWhileRunning };
 }
 
 /** The fixture arguments that make it exit with `code` once its grandchild is running. */
@@ -303,11 +340,27 @@ interface ObservedRun {
   sawGrandchildLive: boolean;
   grandchildPid: number | undefined;
   /**
-   * The setsid grandchild's session id, read while the invocation ran. Equal
-   * to its pid when it leads its own session, which is what makes it escape a
-   * process-group kill.
+   * The setsid grandchild's pid the fixture recorded, read any time (the pid
+   * file outlives the process, so this also answers the fixture started it).
    */
-  setsidSession: { pid: number; sid: number | undefined } | undefined;
+  setsidPid: number | undefined;
+  /**
+   * The setsid grandchild's session id, sampled inside the watch loop while
+   * the invocation was still running. Equal to its pid when it leads its own
+   * session, which is what makes it escape a process-group kill. Undefined
+   * either because the pid was never readable while running (see
+   * `setsidPidReadableWhileRunning`) or because it was readable but /proc
+   * never resolved a session id for it.
+   */
+  setsidSidWhileRunning: number | undefined;
+  /**
+   * Whether the setsid grandchild's pid file was readable at least once
+   * while the invocation was still running. False means the invocation
+   * settled before the watch loop ever polled, so nothing about the
+   * grandchild's session was observed in time: the one genuinely ambiguous
+   * case, as opposed to a pid that was readable but never yielded a sid.
+   */
+  setsidPidReadableWhileRunning: boolean;
 }
 
 async function runAndObserve(spawnPath: ContainmentSpawnPath, projectRoot: string): Promise<ObservedRun> {
@@ -322,17 +375,15 @@ async function runAndObserve(spawnPath: ContainmentSpawnPath, projectRoot: strin
       done = true;
     },
   );
-  let setsidSession: ObservedRun['setsidSession'];
-  const [timeoutClass, sawGrandchildLive] = await Promise.all([
-    invocation,
-    watchSentinelAdvance(projectRoot, () => done).then((advanced) => {
-      // Read while the invocation still runs, before any kill.
-      const pid = recordedSetsidPid(projectRoot);
-      if (advanced && pid !== undefined) setsidSession = { pid, sid: sessionId(pid) };
-      return advanced;
-    }),
-  ]);
-  return { timeoutClass, sawGrandchildLive, grandchildPid: recordedPid(projectRoot), setsidSession };
+  const [timeoutClass, watch] = await Promise.all([invocation, watchSentinelAdvance(projectRoot, () => done)]);
+  return {
+    timeoutClass,
+    sawGrandchildLive: watch.advanced,
+    grandchildPid: recordedPid(projectRoot),
+    setsidPid: recordedSetsidPid(projectRoot),
+    setsidSidWhileRunning: watch.setsidSidWhileRunning,
+    setsidPidReadableWhileRunning: watch.setsidPidReadableWhileRunning,
+  };
 }
 
 /**
@@ -358,7 +409,7 @@ export function describeContainmentConformance(
 
     const reaps = options.knownLeak !== undefined ? test.failing : it;
 
-    if (!requiresSetsidContainment && hostContainment.mechanism === 'process-group') {
+    if (!requiresSetsidContainment && hostContainment.mechanism !== 'cgroup') {
       // Visible in the run's skip count, naming why this host cannot prove it.
       it.skip(`kills a grandchild that called setsid (host has no cgroup containment: ${hostContainment.reason})`, () => {});
     }
@@ -390,8 +441,27 @@ export function describeContainmentConformance(
         // this, the fixture could stop modelling the escape and the suite
         // would still pass.
         if (requiresSetsidContainment) {
-          expect(run.setsidSession).toBeDefined();
-          expect(run.setsidSession!.sid).toBe(run.setsidSession!.pid);
+          // The fixture did start it, whether or not the watch loop caught
+          // it while it ran (the pid file outlives the process).
+          expect(run.setsidPid, 'setsid grandchild: no pid recorded').toBeDefined();
+          const setsidPid = run.setsidPid!;
+          if (run.setsidSidWhileRunning !== undefined) {
+            expect(run.setsidSidWhileRunning).toBe(setsidPid);
+          } else if (run.setsidPidReadableWhileRunning) {
+            // Its pid was readable at least once while it was still
+            // running, so we had a real chance to read its session and
+            // never got one. That is not the same as the invocation
+            // settling before our first poll (handled below), so it does
+            // not get the benefit of the doubt.
+            expect(
+              run.setsidSidWhileRunning,
+              'setsid grandchild: pid was readable while the invocation ran, but its session id was never read (expected it to equal its pid)',
+            ).toBeDefined();
+          }
+          // Else: the invocation settled before the watch loop's first poll,
+          // so nothing about the grandchild's session was observed in time.
+          // Genuinely ambiguous; the pid-recorded assertion above still holds
+          // it accountable for having started at all.
         }
 
         await expectGrandchildReaped(projectRoot);

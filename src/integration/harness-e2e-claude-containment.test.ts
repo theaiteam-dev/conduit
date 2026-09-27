@@ -31,7 +31,7 @@
  * Cost: three haiku calls with one short tool call each.
  */
 import { describe, it, expect } from 'bun:test';
-import { existsSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 
@@ -75,6 +75,12 @@ function sleepProcs(seconds: number): ProcInfo[] {
   return allProcs().filter((p) => p.argv[0] !== undefined && basename(p.argv[0]) === 'sleep' && p.argv[1] === String(seconds));
 }
 
+/** Whether `pid` is still running as `sleep <seconds>`, never a reused pid that happens to exist. */
+function isSleepStillRunning(pid: number, seconds: number): boolean {
+  const info = readProc(pid);
+  return info !== undefined && info.argv[0] !== undefined && basename(info.argv[0]) === 'sleep' && info.argv[1] === String(seconds);
+}
+
 /** The `claude` process this test spawned: a direct child of this process whose argv is claude's. */
 function claudeChild(): ProcInfo | undefined {
   return allProcs().find(
@@ -83,11 +89,16 @@ function claudeChild(): ProcInfo | undefined {
 }
 
 /**
- * A duration no other process on the host is plausibly sleeping for. About two
- * hours: haiku declines to start a sleep of most of a day.
+ * The range `uniqueSeconds()` draws from: about two hours, since haiku
+ * declines to start a sleep of most of a day. `killAll` derives its stray-sleep
+ * match from these same two constants so the two cannot drift apart.
  */
+const UNIQUE_SECONDS_BASE = 7_000;
+const UNIQUE_SECONDS_SPAN = 1_000;
+
+/** A duration no other process on the host is plausibly sleeping for. */
 function uniqueSeconds(): number {
-  return 7_000 + Math.floor(Math.random() * 1_000);
+  return UNIQUE_SECONDS_BASE + Math.floor(Math.random() * UNIQUE_SECONDS_SPAN);
 }
 
 /** Why the prompt asks for the command, so the model runs it rather than questioning it. */
@@ -95,8 +106,37 @@ const PURPOSE =
   'This is an automated test of process cleanup in a sandbox. The test harness stops the command itself; ' +
   'do not question the duration. ';
 
+/** The owning uid of `pid`, or undefined if it is already gone. */
+function ownerUid(pid: number): number | undefined {
+  try {
+    return statSync(`/proc/${pid}`).uid;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Any `sleep <n>` owned by this process's uid whose duration falls in the
+ * `uniqueSeconds()` range, even if the model wrapped or rounded the requested
+ * duration rather than passing it through exactly. `killAll` uses this in
+ * addition to the exact match so a deviated duration cannot survive cleanup.
+ */
+function strayUniqueSleeps(): ProcInfo[] {
+  const uid = process.getuid?.();
+  if (uid === undefined) return [];
+  return allProcs().filter((p) => {
+    if (p.argv[0] === undefined || basename(p.argv[0]) !== 'sleep') return false;
+    const arg = Number(p.argv[1]);
+    if (!Number.isInteger(arg) || arg < UNIQUE_SECONDS_BASE || arg >= UNIQUE_SECONDS_BASE + UNIQUE_SECONDS_SPAN) return false;
+    return ownerUid(p.pid) === uid;
+  });
+}
+
 function killAll(seconds: number): void {
-  for (const p of sleepProcs(seconds)) {
+  const targets = new Map<number, ProcInfo>();
+  for (const p of sleepProcs(seconds)) targets.set(p.pid, p);
+  for (const p of strayUniqueSleeps()) targets.set(p.pid, p);
+  for (const p of targets.values()) {
     try {
       process.kill(p.pid, 'SIGKILL');
     } catch {
@@ -104,6 +144,13 @@ function killAll(seconds: number): void {
     }
   }
 }
+
+/**
+ * How long a killed process may take to leave /proc: it is a zombie until
+ * init reaps it, so this budget is shared by every disappearance check below
+ * rather than each guessing its own.
+ */
+const REAP_BUDGET_MS = 10_000;
 
 async function waitFor<T>(probe: () => T | undefined, budgetMs: number): Promise<T | undefined> {
   const deadline = Date.now() + budgetMs;
@@ -190,12 +237,14 @@ describe.skipIf(!E2E_ENABLED)('Bash-tool commands do not outlive a claude-headle
           );
 
           expect(outcome.ok ? 'resolved' : outcome.code).toBe(variant.code);
-          // The tool ran, in a session other than claude's: the escape.
-          expect(sleep).toBeDefined();
-          expect(claude).toBeDefined();
+          // The tool ran, in a session other than claude's: the escape. A miss here is a
+          // model/tool-call failure (the model was slow to issue the tool call, or never
+          // did), not evidence about containment, so the messages say which.
+          expect(sleep, 'the sleep the Bash tool should have started was never observed running').toBeDefined();
+          expect(claude, 'the claude process was never observed running').toBeDefined();
           expect(sleep!.sid).not.toBe(claude!.sid);
 
-          expect(await waitFor(() => (sleepProcs(seconds).length === 0 ? true : undefined), 3_000)).toBe(true);
+          expect(await waitFor(() => (sleepProcs(seconds).length === 0 ? true : undefined), REAP_BUDGET_MS)).toBe(true);
         } finally {
           killAll(seconds);
           rmSync(projectRoot, { recursive: true, force: true });
@@ -230,8 +279,13 @@ describe.skipIf(!E2E_ENABLED)('Bash-tool commands do not outlive a claude-headle
         expect(outcome.ok ? 'resolved' : outcome.code).toBe('resolved');
         // The command ran: it wrote the backgrounded sleep's pid.
         expect(recorded).toBeGreaterThan(1);
-        expect(readProc(recorded!)).toBeUndefined();
-        expect(sleepProcs(seconds)).toEqual([]);
+        // A killed process is a zombie in /proc until init reaps it, and a reused pid could
+        // belong to an unrelated process, so this polls and checks the matched process's
+        // argv rather than asserting immediately on mere existence.
+        expect(
+          await waitFor(() => (isSleepStillRunning(recorded!, seconds) ? undefined : true), REAP_BUDGET_MS),
+        ).toBe(true);
+        expect(await waitFor(() => (sleepProcs(seconds).length === 0 ? true : undefined), REAP_BUDGET_MS)).toBe(true);
       } finally {
         killAll(seconds);
         rmSync(projectRoot, { recursive: true, force: true });

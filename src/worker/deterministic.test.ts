@@ -25,7 +25,7 @@
  *     // MUST call checkCommandAllowed first and THROW (refuse) before spawning if denied.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync, chmodSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -34,6 +34,7 @@ import {
   type DeterministicCommand,
   type LawLiteConfig,
 } from './deterministic';
+import type { Containment } from './cgroup-containment';
 import { describeContainmentConformance } from './harness-containment.conformance';
 
 const ALLOW: LawLiteConfig = { allowlist: ['bun'] };
@@ -430,4 +431,41 @@ describe('runDeterministic: descendants holding the output pipes (#10, #17)', ()
     expect(result.stderr).toMatch(/exceeded its timeout of 300ms/);
     expect(await waitForPidGone(grandchildPid())).toBe(true);
   }, 40_000);
+});
+
+// ---------------------------------------------------------------------------
+// PR review item 13 (deterministic.ts line 238): a cgroup is created by
+// prepareContainedCommand, but the spawn itself then throws (e.g. a bad cwd).
+// The catch in runDeterministic must remove the just-created cgroup before
+// rethrowing, so a spawn failure never leaks a `conduit-*` directory.
+//
+// `containment` here is `{ mechanism: 'cgroup', parent: dir }`: on this
+// mechanism prepareContainedCommand only resolves the command and
+// `mkdirSync`s a plain directory under `parent` — no real cgroup v2
+// filesystem is required, so this reproduces on any host, cgroups or not.
+// ---------------------------------------------------------------------------
+
+describe('runDeterministic: cgroup cleanup when the spawn itself throws (review item 13)', () => {
+  it('removes the cgroup and rethrows the original spawn error, leaving no conduit-* directory behind', async () => {
+    // `true` resolves against PATH regardless of cwd (Bun.which does not
+    // require the cwd to exist), so prepareContainedCommand succeeds and
+    // creates the cgroup; Bun.spawn then throws ENOENT because the cwd itself
+    // does not exist.
+    const missingCwd = join(dir, 'does-not-exist');
+    const containment: Containment = { mechanism: 'cgroup', parent: dir };
+
+    let thrown: unknown;
+    try {
+      await runDeterministic(
+        { command: 'true', args: [] },
+        { allowlist: ['true'], cwd: missingCwd, containment },
+      );
+    } catch (err) {
+      thrown = err;
+    }
+
+    expect(thrown).toBeInstanceOf(Error);
+    expect((thrown as { code?: string }).code).toBe('ENOENT');
+    expect(readdirSync(dir).filter((name) => name.startsWith('conduit-'))).toEqual([]);
+  });
 });
