@@ -27,7 +27,13 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Card } from '../types/kernel';
-import { openConduitDB, SCHEMA_VERSION, DEFAULT_RUN_ID, type ConduitDB } from './db';
+import {
+  openConduitDB,
+  SCHEMA_VERSION,
+  DEFAULT_RUN_ID,
+  COUNT_QUEUED_INGRESS_FOR_RUN_SQL,
+  type ConduitDB,
+} from './db';
 
 let dir: string;
 let stateDbPath: string;
@@ -654,28 +660,21 @@ describe('hot-path indexes (finding #10)', () => {
     }
   });
 
-  // PR #76 review (coderabbitai): countQueuedIngressForRun filtered on run_id
+  // countQueuedIngressForRun filtered on run_id
   // alone, which does not imply idx_ingress_events_run_id's partial WHERE
   // (flow_path IS NOT NULL) — SQLite falls back to a full table scan.
+  //
+  // This feeds the actual production SQL (exported from db.ts as
+  // COUNT_QUEUED_INGRESS_FOR_RUN_SQL) into EXPLAIN QUERY PLAN rather than a
+  // hand-copied duplicate, so a future edit that drops the flow_path filter
+  // fails this test instead of leaving it passing against a frozen copy.
   it("countQueuedIngressForRun's query plan uses the index (no full scan of ingress_events)", () => {
     closeConduit();
     const raw = new Database(stateDbPath, { readonly: true });
     try {
       const plan = raw
-        .query(
-          `EXPLAIN QUERY PLAN
-           SELECT COUNT(*) AS n FROM ingress_events e
-            WHERE e.run_id = 'run-1'
-              AND e.flow_path IS NOT NULL
-              AND (e.spawn_state = 'accepted' OR (e.spawn_state = 'failed' AND e.spawn_attempts < 3))
-              AND ('ev-before' IS NULL OR EXISTS (
-                SELECT 1 FROM ingress_events b
-                WHERE b.event_id = 'ev-before'
-                  AND (e.received_at < b.received_at
-                       OR (e.received_at = b.received_at AND e.event_id < b.event_id))
-              ))`,
-        )
-        .all()
+        .query(`EXPLAIN QUERY PLAN ${COUNT_QUEUED_INGRESS_FOR_RUN_SQL}`)
+        .all({ $run_id: 'run-1', $cap: 3, $before: 'ev-before' })
         .map((r) => (r as { detail: string }).detail)
         .join(' | ');
       expect(plan).toContain('USING INDEX idx_ingress_events_run_id');

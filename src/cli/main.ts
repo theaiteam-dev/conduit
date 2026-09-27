@@ -813,7 +813,7 @@ type AppendPassAdmission =
 
 /**
  * Every event in `passEvents` already consumed by some earlier pass (issue
- * #36; PR #76 review, coderabbitai). `recordPassEvents`' `event_id` primary
+ * #36). `recordPassEvents`' `event_id` primary
  * key means launching any of these again would either replay the event or
  * throw a raw constraint violation, so the caller must decide up front.
  */
@@ -831,7 +831,7 @@ function findAppliedPassEvents(
 
 /**
  * Decide what a `--pass-event` launch should do about events already
- * consumed by an earlier pass (issue #36; PR #76 review, coderabbitai).
+ * consumed by an earlier pass (issue #36).
  *
  *   - none of `passEvents` consumed: nothing to decide, returns `null` and
  *     the caller proceeds;
@@ -878,6 +878,45 @@ function decidePassEventAdmission(deps: CliDeps, passEvents: readonly string[]):
 }
 
 /**
+ * Whether `err` is the raw SQLite PRIMARY KEY violation `recordPassEvents`
+ * throws on `run_pass_events.event_id`:
+ * a concurrent launch consumed one of `passEvents` in the window between
+ * `decidePassEventAdmission`'s pre-check and the seed transaction below. The
+ * pass-1 path holds no lease across that window at all; the leased
+ * `--append-pass` path re-checks under the lease but is caught here too, as a
+ * second line of defense. Matched on both the SQLite error code and the
+ * table name so an unrelated PRIMARY KEY violation is never mistaken for this
+ * race and silently swallowed.
+ */
+function isPassEventRaceViolation(err: unknown): boolean {
+  return (
+    err instanceof Error &&
+    (err as { code?: string }).code === 'SQLITE_CONSTRAINT_PRIMARYKEY' &&
+    err.message.includes('run_pass_events')
+  );
+}
+
+/**
+ * The same "refuse loudly" message `decidePassEventAdmission` produces, built
+ * from a re-query (`findAppliedPassEvents`) after `isPassEventRaceViolation`
+ * catches the seed transaction's own constraint violation — the pre-check
+ * missed these events because the concurrent launch that consumed them landed
+ * after it ran.
+ */
+function formatPassEventRaceRefusal(applied: Array<{ eventId: string; runId: string; pass: number }>): string {
+  const detail = applied
+    .map(
+      (a) =>
+        `event ${JSON.stringify(a.eventId)} was already consumed by pass ${a.pass} of run ${JSON.stringify(a.runId)}`,
+    )
+    .join('; ');
+  return (
+    `a concurrent launch consumed ${applied.length} of these --pass-event id(s) between the admission check ` +
+    `and this launch's own seed (${detail}); refusing rather than mixing already-consumed input into a new pass`
+  );
+}
+
+/**
  * Admit a `--append-pass` invocation (issue #36), or say why not.
  *
  *   - the run must exist, recorded against this flow path and project root
@@ -891,7 +930,7 @@ function decidePassEventAdmission(deps: CliDeps, passEvents: readonly string[]):
  *     already consumed, the launch is ambiguous (its input already carries a
  *     consumed event's content mixed with a new one) — refuse loudly with
  *     EXIT_PASS_REFUSED, lease released, rather than silently dropping the
- *     new event(s) (PR #76 review, coderabbitai; the listener itself never
+ *     new event(s) (the listener itself never
  *     sends a mixed set, since it filters consumed events via
  *     run_pass_events, so this only guards a caller outside that contract);
  *   - the run's previous pass must have concluded (run-passes.ts
@@ -1265,7 +1304,7 @@ async function cmdRun(argv: string[], deps: CliDeps): Promise<number> {
     passBudgetMaxTokens = admission.budgetMaxTokens;
   }
 
-  // ── Pass-event admission for pass 1 of a fresh run (PR #76 review, coderabbitai) ──
+  // ── Pass-event admission for pass 1 of a fresh run ──
   // `--append-pass` routes through admitAppendPass above; a bare
   // `conduit run --run-id X --pass-event ...` (pass 1) never calls it, but
   // run_pass_events.event_id is a primary key with no run scoping, so a
@@ -1376,13 +1415,43 @@ async function cmdRun(argv: string[], deps: CliDeps): Promise<number> {
       // One transaction: the pass's entry card and the record of which ingress
       // events it covers (issue #36) exist together or not at all, so the
       // listener can trust run_pass_events to mean "this pass exists".
-      deps.db.getStateDb().transaction(() => {
-        deps.db.insertCard(entryCard);
-        if (passEvents.length > 0) deps.db.recordPassEvents(effectiveRunId, passNumber ?? 1, passEvents);
-        // A pass reopens a finished run: 'running' until this process records how
-        // the pass ended, exactly as a fresh registration starts.
-        if (passNumber !== null) updateRunStatus(deps.db, effectiveRunId, 'running', null);
-      })();
+      try {
+        deps.db.getStateDb().transaction(() => {
+          deps.db.insertCard(entryCard);
+          if (passEvents.length > 0) deps.db.recordPassEvents(effectiveRunId, passNumber ?? 1, passEvents);
+          // A pass reopens a finished run: 'running' until this process records how
+          // the pass ended, exactly as a fresh registration starts.
+          if (passNumber !== null) updateRunStatus(deps.db, effectiveRunId, 'running', null);
+        })();
+      } catch (err) {
+        // A concurrent launch consumed one of passEvents between the
+        // admission pre-check and this transaction:
+        // recordPassEvents' own PRIMARY KEY on
+        // run_pass_events.event_id caught what the pre-check missed. The
+        // transaction rolled back the entry card with it. Convert the raw
+        // constraint violation into the same loud, listener-legible
+        // EXIT_PASS_REFUSED the pre-check itself produces on a mixed set,
+        // rather than letting a lost race surface as an uncaught SQLite
+        // error.
+        if (!isPassEventRaceViolation(err)) throw err;
+        const applied = findAppliedPassEvents(deps.db, passEvents);
+        if (applied.length === 0) throw err; // not actually about passEvents — surface the real error
+        deps.io.err(`error: refusing this launch — ${formatPassEventRaceRefusal(applied)}`);
+        if (appendPass) {
+          // Symmetric with every other admitAppendPass refusal: the lease
+          // taken around the admission check must not be left held.
+          releaseRunLease(deps.db, effectiveRunId, process.pid);
+        } else {
+          // This invocation's own registerRun call (above) just created the
+          // run row — the pre-check refusal path (decidePassEventAdmission,
+          // called before registerRun) never reaches it, so a fresh run
+          // refused here would otherwise leave a run row behind that the
+          // equivalent pre-check refusal does not. Undo it so both refusal
+          // paths leave the same "no run" state.
+          deps.db.deleteRun(effectiveRunId);
+        }
+        return EXIT_PASS_REFUSED;
+      }
     } else if (flow.happyPathNext !== undefined && entryStationId !== undefined) {
       // FR-9 fail-closed: applies only to flows with declared entry stations (WI-351+
       // flows that use `next` declarations). If no --input and no runnable card exists,

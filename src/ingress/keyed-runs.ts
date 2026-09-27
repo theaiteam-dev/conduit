@@ -550,13 +550,13 @@ export async function drainKeyedRun(deps: KeyedRunDeps, runId: string): Promise<
         : [row.substrate_json === null ? 'substrate_json' : null, row.flow_path === null ? 'flow_path' : null]
             .filter((field): field is string => field !== null)
             .join(' and ');
-    db.setKeyedRunPending(runId, null);
     db.appendIngressLog({
       source: DRAIN_SOURCE,
       eventId: pendingEventId,
       outcome: 'rejected_malformed',
       reason: `pending event '${pendingEventId}' for keyed run '${runId}' is missing ${missing}; dropped rather than launched as a pass`,
     });
+    db.setKeyedRunPending(runId, null);
     return null;
   }
   const event: KeyedEvent = {
@@ -571,8 +571,12 @@ export async function drainKeyedRun(deps: KeyedRunDeps, runId: string): Promise<
   // again would run it twice, so the pending slot is simply empty.
   const applied = db.getPassForEvent(row.event_id);
   if (applied !== null) {
+    // settleApplied writes the durable log row before the pending pointer is
+    // cleared, for the same reason as the malformed branch above: a throw
+    // from appendIngressLog must not leave the event dropped with no record.
+    const outcome = settleApplied(deps, event, applied);
     db.setKeyedRunPending(runId, null);
-    return settleApplied(deps, event, applied);
+    return outcome;
   }
 
   const decision = decide(deps, keyed, null);

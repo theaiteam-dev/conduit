@@ -1110,6 +1110,26 @@ export interface ConduitDB {
   close(): void;
 }
 
+/**
+ * SQL for countQueuedIngressForRun, hoisted so its query-plan test exercises
+ * the exact string the production query runs rather than a hand-copied
+ * duplicate that can drift out of sync.
+ *
+ * flow_path IS NOT NULL is redundant with the accept path (every keyed row
+ * has full attribution), but it lets SQLite match idx_ingress_events_run_id's
+ * partial WHERE, which run_id = ? alone does not imply.
+ */
+export const COUNT_QUEUED_INGRESS_FOR_RUN_SQL = `SELECT COUNT(*) AS n FROM ingress_events e
+         WHERE e.run_id = $run_id
+           AND e.flow_path IS NOT NULL
+           AND (e.spawn_state = 'accepted' OR (e.spawn_state = 'failed' AND e.spawn_attempts < $cap))
+           AND ($before IS NULL OR EXISTS (
+             SELECT 1 FROM ingress_events b
+             WHERE b.event_id = $before
+               AND (e.received_at < b.received_at
+                    OR (e.received_at = b.received_at AND e.event_id < b.event_id))
+           ))`;
+
 // ---------------------------------------------------------------------------
 // Implementation
 // ---------------------------------------------------------------------------
@@ -1328,21 +1348,7 @@ class ConduitDBImpl implements ConduitDB {
 
   countQueuedIngressForRun(runId: string, cap: number, beforeEventId: string | null): number {
     const row = this.stateDb
-      .prepare(
-        // flow_path IS NOT NULL is redundant with the accept path (every keyed row
-        // has full attribution), but it lets SQLite match idx_ingress_events_run_id's
-        // partial WHERE, which run_id = ? alone does not imply (PR #76 review).
-        `SELECT COUNT(*) AS n FROM ingress_events e
-         WHERE e.run_id = $run_id
-           AND e.flow_path IS NOT NULL
-           AND (e.spawn_state = 'accepted' OR (e.spawn_state = 'failed' AND e.spawn_attempts < $cap))
-           AND ($before IS NULL OR EXISTS (
-             SELECT 1 FROM ingress_events b
-             WHERE b.event_id = $before
-               AND (e.received_at < b.received_at
-                    OR (e.received_at = b.received_at AND e.event_id < b.event_id))
-           ))`,
-      )
+      .prepare(COUNT_QUEUED_INGRESS_FOR_RUN_SQL)
       .get({ $run_id: runId, $cap: cap, $before: beforeEventId }) as { n: number };
     return row.n;
   }
@@ -1391,7 +1397,7 @@ class ConduitDBImpl implements ConduitDB {
     const insert = this.stateDb.prepare(
       'INSERT INTO run_pass_events (event_id, run_id, pass) VALUES ($event_id, $run_id, $pass)',
     );
-    // Atomic on its own (PR #76 review): a duplicate later in the list must not
+    // Atomic on its own: a duplicate later in the list must not
     // leave an earlier insert recorded. bun:sqlite nests this as a savepoint
     // when the sole caller (src/cli/main.ts) already holds an outer transaction.
     this.stateDb.transaction(() => {

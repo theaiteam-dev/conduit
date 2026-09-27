@@ -68,8 +68,12 @@ function resolveSubject(
 
 /**
  * Resolve every part of a run key, in declared order. A json_path part tries
- * its alternatives in order and takes the first that yields a non-empty
- * scalar. Returns the reason for the first unresolved part otherwise.
+ * its alternatives in order and takes the first non-empty scalar that is also
+ * within MAX_RUN_KEY_PART_LENGTH; an over-length candidate is treated as
+ * unresolved and the loop falls through to the next alternative, rather than
+ * rejecting the whole key on the first candidate that happens to resolve.
+ * Returns the reason for the first unresolved part otherwise: an over-length
+ * reason if some candidate resolved but none fit, else "did not resolve".
  */
 export function resolveRunKey(parts: readonly RunKeyPart[], event: KeyedEventSurface): ResolveRunKeyResult {
   const resolved: string[] = [];
@@ -77,22 +81,26 @@ export function resolveRunKey(parts: readonly RunKeyPart[], event: KeyedEventSur
     const candidates: Array<{ header: string } | { json_path: string }> =
       'header' in part ? [{ header: part.header }] : part.json_path.map((path) => ({ json_path: path }));
     let value: string | null = null;
+    let overLength: string | null = null;
     for (const candidate of candidates) {
       const v = resolveSubject(candidate, event);
-      if (v !== null && v !== '') {
-        value = v;
-        break;
+      if (v === null || v === '') continue;
+      if (v.length > MAX_RUN_KEY_PART_LENGTH) {
+        if (overLength === null) overLength = v;
+        continue;
       }
+      value = v;
+      break;
     }
     const label = 'header' in part ? `header '${part.header}'` : `json_path ${JSON.stringify(part.json_path)}`;
     if (value === null) {
+      if (overLength !== null) {
+        return {
+          ok: false,
+          reason: `run_key part ${index} (${label}) is ${overLength.length} chars, over the ${MAX_RUN_KEY_PART_LENGTH}-char limit`,
+        };
+      }
       return { ok: false, reason: `run_key part ${index} (${label}) did not resolve to a non-empty scalar` };
-    }
-    if (value.length > MAX_RUN_KEY_PART_LENGTH) {
-      return {
-        ok: false,
-        reason: `run_key part ${index} (${label}) is ${value.length} chars, over the ${MAX_RUN_KEY_PART_LENGTH}-char limit`,
-      };
     }
     resolved.push(value);
   }

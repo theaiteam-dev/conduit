@@ -187,7 +187,7 @@ describe('commitFanOut child-id collision', () => {
     expectOk(commitFanOut(db, 'run-b', 'p', proposal, { onPathConflict: 'reject' }));
   });
 
-  // PR #76 review (D) — two children in the SAME proposal sharing an id both
+  // Two children in the same proposal sharing an id both
   // pass the per-row "does this id already own a card?" check (neither is in
   // `cards` yet), so without a dedicated check the insert throws out of the
   // tick instead of being rejected as a validation error.

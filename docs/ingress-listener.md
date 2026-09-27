@@ -353,12 +353,16 @@ channels:
 ```
 
 - Each part is `{ json_path: <path> }`, `{ json_path: [<path>, ...] }`
-  (alternatives: the first that resolves wins), or `{ header: <name> }`.
-  Paths use the same `$.` dialect as `substrate`, rooted at the request body.
+  (alternatives: the first that resolves to a non-empty scalar within the
+  512-character limit wins; an alternative over that limit is skipped like an
+  unresolved one, so a later, shorter alternative can still resolve the part),
+  or `{ header: <name> }`. Paths use the same `$.` dialect as `substrate`,
+  rooted at the request body.
 - Only non-empty scalar values count. If any part does not resolve, the event
   is refused: `400`, logged `rejected_run_key`, never accepted. There is no
   content-hash fallback, since a fallback key would quietly give the event a
-  run of its own. A part longer than 512 characters is refused the same way.
+  run of its own. A part is refused the same way when every alternative is
+  either unresolved or over 512 characters.
 - The run id is `igk-<flow>-<hash>`, where the hash covers the flow id and the
   ordered parts, so two flows keyed on the same subject never share a run.
   Leave out anything that changes as the flow works (a head SHA, for a flow

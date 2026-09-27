@@ -556,7 +556,7 @@ describe('run-slot-aware re-drive (the original listener-backpressure work)', ()
 });
 
 // ===========================================================================
-// Keyed rows go through the router, not respawn (issue #36, PR #76 review)
+// Keyed rows go through the router, not respawn (issue #36)
 // ===========================================================================
 
 describe('the keyed branch of the redrive sweep (issue #36)', () => {

@@ -176,7 +176,7 @@ describe('run_pass_events', () => {
     expect(() => db.recordPassEvents(KEYED.runId, 3, ['ev-2'])).toThrow();
   });
 
-  // PR #76 review (github-actions): the insert loop is not atomic on its own —
+  // the insert loop is not atomic on its own —
   // a duplicate later in the list must not leave an earlier insert recorded,
   // since callers rely on "a row here means the pass exists".
   it('rolls back the whole call when one event in the list is already recorded', () => {

@@ -38,7 +38,7 @@ sig = "692e844779431be5"
 [[bindings]]
 doc = "SPEC.md"
 target = "src/ingress/run-key.ts#resolveRunKey"
-sig = "700f435d7b3eb1f7"
+sig = "a9588a9bd1008961"
 
 [[bindings]]
 doc = "SPEC.md"
@@ -73,4 +73,4 @@ sig = "bd240b0922e20e22"
 [[bindings]]
 doc = "docs/installation.md"
 target = "src/cli/main.ts"
-sig = "da8e322b74a4c364"
+sig = "d0de91579daf9894"

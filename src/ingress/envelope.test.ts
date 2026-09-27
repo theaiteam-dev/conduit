@@ -337,11 +337,11 @@ describe('stampKeyedPass', () => {
     expect('events_truncated' in envelope).toBe(false);
   });
 
-  // PR #76 review (A) — MAX_PASS_EVENTS_BYTES alone bounds only the events
+  // MAX_PASS_EVENTS_BYTES alone bounds only the events
   // list, not the whole argv string a large base substrate is embedded in.
   // The events budget must shrink to keep the WHOLE stamped string under
   // MAX_STAMPED_SUBSTRATE_BYTES, not just the events list under its own cap.
-  describe('total stamped-string cap (PR #76 review A)', () => {
+  describe('total stamped-string cap', () => {
     it('shrinks the events list when the base substrate alone is large', () => {
       const covered: PassEventInput[] = [1, 2, 3].map((n) => ({
         eventId: `d-${n}`,
@@ -398,9 +398,9 @@ describe('stampKeyedPass', () => {
     });
   });
 
-  // PR #76 review (B) — a malformed folded substrateJson must not poison
+  // a malformed folded substrateJson must not poison
   // every future pass launch of the run; it is skipped, not thrown.
-  describe('malformed folded event (PR #76 review B)', () => {
+  describe('malformed folded event', () => {
     it('skips an entry whose substrateJson fails to parse instead of throwing', () => {
       const covered: PassEventInput[] = [
         { eventId: 'd-1', receivedAt: 1, substrateJson: '{not valid json' },

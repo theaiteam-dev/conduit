@@ -747,7 +747,7 @@ describe('restart and re-drive', () => {
   });
 });
 
-describe('drainKeyedRun on a pending event the router cannot simply launch (PR #76 review)', () => {
+describe('drainKeyedRun on a pending event the router cannot simply launch', () => {
   function seedFinishedRun(): void {
     db.insertRun({ run_id: RUN, flow: FLOW_PATH, input_fingerprint: 'fp', status: 'done', outcome: 'complete' });
     db.insertCard({
@@ -808,6 +808,39 @@ describe('drainKeyedRun on a pending event the router cannot simply launch (PR #
     expect(entries[0]!.reason).toContain(RUN);
   });
 
+  it('keeps the pending pointer set when appendIngressLog throws for a malformed pending row (issue: log-before-clear ordering)', async () => {
+    seedFinishedRun();
+    db.setKeyedRunPending(RUN, 'ghost-event');
+
+    let calls = 0;
+    const throwingDb = new Proxy(db, {
+      get(target, prop, receiver) {
+        if (prop === 'appendIngressLog') {
+          return (entry: Parameters<ConduitDB['appendIngressLog']>[0]) => {
+            calls += 1;
+            if (calls === 1) throw new Error('boom: log sink unavailable');
+            return target.appendIngressLog(entry);
+          };
+        }
+        return Reflect.get(target, prop, receiver);
+      },
+    }) as ConduitDB;
+
+    await expect(drainKeyedRun({ ...drainDeps(), db: throwingDb }, RUN)).rejects.toThrow('boom: log sink unavailable');
+
+    // The durable log write is attempted before the pending pointer is
+    // cleared, so a throw from it must leave the pointer intact rather than
+    // dropping the event with no record.
+    expect(db.getKeyedRun(RUN)!.pending_event_id).toBe('ghost-event');
+    expect(db.getIngressLog({ outcome: 'rejected_malformed' })).toHaveLength(0);
+
+    // A retry (the log sink is back) now succeeds and clears the pointer.
+    const outcome = await drainKeyedRun(drainDeps(), RUN);
+    expect(outcome).toBeNull();
+    expect(db.getKeyedRun(RUN)!.pending_event_id).toBeNull();
+    expect(db.getIngressLog({ outcome: 'rejected_malformed' })).toHaveLength(1);
+  });
+
   it('settles a pending event a pass already consumed as already_applied instead of dropping it silently', async () => {
     seedFinishedRun();
     db.acceptIngressEvent('ev-applied', NOW - 10, {
@@ -828,5 +861,39 @@ describe('drainKeyedRun on a pending event the router cannot simply launch (PR #
     const entries = db.getIngressLog({ outcome: 'already_applied' });
     expect(entries).toHaveLength(1);
     expect(entries[0]!.reason).toContain('pass 2');
+  });
+
+  it('keeps the pending pointer set when settleApplied throws logging an already-consumed pending event', async () => {
+    seedFinishedRun();
+    db.acceptIngressEvent('ev-applied', NOW - 10, {
+      flowId: FLOW_ID,
+      flowPath: FLOW_PATH,
+      runId: RUN,
+      substrateJson: JSON.stringify({ round: 1 }),
+    });
+    db.markIngressCoalesced('ev-applied');
+    db.setKeyedRunPending(RUN, 'ev-applied');
+    db.recordPassEvents(RUN, 2, ['ev-applied']);
+
+    let calls = 0;
+    const throwingDb = new Proxy(db, {
+      get(target, prop, receiver) {
+        if (prop === 'appendIngressLog') {
+          return (entry: Parameters<ConduitDB['appendIngressLog']>[0]) => {
+            calls += 1;
+            if (calls === 1) throw new Error('boom: log sink unavailable');
+            return target.appendIngressLog(entry);
+          };
+        }
+        return Reflect.get(target, prop, receiver);
+      },
+    }) as ConduitDB;
+
+    await expect(drainKeyedRun({ ...drainDeps(), db: throwingDb }, RUN)).rejects.toThrow('boom: log sink unavailable');
+
+    // markIngressSpawned may already have run, but the pending pointer must
+    // still be set: settleApplied's log write happens before it is cleared.
+    expect(db.getKeyedRun(RUN)!.pending_event_id).toBe('ev-applied');
+    expect(db.getIngressLog({ outcome: 'already_applied' })).toHaveLength(0);
   });
 });

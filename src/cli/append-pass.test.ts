@@ -318,7 +318,7 @@ describe('conduit run --pass-event: the kernel records which events a pass consu
     expect(io.errors.join('\n')).toContain('--pass-event requires --run-id');
   });
 
-  describe('a mixed set of consumed and new events (PR #76 review, coderabbitai)', () => {
+  describe('a mixed set of consumed and new events', () => {
     it('refuses --append-pass rather than silently dropping the new event, and releases the lease', async () => {
       const flowPath = writeFlow();
       const engine = completingEngine();
@@ -389,6 +389,89 @@ describe('conduit run --pass-event: the kernel records which events a pass consu
 
       expect(io.lines.join('\n')).toContain('already consumed by pass 1');
       expect(db.getRun(otherRun)).toBeNull();
+    });
+  });
+
+  describe('a concurrent launch consumes an event between the pre-check and the seed', () => {
+    /**
+     * Wrap `db` so `getPassForEvent` answers `null` the first time it is
+     * asked about `raceEventId` — as if no pass had consumed it yet — and
+     * the real answer on every call after. A real row for that event,
+     * inserted directly below (simulating a concurrent launch that already
+     * won the race), sits behind a pre-check that still sees it as free: the
+     * launch under test proceeds past `decidePassEventAdmission` and only
+     * discovers the collision when its own seed transaction's
+     * `recordPassEvents` hits the table's PRIMARY KEY.
+     */
+    function racedGetPassForEvent(base: ConduitDB, raceEventId: string): ConduitDB {
+      let sawRaceEventOnce = false;
+      return new Proxy(base, {
+        get(target, prop, receiver) {
+          if (prop === 'getPassForEvent') {
+            return (eventId: string) => {
+              if (eventId === raceEventId && !sawRaceEventOnce) {
+                sawRaceEventOnce = true;
+                return null;
+              }
+              return target.getPassForEvent(eventId);
+            };
+          }
+          const value = Reflect.get(target, prop, target);
+          return typeof value === 'function' ? value.bind(target) : value;
+        },
+      }) as ConduitDB;
+    }
+
+    it('refuses a fresh run (pass 1) with EXIT_PASS_REFUSED, a legible message, and no run row', async () => {
+      const flowPath = writeFlow();
+      const raced = racedGetPassForEvent(db, 'ev-race');
+      // A concurrent launch already recorded this event against a different
+      // run's pass, landing after this launch's own pre-check ran.
+      db.recordPassEvents('other-run', 1, ['ev-race']);
+
+      const deps = makeDeps({ db: raced, runEngine: completingEngine().runEngine });
+      const exitCode = await main(
+        ['run', flowPath, '--run-id', RUN, '--input-inline', '{"n":1}', '--pass-event', 'ev-race'],
+        deps,
+      );
+
+      expect(exitCode).toBe(EXIT_PASS_REFUSED);
+      const errors = io.errors.join('\n');
+      expect(errors).toContain('ev-race');
+      expect(errors).toContain('pass 1');
+      expect(errors).toContain('other-run');
+      // No entry card was left behind by the rolled-back seed transaction...
+      expect(cardIds(RUN)).toEqual([]);
+      // ...and, like the pre-check refusal path (above), no run row either:
+      // this invocation's own registerRun call is undone on this refusal.
+      expect(db.getRun(RUN)).toBeNull();
+    });
+
+    it('refuses --append-pass with EXIT_PASS_REFUSED, a legible message, no new pass card, and releases the lease', async () => {
+      const flowPath = writeFlow();
+      const engine = completingEngine();
+      await runPass1(flowPath, makeDeps({ runEngine: engine.runEngine }));
+
+      const raced = racedGetPassForEvent(db, 'ev-race');
+      db.recordPassEvents('other-run', 1, ['ev-race']);
+
+      const deps = makeDeps({ db: raced, runEngine: engine.runEngine });
+      const exitCode = await main(
+        ['run', flowPath, '--run-id', RUN, '--input-inline', '{"n":2}', '--append-pass', '--pass-event', 'ev-race'],
+        deps,
+      );
+
+      expect(exitCode).toBe(EXIT_PASS_REFUSED);
+      const errors = io.errors.join('\n');
+      expect(errors).toContain('ev-race');
+      expect(errors).toContain('pass 1');
+      expect(errors).toContain('other-run');
+      // No pass-2 card was left behind by the rolled-back seed transaction,
+      // and the run itself (which pre-existed this invocation) is untouched.
+      expect(cardIds()).toEqual([`entry-${RUN}`]);
+      expect(db.getRun(RUN)).not.toBeNull();
+      // The lease admitAppendPass took was released on this refusal.
+      expect(db.getRun(RUN)!.holder_pid ?? null).toBeNull();
     });
   });
 });
@@ -579,7 +662,7 @@ describe('conduit run --append-pass: refusals', () => {
   });
 });
 
-describe('conduit run --append-pass: lease release on a post-admission throw (PR #76 review)', () => {
+describe('conduit run --append-pass: lease release on a post-admission throw', () => {
   /** Wrap `db` so `methodName` throws, delegating everything else unchanged. */
   function throwingDb(base: ConduitDB, methodName: keyof ConduitDB, err: Error): ConduitDB {
     return new Proxy(base, {
@@ -614,7 +697,7 @@ describe('conduit run --append-pass: lease release on a post-admission throw (PR
   });
 });
 
-describe('conduit run --append-pass: refusal ordering (PR #76 review)', () => {
+describe('conduit run --append-pass: refusal ordering', () => {
   it('leaves a pre-staged entry input file untouched when admission refuses the pass', async () => {
     const flowPath = writeFlow();
     const engine = completingEngine();

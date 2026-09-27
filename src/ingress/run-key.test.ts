@@ -95,6 +95,27 @@ describe('resolveRunKey', () => {
     expect(resolveRunKey([{ json_path: ['$.id'] }], atBound).ok).toBe(true);
   });
 
+  it('falls through an over-length alternative to a later, short one instead of rejecting the whole key', () => {
+    const event = {
+      headers: {},
+      body: { long: 'x'.repeat(MAX_RUN_KEY_PART_LENGTH + 1), short: 'ok' },
+    };
+    const result = resolveRunKey([{ json_path: ['$.long', '$.short'] }], event);
+    expect(result).toEqual({ ok: true, parts: ['ok'] });
+  });
+
+  it('reports the over-length reason when every alternative is over-length', () => {
+    const event = {
+      headers: {},
+      body: { a: 'x'.repeat(MAX_RUN_KEY_PART_LENGTH + 1), b: 'y'.repeat(MAX_RUN_KEY_PART_LENGTH + 2) },
+    };
+    const result = resolveRunKey([{ json_path: ['$.a', '$.b'] }], event);
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.reason).toContain('part 0');
+    expect(result.reason).toContain(`over the ${MAX_RUN_KEY_PART_LENGTH}-char limit`);
+  });
+
   it('rejects a non-object body without throwing', () => {
     expect(resolveRunKey([{ json_path: ['$.id'] }], { headers: {}, body: 'plain text' }).ok).toBe(false);
   });
