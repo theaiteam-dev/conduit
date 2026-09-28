@@ -58,6 +58,11 @@ function makeMaker(opts: { canGatePerCall?: boolean; hold?: UsageReport | 'no-us
     async invoke(call) {
       calls.push(call);
       if (opts.hold !== undefined) {
+        // What the agent-sdk adapter emits for the call it held.
+        call.onEvent?.({
+          type: 'gate-decision', toolName: 'AskUserQuestion', toolCallId: 'tu-1', decision: 'hold', code: 'needs_human',
+          reason: 'asks a human', seq: 0,
+        });
         throw Object.assign(new Error('agent-sdk: the tool gate held the card on AskUserQuestion (needs_human)'), {
           code: HARNESS_GATE_HOLD_CODE,
           ...(opts.hold !== 'no-usage' ? { usage: opts.hold } : {}),
@@ -250,6 +255,13 @@ describe('issue #21: a gate hold moves the card to hold', () => {
     const reasons = db.getCardLog('entry').filter((e) => e.kind === 'terminal').map((e) => (e as { reason: string }).reason);
     expect(reasons.join('\n')).toContain('harness tool gate held station');
     expect(reasons.join('\n')).toContain('needs_human');
+    // The gate decision the adapter emitted is journaled and joins the maker span by invocation id.
+    const rows = db.getHarnessEventsForRun(DEFAULT_RUN_ID, 'entry');
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ kind: 'gate-decision', decision: 'hold', gateCode: 'needs_human', toolName: 'AskUserQuestion' });
+    const span = db.getJournalSpansForRun(DEFAULT_RUN_ID, 'entry').find((sp) => sp.name === 'coder.harness');
+    expect(span?.invocationId).toBe(rows[0]!.invocationId);
+    expect(span?.attributes.outcome).toBe('harness-gate-hold');
     // No scrap: the card is waiting for a human, not written off.
     expect(db.getCardLog('entry').some((e) => e.kind === 'entered_lane' && (e as { destLane?: string }).destLane === 'scrap')).toBe(false);
   });
