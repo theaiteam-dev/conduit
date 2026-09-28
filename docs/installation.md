@@ -323,6 +323,7 @@ These probes run whether or not a flow argument is given:
 |------------|---------------|
 | `state_db_volume` | Writes and deletes a temp file in the state-DB directory. Paths under `/data` must also be backed by an actual Docker mount; no-volume containers report FAIL instead of silently using ephemeral storage |
 | `project-root-present` | Checks `CONDUIT_PROJECT_ROOT` on disk. Reports FAIL only when the env var is set to a non-existent path. Reports ok (no-op) when the env var is unset or empty — the engine image sets it to an empty string so the probe is a no-op there. Per-flow images set `CONDUIT_PROJECT_ROOT=/flow` so the baked-in directory is verified |
+| `process-containment` | Which mechanism kills the processes a station or harness starts: a per-invocation cgroup v2, or the process-group kill alone. Never FAILs. On the fallback the detail starts with `warning:` and names the reason; a command that starts a new session (every command Claude Code's Bash tool runs) can then outlive its invocation. A default Docker or Podman container reports the fallback, because `/sys/fs/cgroup` is read-only there. See [Process-tree termination](harness-containment.md#process-tree-termination) for the requirements and a Podman recipe |
 | `model_api_key` | `CONDUIT_API_KEY` or `OPENAI_API_KEY` is set |
 | `gateway_base_url` | `CONDUIT_BASE_URL` is set |
 
@@ -343,6 +344,7 @@ $ docker run --rm -v conduit_data:/data \
 
   state_db_volume: ok
   project-root-present: ok
+  process-containment: ok — warning: process group only (cannot create a cgroup under /sys/fs/cgroup (EROFS)); a command started in a new session can outlive its invocation, see docs/harness-containment.md
   model_api_key: ok
   gateway_base_url: ok — CONDUIT_BASE_URL is configured
 ```
@@ -357,6 +359,7 @@ $ docker run --rm -v conduit_data:/data \
 
   state_db_volume: ok
   project-root-present: ok
+  process-containment: ok — warning: process group only (cannot create a cgroup under /sys/fs/cgroup (EROFS)); a command started in a new session can outlive its invocation, see docs/harness-containment.md
   model_api_key: ok
   gateway_base_url: ok — CONDUIT_BASE_URL is configured
   flow-prereqs-present: ok

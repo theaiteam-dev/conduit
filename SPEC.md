@@ -824,9 +824,10 @@ risk and gets the most poka-yoke.
 > (`claude -p`, `codex exec`, …) instead of the in-kernel Tool-Bridge described below. The
 > harness owns its own tool loop, so the kernel cannot gate individual tool calls
 > pre-execution the way it does here; containment is a documented **profile** at the
-> process boundary (mandatory owned-paths integrity, secrets-by-allowlist, process-group
-> termination, the ADR-0003 container wall, and the adversarial gate as the quality
-> control) rather than the Law. `agentic` keeps its Law-grade meaning in this section
+> process boundary (mandatory owned-paths integrity, secrets-by-allowlist, process-tree
+> termination through a per-invocation cgroup where the host allows it and the
+> process-group kill otherwise, the ADR-0003 container wall, and the adversarial gate as
+> the quality control) rather than the Law. `agentic` keeps its Law-grade meaning in this section
 > unchanged. See [`docs/harness-containment.md`](docs/harness-containment.md) for the
 > full profile.
 

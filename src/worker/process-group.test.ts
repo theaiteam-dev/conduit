@@ -11,11 +11,18 @@
  * single pids only, never a group.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
-import { mkdtempSync, realpathSync, rmSync } from 'node:fs';
+import { mkdtempSync, readdirSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { TERMINATING_SIGNALS, trackProcessGroup, untrackProcessGroup } from './process-group';
-import { expectGrandchildReaped, killRecordedGrandchild, recordedPid } from './harness-containment.conformance';
+import {
+  expectGrandchildReaped,
+  hostContainment,
+  killRecordedGrandchild,
+  recordedPid,
+  recordedSetsidPid,
+  requiresSetsidContainment,
+} from './harness-containment.conformance';
 
 const RUNNER_SCRIPT = join(import.meta.dir, 'containment-signal-runner.ts');
 const READY_BUDGET_MS = 10_000;
@@ -103,7 +110,15 @@ describe('process-group registry: the kernel takes live station groups with it',
     rmSync(projectRoot, { recursive: true, force: true });
   });
 
-  /** Spawn the stand-in kernel and wait until its station's grandchild is running. */
+  /**
+   * Spawn the stand-in kernel and wait until every grandchild `expectGrandchildReaped`
+   * will later assert on has recorded its pid: the plain one always, and the
+   * setsid one too wherever this host requires cgroup containment. Signalling
+   * (or, in 'exit' mode, letting the runner exit) any earlier risks catching
+   * the fixture before it reaches its `setsid -f` line, in which case the
+   * setsid grandchild is never spawned at all rather than merely reaped late
+   * (issue #77 flake: "setsid grandchild: no pid recorded").
+   */
   async function startKernel(runner: 'deterministic' | 'harness', mode?: 'exit'): Promise<void> {
     kernel = Bun.spawn(['bun', RUNNER_SCRIPT, runner, projectRoot, ...(mode ? [mode] : [])], {
       stdin: 'ignore',
@@ -111,15 +126,31 @@ describe('process-group registry: the kernel takes live station groups with it',
       stderr: 'pipe',
     });
     const deadline = Date.now() + READY_BUDGET_MS;
-    while (recordedPid(projectRoot) === undefined && Date.now() < deadline) {
+    const grandchildrenRecorded = () =>
+      recordedPid(projectRoot) !== undefined &&
+      (!requiresSetsidContainment || recordedSetsidPid(projectRoot) !== undefined);
+    while (!grandchildrenRecorded() && Date.now() < deadline) {
       await sleep(20);
     }
     expect(recordedPid(projectRoot)).toBeDefined();
+    if (requiresSetsidContainment) {
+      expect(recordedSetsidPid(projectRoot)).toBeDefined();
+    }
   }
 
   async function waitForKernelExit(): Promise<void> {
     const exited = await Promise.race([kernel!.exited.then(() => true), sleep(EXIT_BUDGET_MS).then(() => false)]);
     expect(exited).toBe(true);
+  }
+
+  /**
+   * Under cgroup containment the kernel's handlers also remove the station's
+   * cgroup on the way out (issue #77), so none named for it is left.
+   */
+  function expectNoKernelCgroupLeft(): void {
+    if (hostContainment.mechanism !== 'cgroup') return;
+    const prefix = `conduit-${kernel!.pid}-`;
+    expect(readdirSync(hostContainment.parent).filter((name) => name.startsWith(prefix))).toEqual([]);
   }
 
   for (const signal of ['SIGINT', 'SIGTERM'] as const) {
@@ -132,6 +163,7 @@ describe('process-group registry: the kernel takes live station groups with it',
       expect(kernel!.signalCode).toBe(signal);
       expect(await new Response(kernel!.stdout).text()).not.toContain('station returned');
       await expectGrandchildReaped(projectRoot);
+      expectNoKernelCgroupLeft();
     }, TEST_TIMEOUT_MS);
   }
 
@@ -142,6 +174,7 @@ describe('process-group registry: the kernel takes live station groups with it',
 
     expect(kernel!.signalCode).toBe('SIGINT');
     await expectGrandchildReaped(projectRoot);
+    expectNoKernelCgroupLeft();
   }, TEST_TIMEOUT_MS);
 
   it('deterministic: process.exit() mid-station kills the station grandchild', async () => {
@@ -150,5 +183,6 @@ describe('process-group registry: the kernel takes live station groups with it',
 
     expect(kernel!.exitCode).toBe(0);
     await expectGrandchildReaped(projectRoot);
+    expectNoKernelCgroupLeft();
   }, TEST_TIMEOUT_MS);
 });

@@ -21,13 +21,14 @@
  *      before the exit, not at timeoutMs.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
-import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync, realpathSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, readdirSync, readFileSync, writeFileSync, realpathSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   runHarnessProcess,
   type HarnessRunnerConfig,
 } from './harness-runner';
+import type { Containment } from './cgroup-containment';
 import {
   describeContainmentConformance,
   CONTAINMENT_FIXTURE,
@@ -240,6 +241,12 @@ describe('harness runner: timeout/natural-exit boundary race (AC2 regression)', 
     // enough to the deadline that the timeout timer routinely fires — the exact
     // interleaving that surfaced the flag-race bug.
     const sleepSeconds = ((timeoutMs * 0.9) / 1000).toFixed(3); // '0.045'
+    // Process-group containment: joining a cgroup costs the child 5-20ms
+    // before it runs (the kernel waits for an RCU grace period on migration),
+    // which would push a 45ms child past a 50ms deadline and turn this into a
+    // test of that overhead. The labelling logic under test does not depend on
+    // the mechanism.
+    const containment = { mechanism: 'process-group', reason: 'boundary-race timing test' } as const;
 
     // Collect every violation so a failure names how often and how it broke,
     // rather than aborting on the first (a 1/300 flake vs a systemic regression
@@ -250,7 +257,7 @@ describe('harness runner: timeout/natural-exit boundary race (AC2 regression)', 
     for (let iter = 0; iter < ITERATIONS; iter++) {
       const result = await runHarnessProcess(
         { command: 'sh', args: ['-c', `sleep ${sleepSeconds}; exit 0`] },
-        config({ timeoutMs }),
+        config({ timeoutMs, containment }),
       );
       // The bug signature: a run that exited 0 but was flagged timedOut.
       if (result.timedOut) {
@@ -667,5 +674,42 @@ describe('runHarnessProcess: a throwing stdoutLineFilter does not produce an unh
     } finally {
       process.off('unhandledRejection', onUnhandledRejection);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// PR review item 14 (harness-runner.ts line 274): a cgroup is created by
+// prepareContainedCommand, but the spawn itself then throws (e.g. a bad cwd).
+// The catch in runHarnessProcess must remove the just-created cgroup before
+// rethrowing, so a spawn failure never leaks a `conduit-*` directory.
+//
+// resolveConfinedCwd only requires `projectRoot` itself to exist; it never
+// checks that the resolved cwd exists, only that it resolves inside the
+// root. So a cwd that is a non-existent subdirectory of `projectRoot` passes
+// that confinement check, lets prepareContainedCommand's Bun.which resolve
+// the command (which does not require the cwd to exist either) and create
+// the cgroup, and only THEN makes Bun.spawn itself throw ENOENT.
+//
+// `containment` here is `{ mechanism: 'cgroup', parent: projectRoot }`: on
+// this mechanism prepareContainedCommand only resolves the command and
+// `mkdirSync`s a plain directory under `parent` — no real cgroup v2
+// filesystem is required, so this reproduces on any host, cgroups or not.
+// ---------------------------------------------------------------------------
+
+describe('runHarnessProcess: cgroup cleanup when the spawn itself throws (review item 14)', () => {
+  it('removes the cgroup and rethrows the original spawn error, leaving no conduit-* directory behind', async () => {
+    const missingCwd = join(projectRoot, 'does-not-exist');
+    const containment: Containment = { mechanism: 'cgroup', parent: projectRoot };
+
+    let thrown: unknown;
+    try {
+      await runHarnessProcess({ command: 'true', args: [] }, config({ cwd: missingCwd, containment }));
+    } catch (err) {
+      thrown = err;
+    }
+
+    expect(thrown).toBeInstanceOf(Error);
+    expect((thrown as { code?: string }).code).toBe('ENOENT');
+    expect(readdirSync(projectRoot).filter((name) => name.startsWith('conduit-'))).toEqual([]);
   });
 });

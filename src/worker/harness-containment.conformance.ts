@@ -22,13 +22,23 @@
  * `harness-containment-registry.test.ts` fails when an adapter in the shipped
  * factory map has no `describeHarnessContainmentConformance` call.
  *
- * The fixture (./containment-fixture.sh) stands in for the binary. It
- * backgrounds a grandchild that records its pid and touches a sentinel file
- * every 100ms, then blocks, or exits with a given code when run with
- * `--exit <code>`. The suite proves the grandchild died two ways: the
- * pid is gone, and the sentinel mtime stops advancing. The second check does
- * not depend on the pid, so a recycled pid cannot make a surviving grandchild
- * look dead.
+ * The fixture (./containment-fixture.sh) stands in for the binary. It starts
+ * two grandchildren that each record a pid and touch a sentinel file every
+ * 100ms, then blocks, or exits with a given code when run with
+ * `--exit <code>`. One is backgrounded with a plain `( ... ) &` and stays in
+ * the fixture's process group. The other is started with `setsid`, as Claude
+ * Code's Bash tool starts every command (issue #77), so a process-group kill
+ * cannot reach it. The suite proves each grandchild died two ways: the pid is
+ * gone, and the sentinel mtime stops advancing. The second check does not
+ * depend on the pid, so a recycled pid cannot make a surviving grandchild look
+ * dead.
+ *
+ * The setsid grandchild can only be killed through a cgroup
+ * (./cgroup-containment.ts). The suite requires it dead wherever the runners
+ * use cgroup containment, and everywhere when
+ * CONDUIT_REQUIRE_CGROUP_CONTAINMENT=1, which CI sets so a host that lost the
+ * mechanism fails rather than skips. On any other host the setsid assertions
+ * are registered as skipped tests that name the reason.
  *
  * This file is not a test file itself. Bun only runs it through the calls in
  * the `*.test.ts` files.
@@ -38,13 +48,33 @@ import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync }
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { HarnessAdapter } from './harness-adapter';
+import { resolveContainment, type Containment } from './cgroup-containment';
+import {
+  PID_FILE,
+  SENTINEL_FILE,
+  SETSID_PID_FILE,
+  SETSID_SENTINEL_FILE,
+  SETSID_SID_FILE,
+  setsidContainmentRequired,
+} from './containment-fixture-files';
 
 /** Absolute path of the stand-in binary every conformance call spawns. */
 export const CONTAINMENT_FIXTURE = join(import.meta.dir, 'containment-fixture.sh');
 
-/** Files the fixture writes into its working directory. */
-const PID_FILE = 'containment.pid';
-const SENTINEL_FILE = 'containment.sentinel';
+/** The fixture's two grandchildren: the pid file and sentinel each one writes. */
+const GRANDCHILDREN = [
+  { label: 'backgrounded grandchild', pidFile: PID_FILE, sentinel: SENTINEL_FILE },
+  { label: 'setsid grandchild', pidFile: SETSID_PID_FILE, sentinel: SETSID_SENTINEL_FILE },
+] as const;
+
+/** The containment the runners resolve on this host, through the same resolver. */
+export const hostContainment: Containment = await resolveContainment();
+
+/** Whether the suite requires the setsid grandchild to die on this host. */
+export const requiresSetsidContainment = setsidContainmentRequired(hostContainment);
+
+/** The grandchildren every reaping assertion covers on this host. */
+const REQUIRED_GRANDCHILDREN = requiresSetsidContainment ? GRANDCHILDREN : GRANDCHILDREN.slice(0, 1);
 
 /**
  * Timing. The invocation timeout leaves room for a loaded CI box to start the
@@ -136,38 +166,71 @@ async function waitForPidGone(pid: number, budgetMs: number): Promise<boolean> {
   return !isAlive(pid);
 }
 
-function sentinelMtime(projectRoot: string): number | undefined {
+function sentinelMtime(projectRoot: string, sentinel: string = SENTINEL_FILE): number | undefined {
   try {
-    return statSync(join(projectRoot, SENTINEL_FILE)).mtimeMs;
+    return statSync(join(projectRoot, sentinel)).mtimeMs;
   } catch {
     return undefined;
   }
 }
 
-/** The grandchild pid the fixture recorded in `projectRoot`, if it got that far. */
-export function recordedPid(projectRoot: string): number | undefined {
-  const path = join(projectRoot, PID_FILE);
+function readPidFile(projectRoot: string, pidFile: string): number | undefined {
+  const path = join(projectRoot, pidFile);
   if (!existsSync(path)) return undefined;
   const pid = Number(readFileSync(path, 'utf-8').trim());
   return Number.isInteger(pid) && pid > 1 ? pid : undefined;
 }
 
 /**
- * Watch the sentinel while the invocation runs and resolve true once its mtime
- * has advanced, proving the grandchild was alive and touching it. Resolves
- * false if the invocation settles first without an advance being seen.
+ * The backgrounded grandchild's pid the fixture recorded in `projectRoot`, if
+ * it got that far. It is written first, so its presence means the fixture is
+ * running.
  */
-async function watchSentinelAdvance(projectRoot: string, settled: () => boolean): Promise<boolean> {
-  let first: number | undefined;
+export function recordedPid(projectRoot: string): number | undefined {
+  return readPidFile(projectRoot, PID_FILE);
+}
+
+/** The setsid grandchild's pid the fixture recorded in `projectRoot`, if it got that far. */
+export function recordedSetsidPid(projectRoot: string): number | undefined {
+  return readPidFile(projectRoot, SETSID_PID_FILE);
+}
+
+/**
+ * The session id the setsid grandchild recorded for itself. It equals the
+ * grandchild's pid when it leads its own session, which is what makes it
+ * escape a process-group kill. Recorded by the fixture, so it is available on
+ * every run, however fast the spawn path killed the grandchild.
+ */
+function recordedSetsidSession(projectRoot: string): number | undefined {
+  return readPidFile(projectRoot, SETSID_SID_FILE);
+}
+
+/** What `watchSentinelAdvance` observed while the invocation was still running. */
+interface SentinelWatch {
+  /**
+   * Every required grandchild's sentinel mtime advanced at least once,
+   * proving each grandchild was alive and touching it. False if the
+   * invocation settled first without every advance being seen.
+   */
+  advanced: boolean;
+}
+
+/** Watch every grandchild's sentinel while the invocation runs. */
+async function watchSentinelAdvance(projectRoot: string, settled: () => boolean): Promise<SentinelWatch> {
+  const first = new Map<string, number>();
+  const advanced = new Set<string>();
   while (!settled()) {
-    const now = sentinelMtime(projectRoot);
-    if (now !== undefined) {
-      if (first === undefined) first = now;
-      else if (now !== first) return true;
+    for (const { sentinel } of REQUIRED_GRANDCHILDREN) {
+      const now = sentinelMtime(projectRoot, sentinel);
+      if (now === undefined) continue;
+      const seen = first.get(sentinel);
+      if (seen === undefined) first.set(sentinel, now);
+      else if (now !== seen) advanced.add(sentinel);
     }
+    if (advanced.size === REQUIRED_GRANDCHILDREN.length) return { advanced: true };
     await sleep(20);
   }
-  return false;
+  return { advanced: false };
 }
 
 /** The fixture arguments that make it exit with `code` once its grandchild is running. */
@@ -176,44 +239,77 @@ export function containmentFixtureExitArgs(code: number): string[] {
 }
 
 /**
- * SIGKILL the grandchild recorded in `projectRoot`, for an afterEach, so a
- * failing test does not leave the fixture's loop running in the developer's
- * session. Only the recorded pid: when the path did not detach the worker,
- * the grandchild shares the test runner's process group, so a group kill here
- * would take the runner down with it.
+ * SIGKILL the grandchildren recorded in `projectRoot`, for an afterEach, so a
+ * failing test does not leave the fixture's loops running in the developer's
+ * session. Only the recorded pids: when the path did not detach the worker,
+ * the backgrounded grandchild shares the test runner's process group, so a
+ * group kill here would take the runner down with it.
  */
 export function killRecordedGrandchild(projectRoot: string): void {
-  const pid = recordedPid(projectRoot);
-  if (pid === undefined) return;
-  try {
-    process.kill(pid, 'SIGKILL');
-  } catch {
-    /* already gone: the expected case */
+  for (const { pidFile } of GRANDCHILDREN) {
+    const pid = readPidFile(projectRoot, pidFile);
+    if (pid === undefined) continue;
+    try {
+      process.kill(pid, 'SIGKILL');
+    } catch {
+      /* already gone: the expected case */
+    }
   }
 }
 
 /**
- * Assert that the fixture's grandchild in `projectRoot` is dead, two ways:
- * the recorded pid disappears, and the sentinel stops advancing. A live
- * grandchild touches the sentinel every 100ms, so an unchanged mtime across
+ * Assert that the fixture's grandchildren in `projectRoot` are dead, each two
+ * ways: the recorded pid disappears, and the sentinel stops advancing. A live
+ * grandchild touches its sentinel every 100ms, so an unchanged mtime across
  * the window means nothing is left running the loop, whatever the pid now
- * refers to.
+ * refers to. Covers the setsid grandchild wherever `requiresSetsidContainment`
+ * holds, and the backgrounded one everywhere.
  */
 export async function expectGrandchildReaped(projectRoot: string): Promise<void> {
-  const pid = recordedPid(projectRoot);
-  expect(pid).toBeDefined();
-  expect(await waitForPidGone(pid!, REAP_BUDGET_MS)).toBe(true);
+  await expectReaped(projectRoot, REQUIRED_GRANDCHILDREN);
+}
 
-  const before = sentinelMtime(projectRoot);
+/**
+ * Assert that only the backgrounded grandchild is dead. For tests of the
+ * process-group fallback, which cannot kill the setsid grandchild.
+ */
+export async function expectBackgroundedGrandchildReaped(projectRoot: string): Promise<void> {
+  await expectReaped(projectRoot, GRANDCHILDREN.slice(0, 1));
+}
+
+async function expectReaped(
+  projectRoot: string,
+  grandchildren: ReadonlyArray<(typeof GRANDCHILDREN)[number]>,
+): Promise<void> {
+  for (const { label, pidFile } of grandchildren) {
+    const pid = readPidFile(projectRoot, pidFile);
+    expect(pid, `${label}: no pid recorded`).toBeDefined();
+    expect(await waitForPidGone(pid!, REAP_BUDGET_MS), `${label} (pid ${pid}) is still running`).toBe(true);
+  }
+
+  const before = grandchildren.map(({ sentinel }) => sentinelMtime(projectRoot, sentinel));
+  // A missing sentinel would make the stall comparison below pass vacuously.
+  grandchildren.forEach(({ label }, i) => {
+    expect(before[i], `${label}: sentinel was never created`).toBeDefined();
+  });
   await sleep(STALL_WINDOW_MS);
-  expect(sentinelMtime(projectRoot)).toBe(before);
+  grandchildren.forEach(({ label, sentinel }, i) => {
+    expect(sentinelMtime(projectRoot, sentinel), `${label}: sentinel still advancing`).toBe(before[i]);
+  });
 }
 
 interface ObservedRun {
   timeoutClass: string | undefined;
-  /** The sentinel advanced while the invocation was running. */
+  /** Every grandchild's sentinel advanced while the invocation was running. */
   sawGrandchildLive: boolean;
   grandchildPid: number | undefined;
+  /**
+   * The setsid grandchild's pid the fixture recorded, read any time (the pid
+   * file outlives the process, so this also answers the fixture started it).
+   */
+  setsidPid: number | undefined;
+  /** The session id the setsid grandchild recorded for itself. */
+  setsidSession: number | undefined;
 }
 
 async function runAndObserve(spawnPath: ContainmentSpawnPath, projectRoot: string): Promise<ObservedRun> {
@@ -228,11 +324,14 @@ async function runAndObserve(spawnPath: ContainmentSpawnPath, projectRoot: strin
       done = true;
     },
   );
-  const [timeoutClass, sawGrandchildLive] = await Promise.all([
-    invocation,
-    watchSentinelAdvance(projectRoot, () => done),
-  ]);
-  return { timeoutClass, sawGrandchildLive, grandchildPid: recordedPid(projectRoot) };
+  const [timeoutClass, watch] = await Promise.all([invocation, watchSentinelAdvance(projectRoot, () => done)]);
+  return {
+    timeoutClass,
+    sawGrandchildLive: watch.advanced,
+    grandchildPid: recordedPid(projectRoot),
+    setsidPid: recordedSetsidPid(projectRoot),
+    setsidSession: recordedSetsidSession(projectRoot),
+  };
 }
 
 /**
@@ -258,6 +357,11 @@ export function describeContainmentConformance(
 
     const reaps = options.knownLeak !== undefined ? test.failing : it;
 
+    if (!requiresSetsidContainment && hostContainment.mechanism !== 'cgroup') {
+      // Visible in the run's skip count, naming why this host cannot prove it.
+      it.skip(`kills a grandchild that called setsid (host has no cgroup containment: ${hostContainment.reason})`, () => {});
+    }
+
     if (options.knownLeak !== undefined) {
       it(
         `reports '${options.timeoutClass}' and the fixture grandchild runs (pinned while ${options.knownLeak} is open)`,
@@ -277,10 +381,23 @@ export function describeContainmentConformance(
         const run = await runAndObserve(spawnPath, projectRoot);
 
         expect(run.timeoutClass).toBe(options.timeoutClass);
-        // The grandchild was running before the kill. Without this, a stalled
-        // sentinel below could mean the fixture never started.
+        // Both grandchildren were running before the kill. Without this, a
+        // stalled sentinel below could mean the fixture never started.
         expect(run.sawGrandchildLive).toBe(true);
         expect(run.grandchildPid).toBeDefined();
+        // The setsid grandchild really left the fixture's session. Without
+        // this, the fixture could stop modelling the escape and the suite
+        // would still pass.
+        if (requiresSetsidContainment) {
+          // The fixture did start it, whether or not the watch loop caught
+          // it while it ran (the pid file outlives the process).
+          expect(run.setsidPid, 'setsid grandchild: no pid recorded').toBeDefined();
+          const setsidPid = run.setsidPid!;
+          // It led its own session. The fixture records the session id
+          // itself, so this is checked on every run however fast the spawn
+          // path killed the grandchild.
+          expect(run.setsidSession, 'setsid grandchild: session id is not its pid').toBe(setsidPid);
+        }
 
         await expectGrandchildReaped(projectRoot);
       },
@@ -307,9 +424,11 @@ export function describeContainmentConformance(
             // A worker that exited on its own was not timed out, even though
             // the path killed its process group afterwards.
             expect(timeoutClass).toBeUndefined();
-            // The fixture exits only after the grandchild has touched the
-            // sentinel, so the grandchild was running when the worker exited.
-            expect(sentinelMtime(projectRoot)).toBeDefined();
+            // The fixture exits only after both grandchildren have touched
+            // their sentinels, so both were running when the worker exited.
+            for (const { sentinel } of REQUIRED_GRANDCHILDREN) {
+              expect(sentinelMtime(projectRoot, sentinel)).toBeDefined();
+            }
             await expectGrandchildReaped(projectRoot);
           },
           TEST_TIMEOUT_MS,
