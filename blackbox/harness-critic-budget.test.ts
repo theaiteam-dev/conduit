@@ -128,17 +128,14 @@ describe("harness journey: critic spend trips the run token budget", () => {
     expect(total("research.harness-critic")).toBe(1000);
   });
 
-  // KERNEL BUG #83 (found by this journey): `conduit run status` reports a run the
-  // consumption andon halted as `running`. After the halt above, the runs row
-  // is status=halted outcome=halted and no process holds the run, but the card
-  // is still `ready` at `research`, and run/run-state.ts getRunState returns
-  // `running` for any run with a non-terminal card unless the halt was a
-  // rate-limit park. An operator reading `run status` is told a dead run is
-  // still going. Remove `.todo` once `run status` names the halt.
-  test.todo("run status reports the andon-halted run as halted, not running", async () => {
+  // Issue #83: the runs row is status=halted and no process holds the run, but
+  // the card is still `ready`, and `run status` used to report `running`.
+  test("run status reports the andon-halted run as halted, with its resume command", async () => {
     const status = await f.runStatus();
+    expect(status.exitCode).toBe(0);
     expect(status.stdout).not.toContain(`run ${f.runId}: running`);
-    expect(status.stdout).toContain("halted");
+    expect(status.stdout).toContain(`run ${f.runId}: halted with 1 unfinished card;`);
+    expect(status.stdout).toMatch(new RegExp(`resume with: conduit resume \\S+ --run ${f.runId}`));
   });
 });
 

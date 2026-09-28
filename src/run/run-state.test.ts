@@ -17,7 +17,7 @@
  */
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import { openConduitDB, DEFAULT_RUN_ID, type ConduitDB } from '../persistence/db';
-import { getRunState, getRunParkedRelease, formatParkedRun, type RunStateResult } from './run-state';
+import { getRunState, getRunParkedRelease, formatParkedRun, formatHaltedRun, type RunStateResult } from './run-state';
 import type { Card } from '../types/kernel';
 
 let db: ConduitDB;
@@ -562,17 +562,18 @@ describe('getRunState — parked (issue #7)', () => {
 
   it('does NOT trust a stale parked row while a resume has cards in flight', () => {
     // After a parked exit the row stays halted/parked until the resumed process
-    // exits. `run status` mid-resume must read the cards, not the row.
+    // exits. `run status` mid-resume must read the cards and the lease, not the row.
     db.insertRun({ run_id: 'r', flow: '/flows/vertical.yaml', input_fingerprint: 'fp', status: 'halted', outcome: 'parked' });
+    holdLease('r', process.pid);
     db.insertCard(makeCard('r', 'c1', { status: 'working' }));
     expect(getRunState(db, 'r', 1000)).toEqual({ status: 'running' });
   });
 
-  it('does NOT report parked once the gate has passed and the card is merely ready', () => {
+  it('reports a halt, not parked, once the gate has passed and nothing resumed the run', () => {
     db.insertRun({ run_id: 'r', flow: '/flows/vertical.yaml', input_fingerprint: 'fp', status: 'halted', outcome: 'parked' });
     db.insertCard(makeCard('r', 'c1'));
     parkCard(makeCard('r', 'c1'), 1300);
-    expect(getRunState(db, 'r', 1300)).toEqual({ status: 'running' });
+    expect(getRunState(db, 'r', 1300)).toEqual({ status: 'halted', unfinished: 1, flow: '/flows/vertical.yaml' });
   });
 
   it('still reports a plain halt as terminal/held, never parked', () => {
@@ -580,6 +581,95 @@ describe('getRunState — parked (issue #7)', () => {
     db.insertCard(makeCard('r', 'c1'));
     terminalCard(makeCard('r', 'c1'), 'scrap');
     expect(getRunState(db, 'r')).toEqual({ status: 'terminal', outcome: 'halted' });
+  });
+});
+
+/** Record `pid` as the run's lease holder, as acquireRunLease does. */
+function holdLease(runId: string, pid: number): void {
+  db.getStateDb()
+    .prepare('UPDATE runs SET holder_pid = $pid, lease_acquired_at = 1 WHERE run_id = $r')
+    .run({ $pid: pid, $r: runId });
+}
+
+// Issue #83: the andon halted the run and left a card unfinished. No process
+// drives it, so reporting it `running` told the operator a stopped run was going.
+describe('getRunState — halted with unfinished cards (issue #83)', () => {
+  const FLOW = '/flows/research.yaml';
+  const haltedRun = (runId: string) =>
+    db.insertRun({ run_id: runId, flow: FLOW, input_fingerprint: 'fp', status: 'halted', outcome: 'halted' });
+
+  it('reports halted, with the unfinished count and flow, when no process holds the run', () => {
+    haltedRun('r');
+    db.insertCard(makeCard('r', 'c1', { status: 'ready' }));
+    const done = makeCard('r', 'c2');
+    db.insertCard(done);
+    terminalCard(done, 'done');
+    expect(getRunState(db, 'r')).toEqual({ status: 'halted', unfinished: 1, flow: FLOW });
+  });
+
+  it('counts every unfinished card, including ones waiting on others', () => {
+    haltedRun('r');
+    db.insertCard(makeCard('r', 'c1', { status: 'ready' }));
+    db.insertCard(makeCard('r', 'c2', { status: 'waiting' }));
+    db.insertCard(makeCard('r', 'c3', { status: 'awaiting_children' }));
+    expect(getRunState(db, 'r')).toEqual({ status: 'halted', unfinished: 3, flow: FLOW });
+  });
+
+  it('reports halted when the recorded lease holder is dead', () => {
+    haltedRun('r');
+    holdLease('r', 4242);
+    db.insertCard(makeCard('r', 'c1', { status: 'ready' }));
+    expect(getRunState(db, 'r', 1000, () => false).status).toBe('halted');
+  });
+
+  it('reports running while a live process holds the lease: resume does not rewrite the row', () => {
+    haltedRun('r');
+    holdLease('r', 4242);
+    db.insertCard(makeCard('r', 'c1', { status: 'working' }));
+    const probed: number[] = [];
+    const alive = (pid: number) => {
+      probed.push(pid);
+      return true;
+    };
+    expect(getRunState(db, 'r', 1000, alive)).toEqual({ status: 'running' });
+    expect(probed).toEqual([4242]);
+  });
+
+  it('a held card still reports held, not halted', () => {
+    haltedRun('r');
+    const held = makeCard('r', 'c1');
+    db.insertCard(held);
+    holdCard(held, 'owned-paths violation');
+    db.insertCard(makeCard('r', 'c2', { status: 'ready' }));
+    expect(getRunState(db, 'r').status).toBe('held');
+  });
+
+  it('a halted run with every card terminal is still terminal', () => {
+    haltedRun('r');
+    const c1 = makeCard('r', 'c1');
+    db.insertCard(c1);
+    terminalCard(c1, 'scrap');
+    expect(getRunState(db, 'r')).toEqual({ status: 'terminal', outcome: 'halted' });
+  });
+
+  it('a run recorded running with no lease yet is still running: the row is written before the lease is taken', () => {
+    seedRun('r');
+    db.insertCard(makeCard('r', 'c1', { status: 'ready' }));
+    expect(getRunState(db, 'r', 1000, () => false).status).toBe('running');
+  });
+});
+
+describe('formatHaltedRun — what the operator needs to continue a halt', () => {
+  it('names the unfinished cards and the exact resume command', () => {
+    const line = formatHaltedRun('job-7', '/flows/research.yaml', 2);
+    expect(line).toContain('halted with 2 unfinished cards');
+    expect(line).toContain('resume with: conduit resume /flows/research.yaml --run job-7');
+  });
+
+  it('uses the singular for one card and quotes a flow path with spaces', () => {
+    const line = formatHaltedRun('job-7', '/home/me/My Flows/f.yaml', 1);
+    expect(line).toContain('halted with 1 unfinished card;');
+    expect(line).toContain(`conduit resume '/home/me/My Flows/f.yaml' --run job-7`);
   });
 });
 

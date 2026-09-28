@@ -27,7 +27,7 @@ import { openConduitDB, DEFAULT_RUN_ID } from '../persistence/db';
 import { validateRunId } from '../run/run-id';
 import { registerRun, computeFingerprint } from '../run/run-registry';
 import { acquireRunLease, releaseRunLease, peekRunLeaseHolder, defaultIsPidAlive } from '../run/run-lock';
-import { getRunState, getRunParkedRelease, formatParkedRun, type RunStateResult } from '../run/run-state';
+import { getRunState, getRunParkedRelease, formatParkedRun, formatHaltedRun, type RunStateResult } from '../run/run-state';
 import {
   checkRunAppendable,
   hasLaterPasses,
@@ -687,6 +687,8 @@ export function formatRunState(runId: string, state: RunStateResult): string {
       return `run ${runId}: held (${state.heldCards.length} held card${state.heldCards.length === 1 ? '' : 's'})`;
     case 'parked':
       return `run ${runId}: ${formatParkedRun(runId, state.flow, state.releaseAt)}`;
+    case 'halted':
+      return `run ${runId}: ${formatHaltedRun(runId, state.flow, state.unfinished)}`;
     case 'terminal':
       return `run ${runId}: terminal (outcome=${state.outcome})`;
   }

@@ -1,5 +1,6 @@
 import type { ConduitDB } from '../persistence/db';
 import type { Status } from '../types/kernel';
+import { defaultIsPidAlive, peekRunLeaseHolder } from './run-lock';
 
 export type RunStateResult =
   | { status: 'not_found' }
@@ -12,6 +13,12 @@ export type RunStateResult =
    * is the recorded flow path, so the resume command can be printed verbatim.
    */
   | { status: 'parked'; releaseAt: number; flow: string }
+  /**
+   * The engine recorded a halt (andon, liveness stall) that left `unfinished`
+   * cards outside a terminal lane, and no live process holds the run lease, so
+   * nothing is driving it (issue #83). `flow` is for the resume command.
+   */
+  | { status: 'halted'; unfinished: number; flow: string }
   | { status: 'terminal'; outcome: string };
 
 const TERMINAL_STATUSES = new Set(['complete', 'scrapped', 'held']);
@@ -129,8 +136,17 @@ export function formatReleaseAt(releaseAt: number): string {
 export function formatParkedRun(runId: string, flow: string, releaseAt: number): string {
   return (
     `parked behind a provider rate limit until ${formatReleaseAt(releaseAt)} — nothing was scrapped; ` +
-    `resume with: conduit resume ${shellQuote(flow)} --run ${shellQuote(runId)}`
+    `resume with: ${resumeCommand(runId, flow)}`
   );
+}
+
+/** The `run status` line for a halt that left cards unfinished (issue #83). */
+export function formatHaltedRun(runId: string, flow: string, unfinished: number): string {
+  return `halted with ${unfinished} unfinished card${unfinished === 1 ? '' : 's'}; resume with: ${resumeCommand(runId, flow)}`;
+}
+
+function resumeCommand(runId: string, flow: string): string {
+  return `conduit resume ${shellQuote(flow)} --run ${shellQuote(runId)}`;
 }
 
 /**
@@ -146,11 +162,13 @@ function shellQuote(value: string): string {
 /**
  * `now` is in the run clock's frame (epoch seconds), used only to confirm a
  * recorded park against the cards; the default is the production clock.
+ * `isPidAlive` probes the run lease holder; tests inject it.
  */
 export function getRunState(
   db: ConduitDB,
   runId: string,
   now: number = Math.floor(Date.now() / 1000),
+  isPidAlive: (pid: number) => boolean = defaultIsPidAlive,
 ): RunStateResult {
   const run = db.getRun(runId);
   if (!run) return { status: 'not_found' };
@@ -193,8 +211,17 @@ export function getRunState(
     if (parked !== null) return { status: 'parked', releaseAt: parked.releaseAt, flow: run.flow };
   }
 
-  const hasActive = cards.some((c) => !TERMINAL_STATUSES.has(c.status));
-  if (hasActive) return { status: 'running' };
+  const unfinished = cards.filter((c) => !TERMINAL_STATUSES.has(c.status)).length;
+  if (unfinished === 0) return { status: 'terminal', outcome: run.outcome ?? 'unknown' };
 
-  return { status: 'terminal', outcome: run.outcome ?? 'unknown' };
+  // A halted row with unfinished cards is either stopped or being resumed:
+  // resume takes the lease but leaves the row as it is until it exits. The
+  // lease holder tells them apart, so only a halt nobody drives reads halted.
+  if (run.status === 'halted') {
+    const holder = peekRunLeaseHolder(db, runId);
+    if (holder === null || !isPidAlive(holder.holderPid)) {
+      return { status: 'halted', unfinished, flow: run.flow };
+    }
+  }
+  return { status: 'running' };
 }
