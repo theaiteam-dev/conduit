@@ -14,9 +14,10 @@ export type RunStateResult =
    */
   | { status: 'parked'; releaseAt: number; flow: string }
   /**
-   * The engine recorded a halt (andon, liveness stall) that left `unfinished`
-   * cards outside a terminal lane, and no live process holds the run lease, so
-   * nothing is driving it (issue #83). `flow` is for the resume command.
+   * The run left `unfinished` cards outside a terminal lane and no live process
+   * holds the run lease, so nothing is driving it: the engine recorded a halt
+   * (andon, liveness stall), or the driver died without recording one (issue
+   * #83). `flow` is for the resume command.
    */
   | { status: 'halted'; unfinished: number; flow: string }
   | { status: 'terminal'; outcome: string };
@@ -214,14 +215,15 @@ export function getRunState(
   const unfinished = cards.filter((c) => !TERMINAL_STATUSES.has(c.status)).length;
   if (unfinished === 0) return { status: 'terminal', outcome: run.outcome ?? 'unknown' };
 
-  // A halted row with unfinished cards is either stopped or being resumed:
-  // resume takes the lease but leaves the row as it is until it exits. The
-  // lease holder tells them apart, so only a halt nobody drives reads halted.
-  if (run.status === 'halted') {
-    const holder = peekRunLeaseHolder(db, runId);
-    if (holder === null || !isPidAlive(holder.holderPid)) {
-      return { status: 'halted', unfinished, flow: run.flow };
-    }
+  // The row alone cannot say whether anything drives the run: resume takes the
+  // lease but leaves a halted row as it is until it exits, and a driver killed
+  // by SIGKILL or the OOM killer leaves the row 'running' with its dead pid as
+  // holder. The lease holder tells them apart. A 'running' row with no holder is
+  // a run between registerRun and acquireRunLease, so it still reads running.
+  const holder = peekRunLeaseHolder(db, runId);
+  const driven = holder !== null && isPidAlive(holder.holderPid);
+  if (!driven && (run.status === 'halted' || holder !== null)) {
+    return { status: 'halted', unfinished, flow: run.flow };
   }
   return { status: 'running' };
 }

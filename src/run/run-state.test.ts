@@ -652,6 +652,20 @@ describe('getRunState — halted with unfinished cards (issue #83)', () => {
     expect(getRunState(db, 'r')).toEqual({ status: 'terminal', outcome: 'halted' });
   });
 
+  it('reports halted when a run recorded running lost its driver: the lease holder died without recording an outcome', () => {
+    seedRun('r');
+    holdLease('r', 4242);
+    db.insertCard(makeCard('r', 'c1', { status: 'working' }));
+    expect(getRunState(db, 'r', 1000, () => false)).toEqual({ status: 'halted', unfinished: 1, flow: 'studio' });
+  });
+
+  it('reports running while the driver of a run recorded running is alive', () => {
+    seedRun('r');
+    holdLease('r', 4242);
+    db.insertCard(makeCard('r', 'c1', { status: 'working' }));
+    expect(getRunState(db, 'r', 1000, () => true)).toEqual({ status: 'running' });
+  });
+
   it('a run recorded running with no lease yet is still running: the row is written before the lease is taken', () => {
     seedRun('r');
     db.insertCard(makeCard('r', 'c1', { status: 'ready' }));
