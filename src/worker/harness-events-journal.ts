@@ -145,6 +145,10 @@ export function harnessEventRow(
     case 'reasoning-delta':
     case 'tool-input-start':
       return null;
+    // Issue #21: not persisted yet. The agent-sdk adapter slice adds the row
+    // kind, the schema change and the read side together.
+    case 'gate-decision':
+      return null;
   }
 }
 
