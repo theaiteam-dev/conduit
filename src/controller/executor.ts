@@ -138,11 +138,11 @@ const DEFAULT_RATE_LIMIT_PARK_SECONDS = 5 * 60;
  * whatever the provider reported.
  *
  * Capping it costs one extra CLI call per hour while a cap persists (the card
- * wakes, is capped again, re-parks) and buys three things: the consumption andon
- * is re-evaluated each time rather than once before a long sleep, the reset
- * estimate is refreshed instead of trusted for hours, and a run that is going
- * to halt on wall clock does so promptly rather than after sleeping through the
- * budget it had already exhausted.
+ * wakes, is capped again, re-parks) and buys two things: the consumption andon
+ * is re-evaluated each time rather than once before a long sleep, and the reset
+ * estimate is refreshed instead of trusted for hours. (The wall-clock budget
+ * bounds the sleep on its own: the release-gate wait ends at the run's deadline
+ * when that comes first, issue #84.)
  */
 const MAX_RATE_LIMIT_PARK_SECONDS = 60 * 60;
 
@@ -920,16 +920,23 @@ export async function runExecutor(args: RunEngineArgs): Promise<void> {
         }
       }
 
-      // ── Release-gate wait (v10 fan-out stagger) ─────────────────────────
+      // ── Release-gate wait (v10 fan-out stagger, issue #3 rate-limit park) ──
       // A card can be READY yet held behind a future release_at (the cache-warming
-      // stagger); planTick reports zero actions for it. That is NOT a stall — sleep
-      // until the earliest gate elapses, then re-tick. The wait horizon is the time
-      // remaining to the soonest gate (from the MIN(release_at) query below), floored
-      // at 1s; the executor derives it here rather than from plan.nextWakeSeconds
-      // (which the run loop drives with busy/idleWakeSeconds=0). The sleep is
-      // injectable (default setTimeout): production advances the wall clock past the
-      // gate; a test injects a fast sleep so its advancing clock re-ticks without
-      // burning real time.
+      // stagger or a rate-limit park); planTick reports zero actions for it. That is
+      // NOT a stall — sleep until the earliest gate elapses, then re-tick. The wait
+      // ends at the soonest gate (from the MIN(release_at) query below) or at the
+      // wall-clock deadline, whichever comes first, floored at 1s: a gate past the
+      // deadline wakes the loop at the deadline so the andon halts the run there
+      // (issue #84). The deadline is only used when it's a finite number: a
+      // flow.yaml value the loader doesn't validate (e.g. a non-numeric
+      // wall_clock_minutes) can make wallClockSeconds NaN, and capping by a NaN
+      // deadline turns the whole wait into NaN, which is a sleep that fires
+      // immediately rather than a wait for the gate (PR #87 review). The
+      // executor derives the wait here rather than from
+      // plan.nextWakeSeconds (which the run loop drives with busy/idleWakeSeconds=0).
+      // The sleep is injectable (default setTimeout): production advances the wall
+      // clock past the gate; a test injects a fast sleep so its advancing clock
+      // re-ticks without burning real time.
       const releaseGate = stateDb
         .prepare(
           `SELECT MIN(release_at) AS soonest FROM cards
@@ -939,9 +946,11 @@ export async function runExecutor(args: RunEngineArgs): Promise<void> {
       if (releaseGate.soonest !== null) {
         // Honor the consumption andon BEFORE sleeping: a run that blows its
         // wall-clock/token budget mid-stagger must halt, not sleep on until the
-        // gate opens. (No reclaim pass is needed here — this branch is only reached
-        // with zero in-flight workers: the poolMode block above returns while any
-        // worker is live, and in-process transforms complete within their tick.)
+        // gate opens. A budget that runs out during the sleep trips here on the
+        // next pass, since the sleep ends at the deadline. (No reclaim pass is
+        // needed here — this branch is only reached with zero in-flight workers:
+        // the poolMode block above returns while any worker is live, and
+        // in-process transforms complete within their tick.)
         const gateAndon = checkConsumptionAndon(
           { runStartedAt, now: currentNow, tokensSpent },
           { wallClockSeconds, maxTokens },
@@ -954,7 +963,9 @@ export async function runExecutor(args: RunEngineArgs): Promise<void> {
           halted = true;
           break;
         }
-        const waitSeconds = Math.max(1, releaseGate.soonest - currentNow);
+        const deadline = runStartedAt + wallClockSeconds;
+        const wakeAt = Number.isFinite(deadline) ? Math.min(releaseGate.soonest, deadline) : releaseGate.soonest;
+        const waitSeconds = Math.max(1, wakeAt - currentNow);
         await sleep(waitSeconds * 1000);
         continue;
       }
@@ -3958,9 +3969,10 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
         // So: leave `callsMade` alone, stamp cards.release_at with the reset the
         // provider itself reported, and hand the card back to 'ready' at the
         // same lane. The existing release gate (planTick) keeps it
-        // undispatchable until then, and the run loop already sleeps to the
-        // soonest gate with the consumption andon checked FIRST — so a cap
-        // longer than the run's wall-clock budget halts rather than idling.
+        // undispatchable until then, and the run loop sleeps to the soonest
+        // gate or the wall-clock deadline, whichever is first, with the
+        // consumption andon checked before and after. A cap longer than the
+        // run's wall-clock budget halts at the deadline rather than idling.
         if ((invokeErr as { code?: string }).code === 'harness-rate-limited') {
           const resetAtMs = (invokeErr as { resetAtMs?: number }).resetAtMs;
           const releaseAt = releaseAtForRateLimit(currentNow, resetAtMs, Date.now());
