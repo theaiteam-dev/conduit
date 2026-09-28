@@ -20,6 +20,7 @@ import {
   createContainmentResolver,
   describeContainment,
   detectContainment,
+  isOwnerGone,
   killCgroup,
   prepareContainedCommand,
   processStartTime,
@@ -365,6 +366,77 @@ describe('prepareContainedCommand: the spawn wrapper does not interpolate argv i
   );
 });
 
+describe('isOwnerGone: every branch, with the dependencies injected (no real /proc needed)', () => {
+  it('is undefined for a name this kernel did not create', () => {
+    expect(isOwnerGone('not-a-cgroup-name')).toBeUndefined();
+    expect(isOwnerGone('conduit-not-a-pid-1')).toBeUndefined();
+  });
+
+  it('legacy name (no start time), owner pid alive: kept', () => {
+    const gone = isOwnerGone('conduit-4242-1', { selfPid: 1, isPidAlive: (pid) => pid === 4242 });
+    expect(gone).toBe(false);
+  });
+
+  it('legacy name (no start time), owner pid dead: reaped', () => {
+    const gone = isOwnerGone('conduit-4242-1', { selfPid: 1, isPidAlive: () => false });
+    expect(gone).toBe(true);
+  });
+
+  it('start-time name, owner start time matches: kept', () => {
+    const gone = isOwnerGone('conduit-4242-1000-1', {
+      selfPid: 1,
+      processStartTime: (pid) => (pid === 4242 ? 1000 : undefined),
+    });
+    expect(gone).toBe(false);
+  });
+
+  it('start-time name, owner start time differs (pid was reused): reaped', () => {
+    const gone = isOwnerGone('conduit-4242-1000-1', {
+      selfPid: 1,
+      processStartTime: (pid) => (pid === 4242 ? 9999 : undefined),
+    });
+    expect(gone).toBe(true);
+  });
+
+  it('start-time name, owner stat unreadable but pid answers kill(0) (hidepid): kept', () => {
+    const gone = isOwnerGone('conduit-4242-1000-1', {
+      selfPid: 1,
+      processStartTime: () => undefined,
+      isPidAlive: (pid) => pid === 4242,
+    });
+    expect(gone).toBe(false);
+  });
+
+  it('start-time name, owner stat unreadable and pid dead: reaped', () => {
+    const gone = isOwnerGone('conduit-4242-1000-1', {
+      selfPid: 1,
+      processStartTime: () => undefined,
+      isPidAlive: () => false,
+    });
+    expect(gone).toBe(true);
+  });
+
+  it('self pid, start-time name, start time matches this kernel: kept', () => {
+    const gone = isOwnerGone('conduit-4242-1000-1', { selfPid: 4242, selfStartTime: 1000 });
+    expect(gone).toBe(false);
+  });
+
+  it('self pid, start-time name, start time differs (a previous kernel reused this pid): reaped', () => {
+    const gone = isOwnerGone('conduit-4242-1000-1', { selfPid: 4242, selfStartTime: 2000 });
+    expect(gone).toBe(true);
+  });
+
+  it("self pid, own start time unreadable: kept (ambiguous, not reaped out from under a live kernel)", () => {
+    const gone = isOwnerGone('conduit-4242-1000-1', { selfPid: 4242, selfStartTime: undefined });
+    expect(gone).toBe(false);
+  });
+
+  it('self pid, legacy name (no start time): kept regardless of this kernel\'s start time', () => {
+    const gone = isOwnerGone('conduit-4242-1', { selfPid: 4242, selfStartTime: 1000 });
+    expect(gone).toBe(false);
+  });
+});
+
 describe('cgroup cleanup', () => {
   it('removeCgroupsSync writes cgroup.kill again while a cgroup stays populated', () => {
     // A plain directory standing in for a populated cgroup: rmdir fails
@@ -464,6 +536,57 @@ describe('cgroup cleanup', () => {
       killCgroup(stale);
       killCgroup(live);
       await Promise.all([removeCgroup(stale, 1_000), removeCgroup(live, 1_000)]);
+    }
+  });
+
+  itWithCgroup('keeps a legacy-named cgroup (no start time) whose owner pid is still alive', async () => {
+    if (hostContainment.mechanism !== 'cgroup') throw new Error('unreachable');
+    // A live process stands in for a still-running kernel whose cgroups
+    // predate issue #81 (no start time in the name).
+    const owner = Bun.spawn(['sleep', '30']);
+    const live = join(hostContainment.parent, `conduit-${owner.pid}-1`);
+    mkdirSync(live);
+    const held = await spawnInCgroup(live);
+    try {
+      await detectContainment();
+
+      expect(existsSync(live)).toBe(true);
+      expect(isAlive(held.pid)).toBe(true);
+    } finally {
+      for (const pid of [held.pid, owner.pid]) {
+        try {
+          process.kill(pid, 'SIGKILL');
+        } catch {
+          /* already gone */
+        }
+      }
+      killCgroup(live);
+      await removeCgroup(live, 1_000);
+    }
+  });
+
+  itWithCgroup("detection reaps a stale cgroup that matches this kernel's own pid but an older start time", async () => {
+    if (hostContainment.mechanism !== 'cgroup') throw new Error('unreachable');
+    // Same pid as this kernel, a start time that is not this kernel's: stands
+    // in for a previous kernel that happened to be given this same pid.
+    const ownStartTime = processStartTime(process.pid);
+    expect(ownStartTime).toBeDefined();
+    const stale = join(hostContainment.parent, `conduit-${process.pid}-${ownStartTime! + 1}-1`);
+    mkdirSync(stale);
+    const orphan = await spawnInCgroup(stale);
+    try {
+      await detectContainment();
+
+      await orphan.exited;
+      expect(orphan.signalCode).toBe('SIGKILL');
+      expect(existsSync(stale)).toBe(false);
+    } finally {
+      try {
+        process.kill(orphan.pid, 'SIGKILL');
+      } catch {
+        /* already gone */
+      }
+      await removeCgroup(stale, 1_000);
     }
   });
 

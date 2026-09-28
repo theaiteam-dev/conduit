@@ -258,25 +258,61 @@ function unifiedCgroupPath(procSelfCgroup: string): string | undefined {
   return undefined;
 }
 
+/** Injectable dependencies of `isOwnerGone`, defaulted to the real ones in production. */
+export interface IsOwnerGoneDeps {
+  /** This kernel's own pid. Defaults to `process.pid`. */
+  selfPid?: number;
+  /**
+   * This kernel's own start time, as read once by the caller (`sweepStaleCgroups`
+   * reads it a single time per sweep rather than once per entry). Defaults to
+   * reading it fresh via `processStartTime(selfPid)`. Undefined when it cannot be
+   * read, which is treated as ambiguous: a name matching this kernel's pid is then
+   * kept rather than reaped.
+   */
+  selfStartTime?: number;
+  /** Whether a pid is currently running. Defaults to the real `isPidAlive`. */
+  isPidAlive?: (pid: number) => boolean;
+  /** A process's start time reader. Defaults to the real `processStartTime`. */
+  processStartTime?: (pid: number) => number | undefined;
+}
+
 /**
  * Whether the kernel that created the cgroup named `name` is gone. The name
  * carries the owner's pid and start time, so a pid that another process has
- * since been given does not keep the cgroup alive. A name with no start time
+ * since been given does not keep the cgroup alive. That includes this kernel's
+ * own pid: a name with this pid and a different start time was left by an
+ * earlier kernel that held the same pid. A name with no start time
  * (`conduit-<pid>-<n>`, from a kernel built before issue #81) falls back to
  * whether the pid is running, as does an owner whose start time cannot be
  * read. Undefined for a name the kernel did not create.
  */
-function isOwnerGone(name: string): boolean | undefined {
+export function isOwnerGone(name: string, deps: IsOwnerGoneDeps = {}): boolean | undefined {
+  const selfPid = deps.selfPid ?? process.pid;
+  // A key present with value `undefined` (the caller read its own start time
+  // and got nothing back) must stay undefined here, not fall through to a
+  // fresh read, so distinguish "omitted" from "provided as undefined".
+  const selfStartTime = 'selfStartTime' in deps ? deps.selfStartTime : processStartTime(selfPid);
+  const isAlive = deps.isPidAlive ?? isPidAlive;
+  const getStartTime = deps.processStartTime ?? processStartTime;
+
   const match = /^conduit-(\d+)-(?:(\d+)-[^-]+|[^-]+)$/.exec(name);
   if (match === null) return undefined;
   const owner = Number(match[1]);
-  if (owner === process.pid) return false;
-  if (match[2] === undefined) return !isPidAlive(owner);
-  const startTime = processStartTime(owner);
+
+  if (owner === selfPid) {
+    // A legacy name cannot be told apart from this kernel's, so keep it. An
+    // unreadable own start time is ambiguous the same way.
+    if (match[2] === undefined) return false;
+    if (selfStartTime === undefined) return false;
+    return Number(match[2]) !== selfStartTime;
+  }
+
+  if (match[2] === undefined) return !isAlive(owner);
+  const startTime = getStartTime(owner);
   // An unreadable stat for a pid that still answers kill(0) is another user's
   // process under a `hidepid` /proc mount. Keep its cgroup: killing a live
   // kernel's invocation is worse than leaving an orphan for a later sweep.
-  if (startTime === undefined) return !isPidAlive(owner);
+  if (startTime === undefined) return !isAlive(owner);
   return startTime !== Number(match[2]);
 }
 
@@ -293,9 +329,11 @@ async function sweepStaleCgroups(parent: string): Promise<void> {
   } catch {
     return;
   }
+  // Read once for the whole sweep rather than once per entry.
+  const selfStartTime = processStartTime(process.pid);
   const stale: string[] = [];
   for (const name of entries) {
-    if (isOwnerGone(name) !== true) continue;
+    if (isOwnerGone(name, { selfStartTime }) !== true) continue;
     const dir = join(parent, name);
     killCgroup(dir);
     stale.push(dir);
