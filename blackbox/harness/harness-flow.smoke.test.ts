@@ -4,7 +4,9 @@
  * fake-claude appends to invocations.ndjson from its own process, so a read
  * that races a write can see a truncated final line. cleanup() reads that log
  * to find orphaned stubs, and a throw there must not leak the temp root. The
- * reap itself must kill a live stub and leave a recycled pid alone.
+ * reap itself must kill a live stub and leave a recycled pid alone, including
+ * the real case: a `conduit run` the helper's timeout SIGKILLed, whose own
+ * group kill of the stub never ran.
  *
  * BLACK-BOX RULE: zero imports from src/.
  */
@@ -16,6 +18,35 @@ import { isOrphanedStub, pidAlive, startHarnessFlow } from "./harness-flow";
 
 const FAKE_CLAUDE = join(import.meta.dir, "fake-claude.ts");
 const IDLE = "setTimeout(() => {}, 30_000)";
+
+const HANGING_FLOW = `
+flow: bb-harness-flow-smoke
+project_root: .
+flow_version: 1
+budgets:
+  run: { wall_clock_minutes: 2, max_tokens: 100000 }
+  per_card: { max_execution_attempts: 1 }
+  liveness: { no_progress_minutes: 1 }
+terminal_lanes: [done, scrap, hold]
+stations:
+  - id: research
+    worker:
+      kind: harness
+      harness: claude-headless
+      tools: [Read]
+      prompt_file: prompts/maker.md
+      prompt_version: "1"
+      timeout_seconds: 60
+      output_schema:
+        fields:
+          - { name: summary, type: string, required: true }
+    inputs: [topic.md]
+    outputs: [result.json]
+    next: done
+channels:
+  ingress:
+    type: cli
+`;
 
 function scaffold() {
   return startHarnessFlow({
@@ -80,4 +111,25 @@ describe("startHarnessFlow — stub log and cleanup", () => {
       await Promise.all([stub.exited, other.exited]);
     }
   });
+
+  test("cleanup() reaps the stub a timed-out `conduit run` left behind", async () => {
+    const f = startHarnessFlow({
+      flowYaml: HANGING_FLOW,
+      files: { "prompts/maker.md": "ROLE:MAKER Answer topic.md.\n", "topic.md": "What is a kanban card?\n" },
+      entryInput: "topic.md",
+      roles: [{ name: "maker", promptIncludes: "ROLE:MAKER", calls: [{ hang: true }] }],
+    });
+    let pids: number[] = [];
+    try {
+      // The stub hangs well past this, so the helper's timeout SIGKILLs conduit.
+      const run = await f.run([], { timeoutMs: 4_000 });
+      expect(run.exitCode).not.toBe(0);
+      pids = f.stubLog().map((e) => e.pid);
+      expect(pids).toHaveLength(1);
+      expect(isOrphanedStub(pids[0]!)).toBe(true);
+    } finally {
+      await f.cleanup();
+    }
+    await f.waitFor(() => pids.every((pid) => !pidAlive(pid)), { timeoutMs: 2_000 });
+  }, 30_000);
 });
