@@ -2806,9 +2806,13 @@ async function runGateCheckOrAdvance(args: GateCheckOrAdvanceArgs): Promise<bool
     // stale here; read the clock fresh.
     const criticReadyWaiting = countReadyWaiting(stateDb, runId, cardId, now());
     // Issue #71: the critic's one invoke() gets its own invocation id, minted
-    // here so the `<station>.harness-critic` span below can carry it. It runs
-    // under the maker's attempt, so the id is what tells its rows apart. A
-    // transform critic never uses it.
+    // here so the `<station>.harness-critic` span below can carry it. Its rows
+    // are stamped with card.attempt because that is the attempt the
+    // `.harness-critic` span records, and a row always carries the attempt of
+    // the span it joins to. The maker's rows and spans use attemptIndex
+    // (card.attempt + callsMade), so after a maker retry the critic's attempt
+    // is lower than the maker's last call; the invocation id, not the
+    // attempt, is what ties rows to one call. A transform critic never uses it.
     const criticEvents = stampHarnessEvents(
       createHarnessEventJournalSink(db, { runId, cardId, station: stationId }),
       card.attempt,

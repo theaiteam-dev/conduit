@@ -423,9 +423,11 @@ CREATE TABLE IF NOT EXISTS ingress_log (
 -- the path it touched and, for a failed Bash call, the exit code parsed from
 -- its error string. Unique per (run, card, station, attempt, invocation_id,
 -- seq): invocation_id is in the key because a rate-limit park re-invokes
--- under the same attempt and a gate critic runs under the maker's, so attempt
--- alone does not identify one call; seq restarts at 0 per invocation. A
--- replayed key is ignored.
+-- under the same attempt and a gate critic can share an attempt number with
+-- a maker call, so attempt alone does not identify one call. A row's attempt
+-- is the attempt of the span it joins to: attemptIndex for the maker,
+-- card.attempt for the critic. seq restarts at 0 per invocation. A replayed
+-- key is ignored.
 -- Created via IF NOT EXISTS so JOURNAL_DDL self-heals an older journal.
 CREATE TABLE IF NOT EXISTS harness_events (
   id                           INTEGER PRIMARY KEY AUTOINCREMENT,
