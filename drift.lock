@@ -13,7 +13,7 @@ sig = "963aca840f24ee89"
 [[bindings]]
 doc = "CLAUDE.md"
 target = "src/persistence/db.ts#SCHEMA_VERSION"
-sig = "c22cd2dc051a0328"
+sig = "6af79b5e2d52ef3d"
 
 [[bindings]]
 doc = "SPEC.md"
@@ -73,4 +73,4 @@ sig = "bd240b0922e20e22"
 [[bindings]]
 doc = "docs/installation.md"
 target = "src/cli/main.ts"
-sig = "7386a7ac13606bc6"
+sig = "20fd1cc447f7ae84"

@@ -34,15 +34,20 @@ lease renewals, and journal writes assume a single driving process — so it's n
 per-run advisory lease:
 
 - The first `conduit run`/`resume` for a given run id acquires the lease (`holder_pid`,
-  `lease_acquired_at` on the `runs` table).
+  `lease_acquired_at` and `holder_start_time` on the `runs` table). `conduit run` takes it in
+  the same insert that registers the run, so a launch killed before its engine starts still
+  leaves a holder behind, and `conduit run status` reports that run as halted.
 - A second process invoked against the **same run id** fails fast — exit code 1, with a clear
   message naming the run id and the holding pid — instead of racing the first process or
   silently corrupting shared run state.
-- A stale lease left by a **dead** pid is reclaimed automatically (pid-liveness check) — a
-  crashed holder doesn't permanently wedge the run.
+- A stale lease left by a **dead** holder is reclaimed automatically — a crashed holder doesn't
+  permanently wedge the run. The holder is identified by pid and process start time, so a pid
+  the kernel has since given to another process does not count as the holder.
 
-This is advisory, single-host locking: it depends on reading `/proc`-style pid liveness on the
-same host as the lease holder. It is not a distributed lock.
+This is advisory, single-host locking: it depends on reading pid liveness and
+`/proc/<pid>/stat` on the same host as the lease holder. Where the start time cannot be read
+(no `/proc`, or a lease recorded before schema v12), the check falls back to pid liveness
+alone. It is not a distributed lock.
 
 ## What you still own
 

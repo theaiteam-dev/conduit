@@ -1394,16 +1394,16 @@ function buildV5StateFixture(opts: {
 // AC-1: Fresh DB — all six per-run tables + runs table + run_id column + SCHEMA_VERSION = 8.
 
 describe('WI-474 AC-1: fresh DB gains run_id on all per-run tables and a runs table', () => {
-  it('SCHEMA_VERSION is 11', () => {
-    expect(SCHEMA_VERSION).toBe(11);
+  it('SCHEMA_VERSION is 12', () => {
+    expect(SCHEMA_VERSION).toBe(12);
   });
 
-  it('PRAGMA user_version is 11 on a fresh DB', () => {
+  it('PRAGMA user_version is 12 on a fresh DB', () => {
     closeConduit();
     const raw = new Database(stateDbPath, { readonly: true });
     try {
       const { user_version } = raw.query('PRAGMA user_version').get() as { user_version: number };
-      expect(user_version).toBe(11);
+      expect(user_version).toBe(12);
     } finally {
       raw.close();
     }
@@ -1685,6 +1685,65 @@ describe('schema v6→v7 migration: runs.project_root', () => {
   });
 });
 
+describe('schema v11→v12 migration: runs.holder_start_time (issue #83)', () => {
+  it('opens an existing v11 DB, adds the column, and leaves existing rows NULL', () => {
+    closeConduit();
+
+    const raw = new Database(stateDbPath);
+    try {
+      raw.exec('DROP TABLE IF EXISTS runs');
+      raw.exec(`
+        CREATE TABLE runs (
+          run_id            TEXT PRIMARY KEY,
+          flow              TEXT NOT NULL,
+          project_root      TEXT,
+          input_fingerprint TEXT NOT NULL,
+          status            TEXT NOT NULL,
+          outcome           TEXT,
+          created_at        INTEGER NOT NULL DEFAULT (unixepoch()),
+          holder_pid        INTEGER,
+          lease_acquired_at INTEGER
+        )
+      `);
+      raw
+        .prepare(
+          `INSERT INTO runs (run_id, flow, input_fingerprint, status, holder_pid, lease_acquired_at)
+           VALUES ('v11-run', 'flow.yaml', 'fp', 'running', 4242, 100)`,
+        )
+        .run();
+      raw.exec('PRAGMA user_version = 11');
+    } finally {
+      raw.close();
+    }
+
+    db = openConduitDB({ stateDbPath, journalDbPath });
+    closeConduit();
+
+    const check = new Database(stateDbPath, { readonly: true });
+    try {
+      expect(columnNames(check, 'runs')).toContain('holder_start_time');
+      const row = check
+        .query("SELECT holder_pid, lease_acquired_at, holder_start_time FROM runs WHERE run_id = 'v11-run'")
+        .get() as { holder_pid: number; lease_acquired_at: number; holder_start_time: number | null };
+      expect(row).toEqual({ holder_pid: 4242, lease_acquired_at: 100, holder_start_time: null });
+      const { user_version } = check.query('PRAGMA user_version').get() as { user_version: number };
+      expect(user_version).toBe(SCHEMA_VERSION);
+    } finally {
+      check.close();
+    }
+  });
+
+  it('a fresh DB has the column', () => {
+    closeConduit();
+    const check = new Database(stateDbPath, { readonly: true });
+    try {
+      expect(columnNames(check, 'runs')).toContain('holder_start_time');
+    } finally {
+      check.close();
+    }
+  });
+});
+
 describe('schema v7→v8 migration: runs.holder_pid / lease_acquired_at (the original run-lock and busy-retry work)', () => {
   it('opens an existing v7 DB cleanly and adds the lease columns, preserving rows', () => {
     closeConduit();
@@ -1751,7 +1810,7 @@ describe('WI-474 AC-6: v5→v6 migration backfills DEFAULT_RUN_ID with no data l
     }).not.toThrow();
   });
 
-  it('stamps the migrated DB at SCHEMA_VERSION (10)', () => {
+  it('stamps the migrated DB at SCHEMA_VERSION (12)', () => {
     buildV5StateFixture();
     db = openConduitDB({ stateDbPath, journalDbPath });
     closeConduit();
@@ -1759,7 +1818,7 @@ describe('WI-474 AC-6: v5→v6 migration backfills DEFAULT_RUN_ID with no data l
     const check = new Database(stateDbPath, { readonly: true });
     try {
       const { user_version } = check.query('PRAGMA user_version').get() as { user_version: number };
-      expect(user_version).toBe(11);
+      expect(user_version).toBe(12);
     } finally {
       check.close();
     }
@@ -1852,7 +1911,7 @@ describe('WI-474 AC-7: migration idempotency', () => {
     }).not.toThrow();
   });
 
-  it('re-opening a current DB leaves SCHEMA_VERSION unchanged at 10', () => {
+  it('re-opening a current DB leaves SCHEMA_VERSION unchanged at 12', () => {
     closeConduit();
     db = openConduitDB({ stateDbPath, journalDbPath });
     closeConduit();
@@ -1860,7 +1919,7 @@ describe('WI-474 AC-7: migration idempotency', () => {
     const check = new Database(stateDbPath, { readonly: true });
     try {
       const { user_version } = check.query('PRAGMA user_version').get() as { user_version: number };
-      expect(user_version).toBe(11);
+      expect(user_version).toBe(12);
     } finally {
       check.close();
     }

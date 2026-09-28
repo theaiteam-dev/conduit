@@ -1,18 +1,31 @@
 import { createHash } from 'node:crypto';
 import { validateRunId } from './run-id';
 import type { ConduitDB, RunRecord } from '../persistence/db';
+import type { RunLeaseClaim } from './run-lock';
 
 export type RegisterRunResult =
   | { kind: 'created'; run: RunRecord }
   | { kind: 'existing'; run: RunRecord }
   | { kind: 'conflict'; recorded: RunRecord };
 
+/**
+ * Record a run, or report the row already recorded under `runId`.
+ *
+ * `holder`, when given, takes the run lease in the same insert that creates
+ * the row (issue #83). A launch that died between a bare insert and its later
+ * `acquireRunLease` left a 'running' row with no holder, and nothing could
+ * tell that row from one whose driver was about to take the lease, so it read
+ * as running forever. With the holder written alongside, a dead launch leaves
+ * a dead holder, which `getRunState` reports as halted. The existing and
+ * conflict paths leave the recorded row and its holder untouched.
+ */
 export function registerRun(
   db: ConduitDB,
   runId: string,
   flow: string,
   inputFingerprint: string,
   projectRoot?: string,
+  holder?: RunLeaseClaim,
 ): RegisterRunResult {
   validateRunId(runId);
 
@@ -25,6 +38,11 @@ export function registerRun(
       project_root: normalizedProjectRoot,
       input_fingerprint: inputFingerprint,
       status: 'running',
+      ...(holder !== undefined && {
+        holder_pid: holder.pid,
+        lease_acquired_at: holder.acquiredAt,
+        holder_start_time: holder.startTime,
+      }),
     });
     return { kind: 'created', run: db.getRun(runId)! };
   }

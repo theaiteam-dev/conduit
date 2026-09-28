@@ -694,6 +694,49 @@ describe('restart and re-drive', () => {
     expect(launches).toHaveLength(1);
   });
 
+  it('judges the lease holder by pid and start time: a reused pid does not keep the run in flight', async () => {
+    // The run finished, but its row still names a holder (a release that was
+    // lost). The pid answers a probe because another process now has it; its
+    // start time differs from the one the lease recorded.
+    seedFinishedRun();
+    db.getStateDb()
+      .prepare('UPDATE runs SET holder_pid = 4242, lease_acquired_at = 1, holder_start_time = 5000 WHERE run_id = $r')
+      .run({ $r: RUN });
+    acceptRow('ev-a', NOW - 20, { round: 'a' });
+    acceptRow('ev-b', NOW - 10, { round: 'b' });
+    const route = (eventId: string, processStartTime: (pid: number) => number | undefined) =>
+      routeKeyedEvent(
+        {
+          db,
+          spawn: controlledSpawn,
+          alerts: { alert: async (a) => void alerts.push(a), channels: {}, globalAlertChannel: '#ops' },
+          slots: createRunSlots(),
+          redriveCap: 3,
+          now: () => NOW,
+          isPidAlive: () => true,
+          processStartTime,
+          launching: new Set<string>(),
+        },
+        {
+          eventId,
+          runId: RUN,
+          flowId: FLOW_ID,
+          flowPath: FLOW_PATH,
+          substrateJson: db.getIngressEvent(eventId)!.substrate_json!,
+          source: 'test',
+        },
+        'sweep',
+      );
+
+    // Same start time: the holder is the process that took the lease.
+    expect(await route('ev-a', () => 5000)).toEqual({ outcome: 'coalesced', runId: RUN });
+    expect(launches).toHaveLength(0);
+
+    // Different start time: the pid was reused, so nothing drives the run.
+    expect(await route('ev-b', () => 9999)).toEqual({ outcome: 'accepted', runId: RUN, pass: 2 });
+    expect(launches).toHaveLength(1);
+  });
+
   it('launches a pending pass recorded before a listener restart', async () => {
     seedFinishedRun();
     acceptRow('ev-pending', NOW - 10, { round: 2 });

@@ -82,7 +82,7 @@ export function parseColumn(cardId: string, column: string, raw: string): unknow
 // Schema version — stored as PRAGMA user_version on the state DB.
 // ---------------------------------------------------------------------------
 
-export const SCHEMA_VERSION = 11;
+export const SCHEMA_VERSION = 12;
 
 export const DEFAULT_RUN_ID = 'default';
 
@@ -229,7 +229,10 @@ CREATE TABLE IF NOT EXISTS runs (
   outcome           TEXT,
   created_at        INTEGER NOT NULL DEFAULT (unixepoch()),
   holder_pid        INTEGER,
-  lease_acquired_at INTEGER
+  lease_acquired_at INTEGER,
+  -- v12 (issue #83): the lease holder's process start time, so a pid the
+  -- kernel has handed to another process does not read as the holder.
+  holder_start_time INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS ingress_events (
@@ -1028,6 +1031,8 @@ export interface RunRecord {
   /** Advisory run-lock holder (the original run-lock and busy-retry work); null when no process holds the lease. */
   holder_pid?: number | null;
   lease_acquired_at?: number | null;
+  /** The holder's process start time (v12, issue #83); null when unheld or not recorded. */
+  holder_start_time?: number | null;
 }
 
 export interface RunInput {
@@ -1037,6 +1042,13 @@ export interface RunInput {
   input_fingerprint: string;
   status: string;
   outcome?: string;
+  /**
+   * The run lease holder, written in the same insert as the row (issue #83).
+   * Omitted: the row is inserted unheld, as before.
+   */
+  holder_pid?: number | null;
+  lease_acquired_at?: number | null;
+  holder_start_time?: number | null;
 }
 
 export interface ConduitDB {
@@ -1355,8 +1367,10 @@ class ConduitDBImpl implements ConduitDB {
   insertRun(run: RunInput): void {
     this.stateDb
       .prepare(
-        `INSERT INTO runs (run_id, flow, project_root, input_fingerprint, status, outcome)
-         VALUES ($run_id, $flow, $project_root, $input_fingerprint, $status, $outcome)`,
+        `INSERT INTO runs (run_id, flow, project_root, input_fingerprint, status, outcome,
+                           holder_pid, lease_acquired_at, holder_start_time)
+         VALUES ($run_id, $flow, $project_root, $input_fingerprint, $status, $outcome,
+                 $holder_pid, $lease_acquired_at, $holder_start_time)`,
       )
       .run({
         $run_id: run.run_id,
@@ -1365,6 +1379,9 @@ class ConduitDBImpl implements ConduitDB {
         $input_fingerprint: run.input_fingerprint,
         $status: run.status,
         $outcome: run.outcome ?? null,
+        $holder_pid: run.holder_pid ?? null,
+        $lease_acquired_at: run.lease_acquired_at ?? null,
+        $holder_start_time: run.holder_start_time ?? null,
       });
   }
 
@@ -1372,7 +1389,7 @@ class ConduitDBImpl implements ConduitDB {
     const row = this.stateDb
       .prepare(
         `SELECT run_id, flow, project_root, input_fingerprint, status, outcome, created_at,
-                holder_pid, lease_acquired_at
+                holder_pid, lease_acquired_at, holder_start_time
          FROM runs WHERE run_id = $run_id`,
       )
       .get({ $run_id: runId }) as RunRecord | undefined;
@@ -2496,6 +2513,7 @@ export function openConduitDB({
   let needsV8ToV9Migration = false;
   let needsV9ToV10Migration = false;
   let needsV10ToV11Migration = false;
+  let needsV11ToV12Migration = false;
 
   const tableExists = (name: string): boolean => {
     const row = stateDb
@@ -2532,6 +2550,7 @@ export function openConduitDB({
     needsV8ToV9Migration = true;
     needsV9ToV10Migration = true;
     needsV10ToV11Migration = true;
+    needsV11ToV12Migration = true;
   } else if (user_version === 3) {
     needsV3ToV4Migration = true;
     needsV4ToV5Migration = true;
@@ -2541,6 +2560,7 @@ export function openConduitDB({
     needsV8ToV9Migration = true;
     needsV9ToV10Migration = true;
     needsV10ToV11Migration = true;
+    needsV11ToV12Migration = true;
   } else if (user_version === 4) {
     needsV4ToV5Migration = true;
     needsV5ToV6Migration = true;
@@ -2549,6 +2569,7 @@ export function openConduitDB({
     needsV8ToV9Migration = true;
     needsV9ToV10Migration = true;
     needsV10ToV11Migration = true;
+    needsV11ToV12Migration = true;
   } else if (user_version === 5) {
     needsV5ToV6Migration = true;
     needsV6ToV7Migration = true;
@@ -2556,26 +2577,34 @@ export function openConduitDB({
     needsV8ToV9Migration = true;
     needsV9ToV10Migration = true;
     needsV10ToV11Migration = true;
+    needsV11ToV12Migration = true;
   } else if (user_version === 6) {
     needsV6ToV7Migration = true;
     needsV7ToV8Migration = true;
     needsV8ToV9Migration = true;
     needsV9ToV10Migration = true;
     needsV10ToV11Migration = true;
+    needsV11ToV12Migration = true;
   } else if (user_version === 7) {
     needsV7ToV8Migration = true;
     needsV8ToV9Migration = true;
     needsV9ToV10Migration = true;
     needsV10ToV11Migration = true;
+    needsV11ToV12Migration = true;
   } else if (user_version === 8) {
     needsV8ToV9Migration = true;
     needsV9ToV10Migration = true;
     needsV10ToV11Migration = true;
+    needsV11ToV12Migration = true;
   } else if (user_version === 9) {
     needsV9ToV10Migration = true;
     needsV10ToV11Migration = true;
+    needsV11ToV12Migration = true;
   } else if (user_version === 10) {
     needsV10ToV11Migration = true;
+    needsV11ToV12Migration = true;
+  } else if (user_version === 11) {
+    needsV11ToV12Migration = true;
   } else if (user_version !== SCHEMA_VERSION) {
     stateDb.close();
     throw new Error(
@@ -2855,6 +2884,19 @@ export function openConduitDB({
       );
       CREATE INDEX IF NOT EXISTS idx_run_pass_events_run ON run_pass_events(run_id, pass);
     `);
+    stateDb.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+  }
+
+  if (needsV11ToV12Migration) {
+    // Additive v11→v12 migration (issue #83): the run lease holder's process
+    // start time. Nullable: a lease taken before v12 has none, and the liveness
+    // check falls back to the pid probe for it. Guarded like the v7→v8 ALTERs.
+    try {
+      stateDb.exec('ALTER TABLE runs ADD COLUMN holder_start_time INTEGER');
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (!msg.includes('duplicate column name')) throw err;
+    }
     stateDb.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
   }
 

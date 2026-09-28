@@ -51,7 +51,7 @@
  * the spawn seam takes an argv array.
  */
 import type { ConduitDB, IngressEventRecord, KeyedRunRecord } from '../persistence/db';
-import { defaultIsPidAlive, peekRunLeaseHolder } from '../run/run-lock';
+import { isLeaseHolderAlive, peekRunLeaseHolder } from '../run/run-lock';
 import {
   checkRunAppendable,
   nextPassNumber,
@@ -78,8 +78,13 @@ export interface KeyedRunDeps {
   redriveCap: number;
   /** Listener clock, unix MILLISECONDS. */
   now: () => number;
-  /** Is a recorded lease holder alive? Defaults to the real pid probe. */
+  /** Is a recorded lease holder's pid alive? Defaults to the real pid probe. */
   isPidAlive?: (pid: number) => boolean;
+  /**
+   * A process's start time, compared with the one the lease recorded so a
+   * reused pid is not taken for the holder. Defaults to reading /proc.
+   */
+  processStartTime?: (pid: number) => number | undefined;
   /**
    * Event ids whose launch is in progress in this process (between the slot
    * acquire and the row's mark). The re-drive sweep skips them; one set is
@@ -140,7 +145,7 @@ function passInFlight(deps: KeyedRunDeps, runId: string, beforeEventId: string |
     return 'a resume of this run is in flight';
   }
   const holder = peekRunLeaseHolder(db, runId);
-  if (holder !== null && (deps.isPidAlive ?? defaultIsPidAlive)(holder.holderPid)) {
+  if (holder !== null && isLeaseHolderAlive(holder, deps)) {
     return `process ${holder.holderPid} holds the run lease`;
   }
   if (db.countQueuedIngressForRun(runId, deps.redriveCap, beforeEventId) > 0) {

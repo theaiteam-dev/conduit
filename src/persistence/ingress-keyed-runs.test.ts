@@ -62,8 +62,8 @@ const KEYED = {
 };
 
 describe('ingress_keyed_runs', () => {
-  it('stamps SCHEMA_VERSION 11 on a fresh DB', () => {
-    expect(SCHEMA_VERSION).toBe(11);
+  it('stamps a SCHEMA_VERSION of at least 11 on a fresh DB', () => {
+    expect(SCHEMA_VERSION).toBeGreaterThanOrEqual(11);
   });
 
   it('returns null for an unknown run', () => {

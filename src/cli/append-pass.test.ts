@@ -34,6 +34,8 @@ import type { ModelAdapter, ModelCall } from '../worker/adapter';
 import { runExecutor } from '../controller/executor';
 import { EXIT_PASS_REFUSED, EXIT_RUN_LEASE_CONFLICT } from '../run/run-passes';
 import { main, type CliDeps, type CliIO, type RunEngineArgs } from './main';
+import { peekRunLeaseHolder } from '../run/run-lock';
+import { getRunState } from '../run/run-state';
 
 function makeIO(): CliIO & { lines: string[]; errors: string[] } {
   const lines: string[] = [];
@@ -853,6 +855,98 @@ describe('conduit run --append-pass: lease release on a post-admission throw', (
     // to in.json happens before the transaction — it must be undone too, or
     // a later resume/retry reads pass 2's input as if it were pass 1's.
     expect(readFileSync(seedPath, 'utf-8')).toBe('{"n":1}');
+  });
+});
+
+// Issue #83 review: a launch that registered the run and then threw before
+// the engine ran left a 'running' row that `run status` reported as running
+// forever. The registration now carries the lease, and the failure path
+// records how the launch ended and releases it.
+describe('conduit run: a launch that throws after registering the run', () => {
+  function throwingDb(base: ConduitDB, methodName: keyof ConduitDB, err: Error): ConduitDB {
+    return new Proxy(base, {
+      get(target, prop) {
+        if (prop === methodName) return () => { throw err; };
+        const value = Reflect.get(target, prop, target);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    }) as ConduitDB;
+  }
+  const throwingRegistry = () => {
+    throw new Error('boom: harness registry');
+  };
+
+  it('holds the run lease from registration: seeding already runs under it', async () => {
+    const flowPath = writeFlow();
+    let holderAtSeed: ReturnType<typeof peekRunLeaseHolder> = null;
+    const spyDb = new Proxy(db, {
+      get(target, prop) {
+        if (prop === 'insertCard') {
+          return (card: Parameters<ConduitDB['insertCard']>[0]) => {
+            holderAtSeed = peekRunLeaseHolder(target, RUN);
+            target.insertCard(card);
+          };
+        }
+        const value = Reflect.get(target, prop, target);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    }) as ConduitDB;
+    expect(await runPass1(flowPath, makeDeps({ db: spyDb, runEngine: completingEngine().runEngine }))).toBe(0);
+    expect(holderAtSeed).toMatchObject({ holderPid: process.pid });
+    // The engine's finally still releases it.
+    expect(peekRunLeaseHolder(db, RUN)).toBeNull();
+  });
+
+  it('removes the run row when the seed transaction throws: nothing was seeded, so a retry starts clean', async () => {
+    const flowPath = writeFlow();
+    const deps = makeDeps({ db: throwingDb(db, 'insertCard', new Error('boom: insertCard failed')) });
+    await expect(runPass1(flowPath, deps)).rejects.toThrow('boom: insertCard failed');
+
+    expect(db.getRun(RUN)).toBeNull();
+    expect(getRunState(db, RUN)).toEqual({ status: 'not_found' });
+
+    // The same command then runs, rather than reporting a run that never started.
+    const engine = completingEngine();
+    expect(await runPass1(flowPath, makeDeps({ runEngine: engine.runEngine }))).toBe(0);
+    expect(engine.calls).toHaveLength(1);
+  });
+
+  it('records the run halted and releases the lease when it throws after the entry card is seeded', async () => {
+    const flowPath = writeFlow();
+    const deps = makeDeps({ bindHarnessRegistry: throwingRegistry });
+    await expect(runPass1(flowPath, deps)).rejects.toThrow('boom: harness registry');
+
+    const run = db.getRun(RUN)!;
+    expect(run.status).toBe('halted');
+    expect(run.outcome).toBe('halted');
+    expect(peekRunLeaseHolder(db, RUN)).toBeNull();
+    expect(getRunState(db, RUN)).toMatchObject({ status: 'halted', unfinished: 1 });
+  });
+
+  it('records an appended pass halted and releases the lease when it throws after the pass card is seeded', async () => {
+    const flowPath = writeFlow();
+    await runPass1(flowPath, makeDeps({ runEngine: completingEngine().runEngine }));
+
+    const deps = makeDeps({ bindHarnessRegistry: throwingRegistry });
+    await expect(appendPass(flowPath, deps)).rejects.toThrow('boom: harness registry');
+
+    const run = db.getRun(RUN)!;
+    expect(run.status).toBe('halted');
+    expect(peekRunLeaseHolder(db, RUN)).toBeNull();
+    expect(getRunState(db, RUN)).toMatchObject({ status: 'halted', unfinished: 1 });
+  });
+
+  it('leaves a finished run as it was when an appended pass throws before seeding', async () => {
+    const flowPath = writeFlow();
+    await runPass1(flowPath, makeDeps({ runEngine: completingEngine().runEngine }));
+
+    const deps = makeDeps({ db: throwingDb(db, 'insertCard', new Error('boom: insertCard failed')) });
+    await expect(appendPass(flowPath, deps)).rejects.toThrow('boom: insertCard failed');
+
+    const run = db.getRun(RUN)!;
+    expect(run.status).toBe('done');
+    expect(run.outcome).toBe('complete');
+    expect(peekRunLeaseHolder(db, RUN)).toBeNull();
   });
 });
 

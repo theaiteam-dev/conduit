@@ -1,6 +1,6 @@
 import type { ConduitDB } from '../persistence/db';
 import type { Status } from '../types/kernel';
-import { defaultIsPidAlive, peekRunLeaseHolder } from './run-lock';
+import { isLeaseHolderAlive, peekRunLeaseHolder, type LeaseLiveness } from './run-lock';
 
 export type RunStateResult =
   | { status: 'not_found' }
@@ -163,13 +163,13 @@ function shellQuote(value: string): string {
 /**
  * `now` is in the run clock's frame (epoch seconds), used only to confirm a
  * recorded park against the cards; the default is the production clock.
- * `isPidAlive` probes the run lease holder; tests inject it.
+ * `liveness` probes the run lease holder (`isLeaseHolderAlive`); tests inject it.
  */
 export function getRunState(
   db: ConduitDB,
   runId: string,
   now: number = Math.floor(Date.now() / 1000),
-  isPidAlive: (pid: number) => boolean = defaultIsPidAlive,
+  liveness: LeaseLiveness = {},
 ): RunStateResult {
   const run = db.getRun(runId);
   if (!run) return { status: 'not_found' };
@@ -205,13 +205,18 @@ export function getRunState(
   // The row alone cannot say whether anything drives the run: resume takes the
   // lease but leaves a halted row as it is until it exits, and a driver killed
   // by SIGKILL or the OOM killer leaves the row 'running' with its dead pid as
-  // holder. The lease holder tells them apart. A 'running' row with no holder is
-  // a run between registerRun and acquireRunLease, so it still reads running.
+  // holder. The lease holder tells them apart, judged by pid and start time so
+  // a pid the kernel has since given to another process does not count.
+  // `conduit run` takes the lease in the same insert that registers the run,
+  // so a launch that dies at any point after registering leaves a dead holder.
+  // A 'running' row with no holder is therefore a row written before that
+  // (a pre-v12 launch), or by a caller that registers without a holder; with
+  // no evidence either way it still reads running.
   // It is read before the parked check: a resume that takes a parked run's lease
   // before the gate opens leaves the card `ready` behind the same future
   // release_at, and that run is being driven, so it reads running.
   const holder = peekRunLeaseHolder(db, runId);
-  const driven = holder !== null && isPidAlive(holder.holderPid);
+  const driven = holder !== null && isLeaseHolderAlive(holder, liveness);
 
   // A parked run's cards are all `ready` or waiting on each other, which would
   // otherwise read as running. The runs row says a park was observed at exit —

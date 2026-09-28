@@ -9,8 +9,9 @@
  * pool slots, watchdog).
  *
  * This is a single-host advisory lock, not a distributed one — the holder is
- * identified by OS pid, stored on the run's own row in the `runs` table
- * (columns `holder_pid` / `lease_acquired_at`, schema v8). Acquisition and
+ * identified by OS pid and process start time, stored on the run's own row in
+ * the `runs` table (columns `holder_pid` / `lease_acquired_at`, schema v8, and
+ * `holder_start_time`, schema v12). Acquisition and
  * release run inside a single `BEGIN IMMEDIATE` transaction on the state DB,
  * mirroring the linearization idiom in src/dispatch/claim.ts.
  *
@@ -23,17 +24,26 @@
  * throws (see its doc comment — it always runs from a caller's `finally`,
  * where a thrown error would mask the engine's real result).
  *
- * KNOWN LIMITATION (accepted for a single-host advisory lock): the liveness
- * check is bare pid existence (`isPidAlive`), not process identity. After a
- * host reboot or pid-space wraparound, an unrelated process could reuse the
- * stale holder's pid and be mistaken for the still-live holder, blocking
- * acquisition until an operator intervenes. A fully sound design would also
- * compare process start-time, as `reclaimOrphanedWorkers` does for
- * active_workers — the `runs` table does not currently carry that.
+ * Holder liveness is process identity, not bare pid existence (issue #83).
+ * After a host reboot or pid-space wraparound an unrelated process can be
+ * given a dead holder's pid, and a signal-0 probe alone would report that
+ * process as the holder: `run status` would say `running` forever and
+ * `acquireRunLease` would refuse to reclaim. So a lease records the holder's
+ * start time (`processStartTime`, field 22 of /proc/<pid>/stat, the same
+ * identity the stale-cgroup sweep uses), and `isLeaseHolderAlive` treats a
+ * live pid with a different start time as a dead holder. Every caller that
+ * decides whether a lease holder is live goes through that one function.
+ *
+ * REMAINING LIMITATION: where the start time cannot be read (no /proc, as on
+ * macOS, or a `hidepid` mount hiding another user's process), and for a lease
+ * recorded before schema v12, the check falls back to the pid probe and the
+ * old pid-reuse window applies. It fails closed: a holder is never declared
+ * dead without proof.
  */
 
 import type { ConduitDB } from '../persistence/db';
 import { withBusyRetry } from '../persistence/busy-retry';
+import { processStartTime as defaultProcessStartTime } from '../worker/cgroup-containment';
 
 // ---------------------------------------------------------------------------
 // isPidAlive
@@ -56,6 +66,65 @@ export function defaultIsPidAlive(pid: number): boolean {
 }
 
 // ---------------------------------------------------------------------------
+// isLeaseHolderAlive
+// ---------------------------------------------------------------------------
+
+/** How a lease holder's liveness is probed. Both default to the real host; tests inject them. */
+export interface LeaseLiveness {
+  isPidAlive?: (pid: number) => boolean;
+  /** A process's start time, or undefined when it cannot be read. */
+  processStartTime?: (pid: number) => number | undefined;
+}
+
+/** A run's recorded lease holder, as `peekRunLeaseHolder` returns it. */
+export interface RunLeaseHolder {
+  holderPid: number;
+  acquiredAt: number;
+  /** The holder's start time when the lease was taken; null when unreadable then, or recorded before v12. */
+  holderStartTime: number | null;
+}
+
+/**
+ * Is the process that took this lease still running?
+ *
+ * Dead when its pid is dead. Dead too when the pid is alive but its start time
+ * differs from the one the lease recorded: the kernel gave the pid to another
+ * process. When either start time is unknown (a pre-v12 lease, or a current
+ * one that cannot be read) the pid probe decides alone, so a live holder is
+ * never declared dead on missing evidence.
+ */
+export function isLeaseHolderAlive(
+  holder: Pick<RunLeaseHolder, 'holderPid' | 'holderStartTime'>,
+  liveness: LeaseLiveness = {},
+): boolean {
+  const isPidAlive = liveness.isPidAlive ?? defaultIsPidAlive;
+  if (!isPidAlive(holder.holderPid)) return false;
+  if (holder.holderStartTime === null) return true;
+  const current = (liveness.processStartTime ?? defaultProcessStartTime)(holder.holderPid);
+  return current === undefined || current === holder.holderStartTime;
+}
+
+/**
+ * What a process writes to take a run lease: its pid, the time, and its start
+ * time (null when unreadable). `registerRun` writes the same claim with a new
+ * row, so the two paths record the holder identically.
+ */
+export interface RunLeaseClaim {
+  pid: number;
+  acquiredAt: number;
+  startTime: number | null;
+}
+
+/** The claim `pid` makes on a run lease at `now`. */
+export function leaseClaimFor(
+  pid: number,
+  now: number,
+  processStartTime: (pid: number) => number | undefined = defaultProcessStartTime,
+): RunLeaseClaim {
+  return { pid, acquiredAt: now, startTime: processStartTime(pid) ?? null };
+}
+
+// ---------------------------------------------------------------------------
 // acquireRunLease / releaseRunLease
 // ---------------------------------------------------------------------------
 
@@ -66,6 +135,18 @@ export type AcquireRunLeaseResult =
 interface RunHolderRow {
   holder_pid: number | null;
   lease_acquired_at: number | null;
+  holder_start_time: number | null;
+}
+
+const SELECT_HOLDER = 'SELECT holder_pid, lease_acquired_at, holder_start_time FROM runs WHERE run_id = $run_id';
+
+function toHolder(row: RunHolderRow | undefined): RunLeaseHolder | null {
+  if (!row || row.holder_pid === null) return null;
+  return {
+    holderPid: row.holder_pid,
+    acquiredAt: row.lease_acquired_at ?? 0,
+    holderStartTime: row.holder_start_time ?? null,
+  };
 }
 
 /**
@@ -73,9 +154,11 @@ interface RunHolderRow {
  *
  * Acquires when: no row is holding the lease (holder_pid IS NULL), the
  * current holder IS this same pid (re-entrant — refreshes lease_acquired_at),
- * or the current holder's pid is no longer alive (stale — the previous
- * driver crashed without releasing). Refuses only when a DIFFERENT, live
- * pid holds the lease — a live holder's lease is never silently stolen.
+ * or the current holder is no longer alive by `isLeaseHolderAlive` (stale —
+ * the previous driver crashed without releasing, or its pid now belongs to
+ * another process). Refuses only when a DIFFERENT, live holder has the
+ * lease — a live holder's lease is never silently stolen. The caller's start
+ * time is recorded with the lease.
  *
  * A run_id with no `runs` row at all (not yet registered, or a legacy DB
  * predating run registration) has nothing to protect — treated as a free
@@ -93,28 +176,26 @@ export function acquireRunLease(
   runId: string,
   pid: number,
   now: number,
-  isPidAlive: (pid: number) => boolean = defaultIsPidAlive,
+  liveness: LeaseLiveness = {},
 ): AcquireRunLeaseResult {
   const stateDb = db.getStateDb();
+  const claim = leaseClaimFor(pid, now, liveness.processStartTime);
 
   return withBusyRetry(() =>
     stateDb
       .transaction((): AcquireRunLeaseResult => {
-        const row = stateDb
-          .prepare('SELECT holder_pid, lease_acquired_at FROM runs WHERE run_id = $run_id')
-          .get({ $run_id: runId }) as RunHolderRow | undefined;
+        const holder = toHolder(stateDb.prepare(SELECT_HOLDER).get({ $run_id: runId }) as RunHolderRow | undefined);
 
-        const holderPid = row?.holder_pid ?? null;
-
-        if (holderPid !== null && holderPid !== pid && isPidAlive(holderPid)) {
-          return { acquired: false, holderPid, acquiredAt: row?.lease_acquired_at ?? 0 };
+        if (holder !== null && holder.holderPid !== pid && isLeaseHolderAlive(holder, liveness)) {
+          return { acquired: false, holderPid: holder.holderPid, acquiredAt: holder.acquiredAt };
         }
 
         stateDb
           .prepare(
-            'UPDATE runs SET holder_pid = $pid, lease_acquired_at = $now WHERE run_id = $run_id',
+            `UPDATE runs SET holder_pid = $pid, lease_acquired_at = $now, holder_start_time = $start_time
+             WHERE run_id = $run_id`,
           )
-          .run({ $pid: pid, $now: now, $run_id: runId });
+          .run({ $pid: claim.pid, $now: claim.acquiredAt, $start_time: claim.startTime, $run_id: runId });
 
         return { acquired: true };
       })
@@ -137,8 +218,8 @@ export function acquireRunLease(
  * swallowed; the function reports success via its boolean return instead of
  * by not-throwing. A swallowed failure leaves `holder_pid` stuck, but this
  * self-heals: the next `acquireRunLease` against this run_id finds the
- * recorded holder's pid dead (the process that failed to release is the same
- * one that is now exiting) and reclaims the stale lease.
+ * recorded holder dead (the process that failed to release is the same one
+ * that is now exiting) and reclaims the stale lease.
  */
 export function releaseRunLease(db: ConduitDB, runId: string, pid: number): boolean {
   const stateDb = db.getStateDb();
@@ -147,7 +228,8 @@ export function releaseRunLease(db: ConduitDB, runId: string, pid: number): bool
     withBusyRetry(() =>
       stateDb
         .prepare(
-          'UPDATE runs SET holder_pid = NULL, lease_acquired_at = NULL WHERE run_id = $run_id AND holder_pid = $pid',
+          `UPDATE runs SET holder_pid = NULL, lease_acquired_at = NULL, holder_start_time = NULL
+           WHERE run_id = $run_id AND holder_pid = $pid`,
         )
         .run({ $run_id: runId, $pid: pid }),
     );
@@ -174,16 +256,8 @@ export function releaseRunLease(db: ConduitDB, runId: string, pid: number): bool
  * `conduit run` re-submit that only prints run state) but still want to warn
  * the operator that a live process currently owns this run, rather than
  * silently racing it. Returns null when unheld (no row, or holder_pid IS NULL).
+ * Whether the returned holder is still running is `isLeaseHolderAlive`'s call.
  */
-export function peekRunLeaseHolder(
-  db: ConduitDB,
-  runId: string,
-): { holderPid: number; acquiredAt: number } | null {
-  const row = db
-    .getStateDb()
-    .prepare('SELECT holder_pid, lease_acquired_at FROM runs WHERE run_id = $run_id')
-    .get({ $run_id: runId }) as RunHolderRow | undefined;
-
-  if (!row || row.holder_pid === null) return null;
-  return { holderPid: row.holder_pid, acquiredAt: row.lease_acquired_at ?? 0 };
+export function peekRunLeaseHolder(db: ConduitDB, runId: string): RunLeaseHolder | null {
+  return toHolder(db.getStateDb().prepare(SELECT_HOLDER).get({ $run_id: runId }) as RunHolderRow | undefined);
 }

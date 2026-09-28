@@ -26,7 +26,7 @@ import { startWorkerMain } from '../worker/worker-entry';
 import { openConduitDB, DEFAULT_RUN_ID } from '../persistence/db';
 import { validateRunId } from '../run/run-id';
 import { registerRun, computeFingerprint } from '../run/run-registry';
-import { acquireRunLease, releaseRunLease, peekRunLeaseHolder, defaultIsPidAlive } from '../run/run-lock';
+import { acquireRunLease, releaseRunLease, peekRunLeaseHolder, isLeaseHolderAlive, leaseClaimFor } from '../run/run-lock';
 import { getRunState, getRunParkedRelease, formatParkedRun, formatHaltedRun, type RunStateResult } from '../run/run-state';
 import {
   checkRunAppendable,
@@ -1363,16 +1363,27 @@ async function cmdRun(argv: string[], deps: CliDeps): Promise<number> {
   }
 
   // Register the run. On existing → report state and exit. On conflict → error and exit.
+  // A fresh registration takes the run lease in the same insert (issue #83), so
+  // this process holds it from the moment the row exists: a launch killed
+  // before the engine starts leaves its dead pid as holder, which `run status`
+  // reports as halted, never a 'running' row that nothing drives.
   const registration = appendPass
     ? ({ kind: 'created' } as const)
-    : registerRun(deps.db, effectiveRunId, resolvedFlowPath, fingerprint, projectRoot);
+    : registerRun(
+        deps.db,
+        effectiveRunId,
+        resolvedFlowPath,
+        fingerprint,
+        projectRoot,
+        leaseClaimFor(process.pid, deps.now()),
+      );
   if (registration.kind === 'existing') {
     // This path never drives the engine (read-only status report), so it must
     // NOT acquire the run lease — but it's still worth refusing loudly if a
     // different live process currently holds it, rather than printing
     // possibly-stale run state out from under an in-progress run (the original run-lock and busy-retry work).
     const holder = peekRunLeaseHolder(deps.db, effectiveRunId);
-    if (holder !== null && holder.holderPid !== process.pid && defaultIsPidAlive(holder.holderPid)) {
+    if (holder !== null && holder.holderPid !== process.pid && isLeaseHolderAlive(holder)) {
       deps.io.err(formatRunLeaseConflict(effectiveRunId, holder.holderPid));
       return 1;
     }
@@ -1388,6 +1399,38 @@ async function cmdRun(argv: string[], deps: CliDeps): Promise<number> {
     return 1;
   }
   // kind === 'created' — proceed to seed entry card and run engine.
+
+  // A launch that fails after registering holds the lease on a row that may
+  // read 'running', and releasing the lease alone would leave exactly the row
+  // `run status` cannot tell from a live run (issue #83). So a failed launch
+  // first records how it ended: a fresh run that seeded nothing is removed, as
+  // the pass-event race below removes it, so the same command can run it
+  // again; a run with its entry card seeded is recorded halted, which
+  // `conduit resume` picks up. A row that is not 'running' (an appended pass
+  // that failed before its seed transaction reopened the run) is left as it
+  // was. Never throws: it runs on the way out of a failure, and an error here
+  // must not replace the one that caused it.
+  const abandonLaunch = (): void => {
+    try {
+      if (deps.db.getRun(effectiveRunId)?.status === 'running') {
+        const seeded = (
+          deps.db
+            .getStateDb()
+            .prepare('SELECT COUNT(*) AS n FROM cards WHERE run_id = $run_id')
+            .get({ $run_id: effectiveRunId }) as { n: number }
+        ).n > 0;
+        if (!seeded && !appendPass) deps.db.deleteRun(effectiveRunId);
+        else updateRunStatus(deps.db, effectiveRunId, 'halted', 'halted');
+      }
+    } catch (err) {
+      deps.io.err(
+        `run: could not record the failed launch of run ${JSON.stringify(effectiveRunId)}: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+    releaseRunLease(deps.db, effectiveRunId, process.pid);
+  };
 
   // ── Card seeding (FR-9) ───────────────────────────────────────────────────
   let seededCardId: string | null = null;
@@ -1554,6 +1597,7 @@ async function cmdRun(argv: string[], deps: CliDeps): Promise<number> {
           'no runnable card in DB and no --input/--input-inline provided — ' +
             'nothing to seed for this run (use --input <file> to provide the entry data)',
         );
+        abandonLaunch();
         return 1;
       }
     }
@@ -1592,18 +1636,19 @@ async function cmdRun(argv: string[], deps: CliDeps): Promise<number> {
       runArgs.onMessage = pool.onMessage;
     }
   } catch (err) {
-    // The lease acquired in admitAppendPass (or none, on the non-append
-    // path) must not be left held if anything below throws before the
-    // engine-drive try/finally takes ownership of releasing it.
-    if (appendPass) {
-      releaseRunLease(deps.db, effectiveRunId, process.pid);
-    }
+    // The lease taken by registerRun (or by admitAppendPass, for a pass) must
+    // not be left held if anything above throws before the engine-drive
+    // try/finally takes ownership of releasing it, and the row must not be
+    // left reading 'running'.
+    abandonLaunch();
     throw err;
   }
 
   // ── Acquire the per-run advisory lease (the original run-lock and busy-retry work) ──────────────────────────
   // After registration succeeds, before the engine dispatches any work: fail
   // fast (no wait/poll) if another live process is already driving this run.
+  // registerRun (or admitAppendPass) already took the lease for this pid, so
+  // this re-entrant acquire refreshes it rather than contending for it.
   const leaseResult = acquireRunLease(deps.db, effectiveRunId, process.pid, deps.now());
   if (!leaseResult.acquired) {
     deps.io.err(formatRunLeaseConflict(effectiveRunId, leaseResult.holderPid));
@@ -1634,11 +1679,16 @@ async function cmdRun(argv: string[], deps: CliDeps): Promise<number> {
   }
 
   // ── Run the engine ─────────────────────────────────────────────────────────
+  // An engine that throws never reaches recordRunExit below, so it records the
+  // run halted on the way out rather than leaving it 'running' with no holder.
+  let engineReturned = false;
   try {
     await deps.runEngine(runArgs);
+    engineReturned = true;
   } finally {
     pool?.dispose();
-    releaseRunLease(deps.db, effectiveRunId, process.pid);
+    if (engineReturned) releaseRunLease(deps.db, effectiveRunId, process.pid);
+    else abandonLaunch();
   }
 
   // ── Exit code (FR-12): 0 = completed (card at done), 1 = halted ──────────

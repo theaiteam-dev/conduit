@@ -23,6 +23,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { openConduitDB, DEFAULT_RUN_ID, type ConduitDB } from '../persistence/db';
 import { registerRun, computeFingerprint, type RegisterRunResult } from './run-registry';
+import { acquireRunLease, peekRunLeaseHolder } from './run-lock';
 
 let dir: string;
 let stateDbPath: string;
@@ -136,6 +137,53 @@ describe('registerRun — idempotent re-submit returns existing (AC-2)', () => {
     registerRun(db, 'run-multi', 'studio', 'fp-x');
     const third = registerRun(db, 'run-multi', 'studio', 'fp-x');
     expect(third.kind).toBe('existing');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Registration takes the run lease in the same insert (issue #83 review): a
+// launch killed between registering and acquiring the lease used to leave a
+// 'running' row with no holder, which read as running forever.
+// ---------------------------------------------------------------------------
+
+describe('registerRun — optional lease holder written with the row', () => {
+  const HOLDER = { pid: 4242, acquiredAt: 1_000, startTime: 5_000 };
+
+  it('writes the holder pid, acquired-at and start time in the created row', () => {
+    const result = registerRun(db, 'run-held', 'studio', 'fp', undefined, HOLDER);
+    expect(result.kind).toBe('created');
+    expect(peekRunLeaseHolder(db, 'run-held')).toEqual({ holderPid: 4242, acquiredAt: 1_000, holderStartTime: 5_000 });
+  });
+
+  it('writes a NULL start time when the caller could not read one', () => {
+    registerRun(db, 'run-held', 'studio', 'fp', undefined, { ...HOLDER, startTime: null });
+    expect(peekRunLeaseHolder(db, 'run-held')).toEqual({ holderPid: 4242, acquiredAt: 1_000, holderStartTime: null });
+  });
+
+  it('writes no holder when none is given', () => {
+    registerRun(db, 'run-free', 'studio', 'fp');
+    expect(peekRunLeaseHolder(db, 'run-free')).toBeNull();
+  });
+
+  it('leaves an existing row and its holder untouched', () => {
+    registerRun(db, 'run-held', 'studio', 'fp', undefined, HOLDER);
+    const again = registerRun(db, 'run-held', 'studio', 'fp', undefined, { pid: 9, acquiredAt: 2_000, startTime: 1 });
+    expect(again.kind).toBe('existing');
+    expect(peekRunLeaseHolder(db, 'run-held')).toEqual({ holderPid: 4242, acquiredAt: 1_000, holderStartTime: 5_000 });
+  });
+
+  it('leaves a conflicting row and its holder untouched', () => {
+    registerRun(db, 'run-held', 'studio', 'fp', undefined, HOLDER);
+    const clash = registerRun(db, 'run-held', 'studio', 'fp-other', undefined, { pid: 9, acquiredAt: 2_000, startTime: 1 });
+    expect(clash.kind).toBe('conflict');
+    expect(peekRunLeaseHolder(db, 'run-held')).toEqual({ holderPid: 4242, acquiredAt: 1_000, holderStartTime: 5_000 });
+  });
+
+  it('the registering pid can then acquire its own lease (re-entrant)', () => {
+    registerRun(db, 'run-held', 'studio', 'fp', undefined, HOLDER);
+    const lease = acquireRunLease(db, 'run-held', 4242, 2_000, { isPidAlive: () => true, processStartTime: () => 5_000 });
+    expect(lease).toEqual({ acquired: true });
+    expect(peekRunLeaseHolder(db, 'run-held')).toEqual({ holderPid: 4242, acquiredAt: 2_000, holderStartTime: 5_000 });
   });
 });
 

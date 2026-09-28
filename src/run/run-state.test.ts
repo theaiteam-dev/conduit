@@ -18,6 +18,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import { openConduitDB, DEFAULT_RUN_ID, type ConduitDB } from '../persistence/db';
 import { getRunState, getRunParkedRelease, formatParkedRun, formatHaltedRun, type RunStateResult } from './run-state';
+import { registerRun } from './run-registry';
 import type { Card } from '../types/kernel';
 
 let db: ConduitDB;
@@ -586,7 +587,7 @@ describe('getRunState — parked (issue #7)', () => {
     db.insertCard(makeCard('r', 'c1'));
     parkCard(makeCard('r', 'c1'), 1300);
     holdLease('r', 4242);
-    expect(getRunState(db, 'r', 1000, () => true)).toEqual({ status: 'running' });
+    expect(getRunState(db, 'r', 1000, { isPidAlive: () => true })).toEqual({ status: 'running' });
   });
 
   it('still reports parked when the recorded lease holder is dead', () => {
@@ -594,7 +595,7 @@ describe('getRunState — parked (issue #7)', () => {
     db.insertCard(makeCard('r', 'c1'));
     parkCard(makeCard('r', 'c1'), 1300);
     holdLease('r', 4242);
-    expect(getRunState(db, 'r', 1000, () => false)).toEqual({ status: 'parked', releaseAt: 1300, flow: '/flows/vertical.yaml' });
+    expect(getRunState(db, 'r', 1000, { isPidAlive: () => false })).toEqual({ status: 'parked', releaseAt: 1300, flow: '/flows/vertical.yaml' });
   });
 
   it('still reports parked when no process holds the lease', () => {
@@ -613,10 +614,10 @@ describe('getRunState — parked (issue #7)', () => {
 });
 
 /** Record `pid` as the run's lease holder, as acquireRunLease does. */
-function holdLease(runId: string, pid: number): void {
+function holdLease(runId: string, pid: number, startTime: number | null = null): void {
   db.getStateDb()
-    .prepare('UPDATE runs SET holder_pid = $pid, lease_acquired_at = 1 WHERE run_id = $r')
-    .run({ $pid: pid, $r: runId });
+    .prepare('UPDATE runs SET holder_pid = $pid, lease_acquired_at = 1, holder_start_time = $st WHERE run_id = $r')
+    .run({ $pid: pid, $st: startTime, $r: runId });
 }
 
 // Issue #83: the andon halted the run and left a card unfinished. No process
@@ -647,7 +648,7 @@ describe('getRunState — halted with unfinished cards (issue #83)', () => {
     haltedRun('r');
     holdLease('r', 4242);
     db.insertCard(makeCard('r', 'c1', { status: 'ready' }));
-    expect(getRunState(db, 'r', 1000, () => false).status).toBe('halted');
+    expect(getRunState(db, 'r', 1000, { isPidAlive: () => false }).status).toBe('halted');
   });
 
   it('reports running while a live process holds the lease: resume does not rewrite the row', () => {
@@ -659,7 +660,7 @@ describe('getRunState — halted with unfinished cards (issue #83)', () => {
       probed.push(pid);
       return true;
     };
-    expect(getRunState(db, 'r', 1000, alive)).toEqual({ status: 'running' });
+    expect(getRunState(db, 'r', 1000, { isPidAlive: alive })).toEqual({ status: 'running' });
     expect(probed).toEqual([4242]);
   });
 
@@ -684,20 +685,46 @@ describe('getRunState — halted with unfinished cards (issue #83)', () => {
     seedRun('r');
     holdLease('r', 4242);
     db.insertCard(makeCard('r', 'c1', { status: 'working' }));
-    expect(getRunState(db, 'r', 1000, () => false)).toEqual({ status: 'halted', unfinished: 1, flow: 'studio' });
+    expect(getRunState(db, 'r', 1000, { isPidAlive: () => false })).toEqual({ status: 'halted', unfinished: 1, flow: 'studio' });
   });
 
   it('reports running while the driver of a run recorded running is alive', () => {
     seedRun('r');
     holdLease('r', 4242);
     db.insertCard(makeCard('r', 'c1', { status: 'working' }));
-    expect(getRunState(db, 'r', 1000, () => true)).toEqual({ status: 'running' });
+    expect(getRunState(db, 'r', 1000, { isPidAlive: () => true })).toEqual({ status: 'running' });
   });
 
-  it('a run recorded running with no lease yet is still running: the row is written before the lease is taken', () => {
+  it('a run recorded running with no lease holder is still running: a legacy row, or a registration without a holder', () => {
     seedRun('r');
     db.insertCard(makeCard('r', 'c1', { status: 'ready' }));
-    expect(getRunState(db, 'r', 1000, () => false).status).toBe('running');
+    expect(getRunState(db, 'r', 1000, { isPidAlive: () => false }).status).toBe('running');
+  });
+
+  it('reports halted when the holder pid is alive but was reused by another process', () => {
+    seedRun('r');
+    holdLease('r', 4242, 5_000);
+    db.insertCard(makeCard('r', 'c1', { status: 'working' }));
+    const reused = { isPidAlive: () => true, processStartTime: () => 9_999 };
+    expect(getRunState(db, 'r', 1000, reused)).toEqual({ status: 'halted', unfinished: 1, flow: 'studio' });
+  });
+
+  it('reports running when the holder pid is alive with the start time the lease recorded', () => {
+    seedRun('r');
+    holdLease('r', 4242, 5_000);
+    db.insertCard(makeCard('r', 'c1', { status: 'working' }));
+    const same = { isPidAlive: () => true, processStartTime: () => 5_000 };
+    expect(getRunState(db, 'r', 1000, same)).toEqual({ status: 'running' });
+  });
+
+  it('reports halted for a launch killed right after registering: registerRun took the lease in the same insert', () => {
+    // The SIGKILL window issue #83's review found: the launch registered the
+    // run and died before seeding finished. The holder is written with the
+    // row, so the dead pid is visible and the run does not read running.
+    const created = registerRun(db, 'r', 'studio', 'fp-r', undefined, { pid: 4242, acquiredAt: 1, startTime: 5_000 });
+    expect(created.kind).toBe('created');
+    db.insertCard(makeCard('r', 'c1', { status: 'ready' }));
+    expect(getRunState(db, 'r', 1000, { isPidAlive: () => false })).toEqual({ status: 'halted', unfinished: 1, flow: 'studio' });
   });
 });
 
