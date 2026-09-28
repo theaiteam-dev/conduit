@@ -259,7 +259,8 @@ export function getRunState(
   // so a launch that dies at any point after registering leaves a dead holder.
   // A 'running' row with no holder is therefore a row written before that
   // (a pre-v12 launch), or by a caller that registers without a holder; with
-  // no evidence either way it still reads running.
+  // no evidence either way it reads running while it has unfinished cards, and
+  // terminal once it has none, as below.
   // It is read before the parked check: a resume that takes a parked run's lease
   // before the gate opens leaves the card `ready` behind the same future
   // release_at, and that run is being driven, so it reads running.
