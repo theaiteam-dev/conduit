@@ -1,5 +1,6 @@
-import type { ConduitDB } from '../persistence/db';
+import type { ConduitDB, RunRecord } from '../persistence/db';
 import type { Status } from '../types/kernel';
+import { isLeaseHolderAlive, peekRunLeaseHolder, type LeaseLiveness } from './run-lock';
 
 export type RunStateResult =
   | { status: 'not_found' }
@@ -12,9 +13,56 @@ export type RunStateResult =
    * is the recorded flow path, so the resume command can be printed verbatim.
    */
   | { status: 'parked'; releaseAt: number; flow: string }
+  /**
+   * The run left `unfinished` cards outside a terminal lane and no live process
+   * holds the run lease, so nothing is driving it: the engine recorded a halt
+   * (andon, liveness stall), or the driver died without recording one (issue
+   * #83). `flow` is for the resume command.
+   */
+  | { status: 'halted'; unfinished: number; flow: string }
+  /**
+   * A launch that failed before seeding any card (issue #83, `isFailedLaunch`):
+   * the run has no cards and nothing drives it. Nothing ran, so there is
+   * nothing to resume; the same `conduit run` command retries it. `flow` is
+   * the recorded flow path.
+   */
+  | { status: 'launch_failed'; flow: string }
   | { status: 'terminal'; outcome: string };
 
 const TERMINAL_STATUSES = new Set(['complete', 'scrapped', 'held']);
+
+/**
+ * Is this run a launch that failed before seeding any card (issue #83)?
+ *
+ * The run has no cards, and either it is recorded halted or it still reads
+ * 'running' with a recorded lease holder that is no longer alive. The first
+ * is a launch that failed and recorded it: `conduit run` records a launch that
+ * fails after registering as halted rather than deleting the row, so the
+ * failure stays visible to `run status`. The second is a launch killed before
+ * it could record anything (SIGKILL, the OOM killer): registration writes the
+ * holder with the row, so its dead pid is left behind. A halted row with no
+ * cards comes from no other path, because every exit that drove the engine
+ * with no card of its own records the run done. A 'running' row with no holder
+ * is not counted: without a holder nothing says whether a launch is still
+ * seeding it.
+ *
+ * The single predicate behind `registerRun`'s retry, `getRunState`'s
+ * `launch_failed`, the append-pass refusal, the resume refusal and the
+ * ingress router's pass-1 relaunch. `liveness` probes the holder; tests inject it.
+ */
+export function isFailedLaunch(db: ConduitDB, run: RunRecord | null, liveness: LeaseLiveness = {}): boolean {
+  if (run === null) return false;
+  if (run.status !== 'halted') {
+    if (run.status !== 'running') return false;
+    const holder = peekRunLeaseHolder(db, run.run_id);
+    if (holder === null || isLeaseHolderAlive(holder, liveness)) return false;
+  }
+  const { n } = db
+    .getStateDb()
+    .prepare('SELECT COUNT(*) AS n FROM cards WHERE run_id = $r')
+    .get({ $r: run.run_id }) as { n: number };
+  return n === 0;
+}
 
 /** The soonest gate among a run's parked cards, when the run halted as parked. */
 export interface ParkedRelease {
@@ -129,8 +177,25 @@ export function formatReleaseAt(releaseAt: number): string {
 export function formatParkedRun(runId: string, flow: string, releaseAt: number): string {
   return (
     `parked behind a provider rate limit until ${formatReleaseAt(releaseAt)} — nothing was scrapped; ` +
-    `resume with: conduit resume ${shellQuote(flow)} --run ${shellQuote(runId)}`
+    `resume with: ${resumeCommand(runId, flow)}`
   );
+}
+
+/** The `run status` line for a halt that left cards unfinished (issue #83). */
+export function formatHaltedRun(runId: string, flow: string, unfinished: number): string {
+  return `halted with ${unfinished} unfinished card${unfinished === 1 ? '' : 's'}; resume with: ${resumeCommand(runId, flow)}`;
+}
+
+/**
+ * The `run status` line for a launch that failed before seeding (issue #83).
+ * The command cannot be printed: the input it was given is not recorded.
+ */
+export function formatLaunchFailedRun(): string {
+  return 'launch failed before any card was seeded; re-run the same conduit run command to retry';
+}
+
+function resumeCommand(runId: string, flow: string): string {
+  return `conduit resume ${shellQuote(flow)} --run ${shellQuote(runId)}`;
 }
 
 /**
@@ -146,11 +211,13 @@ function shellQuote(value: string): string {
 /**
  * `now` is in the run clock's frame (epoch seconds), used only to confirm a
  * recorded park against the cards; the default is the production clock.
+ * `liveness` probes the run lease holder (`isLeaseHolderAlive`); tests inject it.
  */
 export function getRunState(
   db: ConduitDB,
   runId: string,
   now: number = Math.floor(Date.now() / 1000),
+  liveness: LeaseLiveness = {},
 ): RunStateResult {
   const run = db.getRun(runId);
   if (!run) return { status: 'not_found' };
@@ -183,18 +250,49 @@ export function getRunState(
     };
   }
 
+  // The row alone cannot say whether anything drives the run: resume takes the
+  // lease but leaves a halted row as it is until it exits, and a driver killed
+  // by SIGKILL or the OOM killer leaves the row 'running' with its dead pid as
+  // holder. The lease holder tells them apart, judged by pid and start time so
+  // a pid the kernel has since given to another process does not count.
+  // `conduit run` takes the lease in the same insert that registers the run,
+  // so a launch that dies at any point after registering leaves a dead holder.
+  // A 'running' row with no holder is therefore a row written before that
+  // (a pre-v12 launch), or by a caller that registers without a holder; with
+  // no evidence either way it reads running while it has unfinished cards, and
+  // terminal once it has none, as below.
+  // It is read before the parked check: a resume that takes a parked run's lease
+  // before the gate opens leaves the card `ready` behind the same future
+  // release_at, and that run is being driven, so it reads running.
+  const holder = peekRunLeaseHolder(db, runId);
+  const driven = holder !== null && isLeaseHolderAlive(holder, liveness);
+
   // A parked run's cards are all `ready` or waiting on each other, which would
   // otherwise read as running. The runs row says a park was observed at exit —
   // but it stays stamped until the NEXT exit, so a resume in flight (cards
-  // working) or a gate that has since passed must not still read as parked:
-  // confirm against the cards with the same predicate that stamped the row.
-  if (run.status === 'halted' && run.outcome === 'parked') {
+  // working, or a live holder still waiting on the same gate) or a gate that
+  // has since passed must not still read as parked: confirm against the cards
+  // with the same predicate that stamped the row, and only once no live
+  // process is driving it.
+  if (!driven && run.status === 'halted' && run.outcome === 'parked') {
     const parked = getRunParkedRelease(db, runId, now);
     if (parked !== null) return { status: 'parked', releaseAt: parked.releaseAt, flow: run.flow };
   }
 
-  const hasActive = cards.some((c) => !TERMINAL_STATUSES.has(c.status));
-  if (hasActive) return { status: 'running' };
+  // A failed launch has no cards, so it would otherwise read as terminal. A
+  // live holder is a launch, retry or resume under way, which reads running.
+  // It is checked first because isFailedLaunch does not look at the holder of
+  // a halted row.
+  if (cards.length === 0) {
+    if (driven) return { status: 'running' };
+    if (isFailedLaunch(db, run, liveness)) return { status: 'launch_failed', flow: run.flow };
+  }
 
-  return { status: 'terminal', outcome: run.outcome ?? 'unknown' };
+  const unfinished = cards.filter((c) => !TERMINAL_STATUSES.has(c.status)).length;
+  if (unfinished === 0) return { status: 'terminal', outcome: run.outcome ?? 'unknown' };
+
+  if (!driven && (run.status === 'halted' || holder !== null)) {
+    return { status: 'halted', unfinished, flow: run.flow };
+  }
+  return { status: 'running' };
 }

@@ -26,8 +26,16 @@ import { startWorkerMain } from '../worker/worker-entry';
 import { openConduitDB, DEFAULT_RUN_ID } from '../persistence/db';
 import { validateRunId } from '../run/run-id';
 import { registerRun, computeFingerprint } from '../run/run-registry';
-import { acquireRunLease, releaseRunLease, peekRunLeaseHolder, defaultIsPidAlive } from '../run/run-lock';
-import { getRunState, getRunParkedRelease, formatParkedRun, type RunStateResult } from '../run/run-state';
+import { acquireRunLease, releaseRunLease, peekRunLeaseHolder, isLeaseHolderAlive, leaseClaimFor } from '../run/run-lock';
+import {
+  getRunState,
+  getRunParkedRelease,
+  formatParkedRun,
+  formatHaltedRun,
+  formatLaunchFailedRun,
+  isFailedLaunch,
+  type RunStateResult,
+} from '../run/run-state';
 import {
   checkRunAppendable,
   hasLaterPasses,
@@ -687,6 +695,10 @@ export function formatRunState(runId: string, state: RunStateResult): string {
       return `run ${runId}: held (${state.heldCards.length} held card${state.heldCards.length === 1 ? '' : 's'})`;
     case 'parked':
       return `run ${runId}: ${formatParkedRun(runId, state.flow, state.releaseAt)}`;
+    case 'halted':
+      return `run ${runId}: ${formatHaltedRun(runId, state.flow, state.unfinished)}`;
+    case 'launch_failed':
+      return `run ${runId}: ${formatLaunchFailedRun()}`;
     case 'terminal':
       return `run ${runId}: terminal (outcome=${state.outcome})`;
   }
@@ -1361,16 +1373,30 @@ async function cmdRun(argv: string[], deps: CliDeps): Promise<number> {
   }
 
   // Register the run. On existing → report state and exit. On conflict → error and exit.
+  // A fresh registration takes the run lease in the same insert (issue #83), so
+  // this process holds it from the moment the row exists: a launch killed
+  // before the engine starts leaves its dead pid as holder, which `run status`
+  // reports as halted, never a 'running' row that nothing drives. A failed
+  // launch (no cards, and halted or left 'running' by a dead holder; see
+  // isFailedLaunch) is re-registered in place and comes back 'created' with
+  // `retried`, so the same command seeds and drives it.
   const registration = appendPass
-    ? ({ kind: 'created' } as const)
-    : registerRun(deps.db, effectiveRunId, resolvedFlowPath, fingerprint, projectRoot);
+    ? ({ kind: 'created', retried: false } as const)
+    : registerRun(
+        deps.db,
+        effectiveRunId,
+        resolvedFlowPath,
+        fingerprint,
+        projectRoot,
+        leaseClaimFor(process.pid, deps.now()),
+      );
   if (registration.kind === 'existing') {
     // This path never drives the engine (read-only status report), so it must
     // NOT acquire the run lease — but it's still worth refusing loudly if a
     // different live process currently holds it, rather than printing
     // possibly-stale run state out from under an in-progress run (the original run-lock and busy-retry work).
     const holder = peekRunLeaseHolder(deps.db, effectiveRunId);
-    if (holder !== null && holder.holderPid !== process.pid && defaultIsPidAlive(holder.holderPid)) {
+    if (holder !== null && holder.holderPid !== process.pid && isLeaseHolderAlive(holder)) {
       deps.io.err(formatRunLeaseConflict(effectiveRunId, holder.holderPid));
       return 1;
     }
@@ -1386,6 +1412,47 @@ async function cmdRun(argv: string[], deps: CliDeps): Promise<number> {
     return 1;
   }
   // kind === 'created' — proceed to seed entry card and run engine.
+  if (registration.retried) {
+    deps.io.err(
+      `run: retrying run ${JSON.stringify(effectiveRunId)}: its earlier launch failed before any card was seeded`,
+    );
+  }
+
+  // A launch that fails after registering holds the lease on a row that may
+  // read 'running', and releasing the lease alone would leave exactly the row
+  // `run status` cannot tell from a live run (issue #83). So a failed launch
+  // first records the row halted, then releases the lease. The row is kept
+  // even when nothing was seeded, so the failure stays on record: a halted row
+  // with no cards is a failed launch, which `run status` reports as such and
+  // which the same command retries (registerRun), while a run with its entry
+  // card seeded is an ordinary halt that `conduit resume` picks up. A row that
+  // is not 'running' (an appended pass that failed before its seed
+  // transaction reopened the run) is left as it was. Never throws: it runs on
+  // the way out of a failure, and an error here must not replace the one that
+  // caused it. The record and the release are caught separately, so a failed
+  // record still releases the lease.
+  const abandonLaunch = (): void => {
+    try {
+      if (deps.db.getRun(effectiveRunId)?.status === 'running') {
+        updateRunStatus(deps.db, effectiveRunId, 'halted', 'halted');
+      }
+    } catch (err) {
+      deps.io.err(
+        `run: could not record the failed launch of run ${JSON.stringify(effectiveRunId)}: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+    try {
+      releaseRunLease(deps.db, effectiveRunId, process.pid);
+    } catch (err) {
+      deps.io.err(
+        `run: could not release the run lease of run ${JSON.stringify(effectiveRunId)}: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+  };
 
   // ── Card seeding (FR-9) ───────────────────────────────────────────────────
   let seededCardId: string | null = null;
@@ -1513,9 +1580,10 @@ async function cmdRun(argv: string[], deps: CliDeps): Promise<number> {
         // The lease taken around admitAppendPass's admission check (or, for a
         // fresh run, the run row registerRun just created above) must not
         // outlive this launch either way — a repeat no-op and a genuine
-        // refusal both clean up identically.
-        if (appendPass) {
-          releaseRunLease(deps.db, effectiveRunId, process.pid);
+        // refusal both clean up identically. A retried failed launch keeps
+        // its row, recorded halted again, since that failure is on record.
+        if (appendPass || registration.retried) {
+          abandonLaunch();
         } else {
           deps.db.deleteRun(effectiveRunId);
         }
@@ -1552,6 +1620,7 @@ async function cmdRun(argv: string[], deps: CliDeps): Promise<number> {
           'no runnable card in DB and no --input/--input-inline provided — ' +
             'nothing to seed for this run (use --input <file> to provide the entry data)',
         );
+        abandonLaunch();
         return 1;
       }
     }
@@ -1590,18 +1659,19 @@ async function cmdRun(argv: string[], deps: CliDeps): Promise<number> {
       runArgs.onMessage = pool.onMessage;
     }
   } catch (err) {
-    // The lease acquired in admitAppendPass (or none, on the non-append
-    // path) must not be left held if anything below throws before the
-    // engine-drive try/finally takes ownership of releasing it.
-    if (appendPass) {
-      releaseRunLease(deps.db, effectiveRunId, process.pid);
-    }
+    // The lease taken by registerRun (or by admitAppendPass, for a pass) must
+    // not be left held if anything above throws before the engine-drive
+    // try/finally takes ownership of releasing it, and the row must not be
+    // left reading 'running'.
+    abandonLaunch();
     throw err;
   }
 
   // ── Acquire the per-run advisory lease (the original run-lock and busy-retry work) ──────────────────────────
   // After registration succeeds, before the engine dispatches any work: fail
   // fast (no wait/poll) if another live process is already driving this run.
+  // registerRun (or admitAppendPass) already took the lease for this pid, so
+  // this re-entrant acquire refreshes it rather than contending for it.
   const leaseResult = acquireRunLease(deps.db, effectiveRunId, process.pid, deps.now());
   if (!leaseResult.acquired) {
     deps.io.err(formatRunLeaseConflict(effectiveRunId, leaseResult.holderPid));
@@ -1632,11 +1702,16 @@ async function cmdRun(argv: string[], deps: CliDeps): Promise<number> {
   }
 
   // ── Run the engine ─────────────────────────────────────────────────────────
+  // An engine that throws never reaches recordRunExit below, so it records the
+  // run halted on the way out rather than leaving it 'running' with no holder.
+  let engineReturned = false;
   try {
     await deps.runEngine(runArgs);
+    engineReturned = true;
   } finally {
     pool?.dispose();
-    releaseRunLease(deps.db, effectiveRunId, process.pid);
+    if (engineReturned) releaseRunLease(deps.db, effectiveRunId, process.pid);
+    else abandonLaunch();
   }
 
   // ── Exit code (FR-12): 0 = completed (card at done), 1 = halted ──────────
@@ -1795,6 +1870,20 @@ async function cmdResume(argv: string[], deps: CliDeps): Promise<number> {
   for (const runId of effectiveRunIds) {
     const recordedRun = deps.db.getRun(runId);
     const resumeProjectRoot = projectRootOverride ?? recordedRun?.project_root ?? defaultResumeProjectRoot;
+
+    // A launch that failed before seeding (issue #83) has nothing to resume:
+    // the engine would find no card, and the exit below would record the run
+    // done, which ends any retry of it. The same `conduit run` command is what
+    // retries it, so resume says so instead. Checked before the lease, since
+    // taking it would make a failed launch's dead holder this live process.
+    if (isFailedLaunch(deps.db, recordedRun)) {
+      if (scopedRunId !== undefined) {
+        deps.io.err(`error: run ${JSON.stringify(runId)} has nothing to resume: ${formatLaunchFailedRun()}`);
+        return 1;
+      }
+      deps.io.err(`warning: skipping run ${JSON.stringify(runId)}: ${formatLaunchFailedRun()}`);
+      continue;
+    }
 
     // WI-593 (FR-9): an explicit --project-root override that RE-ANCHORS
     // containment away from the run's recorded root must never be silent —
@@ -3043,7 +3132,9 @@ export function buildProductionDeps(): CliDeps {
           // makes re-drive idempotent: if the original run already exists with
           // an identical fingerprint, `conduit run` reports its state and exits
           // 0 (served → 'spawned'); if another live process holds the run's
-          // lease it exits non-zero ('transient_failure', retried later).
+          // lease it exits non-zero ('transient_failure', retried later). A
+          // run whose launch failed before seeding (issue #83) is retried in
+          // place by registerRun, so re-driving its event seeds and drives it.
           //
           // Pre-v9 rows have no attribution, so the owning flow can only be
           // recovered when the allowlist is unambiguous:

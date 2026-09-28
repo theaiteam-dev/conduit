@@ -708,6 +708,9 @@ describe('issue #26 AC3 — a harness gate critic\'s own spend reaches the run b
     const errText = err.join('\n');
     expect(errText).toMatch(/andon/i);
     expect(errText).toMatch(/token/i);
+    // Issue #83: one halt, one andon line. The station's trip and the tick's
+    // consumption check both saw the same exhausted budget and each printed it.
+    expect(err.filter((l) => l.startsWith('andon:'))).toEqual(['andon: run halted — tokens budget exceeded']);
   });
 
   it('does NOT halt the same flow when the budget is generous — it runs to a rework-cap scrap instead', async () => {

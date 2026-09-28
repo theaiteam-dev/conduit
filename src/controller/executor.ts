@@ -407,6 +407,14 @@ export async function runExecutor(args: RunEngineArgs): Promise<void> {
   let lastAdapterActivityAt = runStartedAt;
   let halted = false;
   let andonTripped = false;
+  // A station's andon trip only ends the tick; it never prints. The consumption
+  // check after the action batch reads the same tokensSpent and currentNow, so
+  // it trips too and prints the one andon line, with the drain and rate-limit
+  // wording (issue #83). That invariant is why onAndonTrip takes no reason; see
+  // ExecuteStationArgs.onAndonTrip.
+  const haltOnStationAndon = (): void => {
+    halted = true;
+  };
   // skip_when (issue #32): 'run' decisions memoized for the lifetime of this
   // runExecutor call, keyed by (card, lane, attempt) — see applySkipWhen.
   const skipWhenRunMemo = new Set<string>();
@@ -1217,10 +1225,7 @@ export async function runExecutor(args: RunEngineArgs): Promise<void> {
           wallClockSeconds,
           maxTokens,
           getTokensSpent: () => tokensSpent,
-          onAndonTrip: (reason: string) => {
-            io.err(`andon: run halted — ${reason}`);
-            halted = true;
-          },
+          onAndonTrip: haltOnStationAndon,
           err: io.err,
           harnessRegistry: args.harnessRegistry,
           foldHarnessUsage,
@@ -1281,10 +1286,7 @@ export async function runExecutor(args: RunEngineArgs): Promise<void> {
               wallClockSeconds,
               maxTokens,
               getTokensSpent: () => tokensSpent,
-              onAndonTrip: (reason: string) => {
-                io.err(`andon: run halted — ${reason}`);
-                halted = true;
-              },
+              onAndonTrip: haltOnStationAndon,
               err: io.err,
               harnessRegistry: args.harnessRegistry,
               foldHarnessUsage,
@@ -1523,7 +1525,15 @@ interface ExecuteStationArgs {
   wallClockSeconds: number;
   maxTokens: number;
   getTokensSpent: () => number;
-  onAndonTrip: (reason: string) => void;
+  /**
+   * Takes no reason (issue #83): every station-level trip below is
+   * checkConsumptionAndon evaluated over the tick's currentNow and the shared
+   * tokensSpent, so the tick-level check that follows the action batch always
+   * re-trips on the same condition and prints the one andon line. A station
+   * that ever halts on a dimension the tick check does not re-read must print
+   * its own line before calling this.
+   */
+  onAndonTrip: () => void;
   /** Error-surfacing channel — forwarded to escalateToHold so in-station escalations are visible on stderr (Change 2). */
   err: (msg: string) => void;
   /**
@@ -1791,7 +1801,8 @@ interface DeterministicArgs {
   wallClockSeconds: number;
   maxTokens: number;
   getTokensSpent: () => number;
-  onAndonTrip: (reason: string) => void;
+  /** See ExecuteStationArgs.onAndonTrip. */
+  onAndonTrip: () => void;
   /**
    * WI-570 follow-up (review #1): threaded through so this maker's
    * `check.critic.harness` (agentic critic) can be resolved by
@@ -2360,7 +2371,8 @@ interface GateCheckOrAdvanceArgs {
   wallClockSeconds: number;
   maxTokens: number;
   getTokensSpent: () => number;
-  onAndonTrip: (reason: string) => void;
+  /** See ExecuteStationArgs.onAndonTrip. */
+  onAndonTrip: () => void;
   /**
    * Engine-config harness adapter registry (WI-560), threaded through so an
    * AGENTIC critic (gateConfig.criticHarness, WI-570) can be resolved by name.
@@ -2914,7 +2926,7 @@ async function runGateCheckOrAdvance(args: GateCheckOrAdvanceArgs): Promise<bool
       { wallClockSeconds, maxTokens },
     );
     if (andon2.tripped) {
-      onAndonTrip(`${andon2.reason} budget exceeded`);
+      onAndonTrip();
       // Card is in 'working', not 'done' — release slot.
       releaseSlot(stateDb, cardId, stationId, runId);
       return false;
@@ -3119,7 +3131,8 @@ interface TransformArgs {
   wallClockSeconds: number;
   maxTokens: number;
   getTokensSpent: () => number;
-  onAndonTrip: (reason: string) => void;
+  /** See ExecuteStationArgs.onAndonTrip. */
+  onAndonTrip: () => void;
   /**
    * WI-570 follow-up (review #1): threaded through so this maker's
    * `check.critic.harness` (agentic critic) can be resolved by
@@ -3393,7 +3406,7 @@ async function executeTransformStation(args: TransformArgs): Promise<boolean> {
       { wallClockSeconds, maxTokens },
     );
     if (andon.tripped) {
-      onAndonTrip(`${andon.reason} budget exceeded`);
+      onAndonTrip();
       // Release the slot so the card doesn't remain stuck in 'working'.
       releaseSlot(stateDb, cardId, stationId, runId);
       return false;
@@ -3587,7 +3600,8 @@ interface HarnessArgs {
   wallClockSeconds: number;
   maxTokens: number;
   getTokensSpent: () => number;
-  onAndonTrip: (reason: string) => void;
+  /** See ExecuteStationArgs.onAndonTrip. */
+  onAndonTrip: () => void;
   harnessRegistry?: HarnessRegistry;
   /** Folds harness-reported usage into the run/wave budget accumulators (WI-567). */
   foldHarnessUsage: (tokens: number) => void;
@@ -4318,7 +4332,7 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
       { wallClockSeconds, maxTokens },
     );
     if (andon.tripped) {
-      onAndonTrip(`${andon.reason} budget exceeded`);
+      onAndonTrip();
       releaseSlot(stateDb, cardId, stationId, runId);
       return false;
     }
@@ -4390,7 +4404,8 @@ interface SubflowArgs {
   wallClockSeconds: number;
   maxTokens: number;
   getTokensSpent: () => number;
-  onAndonTrip: (reason: string) => void;
+  /** See ExecuteStationArgs.onAndonTrip. */
+  onAndonTrip: () => void;
   harnessRegistry?: HarnessRegistry;
   foldHarnessUsage: (tokens: number) => void;
   stampHarnessActivity: () => void;
@@ -4588,7 +4603,7 @@ async function executeSubflowStation(args: SubflowArgs): Promise<boolean> {
       { wallClockSeconds, maxTokens },
     );
     if (andon.tripped) {
-      onAndonTrip(`${andon.reason} budget exceeded`);
+      onAndonTrip();
       releaseSlot(stateDb, cardId, stationId, runId);
       return false;
     }

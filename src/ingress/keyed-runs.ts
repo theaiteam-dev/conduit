@@ -8,7 +8,8 @@
  * accepted event does next, decided here for the hot accept path, the re-drive
  * sweeps, and the pending drain alike:
  *
- *   - no run yet                  → launch pass 1 (`conduit run --run-id`).
+ *   - no run yet, or a launch     → launch pass 1 (`conduit run --run-id`).
+ *     that failed before seeding
  *   - a pass is in flight         → fold the event into the run's PENDING pass
  *     (a launch or resume holds    ('coalesced'). Six events during one pass
  *     one of the run's slots, a    produce ONE trailing pass, not six. The
@@ -51,7 +52,8 @@
  * the spawn seam takes an argv array.
  */
 import type { ConduitDB, IngressEventRecord, KeyedRunRecord } from '../persistence/db';
-import { defaultIsPidAlive, peekRunLeaseHolder } from '../run/run-lock';
+import { isLeaseHolderAlive, peekRunLeaseHolder } from '../run/run-lock';
+import { isFailedLaunch } from '../run/run-state';
 import {
   checkRunAppendable,
   nextPassNumber,
@@ -78,8 +80,13 @@ export interface KeyedRunDeps {
   redriveCap: number;
   /** Listener clock, unix MILLISECONDS. */
   now: () => number;
-  /** Is a recorded lease holder alive? Defaults to the real pid probe. */
+  /** Is a recorded lease holder's pid alive? Defaults to the real pid probe. */
   isPidAlive?: (pid: number) => boolean;
+  /**
+   * A process's start time, compared with the one the lease recorded so a
+   * reused pid is not taken for the holder. Defaults to reading /proc.
+   */
+  processStartTime?: (pid: number) => number | undefined;
   /**
    * Event ids whose launch is in progress in this process (between the slot
    * acquire and the row's mark). The re-drive sweep skips them; one set is
@@ -140,7 +147,7 @@ function passInFlight(deps: KeyedRunDeps, runId: string, beforeEventId: string |
     return 'a resume of this run is in flight';
   }
   const holder = peekRunLeaseHolder(db, runId);
-  if (holder !== null && (deps.isPidAlive ?? defaultIsPidAlive)(holder.holderPid)) {
+  if (holder !== null && isLeaseHolderAlive(holder, deps)) {
     return `process ${holder.holderPid} holds the run lease`;
   }
   if (db.countQueuedIngressForRun(runId, deps.redriveCap, beforeEventId) > 0) {
@@ -155,7 +162,11 @@ function decide(deps: KeyedRunDeps, keyed: KeyedRunRecord, beforeEventId: string
   if (why !== null) return { kind: 'in_flight', why };
 
   const run = db.getRun(keyed.run_id);
-  if (run === null) return { kind: 'launch', pass: 1 };
+  // A launch that failed before seeding (issue #83) left a halted row with no
+  // cards. Pass 1 never ran, so it is launched again as pass 1: a plain
+  // `conduit run --run-id` retries that row in place. The holder is judged by
+  // the same injected probes as passInFlight above.
+  if (run === null || isFailedLaunch(db, run, deps)) return { kind: 'launch', pass: 1 };
   if (run.status === 'halted' && run.outcome === 'parked') return { kind: 'parked' };
 
   const appendable = checkRunAppendable(db, keyed.run_id, Math.floor(deps.now() / 1000));

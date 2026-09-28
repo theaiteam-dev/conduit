@@ -17,6 +17,7 @@
  * state.
  */
 import type { ConduitDB } from '../persistence/db';
+import { isFailedLaunch } from './run-state';
 
 /**
  * Exit code of `conduit run --append-pass` when the run exists but is not in a
@@ -80,7 +81,7 @@ export function hasLaterPasses(db: ConduitDB, runId: string): boolean {
 }
 
 /** Why a run cannot take a pass. */
-export type RunNotAppendableState = 'not_found' | 'running' | 'parked' | 'held' | 'unfinished';
+export type RunNotAppendableState = 'not_found' | 'running' | 'parked' | 'held' | 'unfinished' | 'launch_failed';
 
 export type RunAppendableResult =
   | { ok: true }
@@ -126,6 +127,18 @@ export function checkRunAppendable(db: ConduitDB, runId: string, _nowSeconds: nu
       ok: false,
       state: 'running',
       detail: 'the run has not finished (resume it with conduit resume if its driver crashed)',
+    };
+  }
+
+  // A launch that failed before seeding (issue #83) has no pass to follow:
+  // the launch itself is what needs retrying, and a plain `conduit run` does it.
+  if (isFailedLaunch(db, run)) {
+    return {
+      ok: false,
+      state: 'launch_failed',
+      detail:
+        'its launch failed before any card was seeded; retry it with the same conduit run command, ' +
+        'without --append-pass',
     };
   }
 

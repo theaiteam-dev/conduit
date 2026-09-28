@@ -162,9 +162,13 @@ describe('checkRunAppendable', () => {
     expect(checkRunAppendable(db, 'r', 1_000)).toMatchObject({ ok: false, state: 'unfinished' });
   });
 
-  it('refuses a run with no cards at all', () => {
+  it('refuses a failed launch (halted, no cards), pointing at a plain conduit run to retry it', () => {
+    // Nothing ran, so there is no pass to follow: the launch itself is what
+    // needs retrying, and a plain `conduit run` with the run id does that.
     run('r', 'halted', 'halted');
-    expect(checkRunAppendable(db, 'r', 1_000)).toMatchObject({ ok: false, state: 'unfinished' });
+    const result = checkRunAppendable(db, 'r', 1_000);
+    expect(result).toMatchObject({ ok: false, state: 'launch_failed' });
+    expect(result.ok === false && result.detail).toContain('without --append-pass');
   });
 
   it('refuses a run still recorded running even when its cards are terminal (its driver died before recording the exit)', () => {

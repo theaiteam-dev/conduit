@@ -528,10 +528,20 @@ docker run --rm \
 
 `conduit resume` exits 0 whenever it drove the engine at all, including when
 the run halts or parks again — non-zero is reserved for the reasons it could
-not start (an unknown run, a lease conflict, an unreadable flow). Check the
+not start (an unknown run, a lease conflict, an unreadable flow, a launch that
+failed before seeding). Check the
 run's own state with `conduit run status --run job-1` rather than the resume
-exit code. For a run with `kind: harness` stations, `run status` also prints how
-much of the run's wall clock each harness station held the serial dispatch path
+exit code. A run that stopped with unfinished cards and no process driving it
+reports `halted with N unfinished cards; resume with: conduit resume ...`; while
+a resume holds it, it reports `running`. A `conduit run` that failed after
+registering the run but before seeding its entry card (or was killed during
+seeding) leaves the run on record with no cards, and `run status` reports
+`launch failed before any card was seeded; re-run the same conduit run command
+to retry`. There is nothing to resume, so `conduit resume` refuses it; the
+same `conduit run --run-id job-1 ...` command retries it in place, and may
+carry a corrected `--input`, since nothing ran under the first one. For a run with `kind: harness`
+stations, `run status` also prints how much of the run's wall clock each
+harness station held the serial dispatch path
 (see [`concurrency-demo.md`](./concurrency-demo.md#gotcha-harness-stations-run-one-card-at-a-time)).
 
 Under the operator stack the listener does this for you — it recognises a

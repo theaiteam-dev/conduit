@@ -694,6 +694,49 @@ describe('restart and re-drive', () => {
     expect(launches).toHaveLength(1);
   });
 
+  it('judges the lease holder by pid and start time: a reused pid does not keep the run in flight', async () => {
+    // The run finished, but its row still names a holder (a release that was
+    // lost). The pid answers a probe because another process now has it; its
+    // start time differs from the one the lease recorded.
+    seedFinishedRun();
+    db.getStateDb()
+      .prepare('UPDATE runs SET holder_pid = 4242, lease_acquired_at = 1, holder_start_time = 5000 WHERE run_id = $r')
+      .run({ $r: RUN });
+    acceptRow('ev-a', NOW - 20, { round: 'a' });
+    acceptRow('ev-b', NOW - 10, { round: 'b' });
+    const route = (eventId: string, processStartTime: (pid: number) => number | undefined) =>
+      routeKeyedEvent(
+        {
+          db,
+          spawn: controlledSpawn,
+          alerts: { alert: async (a) => void alerts.push(a), channels: {}, globalAlertChannel: '#ops' },
+          slots: createRunSlots(),
+          redriveCap: 3,
+          now: () => NOW,
+          isPidAlive: () => true,
+          processStartTime,
+          launching: new Set<string>(),
+        },
+        {
+          eventId,
+          runId: RUN,
+          flowId: FLOW_ID,
+          flowPath: FLOW_PATH,
+          substrateJson: db.getIngressEvent(eventId)!.substrate_json!,
+          source: 'test',
+        },
+        'sweep',
+      );
+
+    // Same start time: the holder is the process that took the lease.
+    expect(await route('ev-a', () => 5000)).toEqual({ outcome: 'coalesced', runId: RUN });
+    expect(launches).toHaveLength(0);
+
+    // Different start time: the pid was reused, so nothing drives the run.
+    expect(await route('ev-b', () => 9999)).toEqual({ outcome: 'accepted', runId: RUN, pass: 2 });
+    expect(launches).toHaveLength(1);
+  });
+
   it('launches a pending pass recorded before a listener restart', async () => {
     seedFinishedRun();
     acceptRow('ev-pending', NOW - 10, { round: 2 });
@@ -749,6 +792,24 @@ describe('restart and re-drive', () => {
     expect(launches).toHaveLength(1);
     expect(launches[0]!.appendPass).toBeUndefined();
     expect(stampedInput(0)).toMatchObject({ pass: 1 });
+  });
+
+  it('re-drives a first event whose launch failed before seeding as pass 1 again, not as a refused pass', async () => {
+    // Issue #83: a launch that failed before seeding any card leaves the run
+    // halted with zero cards. There is no pass to follow, and a plain
+    // `conduit run --run-id` retries it, so the router launches pass 1.
+    db.upsertKeyedRun({ runId: RUN, flowId: FLOW_ID, flowPath: FLOW_PATH, runKey: ['acme/widgets', '7'], maxPasses: undefined });
+    acceptRow('ev-first', NOW - 10, { round: 1 });
+    db.markIngressFailed('ev-first');
+    db.insertRun({ run_id: RUN, flow: FLOW_PATH, input_fingerprint: 'fp', status: 'halted', outcome: 'halted' });
+
+    await boot(makeFlow(keyedIngress()));
+
+    expect(launches).toHaveLength(1);
+    expect(launches[0]!.appendPass).toBeUndefined();
+    expect(launches[0]!.passEvents).toEqual(['ev-first']);
+    expect(stampedInput(0)).toMatchObject({ pass: 1 });
+    expect(db.getIngressLog({ outcome: 'run_not_appendable' })).toHaveLength(0);
   });
 
   it('folds a second event for a run whose first event is still queued, instead of queueing both', async () => {
@@ -1123,6 +1184,34 @@ describe('a failed launch leaves the pending pointer for the next sweep, not orp
       return controlledSpawn(invocation);
     };
   }
+
+  it('judges a failed launch with the injected liveness probe, not the real one', async () => {
+    // A launch left 'running' with no cards. Its recorded holder is this test
+    // process, which the real probe finds alive, but the injected probe says
+    // is dead, so the router must relaunch pass 1.
+    db.insertRun({ run_id: RUN, flow: FLOW_PATH, input_fingerprint: 'fp', status: 'running' });
+    db.getStateDb()
+      .prepare('UPDATE runs SET holder_pid = $pid, lease_acquired_at = 1, holder_start_time = NULL WHERE run_id = $r')
+      .run({ $pid: process.pid, $r: RUN });
+    db.upsertKeyedRun({ runId: RUN, flowId: FLOW_ID, flowPath: FLOW_PATH, runKey: ['acme/widgets', '7'], maxPasses: undefined });
+    acceptRow('ev-a', NOW - 10, { round: 'a' });
+
+    const routed = await routeKeyedEvent(
+      { ...makeDrainDeps(controlledSpawn), isPidAlive: () => false },
+      {
+        eventId: 'ev-a',
+        runId: RUN,
+        flowId: FLOW_ID,
+        flowPath: FLOW_PATH,
+        substrateJson: db.getIngressEvent('ev-a')!.substrate_json!,
+        source: 'test',
+      },
+      'sweep',
+    );
+
+    expect(routed).toEqual({ outcome: 'accepted', runId: RUN, pass: 1 });
+    expect(launches).toHaveLength(1);
+  });
 
   it('keeps the pending pointer set when the launch spawn fails, so the folded event stays drainable', async () => {
     seedFinishedRun();

@@ -183,6 +183,14 @@ describe('conduit run — lease held by a live process (scenario 1)', () => {
   });
 });
 
+/** An entry card left mid-flow, so a halted run reads as an ordinary halt rather than a failed launch. */
+function insertUnfinishedCard(runId: string): void {
+  db.insertCard({
+    run_id: runId, id: `entry-${runId}`, parent_id: null, lane: 'work', status: 'ready',
+    attempt: 0, wave: 0, owned_paths: [], rework_count: 0,
+  });
+}
+
 // ===========================================================================
 // Scenario 2 — conduit resume reclaims a lease held by a certainly-dead pid
 // ===========================================================================
@@ -194,6 +202,9 @@ describe('conduit resume — lease held by a dead process (scenario 2)', () => {
     const stalePid = deadPid();
 
     db.insertRun({ run_id: 'resumable-run', flow: flowPath, input_fingerprint: 'fp', status: 'halted' });
+    // A halted run with no card is a failed launch, which resume refuses;
+    // this one halted with its entry card unfinished.
+    insertUnfinishedCard('resumable-run');
     setHolder('resumable-run', stalePid);
 
     const code = await main(
@@ -262,6 +273,9 @@ describe('conduit resume — bare sweep with a mix of held and free runs (scenar
       status: 'halted',
     });
 
+    insertUnfinishedCard('held-sweep-run');
+    insertUnfinishedCard('free-sweep-run');
+
     const holder = spawnAliveHolder();
     try {
       setHolder('held-sweep-run', holder.pid);
@@ -309,6 +323,7 @@ describe('conduit resume — bare sweep with a mix of held and free runs (scenar
       input_fingerprint: fingerprint,
       status: 'halted',
     });
+    insertUnfinishedCard('held-explicit-run');
 
     const holder = spawnAliveHolder();
     try {

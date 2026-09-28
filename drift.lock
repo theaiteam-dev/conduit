@@ -8,12 +8,12 @@ sig = "c589b70ef7bb72cd"
 [[bindings]]
 doc = "CLAUDE.md"
 target = "src/controller/executor.ts#runExecutor"
-sig = "a5f138205d6821b9"
+sig = "963aca840f24ee89"
 
 [[bindings]]
 doc = "CLAUDE.md"
 target = "src/persistence/db.ts#SCHEMA_VERSION"
-sig = "c22cd2dc051a0328"
+sig = "6af79b5e2d52ef3d"
 
 [[bindings]]
 doc = "SPEC.md"
@@ -53,7 +53,7 @@ sig = "9e1b191a9ef4e321"
 [[bindings]]
 doc = "SPEC.md"
 target = "src/run/run-passes.ts#checkRunAppendable"
-sig = "3fa95a3989816d79"
+sig = "ffc4f3ef78e5b7ae"
 
 [[bindings]]
 doc = "SPEC.md"
@@ -73,4 +73,4 @@ sig = "bd240b0922e20e22"
 [[bindings]]
 doc = "docs/installation.md"
 target = "src/cli/main.ts"
-sig = "7386a7ac13606bc6"
+sig = "b8bb00955562b460"

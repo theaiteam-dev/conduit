@@ -120,7 +120,8 @@ export interface RedriveDeps {
   /**
    * Keyed-run routing (issue #36). A row whose run is keyed is not relaunched
    * through `respawn`: a plain `conduit run --run-id <existing>` is a no-op
-   * for a run that already exists, so the row goes through the keyed router,
+   * for a run that already exists (unless its launch failed before seeding,
+   * which it retries), so the row goes through the keyed router,
    * which launches it as the next pass (`--append-pass`), folds it into a
    * pass in flight, or refuses it. The router does its own bookkeeping.
    * Absent: keyed rows take the unkeyed path (unit-level drivers only).
