@@ -174,8 +174,8 @@ afterEach(() => {
   rmSync(projectDir, { recursive: true, force: true });
 });
 
-async function run(flow: FlowConfig, registry: HarnessRegistry): Promise<void> {
-  let clock = 1000;
+async function run(flow: FlowConfig, registry: HarnessRegistry, startSeconds = 1000): Promise<void> {
+  let clock = startSeconds;
   await runExecutor({
     db: db!, flow, now: () => clock, sleep: async (ms: number) => { clock += Math.max(1, Math.ceil(ms / 1000)); },
     adapter: throwingModel, io, harnessRegistry: registry,
@@ -264,5 +264,23 @@ describe('issue #71: the gate critic journals its events', () => {
     expect([...byInvocation.keys()]).toEqual([makerSpan.invocationId!, criticSpan.invocationId!]);
     expect(byInvocation.get(criticSpan.invocationId!)).toContain('verdict.json');
     expect(JSON.stringify(rows)).not.toContain('SECRET');
+  });
+});
+
+describe('issue #71: event rows take their time from the executor\'s injected clock', () => {
+  it('stamps at_ms from now() (seconds) for the maker and the critic, not the wall clock', async () => {
+    db = openDb();
+    const maker = makeMaker(['ok']);
+    const critic = makeCritic();
+    const registry = createHarnessRegistry([maker.adapter, critic.adapter]);
+    const flow = writeFlow(projectDir, registry, { gated: true });
+    seedCard(db);
+
+    // No retry or park in this run, so the virtual clock never advances.
+    await run(flow, registry, 4242);
+
+    const rows = db.getHarnessEventsForRun(DEFAULT_RUN_ID, 'entry');
+    expect(new Set(rows.map((r) => r.invocationId)).size).toBe(2);
+    expect(rows.map((r) => r.atMs)).toEqual(rows.map(() => 4_242_000));
   });
 });

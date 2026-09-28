@@ -5,8 +5,8 @@
  * Each harness span (`<station>.harness`, `<station>.harness-critic`) is
  * followed by the event rows of the invoke() it reports on, joined by
  * invocation id and printed in seq order. Events of an invocation that has
- * no span yet (the call is still running, or the kernel died mid-call) print
- * after the spans, under a line that names the invocation. That is how tail
+ * no span (the call is still running, or it never finished) print after the
+ * spans, under a line that names the invocation and says `(no span)`. That is how tail
  * follows a live attempt: each run of tail shows the rows written so far,
  * before the span exists. Both commands stay read-only.
  */
@@ -135,7 +135,7 @@ describe('journal tail follows a live attempt', () => {
     db.appendHarnessEvent(event('inv-live', 1, { kind: 'tool-input-available', toolCallId: 't1', toolName: 'Read', path: 'src/a.ts' }));
 
     let lines = await journal('tail');
-    const header = lines.findIndex((l) => l.includes('inv-live') && l.includes('no span yet'));
+    const header = lines.findIndex((l) => l.includes('inv-live') && l.includes('(no span)'));
     expect(header).toBeGreaterThan(lines.findIndex((l) => l.endsWith(' coder.harness')));
     expect(lines.slice(header + 1)).toHaveLength(2);
     expect(lines[header + 2]).toContain('#1 tool-input-available Read path=src/a.ts');
@@ -148,7 +148,7 @@ describe('journal tail follows a live attempt', () => {
     // The call returns and its span is written: the rows move under it.
     span('coder.harness', 'inv-live');
     lines = await journal('tail');
-    expect(lines.some((l) => l.includes('no span yet'))).toBe(false);
+    expect(lines.some((l) => l.includes('(no span)'))).toBe(false);
     expect(lines[lines.length - 4]).toMatch(/ coder\.harness$/);
     expect(lines[lines.length - 1]).toContain('#2 tool-output-available ok');
   });

@@ -37,11 +37,12 @@ historical context, not public releases or public repository history.
   Rows carry the tool name, the path touched, `is_error`, a nullable exit
   code (parsed from a failed Bash call's `Exit code N` string, or the
   process exit on `lifecycle` end), usage, rate-limit windows and a receive
-  timestamp. No prompt text and no tool input or output body is stored.
+  timestamp from the executor's clock. No prompt text and no tool input or output body is stored.
   Harness journal spans gain an `invocation_id` column so rows join to their
   span. `conduit journal inspect` and `conduit journal tail` print each
-  harness span's rows beneath it, and the rows of a call that has no span
-  yet after the spans, so re-running `tail` follows a live call. Both stay
+  harness span's rows beneath it, and the rows of a call with no span after
+  the spans, labelled `(no span)`: a live call, so re-running `tail` follows
+  it, or a call that never finished. Both stay
   read-only. An existing journal gains the table and column when it opens.
 - One ingress run per external subject
   ([#36](https://github.com/theaiteam-dev/conduit/issues/36)). A webhook
