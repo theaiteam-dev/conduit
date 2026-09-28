@@ -202,12 +202,25 @@ export function getRunState(
     };
   }
 
+  // The row alone cannot say whether anything drives the run: resume takes the
+  // lease but leaves a halted row as it is until it exits, and a driver killed
+  // by SIGKILL or the OOM killer leaves the row 'running' with its dead pid as
+  // holder. The lease holder tells them apart. A 'running' row with no holder is
+  // a run between registerRun and acquireRunLease, so it still reads running.
+  // It is read before the parked check: a resume that takes a parked run's lease
+  // before the gate opens leaves the card `ready` behind the same future
+  // release_at, and that run is being driven, so it reads running.
+  const holder = peekRunLeaseHolder(db, runId);
+  const driven = holder !== null && isPidAlive(holder.holderPid);
+
   // A parked run's cards are all `ready` or waiting on each other, which would
   // otherwise read as running. The runs row says a park was observed at exit —
   // but it stays stamped until the NEXT exit, so a resume in flight (cards
-  // working) or a gate that has since passed must not still read as parked:
-  // confirm against the cards with the same predicate that stamped the row.
-  if (run.status === 'halted' && run.outcome === 'parked') {
+  // working, or a live holder still waiting on the same gate) or a gate that
+  // has since passed must not still read as parked: confirm against the cards
+  // with the same predicate that stamped the row, and only once no live
+  // process is driving it.
+  if (!driven && run.status === 'halted' && run.outcome === 'parked') {
     const parked = getRunParkedRelease(db, runId, now);
     if (parked !== null) return { status: 'parked', releaseAt: parked.releaseAt, flow: run.flow };
   }
@@ -215,13 +228,6 @@ export function getRunState(
   const unfinished = cards.filter((c) => !TERMINAL_STATUSES.has(c.status)).length;
   if (unfinished === 0) return { status: 'terminal', outcome: run.outcome ?? 'unknown' };
 
-  // The row alone cannot say whether anything drives the run: resume takes the
-  // lease but leaves a halted row as it is until it exits, and a driver killed
-  // by SIGKILL or the OOM killer leaves the row 'running' with its dead pid as
-  // holder. The lease holder tells them apart. A 'running' row with no holder is
-  // a run between registerRun and acquireRunLease, so it still reads running.
-  const holder = peekRunLeaseHolder(db, runId);
-  const driven = holder !== null && isPidAlive(holder.holderPid);
   if (!driven && (run.status === 'halted' || holder !== null)) {
     return { status: 'halted', unfinished, flow: run.flow };
   }

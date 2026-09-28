@@ -576,6 +576,34 @@ describe('getRunState — parked (issue #7)', () => {
     expect(getRunState(db, 'r', 1300)).toEqual({ status: 'halted', unfinished: 1, flow: '/flows/vertical.yaml' });
   });
 
+  it('reports running, not parked, when a live process holds the lease ahead of the gate (#88)', () => {
+    // conduit resume can acquire a parked run's lease before its provider gate
+    // opens: the card is still ready behind a future release_at, so the row
+    // still reads outcome='parked' and the card shape still satisfies
+    // getRunParkedRelease. Without a holder check, run status would offer a
+    // second resume command while the first one is already driving the run.
+    db.insertRun({ run_id: 'r', flow: '/flows/vertical.yaml', input_fingerprint: 'fp', status: 'halted', outcome: 'parked' });
+    db.insertCard(makeCard('r', 'c1'));
+    parkCard(makeCard('r', 'c1'), 1300);
+    holdLease('r', 4242);
+    expect(getRunState(db, 'r', 1000, () => true)).toEqual({ status: 'running' });
+  });
+
+  it('still reports parked when the recorded lease holder is dead', () => {
+    db.insertRun({ run_id: 'r', flow: '/flows/vertical.yaml', input_fingerprint: 'fp', status: 'halted', outcome: 'parked' });
+    db.insertCard(makeCard('r', 'c1'));
+    parkCard(makeCard('r', 'c1'), 1300);
+    holdLease('r', 4242);
+    expect(getRunState(db, 'r', 1000, () => false)).toEqual({ status: 'parked', releaseAt: 1300, flow: '/flows/vertical.yaml' });
+  });
+
+  it('still reports parked when no process holds the lease', () => {
+    db.insertRun({ run_id: 'r', flow: '/flows/vertical.yaml', input_fingerprint: 'fp', status: 'halted', outcome: 'parked' });
+    db.insertCard(makeCard('r', 'c1'));
+    parkCard(makeCard('r', 'c1'), 1300);
+    expect(getRunState(db, 'r', 1000)).toEqual({ status: 'parked', releaseAt: 1300, flow: '/flows/vertical.yaml' });
+  });
+
   it('still reports a plain halt as terminal/held, never parked', () => {
     db.insertRun({ run_id: 'r', flow: '/flows/vertical.yaml', input_fingerprint: 'fp', status: 'halted', outcome: 'halted' });
     db.insertCard(makeCard('r', 'c1'));
