@@ -1185,6 +1185,34 @@ describe('a failed launch leaves the pending pointer for the next sweep, not orp
     };
   }
 
+  it('judges a failed launch with the injected liveness probe, not the real one', async () => {
+    // A launch left 'running' with no cards. Its recorded holder is this test
+    // process, which the real probe finds alive, but the injected probe says
+    // is dead, so the router must relaunch pass 1.
+    db.insertRun({ run_id: RUN, flow: FLOW_PATH, input_fingerprint: 'fp', status: 'running' });
+    db.getStateDb()
+      .prepare('UPDATE runs SET holder_pid = $pid, lease_acquired_at = 1, holder_start_time = NULL WHERE run_id = $r')
+      .run({ $pid: process.pid, $r: RUN });
+    db.upsertKeyedRun({ runId: RUN, flowId: FLOW_ID, flowPath: FLOW_PATH, runKey: ['acme/widgets', '7'], maxPasses: undefined });
+    acceptRow('ev-a', NOW - 10, { round: 'a' });
+
+    const routed = await routeKeyedEvent(
+      { ...makeDrainDeps(controlledSpawn), isPidAlive: () => false },
+      {
+        eventId: 'ev-a',
+        runId: RUN,
+        flowId: FLOW_ID,
+        flowPath: FLOW_PATH,
+        substrateJson: db.getIngressEvent('ev-a')!.substrate_json!,
+        source: 'test',
+      },
+      'sweep',
+    );
+
+    expect(routed).toEqual({ outcome: 'accepted', runId: RUN, pass: 1 });
+    expect(launches).toHaveLength(1);
+  });
+
   it('keeps the pending pointer set when the launch spawn fails, so the folded event stays drainable', async () => {
     seedFinishedRun();
     acceptRow('ev-a', NOW - 20, { round: 'a' });

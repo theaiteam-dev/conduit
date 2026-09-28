@@ -164,8 +164,9 @@ function decide(deps: KeyedRunDeps, keyed: KeyedRunRecord, beforeEventId: string
   const run = db.getRun(keyed.run_id);
   // A launch that failed before seeding (issue #83) left a halted row with no
   // cards. Pass 1 never ran, so it is launched again as pass 1: a plain
-  // `conduit run --run-id` retries that row in place.
-  if (run === null || isFailedLaunch(db, run)) return { kind: 'launch', pass: 1 };
+  // `conduit run --run-id` retries that row in place. The holder is judged by
+  // the same injected probes as passInFlight above.
+  if (run === null || isFailedLaunch(db, run, deps)) return { kind: 'launch', pass: 1 };
   if (run.status === 'halted' && run.outcome === 'parked') return { kind: 'parked' };
 
   const appendable = checkRunAppendable(db, keyed.run_id, Math.floor(deps.now() / 1000));

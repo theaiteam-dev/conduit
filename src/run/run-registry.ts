@@ -36,6 +36,10 @@ export type RegisterRunResult =
  * the check and the write share one `BEGIN IMMEDIATE` transaction, so two
  * retries of one run cannot both take it. `liveness` probes the recorded
  * holder; tests inject it. `created_at` keeps the first launch's time.
+ *
+ * A caller that omits `holder` gets a 'running' row with no holder, on a fresh
+ * insert and on a retry alike, and `getRunState` reports that row as running
+ * whether or not anything drives it. `conduit run` always passes one.
  */
 export function registerRun(
   db: ConduitDB,
