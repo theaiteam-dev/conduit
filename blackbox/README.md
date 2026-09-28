@@ -49,7 +49,7 @@ user or CI consumer actually sees, not internal implementation details.
 - `harness-critic-budget.test.ts`: the run token budget counts the critic's
   spend (issue #26). Maker alone is under budget, maker plus critic is over,
   and the run halts on the tokens andon; a control run with more budget
-  completes. Holds a `test.todo` for a `run status` bug (see the file).
+  completes. Holds a `test.todo` for a `run status` bug (#83).
 - `harness-idle-timeout.test.ts`: `worker.idle_timeout_seconds` kills a
   silent call, which is retried up to `max_execution_attempts` and then
   scrapped as `harness-idle-timeout`. A `setsid` sleeper spawned by the stub
@@ -60,8 +60,7 @@ user or CI consumer actually sees, not internal implementation details.
   the suite, the same way `test.yml` does, so CI must take the cgroup branch.
 - `harness-rate-limit-park.test.ts`: a blocking provider rate limit parks the
   card with no attempt consumed, and `run status` reports the run parked with
-  its resume command. Holds a `test.todo` for a wall-clock budget bug (see
-  the file).
+  its resume command. Holds a `test.todo` for a wall-clock budget bug (#84).
 - `no-internal-imports.test.ts` + `harness/import-scan.ts` — the zero-imports
   gate (AC-1): a TypeScript-compiler-API scan that fails if any file under
   `blackbox/` imports anything resolving into `src/`.
