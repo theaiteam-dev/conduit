@@ -15,6 +15,7 @@
  * subprocess harness (HEARTBEAT/MARK_DONE) — do not confuse the two.
  */
 
+import { createAgentSdkHarnessAdapter } from './harness-adapter-agent-sdk';
 import { createClaudeHarnessAdapter } from './harness-adapter-claude';
 import { createCodexHarnessAdapter } from './harness-adapter-codex';
 import type { HarnessAdapterConfigDef } from './harness-config';
@@ -424,13 +425,14 @@ const ADAPTER_SPECIFIC_OPTIONS: ReadonlyArray<{
 }> = [
   { field: 'agent', suffix: 'AGENT', adapters: ['claude-headless'] },
   { field: 'pluginDirs', suffix: 'PLUGIN_DIRS', adapters: ['claude-headless'] },
-  { field: 'isolateConfig', suffix: 'ISOLATE_CONFIG', adapters: ['claude-headless'] },
+  { field: 'isolateConfig', suffix: 'ISOLATE_CONFIG', adapters: ['claude-headless', 'agent-sdk'] },
 ];
 
 /** Every adapter the engine ships, keyed by the name a config def can name. */
 const SHIPPED_HARNESS_FACTORIES: Record<string, (config: ShippedAdapterFactoryConfig) => HarnessAdapter> = {
   'claude-headless': createClaudeHarnessAdapter,
   'codex-exec': createCodexHarnessAdapter,
+  'agent-sdk': createAgentSdkHarnessAdapter,
 };
 
 /**

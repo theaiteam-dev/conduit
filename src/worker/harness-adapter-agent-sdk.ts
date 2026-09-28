@@ -1,0 +1,422 @@
+/**
+ * agent-sdk harness adapter (issue #21).
+ *
+ * Runs the Claude Code CLI through `@anthropic-ai/claude-agent-sdk` `query()`
+ * so the kernel can decide every tool call before it runs. The decision is the
+ * per-invocation `HarnessInvocation.gate`, called from a `hooks.PreToolUse`
+ * callback through `callGateFailClosed`. The hook fires for the main agent and
+ * for subagents, and an `allowedTools` rule does not bypass it. A hook denial
+ * does not appear in `result.permission_denials`, so this adapter emits its own
+ * `gate-decision` event for every call the gate sees.
+ *
+ * The loop stays the CLI's own. This is a pre-execution decision on each call,
+ * not the Law-grade Tool-Bridge (SPEC §7, step 9b).
+ *
+ * Process ownership. The SDK would spawn the CLI itself and kill only the
+ * immediate child. `spawnClaudeCodeProcess` hands the spawn back to this
+ * adapter, which starts the CLI detached (its own session and process group),
+ * inside its own cgroup where the host allows it, registers it with
+ * `trackProcessGroup`, and ends it with the same `killContained` the harness
+ * runner uses. That reaches a descendant that called `setsid()`, as every
+ * Claude Code Bash-tool command does (issue #77).
+ *
+ * `Options.env` is not merged with `process.env`: the SDK passes the spawn hook
+ * exactly the env given plus three of its own variables, so the whole
+ * allowlisted env is built here, as the claude-headless adapter builds it.
+ *
+ * Not implemented here: named agents (`agent`, `pluginDirs`), session resume.
+ * Every invocation is a fresh session.
+ */
+
+import { spawn as nodeSpawn, type ChildProcess } from 'node:child_process';
+import { isAbsolute } from 'node:path';
+import type { HookCallback, Options, SDKMessage, SpawnOptions, SpawnedProcess } from '@anthropic-ai/claude-agent-sdk';
+import type {
+  HarnessAdapter, HarnessInvocation, HarnessResult, BinaryProbe, RateLimitSnapshot, RateLimitWindow,
+} from './harness-adapter';
+import {
+  buildKnownUsage, bindingResetAtMs, isRateLimited, type ClaudeResultPayload,
+} from './harness-adapter-claude';
+import { createHarnessEventEmitter } from './harness-events';
+import { mapClaudeStreamMessage, rateLimitWindowsFromInfo, type ClaudeRateLimitInfo } from './harness-events-claude';
+import { HARNESS_GATE_HOLD_CODE, callGateFailClosed, type GateDecision } from './harness-gate';
+import { buildHarnessChildEnv } from './harness-runner';
+import { createRunScopedClaudeConfigDir, removeRunScopedClaudeConfigDir } from './claude-config-isolation';
+import { killContained, trackProcessGroup, untrackProcessGroup } from './process-group';
+import { prepareContainedCommand, removeCgroup, resolveContainment, type Containment } from './cgroup-containment';
+import { existsSync, statSync } from 'node:fs';
+
+/** The part of the SDK's `Query` this adapter uses. */
+export type AgentSdkQuery = AsyncIterable<SDKMessage> & { close?(): void };
+
+/** The SDK's `query()` as this adapter calls it. Injected by tests. */
+export type AgentSdkQueryFn = (params: { prompt: string; options: Options }) => AgentSdkQuery;
+
+export interface AgentSdkHarnessAdapterConfig {
+  /** Absolute project root: the CLI's cwd. */
+  projectRoot: string;
+  /** Env var names visible to the child (NFR-Security-2), sourced from engine config. */
+  envAllowlist: string[];
+  /** Claude Code binary. Defaults to `claude`, resolved on PATH. A path is used as given. */
+  command?: string;
+  /** Default model. A station's own model wins. */
+  model?: string;
+  /**
+   * Point the child at a run-scoped CLAUDE_CONFIG_DIR holding only a link to
+   * the operator's credentials (issue #29). Off by default.
+   */
+  isolateConfig?: boolean;
+  /** Kernel env used to resolve the allowlist, PATH lookup and credentials. Defaults to process.env. */
+  sourceEnv?: Record<string, string | undefined>;
+  /** Injected `query()`, for tests. Defaults to the SDK's, imported on first use. */
+  query?: AgentSdkQueryFn;
+  /** Injected binary-presence probe, for tests. */
+  probe?: () => Promise<BinaryProbe>;
+  /** Injected containment mechanism, for tests. Defaults to the process-wide detection. */
+  containment?: Containment;
+}
+
+/** Longest wait for the killed CLI's `exit` event before the adapter gives up on it. */
+const EXIT_WAIT_MS = 5_000;
+/** Bytes of the child's stderr kept for rate-limit detection and error detail. */
+const STDERR_TAIL_BYTES = 2_000;
+
+function fail(reason: string, code?: string, detail?: Record<string, unknown>): never {
+  throw Object.assign(new Error(`agent-sdk: ${reason}`), code !== undefined ? { code } : {}, detail ?? {});
+}
+
+/** The `claude` a bare name resolves to on `sourceEnv`'s PATH, or a given path. Files only, never a shell function. */
+function resolveExecutable(command: string, sourceEnv: Record<string, string | undefined>): string | null {
+  if (command.includes('/')) return isAbsolute(command) && existsSync(command) && statSync(command).isFile() ? command : null;
+  return Bun.which(command, { PATH: sourceEnv.PATH ?? '/usr/bin:/bin' });
+}
+
+interface ActiveChild {
+  pid: number;
+  cgroup: string | undefined;
+  exited: Promise<number | undefined>;
+}
+
+/**
+ * Build the `agent-sdk` adapter. Every collaborator (`query`, `probe`,
+ * `containment`, `sourceEnv`) is injectable so tests never call the API.
+ */
+export function createAgentSdkHarnessAdapter(config: AgentSdkHarnessAdapterConfig): HarnessAdapter {
+  const command = config.command ?? 'claude';
+  const sourceEnv = config.sourceEnv ?? process.env;
+  const probe =
+    config.probe ??
+    (async (): Promise<BinaryProbe> => {
+      const resolved = resolveExecutable(command, sourceEnv);
+      return resolved !== null
+        ? { present: true, detail: resolved }
+        : { present: false, detail: `'${command}' not found on PATH` };
+    });
+
+  return {
+    name: 'agent-sdk',
+    reportsUsage: true,
+    canRestrictTools: true,
+    canGatePerCall: true,
+    model: config.model,
+
+    async probeBinary(): Promise<BinaryProbe> {
+      return probe();
+    },
+
+    async invoke(call: HarnessInvocation): Promise<HarnessResult> {
+      const executable = resolveExecutable(command, sourceEnv);
+      if (executable === null) fail(`'${command}' was not found on PATH`);
+      if (!existsSync(config.projectRoot) || !statSync(config.projectRoot).isDirectory()) {
+        fail(`project root '${config.projectRoot}' does not exist, cannot confine the harness cwd`);
+      }
+      const queryFn: AgentSdkQueryFn = config.query ?? (await import('@anthropic-ai/claude-agent-sdk')).query;
+      const containment = config.containment ?? (await resolveContainment());
+      const model = call.model ?? config.model;
+
+      // Throws before anything is spawned when the child could not authenticate.
+      const configDir =
+        config.isolateConfig === true ? createRunScopedClaudeConfigDir(sourceEnv, config.envAllowlist) : undefined;
+      const env: Record<string, string> = {
+        ...buildHarnessChildEnv(config.envAllowlist, sourceEnv),
+        ...(configDir !== undefined ? { CLAUDE_CONFIG_DIR: configDir } : {}),
+      };
+
+      const emit = call.onEvent !== undefined ? createHarnessEventEmitter(call.onEvent) : undefined;
+      const abortController = new AbortController();
+      // Mutated from callbacks, so held in an object: a bare `let` would be narrowed to its initial value.
+      const st: {
+        active: ActiveChild | undefined;
+        held: { code: string; reason: string; toolName: string } | undefined;
+        stderrTail: string;
+        timedOut: boolean;
+        idledOut: boolean;
+        finished: boolean;
+      } = { active: undefined, held: undefined, stderrTail: '', timedOut: false, idledOut: false, finished: false };
+      const killAll = (): void => {
+        if (st.active !== undefined) killContained(st.active.pid, st.active.cgroup);
+      };
+
+      const spawnClaudeCodeProcess = (opts: SpawnOptions): SpawnedProcess => {
+        const childEnv: Record<string, string> = {};
+        for (const [name, value] of Object.entries(opts.env)) if (value !== undefined) childEnv[name] = value;
+        const contained = prepareContainedCommand(containment, [opts.command, ...opts.args], {
+          ...(opts.cwd !== undefined ? { cwd: opts.cwd } : {}),
+          env: childEnv,
+        });
+        let child: ChildProcess;
+        try {
+          child = nodeSpawn(contained.argv[0]!, contained.argv.slice(1), {
+            ...(opts.cwd !== undefined ? { cwd: opts.cwd } : {}),
+            env: childEnv,
+            // setsid(): the CLI leads its own session and group, so its pid addresses the whole group.
+            detached: true,
+            stdio: ['pipe', 'pipe', 'pipe'],
+          });
+        } catch (err) {
+          if (contained.cgroup !== undefined) void removeCgroup(contained.cgroup);
+          throw err;
+        }
+        if (child.pid === undefined) {
+          if (contained.cgroup !== undefined) void removeCgroup(contained.cgroup);
+          throw new Error(`agent-sdk: failed to spawn '${opts.command}'`);
+        }
+        const pid = child.pid;
+        trackProcessGroup(pid, contained.cgroup);
+        const exited = new Promise<number | undefined>((resolve) => {
+          child.once('exit', (code) => resolve(code ?? undefined));
+          child.once('error', () => resolve(undefined));
+        });
+        st.active = { pid, cgroup: contained.cgroup, exited };
+        child.stderr?.on('data', (chunk: Buffer) => {
+          st.stderrTail = (st.stderrTail + chunk.toString('utf-8')).slice(-STDERR_TAIL_BYTES);
+        });
+        // The SDK's own signal fires after its stdin-EOF grace; the kill is what ends the tree.
+        opts.signal.addEventListener('abort', killAll, { once: true });
+        return child as unknown as SpawnedProcess;
+      };
+
+      // The gate. Absent, every call is denied: an adapter that can gate must never run ungated.
+      const preToolUse: HookCallback = async (input, toolUseId) => {
+        if (input.hook_event_name !== 'PreToolUse') return { continue: true };
+        const toolCallId = toolUseId ?? input.tool_use_id;
+        const decision: GateDecision =
+          call.gate !== undefined
+            ? callGateFailClosed(call.gate, {
+                toolName: input.tool_name,
+                input: input.tool_input,
+                toolCallId,
+                ...(input.agent_id !== undefined ? { agentId: input.agent_id } : {}),
+                ...(input.agent_type !== undefined ? { agentType: input.agent_type } : {}),
+              })
+            : { decision: 'deny', code: 'gate_error', reason: 'no tool gate was supplied for this invocation' };
+        emit?.({
+          type: 'gate-decision',
+          toolCallId,
+          toolName: input.tool_name,
+          decision: decision.decision,
+          ...(decision.decision !== 'allow' ? { code: decision.code, reason: decision.reason } : {}),
+          ...(input.agent_id !== undefined ? { agentId: input.agent_id } : {}),
+        });
+        // Allow returns no permissionDecision, so the SDK's normal permission flow continues and
+        // `allowedTools` decides. Returning 'allow' here would grant what no rule granted.
+        if (decision.decision === 'allow') return { continue: true };
+        if (decision.decision === 'hold' && st.held === undefined) {
+          st.held = { code: decision.code, reason: decision.reason, toolName: input.tool_name };
+          // After the deny has been returned: end the process, gracefully then by force.
+          setImmediate(() => {
+            abortController.abort();
+            killAll();
+          });
+        }
+        return {
+          hookSpecificOutput: {
+            hookEventName: 'PreToolUse',
+            permissionDecision: 'deny',
+            permissionDecisionReason: decision.reason,
+          },
+        };
+      };
+
+      const options: Options = {
+        cwd: config.projectRoot,
+        env,
+        pathToClaudeCodeExecutable: executable,
+        settingSources: [],
+        permissionMode: 'default',
+        abortController,
+        spawnClaudeCodeProcess,
+        hooks: { PreToolUse: [{ hooks: [preToolUse] }] },
+        // Defence in depth: the gate is the enforcement. Empty tools is the executor's encoding of a
+        // waived `unrestricted_tools` station and passes no narrowing.
+        ...(call.tools.length > 0 ? { allowedTools: call.tools } : {}),
+        ...(model !== undefined ? { model } : {}),
+      };
+
+      // Stream state.
+      let result: ClaudeResultPayload | null = null;
+      let assistantError: string | undefined;
+      const windowsByName = new Map<string, RateLimitWindow>();
+      let rateLimitStatus: string | undefined;
+      let rateLimitOverage: boolean | undefined;
+      let sawRateLimit = false;
+      const rateLimitSnapshot = (): RateLimitSnapshot | undefined =>
+        sawRateLimit
+          ? {
+              ...(rateLimitStatus !== undefined ? { status: rateLimitStatus } : {}),
+              ...(rateLimitOverage !== undefined ? { usingOverage: rateLimitOverage } : {}),
+              windows: [...windowsByName.values()],
+            }
+          : undefined;
+
+      // Timers, as in runHarnessProcess: wall-clock, plus an idle bound reset by every message.
+      const timer = setTimeout(() => {
+        st.timedOut = true;
+        killAll();
+        abortController.abort();
+      }, call.timeoutMs);
+      let idleTimer: ReturnType<typeof setTimeout> | undefined;
+      const resetIdleTimer = (): void => {
+        if (call.idleTimeoutMs === undefined || st.finished) return;
+        if (idleTimer !== undefined) clearTimeout(idleTimer);
+        idleTimer = setTimeout(() => {
+          if (st.timedOut) return;
+          st.idledOut = true;
+          killAll();
+          abortController.abort();
+        }, call.idleTimeoutMs);
+      };
+      resetIdleTimer();
+
+      emit?.({ type: 'lifecycle', phase: 'start' });
+      let iteratorError: unknown;
+      let stream: AgentSdkQuery | undefined;
+      let exitCode: number | undefined;
+      try {
+        try {
+          stream = queryFn({ prompt: call.prompt, options });
+          let index = 0;
+          for await (const message of stream) {
+            call.onProgress?.();
+            resetIdleTimer();
+            const m = message as unknown as Record<string, unknown>;
+            if (m.type === 'result') result = m as unknown as ClaudeResultPayload;
+            else if (m.type === 'assistant' && typeof m.error === 'string') assistantError = m.error;
+            else if (m.type === 'rate_limit_event' && typeof m.rate_limit_info === 'object' && m.rate_limit_info !== null) {
+              const info = m.rate_limit_info as ClaudeRateLimitInfo;
+              sawRateLimit = true;
+              if (typeof info.status === 'string') rateLimitStatus = info.status;
+              if (typeof info.isUsingOverage === 'boolean') rateLimitOverage = info.isUsingOverage;
+              for (const w of rateLimitWindowsFromInfo(info)) windowsByName.set(w.name, w);
+            }
+            for (const event of mapClaudeStreamMessage(m, index)) emit?.(event);
+            index += 1;
+          }
+        } catch (err) {
+          iteratorError = err;
+        } finally {
+          st.finished = true;
+          clearTimeout(timer);
+          if (idleTimer !== undefined) clearTimeout(idleTimer);
+          try {
+            stream?.close?.();
+          } catch {
+            /* already closed */
+          }
+          // The CLI has ended or is being ended. A descendant it backgrounded may still run: kill the
+          // group and the cgroup before waiting, as the runner does on every exit path (#17).
+          killAll();
+          if (st.active !== undefined) {
+            const child = st.active;
+            exitCode = await Promise.race([
+              child.exited,
+              new Promise<undefined>((r) => setTimeout(() => r(undefined), EXIT_WAIT_MS)),
+            ]);
+            untrackProcessGroup(child.pid);
+            if (child.cgroup !== undefined) await removeCgroup(child.cgroup);
+          }
+        }
+
+        const rateLimit = rateLimitSnapshot();
+        emit?.(
+          st.idledOut && (iteratorError !== undefined || result === null)
+            ? { type: 'lifecycle', phase: 'idle-timeout' }
+            : st.timedOut && (iteratorError !== undefined || result === null)
+              ? { type: 'lifecycle', phase: 'timeout' }
+              : { type: 'lifecycle', phase: 'end', ...(exitCode !== undefined ? { exitCode } : {}) },
+        );
+
+        // A hold wins over everything: a human is asked, and the call's spend is still billed.
+        if (st.held !== undefined) {
+          const usage = buildKnownUsage(result, rateLimit);
+          fail(
+            `the tool gate held the card on ${st.held.toolName} (${st.held.code}): ${st.held.reason}`,
+            HARNESS_GATE_HOLD_CODE,
+            usage !== undefined ? { usage } : undefined,
+          );
+        }
+        const failedOnItsOwn = iteratorError !== undefined || result === null;
+        if (st.idledOut && failedOnItsOwn) {
+          const usage = buildKnownUsage(result, rateLimit);
+          fail(
+            'invocation produced no output for longer than the idle timeout and was killed',
+            'harness-idle-timeout',
+            usage !== undefined ? { usage } : undefined,
+          );
+        }
+        if (st.timedOut && failedOnItsOwn) {
+          const usage = buildKnownUsage(result, rateLimit);
+          fail('invocation exceeded its timeout and was killed', 'harness-timeout', usage !== undefined ? { usage } : undefined);
+        }
+
+        const errorText = iteratorError instanceof Error ? iteratorError.message : iteratorError !== undefined ? String(iteratorError) : '';
+        const resultFailed = result !== null && (result.is_error === true || (result.subtype !== undefined && result.subtype !== 'success'));
+        if (iteratorError !== undefined || resultFailed || result === null) {
+          // Provider cap first: retrying it now cannot work, and the executor parks rather than scraps.
+          if (
+            assistantError === 'rate_limit' ||
+            isRateLimited(result, rateLimit, `${st.stderrTail}\n${errorText}`.trim())
+          ) {
+            const resetAtMs = bindingResetAtMs(rateLimit);
+            const usage = buildKnownUsage(result, rateLimit);
+            fail(`provider rate limit: ${result?.result ?? rateLimit?.status ?? 'no detail reported'}`, 'harness-rate-limited', {
+              ...(resetAtMs !== undefined ? { resetAtMs } : {}),
+              ...(rateLimit !== undefined ? { rateLimit } : {}),
+              ...(usage !== undefined ? { usage } : {}),
+            });
+          }
+          // Authentication is classified on the assistant error or the terminal reason, never on
+          // `subtype`, which reads 'success' for it. It uses the nonzero-exit class the executor
+          // already handles: retrying will not help, and nothing was billed.
+          const authFailed =
+            assistantError === 'authentication_failed' || (result?.is_error === true && result.terminal_reason === 'api_error');
+          const detail = authFailed
+            ? `authentication failed: ${result?.result ?? errorText}`.trim()
+            : result !== null
+              ? `${result.terminal_reason ?? result.subtype ?? 'unknown reason'}: ${result.result ?? errorText}`.trim()
+              : errorText !== ''
+                ? errorText
+                : 'the stream ended without a result message';
+          const usage = buildKnownUsage(result, rateLimit);
+          fail(
+            `exited${exitCode !== undefined ? ` with code ${exitCode}` : ''}: ${detail}`,
+            'harness-nonzero-exit',
+            usage !== undefined ? { usage } : undefined,
+          );
+        }
+
+        if (typeof result.usage !== 'object' || result.usage === null || Array.isArray(result.usage)) {
+          fail('response payload had a missing or malformed usage object');
+        }
+        if (typeof result.total_cost_usd !== 'number') {
+          fail('response payload had a missing or non-numeric total_cost_usd');
+        }
+        const usage = buildKnownUsage(result, rateLimit);
+        if (usage === undefined) fail('response payload had a missing or malformed usage object');
+        return { outputs: [], usage };
+      } finally {
+        if (configDir !== undefined) removeRunScopedClaudeConfigDir(configDir);
+      }
+    },
+  };
+}
