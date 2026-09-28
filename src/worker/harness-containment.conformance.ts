@@ -54,6 +54,7 @@ import {
   SENTINEL_FILE,
   SETSID_PID_FILE,
   SETSID_SENTINEL_FILE,
+  SETSID_SID_FILE,
   setsidContainmentRequired,
 } from './containment-fixture-files';
 
@@ -195,19 +196,13 @@ export function recordedSetsidPid(projectRoot: string): number | undefined {
 }
 
 /**
- * The session id of `pid`, read from /proc (Linux). Undefined when the process
- * is gone or /proc is unavailable.
+ * The session id the setsid grandchild recorded for itself. It equals the
+ * grandchild's pid when it leads its own session, which is what makes it
+ * escape a process-group kill. Recorded by the fixture, so it is available on
+ * every run, however fast the spawn path killed the grandchild.
  */
-function sessionId(pid: number): number | undefined {
-  try {
-    const stat = readFileSync(`/proc/${pid}/stat`, 'utf-8');
-    // Fields after the parenthesised comm: state ppid pgrp session ...
-    const fields = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
-    const sid = Number(fields[3]);
-    return Number.isInteger(sid) ? sid : undefined;
-  } catch {
-    return undefined;
-  }
+function recordedSetsidSession(projectRoot: string): number | undefined {
+  return readPidFile(projectRoot, SETSID_SID_FILE);
 }
 
 /** What `watchSentinelAdvance` observed while the invocation was still running. */
@@ -218,26 +213,12 @@ interface SentinelWatch {
    * invocation settled first without every advance being seen.
    */
   advanced: boolean;
-  /**
-   * The setsid grandchild's session id, read from /proc the first time it
-   * came back defined during the loop, i.e. while the grandchild was still
-   * running. Undefined when the grandchild was already gone at every poll
-   * that could read its pid: /proc has no entry for a dead process, so this
-   * says nothing about its session.
-   */
-  setsidSidWhileRunning: number | undefined;
 }
 
-/**
- * Watch every grandchild's sentinel while the invocation runs, and along the
- * way sample the setsid grandchild's session id so the anti-drift check below
- * reads it while the process is known to still be alive rather than after the
- * spawn path may already have killed it.
- */
+/** Watch every grandchild's sentinel while the invocation runs. */
 async function watchSentinelAdvance(projectRoot: string, settled: () => boolean): Promise<SentinelWatch> {
   const first = new Map<string, number>();
   const advanced = new Set<string>();
-  let setsidSidWhileRunning: number | undefined;
   while (!settled()) {
     for (const { sentinel } of REQUIRED_GRANDCHILDREN) {
       const now = sentinelMtime(projectRoot, sentinel);
@@ -246,16 +227,10 @@ async function watchSentinelAdvance(projectRoot: string, settled: () => boolean)
       if (seen === undefined) first.set(sentinel, now);
       else if (now !== seen) advanced.add(sentinel);
     }
-    if (setsidSidWhileRunning === undefined) {
-      const pid = recordedSetsidPid(projectRoot);
-      if (pid !== undefined) setsidSidWhileRunning = sessionId(pid);
-    }
-    if (advanced.size === REQUIRED_GRANDCHILDREN.length) {
-      return { advanced: true, setsidSidWhileRunning };
-    }
+    if (advanced.size === REQUIRED_GRANDCHILDREN.length) return { advanced: true };
     await sleep(20);
   }
-  return { advanced: false, setsidSidWhileRunning };
+  return { advanced: false };
 }
 
 /** The fixture arguments that make it exit with `code` once its grandchild is running. */
@@ -329,13 +304,8 @@ interface ObservedRun {
    * file outlives the process, so this also answers the fixture started it).
    */
   setsidPid: number | undefined;
-  /**
-   * The setsid grandchild's session id, sampled inside the watch loop while
-   * the invocation was still running. Equal to its pid when it leads its own
-   * session, which is what makes it escape a process-group kill. Undefined
-   * when the grandchild was already dead at every poll that read its pid.
-   */
-  setsidSidWhileRunning: number | undefined;
+  /** The session id the setsid grandchild recorded for itself. */
+  setsidSession: number | undefined;
 }
 
 async function runAndObserve(spawnPath: ContainmentSpawnPath, projectRoot: string): Promise<ObservedRun> {
@@ -356,7 +326,7 @@ async function runAndObserve(spawnPath: ContainmentSpawnPath, projectRoot: strin
     sawGrandchildLive: watch.advanced,
     grandchildPid: recordedPid(projectRoot),
     setsidPid: recordedSetsidPid(projectRoot),
-    setsidSidWhileRunning: watch.setsidSidWhileRunning,
+    setsidSession: recordedSetsidSession(projectRoot),
   };
 }
 
@@ -419,13 +389,10 @@ export function describeContainmentConformance(
           // it while it ran (the pid file outlives the process).
           expect(run.setsidPid, 'setsid grandchild: no pid recorded').toBeDefined();
           const setsidPid = run.setsidPid!;
-          // Its session is checked whenever a poll caught it alive. A
-          // grandchild the spawn path had already killed by then has no /proc
-          // entry, which says nothing about its session; the pid file above
-          // and the sentinel advance still show it started and ran.
-          if (run.setsidSidWhileRunning !== undefined) {
-            expect(run.setsidSidWhileRunning).toBe(setsidPid);
-          }
+          // It led its own session. The fixture records the session id
+          // itself, so this is checked on every run however fast the spawn
+          // path killed the grandchild.
+          expect(run.setsidSession, 'setsid grandchild: session id is not its pid').toBe(setsidPid);
         }
 
         await expectGrandchildReaped(projectRoot);

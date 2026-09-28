@@ -18,7 +18,7 @@
  *
  * This file is not a test file. Bun only runs it when a test spawns it.
  */
-import { existsSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { runDeterministic } from './deterministic';
 import { runHarnessProcess } from './harness-runner';
@@ -37,9 +37,21 @@ const timeoutMs = 600_000;
 // adds no second probe.
 const requiresSetsidContainment = setsidContainmentRequired(await resolveContainment());
 
+/**
+ * Whether `file` holds a pid yet. The fixture's `echo "$pid" > file` creates
+ * the file before it writes the pid, so existence alone is not enough.
+ */
+function pidRecorded(file: string): boolean {
+  try {
+    return readFileSync(join(projectRoot, file), 'utf-8').trim() !== '';
+  } catch {
+    return false;
+  }
+}
+
 function grandchildrenRecorded(): boolean {
-  if (!existsSync(join(projectRoot, PID_FILE))) return false;
-  if (requiresSetsidContainment && !existsSync(join(projectRoot, SETSID_PID_FILE))) return false;
+  if (!pidRecorded(PID_FILE)) return false;
+  if (requiresSetsidContainment && !pidRecorded(SETSID_PID_FILE)) return false;
   return true;
 }
 

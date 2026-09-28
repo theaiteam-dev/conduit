@@ -13,6 +13,8 @@ export const PID_FILE = 'containment.pid';
 export const SENTINEL_FILE = 'containment.sentinel';
 export const SETSID_PID_FILE = 'containment.setsid.pid';
 export const SETSID_SENTINEL_FILE = 'containment.setsid.sentinel';
+/** The setsid grandchild's own session id, which equals its pid when it leads a new session. */
+export const SETSID_SID_FILE = 'containment.setsid.sid';
 
 /**
  * Whether the setsid grandchild must die under `containment`. False only on a

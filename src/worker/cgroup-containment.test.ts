@@ -23,6 +23,7 @@ import {
   killCgroup,
   prepareContainedCommand,
   removeCgroup,
+  removeCgroupsSync,
   type Containment,
 } from './cgroup-containment';
 import { runHarnessProcess } from './harness-runner';
@@ -346,6 +347,19 @@ describe('prepareContainedCommand: the spawn wrapper does not interpolate argv i
 });
 
 describe('cgroup cleanup', () => {
+  it('removeCgroupsSync writes cgroup.kill again while a cgroup stays populated', () => {
+    // A plain directory standing in for a populated cgroup: rmdir fails
+    // (ENOTEMPTY), and cgroup.events reports it populated.
+    const dir = join(scratch, 'stand-in');
+    mkdirSync(dir);
+    writeFileSync(join(dir, 'cgroup.events'), 'populated 1\nfrozen 0\n');
+    writeFileSync(join(dir, 'cgroup.kill'), '');
+
+    removeCgroupsSync([dir], 30);
+
+    expect(readFileSync(join(dir, 'cgroup.kill'), 'utf-8')).toBe('1');
+  });
+
   itWithCgroup('both runners remove their invocation cgroup before returning, on exit and on timeout', async () => {
     await runHarnessProcess({ command: 'sh', args: ['-c', 'exit 0'] }, { projectRoot: scratch, timeoutMs: 5_000 });
     await runHarnessProcess({ command: 'sleep', args: ['5'] }, { projectRoot: scratch, timeoutMs: 200, envAllowlist: ['PATH'] });

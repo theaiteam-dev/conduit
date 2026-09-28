@@ -14,8 +14,9 @@
 # - The setsid grandchild is started with `setsid -f`, so it runs in a new
 #   session and process group, the way Claude Code's Bash tool runs every
 #   command (issue #77). A group kill cannot reach it. It touches
-#   `containment.setsid.sentinel` every 100ms and records its own pid in
-#   `containment.setsid.pid`.
+#   `containment.setsid.sentinel` every 100ms, records its own session id
+#   (field 6 of /proc/self/stat) in `containment.setsid.sid`, and then its
+#   pid in `containment.setsid.pid`, so the pid file implies the session file.
 #
 # Exit mode: `containment-fixture.sh --exit <code>` waits until both
 # grandchildren have touched their sentinels once, then exits with <code>
@@ -56,6 +57,7 @@ has_setsid=
 if command -v setsid >/dev/null 2>&1; then
   has_setsid=1
   setsid -f sh -c '
+    cut -d" " -f6 "/proc/$$/stat" > containment.setsid.sid 2>/dev/null
     echo "$$" > containment.setsid.pid
     while :; do
       touch containment.setsid.sentinel

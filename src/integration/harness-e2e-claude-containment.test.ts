@@ -30,7 +30,7 @@
  *
  * Cost: three haiku calls with one short tool call each.
  */
-import { describe, it, expect } from 'bun:test';
+import { beforeAll, describe, it, expect } from 'bun:test';
 import { existsSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
@@ -206,13 +206,10 @@ async function invokeWatching(
 }
 
 describe.skipIf(!E2E_ENABLED)('Bash-tool commands do not outlive a claude-headless invocation (CONDUIT_E2E_CLAUDE=1)', () => {
-  it(
-    `runs with ${hostContainment.mechanism} containment`,
-    () => {
-      // Not an assertion about the mechanism: the report of which one ran.
-      console.log(`containment: ${JSON.stringify(hostContainment)}`);
-    },
-  );
+  beforeAll(() => {
+    // Not an assertion about the mechanism: the report of which one ran.
+    console.log(`containment: ${JSON.stringify(hostContainment)}`);
+  });
 
   for (const variant of [
     { label: 'the wall-clock timeout', limits: { timeoutMs: 60_000 }, code: 'harness-timeout' },
@@ -278,7 +275,10 @@ describe.skipIf(!E2E_ENABLED)('Bash-tool commands do not outlive a claude-headle
 
         expect(outcome.ok ? 'resolved' : outcome.code).toBe('resolved');
         // The command ran: it wrote the backgrounded sleep's pid.
-        expect(recorded).toBeGreaterThan(1);
+        expect(
+          recorded,
+          'sleep.pid was not written, so the model never ran the Bash command: a model or tool-call failure, not evidence about containment',
+        ).toBeGreaterThan(1);
         // A killed process is a zombie in /proc until init reaps it, and a reused pid could
         // belong to an unrelated process, so this polls and checks the matched process's
         // argv rather than asserting immediately on mere existence.

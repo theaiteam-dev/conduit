@@ -153,7 +153,9 @@ export function killCgroup(
  * but the processes take a moment to exit, and a populated cgroup cannot be
  * removed. Kills again on each retry in case something was mid-fork. Gives up
  * silently after REMOVE_BUDGET_MS; the next kernel's sweep removes the
- * leftover.
+ * leftover. Never rejects: every error is either the goal (ENOENT) or retried
+ * until the deadline, so callers may await it in a catch or finally without
+ * masking the error or result they are handling.
  */
 export async function removeCgroup(dir: string, budgetMs: number = REMOVE_BUDGET_MS): Promise<void> {
   const deadline = Date.now() + budgetMs;
@@ -173,8 +175,9 @@ export async function removeCgroup(dir: string, budgetMs: number = REMOVE_BUDGET
 /**
  * Synchronous `removeCgroup` for the kernel's signal and exit handlers, which
  * cannot await. Blocks for at most `budgetMs` in total across `dirs`, which
- * is normally a few milliseconds: SIGKILLed processes exit promptly. What is
- * still populated at the deadline is left for the next kernel's sweep.
+ * is normally a few milliseconds: SIGKILLed processes exit promptly. Kills
+ * again on each retry, as `removeCgroup` does. What is still populated at the
+ * deadline is left for the next kernel's sweep.
  */
 export function removeCgroupsSync(dirs: readonly string[], budgetMs: number = 250): void {
   const deadline = Date.now() + budgetMs;
@@ -186,7 +189,9 @@ export function removeCgroupsSync(dirs: readonly string[], budgetMs: number = 25
         rmdirSync(dir);
         return false;
       } catch (err) {
-        return (err as { code?: string }).code !== 'ENOENT';
+        if ((err as { code?: string }).code === 'ENOENT') return false;
+        if (isPopulated(dir)) killCgroup(dir);
+        return true;
       }
     });
     if (pending.length === 0 || Date.now() >= deadline) return;

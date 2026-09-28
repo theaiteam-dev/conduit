@@ -159,7 +159,11 @@ namespace, and the kernel's user needs a cgroup it owns. With rootless Podman (w
 `--systemd=always` mounts the container's own cgroup read-write. The engine image runs as
 the non-root `conduit` user, which cannot write the root-owned container cgroup, so start
 the container as root, delegate a subtree to `conduit`, and drop privileges before the
-kernel starts:
+kernel starts. This keeps to the non-root guidance in
+[`deployment-hardening.md`](deployment-hardening.md): under rootless Podman the
+container's root is the unprivileged host service user, it runs only the setup commands,
+and `setpriv` switches to `conduit` before the kernel, so the kernel and every station
+still run as `conduit`:
 
 ```sh
 podman run --systemd=always --user root --entrypoint sh <image> -c '
