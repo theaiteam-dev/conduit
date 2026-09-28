@@ -3981,14 +3981,18 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
           ...(idleTimeoutMs !== undefined ? { idleTimeoutMs } : {}),
           ...(effectiveAgent !== undefined ? { agent: effectiveAgent } : {}),
           // Issue #21: an adapter that gates per call gets this invocation's gate. Owned paths are
-          // enforced by the gate only where the flow opted in, the same condition as the MARK_DONE
-          // integrity gate for the other station kinds; the post-invoke check below stays the backstop.
+          // enforced by the gate only where the flow opted in AND the card declares some, the same
+          // condition as runOwnedPathsIntegrity (empty owned_paths is an opt-out there, so passing []
+          // here would deny every write on a card the integrity check leaves unenforced). The
+          // post-invoke check below stays the backstop.
           ...(harnessAdapter.canGatePerCall === true
             ? {
                 gate: createHarnessToolGate({
                   projectRoot,
                   tools: stationConfig.tools ?? [],
-                  ...(flow.defaults?.enforceOwnedPaths === true ? { ownedPaths: card.owned_paths ?? [] } : {}),
+                  ...(flow.defaults?.enforceOwnedPaths === true && (card.owned_paths ?? []).length > 0
+                    ? { ownedPaths: card.owned_paths }
+                    : {}),
                 }),
               }
             : {}),

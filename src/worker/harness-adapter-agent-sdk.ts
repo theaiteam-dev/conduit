@@ -328,10 +328,15 @@ export function createAgentSdkHarnessAdapter(config: AgentSdkHarnessAdapterConfi
           killAll();
           if (st.active !== undefined) {
             const child = st.active;
+            let exitWait: ReturnType<typeof setTimeout> | undefined;
             exitCode = await Promise.race([
               child.exited,
-              new Promise<undefined>((r) => setTimeout(() => r(undefined), EXIT_WAIT_MS)),
+              new Promise<undefined>((r) => {
+                exitWait = setTimeout(() => r(undefined), EXIT_WAIT_MS);
+              }),
             ]);
+            // An uncleared timer would hold the process open for EXIT_WAIT_MS after every call.
+            clearTimeout(exitWait);
             untrackProcessGroup(child.pid);
             if (child.cgroup !== undefined) await removeCgroup(child.cgroup);
           }

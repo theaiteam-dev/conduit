@@ -101,7 +101,11 @@ function makeCritic(opts: { canGatePerCall?: boolean; hold?: UsageReport } = {})
   return { adapter, calls };
 }
 
-function writeFlow(dir: string, registry: HarnessRegistry, opts: { critic?: boolean; maxTokens?: number } = {}): FlowConfig {
+function writeFlow(
+  dir: string,
+  registry: HarnessRegistry,
+  opts: { critic?: boolean; maxTokens?: number; enforceOwnedPaths?: boolean } = {},
+): FlowConfig {
   mkdirSync(join(dir, 'prompts'), { recursive: true });
   writeFileSync(join(dir, 'prompts', 'coder.md'), 'TASK: {{task.json}}');
   writeFileSync(join(dir, 'prompts', 'verify.md'), 'Check {{result.json}}');
@@ -119,7 +123,7 @@ function writeFlow(dir: string, registry: HarnessRegistry, opts: { critic?: bool
     `
 flow: harness-gate-hold
 project_root: .
-flow_version: 1
+flow_version: 1${opts.enforceOwnedPaths === true ? '\ndefaults:\n  enforce_owned_paths: true' : ''}
 budgets:
   run: { wall_clock_minutes: 10, max_tokens: ${opts.maxTokens ?? 100000} }
   per_card: { max_execution_attempts: 3 }
@@ -147,10 +151,10 @@ stations:
   return loaded.flow;
 }
 
-function seedCard(db: ConduitDB, id: string): void {
+function seedCard(db: ConduitDB, id: string, ownedPaths: string[] = ['task.json', 'result.json']): void {
   db.insertCard({
     run_id: DEFAULT_RUN_ID, id, parent_id: null, lane: 'coder', status: 'ready',
-    attempt: 0, wave: 0, owned_paths: ['task.json', 'result.json'], rework_count: 0,
+    attempt: 0, wave: 0, owned_paths: ownedPaths, rework_count: 0,
   });
 }
 
@@ -300,5 +304,52 @@ describe('issue #21: a gate hold moves the card to hold', () => {
     expect(critic.calls).toHaveLength(1);
     expect(maker.calls).toHaveLength(1);
     expect(getCard(db, 'entry2')?.lane).toBe('coder');
+  });
+});
+
+describe('issue #21: the executor builds the gate from the station, the card and the flow', () => {
+  const write = (path: string) => ({ toolName: 'Write', input: { file_path: path } });
+
+  it('enforces the card owned paths when the flow enforces them and the card declares some', async () => {
+    db = openDb();
+    const { adapter, calls } = makeMaker({ canGatePerCall: true });
+    const registry = createHarnessRegistry([adapter]);
+    seedCard(db, 'entry');
+    await run(writeFlow(dir, registry, { enforceOwnedPaths: true }), registry);
+    const gate = calls[0]!.gate!;
+    expect(gate(write('result.json'))).toEqual({ decision: 'allow' });
+    expect(gate(write('elsewhere.txt'))).toMatchObject({ decision: 'deny', code: 'path_escape' });
+    // The station's tools are the allowlist: Bash is not listed.
+    expect(gate({ toolName: 'Bash', input: { command: 'ls' } })).toMatchObject({ decision: 'deny', code: 'tool_not_allowed' });
+  });
+
+  it('does not enforce owned paths when the flow does not enforce them', async () => {
+    db = openDb();
+    const { adapter, calls } = makeMaker({ canGatePerCall: true });
+    const registry = createHarnessRegistry([adapter]);
+    seedCard(db, 'entry');
+    await run(writeFlow(dir, registry), registry);
+    expect(calls[0]!.gate!(write('elsewhere.txt'))).toEqual({ decision: 'allow' });
+  });
+
+  it('does not enforce owned paths for a card that declares none, as runOwnedPathsIntegrity does not', async () => {
+    db = openDb();
+    const { adapter, calls } = makeMaker({ canGatePerCall: true });
+    const registry = createHarnessRegistry([adapter]);
+    seedCard(db, 'entry', []);
+    await run(writeFlow(dir, registry, { enforceOwnedPaths: true }), registry);
+    expect(calls[0]!.gate!(write('elsewhere.txt'))).toEqual({ decision: 'allow' });
+  });
+
+  it('lets a critic write only its verdict file', async () => {
+    db = openDb();
+    const critic = makeCritic({ canGatePerCall: true });
+    const registry = createHarnessRegistry([makeMaker().adapter, critic.adapter]);
+    seedCard(db, 'entry');
+    await run(writeFlow(dir, registry, { critic: true }), registry);
+    const gate = critic.calls[0]!.gate!;
+    expect(gate(write('verdict.json'))).toEqual({ decision: 'allow' });
+    expect(gate(write(join(dir, 'verdict.json')))).toEqual({ decision: 'allow' });
+    expect(gate(write('result.json'))).toMatchObject({ decision: 'deny', code: 'path_escape' });
   });
 });
