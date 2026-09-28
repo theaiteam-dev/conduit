@@ -16,6 +16,7 @@ import { join } from 'node:path';
 import type { StationGateConfig } from '../types/kernel';
 import type { ModelAdapter } from '../worker/adapter';
 import { resolveHarnessAgent, type HarnessRegistry } from '../worker/harness-adapter';
+import type { HarnessEventSink } from '../worker/harness-events';
 import { DEFAULT_RUN_ID, type ConduitDB, type StoredCardLogEntry } from '../persistence/db';
 import { runGateCheck, runHarnessGateCheck, computeFindingsHash, type CriticUsage } from '../quality/gate';
 import { renderPrompt } from '../flow/render';
@@ -61,6 +62,13 @@ export interface GateReworkInput {
    * critic adapter by name, same as a `kind: harness` maker.
    */
   harnessRegistry?: HarnessRegistry;
+  /**
+   * Issue #71: the stamped event sink for an AGENTIC critic's invoke(),
+   * minted by the executor so the same invocation id lands on the critic's
+   * event rows and its `<station>.harness-critic` span. Unused by a
+   * transform critic.
+   */
+  harnessOnEvent?: HarnessEventSink;
   /** Absolute project root for resolving artifact inputs of the critic prompt. */
   projectRoot: string;
   /**
@@ -197,7 +205,7 @@ function findImmediatelyPriorVerdict(
  *   2. Persisting the decision (card lane/status/rework_count update + slot release).
  */
 export async function runGateRework(input: GateReworkInput): Promise<GateReworkDecision> {
-  const { db, runId, cardId, workerStationId, attempt, maxExecutionAttempts, gateReworkCount, gateConfig, adapter, harnessRegistry, projectRoot, ownedPaths, ownedDirInputs, validBackEdges, capPolicy = 'scrap' } = input;
+  const { db, runId, cardId, workerStationId, attempt, maxExecutionAttempts, gateReworkCount, gateConfig, adapter, harnessRegistry, harnessOnEvent, projectRoot, ownedPaths, ownedDirInputs, validBackEdges, capPolicy = 'scrap' } = input;
 
   // ── Render critic prompt ──────────────────────────────────────────────────
   // The card's scope is threaded so a critic on a child_entry station reads the
@@ -270,6 +278,7 @@ export async function runGateRework(input: GateReworkInput): Promise<GateReworkD
           timeoutMs: gateConfig.criticTimeoutMs ?? DEFAULT_HARNESS_CRITIC_TIMEOUT_MS,
           model: criticModel,
           ...(criticAgent !== undefined ? { agent: criticAgent, agentSha256: criticAgentSha256 } : {}),
+          ...(harnessOnEvent !== undefined ? { onEvent: harnessOnEvent } : {}),
           onReject: gateConfig.onReject,
           validBackEdges,
           tools: gateConfig.criticTools,
