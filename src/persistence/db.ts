@@ -13,6 +13,7 @@
 import { Database } from 'bun:sqlite';
 import type { Card, Status } from '../types/kernel';
 import { withBusyRetry } from './busy-retry';
+import type { RateLimitWindow, UsageBreakdown } from '../worker/harness-adapter';
 
 // ---------------------------------------------------------------------------
 // Read-side trust boundary (finding #12)
@@ -338,6 +339,12 @@ CREATE TABLE IF NOT EXISTS journal (
   prompt_template_version  TEXT,
   agent                    TEXT,
   agent_sha256             TEXT,
+  -- Issue #71: the invocation id the executor minted for the harness call this
+  -- span reports on, maker or critic. harness_events rows carry the same id,
+  -- which is how an event joins to its span: the span is written after the
+  -- call returns, and the events arrive while it runs. NULL on every span
+  -- that is not a harness call, and on every row written before the column.
+  invocation_id            TEXT,
   created_at       INTEGER NOT NULL DEFAULT (unixepoch())
 );
 
@@ -408,6 +415,45 @@ CREATE TABLE IF NOT EXISTS ingress_log (
   reason          TEXT,
   attributes_json TEXT    NOT NULL DEFAULT '{}'
 );
+
+-- harness_events (issue #71): the durable events of one harness invoke() call,
+-- one row per event. Only tool-input-available, tool-output-available, usage,
+-- rate-limit and lifecycle are written; text and reasoning deltas never are.
+-- No prompt text and no tool output bodies: a tool call is recorded by name,
+-- the path it touched and, for a failed Bash call, the exit code parsed from
+-- its error string. Keyed by invocation, not attempt, because a rate-limit
+-- park re-invokes under the same attempt and a gate critic runs under the
+-- maker's; seq restarts at 0 per invocation. A replayed key is ignored.
+-- Created via IF NOT EXISTS so JOURNAL_DDL self-heals an older journal.
+CREATE TABLE IF NOT EXISTS harness_events (
+  id                           INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id                       TEXT    NOT NULL,
+  card_id                      TEXT    NOT NULL,
+  station                      TEXT    NOT NULL,
+  attempt                      INTEGER NOT NULL,
+  invocation_id                TEXT    NOT NULL,
+  seq                          INTEGER NOT NULL,
+  kind                         TEXT    NOT NULL,
+  tool_call_id                 TEXT,
+  tool_name                    TEXT,
+  path                         TEXT,
+  exit_code                    INTEGER,
+  is_error                     INTEGER,
+  tokens                       INTEGER,
+  input_tokens                 INTEGER,
+  output_tokens                INTEGER,
+  cache_read_input_tokens      INTEGER,
+  cache_creation_input_tokens  INTEGER,
+  cost_usd                     REAL,
+  rate_limit_status            TEXT,
+  rate_limit_windows_json      TEXT,
+  phase                        TEXT,
+  -- When the kernel received the event, epoch milliseconds. Orders events
+  -- across invocations; seq orders them within one.
+  at_ms                        INTEGER NOT NULL,
+  UNIQUE(run_id, card_id, station, attempt, invocation_id, seq)
+);
+CREATE INDEX IF NOT EXISTS idx_harness_events_run_card ON harness_events(run_id, card_id);
 `;
 
 // ---------------------------------------------------------------------------
@@ -560,6 +606,11 @@ export interface JournalSpanInput {
   agent?: string;
   /** SHA-256 of that agent's definition file. */
   agentSha256?: string;
+  /**
+   * Issue #71: the invocation id of the harness call this span reports on,
+   * the same id its harness_events rows carry. Omitted on non-harness spans.
+   */
+  invocationId?: string;
 }
 
 /**
@@ -593,6 +644,71 @@ export interface StoredJournalSpan {
   agent?: string | null;
   /** SHA-256 of the agent's definition file; null when the execution ran none. */
   agentSha256?: string | null;
+  /** Invocation id of the harness call (issue #71); null on any other span. */
+  invocationId?: string | null;
+}
+
+/** The harness event kinds the journal keeps (issue #71). Deltas are not among them. */
+export type PersistedHarnessEventKind =
+  | 'tool-input-available'
+  | 'tool-output-available'
+  | 'usage'
+  | 'rate-limit'
+  | 'lifecycle';
+
+/** Input shape for appendHarnessEvent. Fields a kind does not carry are omitted. */
+export interface HarnessEventRowInput {
+  runId: string;
+  cardId: string;
+  station: string;
+  attempt: number;
+  invocationId: string;
+  seq: number;
+  kind: PersistedHarnessEventKind;
+  /** When the kernel received the event, epoch milliseconds. */
+  atMs: number;
+  toolCallId?: string;
+  toolName?: string;
+  /** The file path a tool call touched, when its input or result names one. */
+  path?: string;
+  /**
+   * A failed Bash call's exit code, parsed from its error string, or the
+   * process exit code on a lifecycle `end`. Absent whenever neither is known.
+   */
+  exitCode?: number;
+  /** On tool-output-available only: the harness flagged the result as an error. */
+  isError?: boolean;
+  /** On usage: the total across every token class. */
+  tokens?: number;
+  breakdown?: UsageBreakdown;
+  costUsd?: number;
+  rateLimitStatus?: string;
+  rateLimitWindows?: RateLimitWindow[];
+  /** On lifecycle: start, end, timeout or idle-timeout. */
+  phase?: string;
+}
+
+/** A harness_events row as read back. Absent fields read as null. */
+export interface StoredHarnessEvent {
+  runId: string;
+  cardId: string;
+  station: string;
+  attempt: number;
+  invocationId: string;
+  seq: number;
+  kind: PersistedHarnessEventKind;
+  atMs: number;
+  toolCallId: string | null;
+  toolName: string | null;
+  path: string | null;
+  exitCode: number | null;
+  isError: boolean | null;
+  tokens: number | null;
+  breakdown: UsageBreakdown | null;
+  costUsd: number | null;
+  rateLimitStatus: string | null;
+  rateLimitWindows: RateLimitWindow[] | null;
+  phase: string | null;
 }
 
 /** One harness span's timing, as read by getHarnessTimingsForRun. */
@@ -871,6 +987,32 @@ function toIngressEventRecord(row: RawIngressEventRow): IngressEventRecord {
 
 // ---------------------------------------------------------------------------
 
+/** A harness_events row as SQLite returns it. */
+interface RawHarnessEventRow {
+  run_id: string;
+  card_id: string;
+  station: string;
+  attempt: number;
+  invocation_id: string;
+  seq: number;
+  kind: string;
+  tool_call_id: string | null;
+  tool_name: string | null;
+  path: string | null;
+  exit_code: number | null;
+  is_error: number | null;
+  tokens: number | null;
+  input_tokens: number | null;
+  output_tokens: number | null;
+  cache_read_input_tokens: number | null;
+  cache_creation_input_tokens: number | null;
+  cost_usd: number | null;
+  rate_limit_status: string | null;
+  rate_limit_windows_json: string | null;
+  phase: string | null;
+  at_ms: number;
+}
+
 export interface RunRecord {
   run_id: string;
   flow: string;
@@ -1027,6 +1169,15 @@ export interface ConduitDB {
    * kind (null when the run has none). Read by run/harness-occupancy.ts.
    */
   getHarnessTimingsForRun(runId: string): HarnessTimings;
+  /**
+   * Issue #71: append one durable harness event. INSERT OR IGNORE on the
+   * (run, card, station, attempt, invocation_id, seq) key, so a replay is a
+   * no-op. Wrapped in withBusyRetry: the writer runs inside the harness
+   * stdout drain, and a transient SQLITE_BUSY should not cost the row.
+   */
+  appendHarnessEvent(event: HarnessEventRowInput): void;
+  /** Issue #71: a card's harness events in one run, in insertion order. */
+  getHarnessEventsForRun(runId: string, cardId: string): StoredHarnessEvent[];
   /**
    * Append an ingress event outcome to the observability log (D5, FR-11).
    *
@@ -1448,13 +1599,13 @@ class ConduitDBImpl implements ConduitDB {
             model, input_tokens, output_tokens, cost_usd,
             adapter, duration_ms, usage_unknown,
             cache_read_input_tokens, cache_creation_input_tokens,
-            binding_stamp, prompt_template_version, agent, agent_sha256)
+            binding_stamp, prompt_template_version, agent, agent_sha256, invocation_id)
          VALUES
            ($run_id, $card_id, $station, $attempt, $name, $attributes_json,
             $model, $input_tokens, $output_tokens, $cost_usd,
             $adapter, $duration_ms, $usage_unknown,
             $cache_read_input_tokens, $cache_creation_input_tokens,
-            $binding_stamp, $prompt_template_version, $agent, $agent_sha256)`,
+            $binding_stamp, $prompt_template_version, $agent, $agent_sha256, $invocation_id)`,
       )
       .run({
         $run_id: span.runId,
@@ -1476,7 +1627,94 @@ class ConduitDBImpl implements ConduitDB {
         $prompt_template_version: span.promptTemplateVersion ?? null,
         $agent: span.agent ?? null,
         $agent_sha256: span.agentSha256 ?? null,
+        $invocation_id: span.invocationId ?? null,
       });
+  }
+
+  appendHarnessEvent(event: HarnessEventRowInput): void {
+    const insert = this.journalDb.prepare(
+      `INSERT OR IGNORE INTO harness_events
+         (run_id, card_id, station, attempt, invocation_id, seq, kind,
+          tool_call_id, tool_name, path, exit_code, is_error,
+          tokens, input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens, cost_usd,
+          rate_limit_status, rate_limit_windows_json, phase, at_ms)
+       VALUES
+         ($run_id, $card_id, $station, $attempt, $invocation_id, $seq, $kind,
+          $tool_call_id, $tool_name, $path, $exit_code, $is_error,
+          $tokens, $input_tokens, $output_tokens, $cache_read_input_tokens, $cache_creation_input_tokens, $cost_usd,
+          $rate_limit_status, $rate_limit_windows_json, $phase, $at_ms)`,
+    );
+    const params = {
+      $run_id: event.runId,
+      $card_id: event.cardId,
+      $station: event.station,
+      $attempt: event.attempt,
+      $invocation_id: event.invocationId,
+      $seq: event.seq,
+      $kind: event.kind,
+      $tool_call_id: event.toolCallId ?? null,
+      $tool_name: event.toolName ?? null,
+      $path: event.path ?? null,
+      $exit_code: event.exitCode ?? null,
+      $is_error: event.isError === undefined ? null : event.isError ? 1 : 0,
+      $tokens: event.tokens ?? null,
+      $input_tokens: event.breakdown?.inputTokens ?? null,
+      $output_tokens: event.breakdown?.outputTokens ?? null,
+      $cache_read_input_tokens: event.breakdown?.cacheReadInputTokens ?? null,
+      $cache_creation_input_tokens: event.breakdown?.cacheCreationInputTokens ?? null,
+      $cost_usd: event.costUsd ?? null,
+      $rate_limit_status: event.rateLimitStatus ?? null,
+      $rate_limit_windows_json: event.rateLimitWindows === undefined ? null : JSON.stringify(event.rateLimitWindows),
+      $phase: event.phase ?? null,
+      $at_ms: event.atMs,
+    };
+    withBusyRetry(() => insert.run(params));
+  }
+
+  getHarnessEventsForRun(runId: string, cardId: string): StoredHarnessEvent[] {
+    const rows = this.journalDb
+      .prepare(
+        `SELECT run_id, card_id, station, attempt, invocation_id, seq, kind,
+                tool_call_id, tool_name, path, exit_code, is_error,
+                tokens, input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens, cost_usd,
+                rate_limit_status, rate_limit_windows_json, phase, at_ms
+         FROM harness_events
+         WHERE run_id = $run_id AND card_id = $card_id
+         ORDER BY id ASC`,
+      )
+      .all({ $run_id: runId, $card_id: cardId }) as RawHarnessEventRow[];
+    return rows.map((r) => ({
+      runId: r.run_id,
+      cardId: r.card_id,
+      station: r.station,
+      attempt: r.attempt,
+      invocationId: r.invocation_id,
+      seq: r.seq,
+      kind: r.kind as PersistedHarnessEventKind,
+      atMs: r.at_ms,
+      toolCallId: r.tool_call_id,
+      toolName: r.tool_name,
+      path: r.path,
+      exitCode: r.exit_code,
+      isError: r.is_error === null ? null : r.is_error === 1,
+      tokens: r.tokens,
+      breakdown:
+        r.input_tokens === null
+          ? null
+          : {
+              inputTokens: r.input_tokens,
+              outputTokens: r.output_tokens ?? 0,
+              cacheReadInputTokens: r.cache_read_input_tokens ?? 0,
+              cacheCreationInputTokens: r.cache_creation_input_tokens ?? 0,
+            },
+      costUsd: r.cost_usd,
+      rateLimitStatus: r.rate_limit_status,
+      rateLimitWindows:
+        r.rate_limit_windows_json === null
+          ? null
+          : (parseColumn(r.card_id, 'rate_limit_windows_json', r.rate_limit_windows_json) as RateLimitWindow[]),
+      phase: r.phase,
+    }));
   }
 
   getStationUsage(
@@ -1539,7 +1777,7 @@ class ConduitDBImpl implements ConduitDB {
       .prepare(
         `SELECT card_id, station, attempt, name, attributes_json,
                 adapter, duration_ms, usage_unknown,
-                binding_stamp, prompt_template_version, agent, agent_sha256
+                binding_stamp, prompt_template_version, agent, agent_sha256, invocation_id
          FROM journal
          WHERE card_id = $card_id
          ORDER BY id ASC`,
@@ -1557,6 +1795,7 @@ class ConduitDBImpl implements ConduitDB {
         prompt_template_version: string | null;
         agent: string | null;
         agent_sha256: string | null;
+        invocation_id: string | null;
       }[];
 
     return rows.map((row) => ({
@@ -1576,6 +1815,7 @@ class ConduitDBImpl implements ConduitDB {
       promptTemplateVersion: row.prompt_template_version,
       agent: row.agent,
       agentSha256: row.agent_sha256,
+      invocationId: row.invocation_id,
     }));
   }
 
@@ -1636,7 +1876,7 @@ class ConduitDBImpl implements ConduitDB {
       .prepare(
         `SELECT card_id, station, attempt, name, attributes_json,
                 adapter, duration_ms, usage_unknown,
-                binding_stamp, prompt_template_version, agent, agent_sha256
+                binding_stamp, prompt_template_version, agent, agent_sha256, invocation_id
          FROM journal
          WHERE run_id = $run_id AND card_id = $card_id
          ORDER BY id ASC`,
@@ -1654,6 +1894,7 @@ class ConduitDBImpl implements ConduitDB {
         prompt_template_version: string | null;
         agent: string | null;
         agent_sha256: string | null;
+        invocation_id: string | null;
       }[];
 
     return rows.map((row) => ({
@@ -1673,6 +1914,7 @@ class ConduitDBImpl implements ConduitDB {
       promptTemplateVersion: row.prompt_template_version,
       agent: row.agent,
       agentSha256: row.agent_sha256,
+      invocationId: row.invocation_id,
     }));
   }
 
@@ -2122,6 +2364,7 @@ class ConduitDBImpl implements ConduitDB {
       this.journalDb.prepare('DELETE FROM journal WHERE run_id = $r').run({ $r: runId });
       this.journalDb.prepare('DELETE FROM card_log WHERE run_id = $r').run({ $r: runId });
       this.journalDb.prepare('DELETE FROM work_summaries WHERE run_id = $r').run({ $r: runId });
+      this.journalDb.prepare('DELETE FROM harness_events WHERE run_id = $r').run({ $r: runId });
     })();
 
     // State DB second (authoritative — recoverable source of truth if interrupted).
@@ -2730,6 +2973,10 @@ export function openConduitDB({
     'ALTER TABLE journal ADD COLUMN prompt_template_version TEXT',
     'ALTER TABLE journal ADD COLUMN agent TEXT',
     'ALTER TABLE journal ADD COLUMN agent_sha256 TEXT',
+    // Issue #71: the harness span's invocation id. Nullable, no backfill: a
+    // span written before it has no recorded invocation. The harness_events
+    // table itself needs no step here; JOURNAL_DDL below creates it.
+    'ALTER TABLE journal ADD COLUMN invocation_id TEXT',
   ]) {
     try {
       journalDb.exec(column);
