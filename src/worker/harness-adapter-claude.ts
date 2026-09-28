@@ -26,6 +26,8 @@ import type {
   RateLimitSnapshot, RateLimitWindow, KnownUsage,
 } from './harness-adapter';
 import { runHarnessProcess } from './harness-runner';
+import { createHarnessEventEmitter } from './harness-events';
+import { mapClaudeStreamLine, rateLimitWindowsFromInfo } from './harness-events-claude';
 import { resolveClaudePluginAgent } from './claude-plugin-agents';
 import { createRunScopedClaudeConfigDir, removeRunScopedClaudeConfigDir } from './claude-config-isolation';
 import type { HarnessCommand, HarnessRunnerConfig, HarnessSpawnResult } from './harness-runner';
@@ -193,22 +195,10 @@ export function parseClaudeStream(stdout: string): ParsedClaudeStream {
       if (info.status !== undefined) rateLimitStatus = info.status;
       if (info.isUsingOverage !== undefined) rateLimitOverage = info.isUsingOverage;
 
-      // FLAT FIRST — this is the shape the CLI emits. resetsAt is epoch SECONDS
-      // on the wire; everything downstream works in milliseconds.
-      const fromThisEvent = new Set<string>();
-      if (typeof info.utilization === 'number' && typeof info.resetsAt === 'number') {
-        const name = info.rateLimitType ?? 'window';
-        fromThisEvent.add(name);
-        windowsByName.set(name, { name, utilization: info.utilization, resetsAtMs: info.resetsAt * 1000 });
-      }
-      // Nested fallback, for a build that reports every window at once. The
-      // flat entry wins WITHIN one event (it is this event's own subject);
-      // across events, the later reading wins.
-      for (const [name, w] of Object.entries(info.unifiedWindows ?? {})) {
-        if (typeof w.utilization !== 'number' || typeof w.resetsAt !== 'number') continue;
-        if (fromThisEvent.has(name)) continue;
-        windowsByName.set(name, { name, utilization: w.utilization, resetsAtMs: w.resetsAt * 1000 });
-      }
+      // Flat window first, then the nested fallback; the flat entry wins
+      // WITHIN one event (rateLimitWindowsFromInfo), and across events the
+      // later reading wins.
+      for (const w of rateLimitWindowsFromInfo(info)) windowsByName.set(w.name, w);
     }
   }
   const rateLimit: RateLimitSnapshot | undefined = sawRateLimitEvent
@@ -544,6 +534,23 @@ export function createClaudeHarnessAdapter(config: ClaudeHarnessAdapterConfig): 
       const configDir =
         config.isolateConfig === true ? createRunScopedClaudeConfigDir(sourceEnv, config.envAllowlist) : undefined;
 
+      // Event sink (issue #70). Absent, the line hook below is exactly what it
+      // was and no line is mapped. Present, every stdout line is mapped and
+      // forwarded, while the retention filter still keeps only the two events
+      // parseClaudeStream reads.
+      const emit = call.onEvent !== undefined ? createHarnessEventEmitter(call.onEvent) : undefined;
+      // Line ordinal for mapClaudeStreamLine's uuid-less id fallback.
+      let lineIndex = 0;
+      const onStdoutLine =
+        emit === undefined
+          ? () => call.onProgress?.()
+          : (line: string) => {
+              call.onProgress?.();
+              for (const event of mapClaudeStreamLine(line, lineIndex)) emit(event);
+              lineIndex += 1;
+            };
+
+      emit?.({ type: 'lifecycle', phase: 'start' });
       let spawnResult: HarnessSpawnResult;
       try {
         spawnResult = await run(
@@ -559,12 +566,25 @@ export function createClaudeHarnessAdapter(config: ClaudeHarnessAdapterConfig): 
             // from it. Filtering as it arrives keeps a long station's memory
             // proportional to what we actually read, not to how much it did.
             stdoutLineFilter: (line) => CLAUDE_KEPT_EVENT.test(line),
-            onStdoutLine: () => call.onProgress?.(),
+            onStdoutLine,
           },
         );
+      } catch (err) {
+        // Close the bracket even when no process result exists.
+        emit?.({ type: 'lifecycle', phase: 'end' });
+        throw err;
       } finally {
         if (configDir !== undefined) removeRunScopedClaudeConfigDir(configDir);
       }
+      // Exactly one closing phase, checked in the same order as the throws
+      // below: an idle kill, then a wall-clock kill, then any other exit.
+      emit?.(
+        spawnResult.idledOut
+          ? { type: 'lifecycle', phase: 'idle-timeout' }
+          : spawnResult.timedOut
+            ? { type: 'lifecycle', phase: 'timeout' }
+            : { type: 'lifecycle', phase: 'end', exitCode: spawnResult.exitCode },
+      );
 
       if (spawnResult.idledOut) {
         // A distinct code (issue #31) keeps a hung call apart from a slow one in

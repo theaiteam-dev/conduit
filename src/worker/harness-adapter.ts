@@ -18,6 +18,7 @@
 import { createClaudeHarnessAdapter } from './harness-adapter-claude';
 import { createCodexHarnessAdapter } from './harness-adapter-codex';
 import type { HarnessAdapterConfigDef } from './harness-config';
+import type { HarnessEventSink } from './harness-events';
 import type { HarnessCommand, HarnessRunnerConfig, HarnessSpawnResult } from './harness-runner';
 
 /** A declared input mounted into the harness invocation's working directory. */
@@ -63,6 +64,13 @@ export interface HarnessInvocation {
   model?: string;
   /** Called as the underlying harness emits stdout progress. */
   onProgress?: () => void;
+  /**
+   * Harness event sink (issue #70): what the call did as it ran, numbered by
+   * `seq` from 0 within this call. An adapter that does not implement it
+   * ignores it. A throw from the sink is dropped and cannot fail the call.
+   * The executor stamps attempt and invocationId (harness-events.ts).
+   */
+  onEvent?: HarnessEventSink;
   /**
    * Named agent for this call (issue #28), e.g. `team:coder`. Per-station like
    * `model`: the executor passes `station.agent ?? adapter.agent`, and an
