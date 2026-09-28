@@ -70,7 +70,6 @@ channels:
 describe("harness journey: idle timeout kills and retries a silent harness call", () => {
   let f: HarnessFlow;
   let run: CliResult;
-  let runMs: number;
   let doctorContainment: string;
   const sleeperPidFiles: string[] = [];
 
@@ -107,9 +106,7 @@ describe("harness journey: idle timeout kills and retries a silent harness call"
     doctorContainment =
       (doctor.stdout + doctor.stderr).split("\n").find((l) => l.includes("process-containment:"))?.trim() ?? "";
 
-    const started = Date.now();
     run = await f.run();
-    runMs = Date.now() - started;
   }, TIMEOUT_MS);
 
   afterAll(async () => {
@@ -133,9 +130,6 @@ describe("harness journey: idle timeout kills and retries a silent harness call"
     expect(log.map((e) => `${e.role}#${e.call}`)).toEqual(
       Array.from({ length: ATTEMPTS }, (_, i) => `maker#${i + 1}`),
     );
-    // Each call idled out at ~1s, well short of the 30s wall-clock bound, so the
-    // whole run (three idle kills plus 1s + 2s retry backoff) stays far below it.
-    expect(runMs).toBeLessThan(20_000);
     expect(run.exitCode).toBe(1);
     expect(run.stderr).toMatch(new RegExp(`${f.cardId}: lane=scrap station=research attempt=\\d+ — harness-idle-timeout`));
   });
@@ -150,6 +144,14 @@ describe("harness journey: idle timeout kills and retries a silent harness call"
     // Every attempt's span records why it failed.
     const outcomes = f.journalSpans().filter((s) => s.name === "research.harness").map((s) => s.attributes.outcome);
     expect(outcomes).toEqual(Array.from({ length: ATTEMPTS }, () => "harness-idle-timeout"));
+    // Each call idled out at ~1s. The span's own duration pins that the idle
+    // timer fired, not the 30s wall-clock bound, without timing the whole run.
+    const durations = f.journalSpans().filter((s) => s.name === "research.harness").map((s) => s.duration_ms);
+    expect(durations).toHaveLength(ATTEMPTS);
+    for (const d of durations) {
+      expect(typeof d).toBe("number");
+      expect(d!).toBeLessThan(10_000);
+    }
   });
 
   test("every stub process is dead after the run (process-group kill)", async () => {

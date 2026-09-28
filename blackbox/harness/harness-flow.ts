@@ -206,10 +206,18 @@ export function startHarnessFlow(opts: HarnessFlowOptions): HarnessFlow {
 
   function stubLog(): FakeClaudeLogEntry[] {
     if (!existsSync(logPath)) return [];
-    return readFileSync(logPath, "utf8")
-      .split("\n")
-      .filter((l) => l.length > 0)
-      .map((l) => JSON.parse(l) as FakeClaudeLogEntry);
+    // fake-claude appends from its own process, so a read can race a write
+    // and see a truncated final line. Skip any line that does not parse.
+    const entries: FakeClaudeLogEntry[] = [];
+    for (const l of readFileSync(logPath, "utf8").split("\n")) {
+      if (l.length === 0) continue;
+      try {
+        entries.push(JSON.parse(l) as FakeClaudeLogEntry);
+      } catch {
+        /* partial write */
+      }
+    }
+    return entries;
   }
 
   return {
@@ -250,19 +258,22 @@ export function startHarnessFlow(opts: HarnessFlowOptions): HarnessFlow {
           /* already gone */
         }
       }
-      // A stub still running here was orphaned by a conduit process the
-      // timeout above killed (its own group kill never ran). Match on the
-      // cmdline so a recycled pid is left alone.
-      for (const { pid } of stubLog()) {
-        try {
-          if (pidAlive(pid) && readFileSync(`/proc/${pid}/cmdline`, "utf8").includes(FAKE_CLAUDE)) {
-            process.kill(-pid, "SIGKILL");
+      try {
+        // A stub still running here was orphaned by a conduit process the
+        // timeout above killed (its own group kill never ran). Match on the
+        // cmdline so a recycled pid is left alone.
+        for (const { pid } of stubLog()) {
+          try {
+            if (pidAlive(pid) && readFileSync(`/proc/${pid}/cmdline`, "utf8").includes(FAKE_CLAUDE)) {
+              process.kill(-pid, "SIGKILL");
+            }
+          } catch {
+            /* already gone */
           }
-        } catch {
-          /* already gone */
         }
+      } finally {
+        rmSync(root, { recursive: true, force: true });
       }
-      rmSync(root, { recursive: true, force: true });
     },
   };
 }
