@@ -785,6 +785,20 @@ describe('getRunState: a launch that failed before seeding (issue #83)', () => {
   it('isFailedLaunch is false for a missing run', () => {
     expect(isFailedLaunch(db, null)).toBe(false);
   });
+
+  it('a completed zero-card row with a dead recorded holder is terminal, not launch_failed', () => {
+    // Neither 'halted' nor 'running' — isFailedLaunch returns false for this
+    // row on its status alone, before it ever looks at the holder. getRunState
+    // must agree: a stale lease row left behind after the run finished is not
+    // evidence the launch failed.
+    seedRun('r', 'complete');
+    holdLease('r', 4242);
+    expect(isFailedLaunch(db, db.getRun('r'), { isPidAlive: () => false })).toBe(false);
+    expect(getRunState(db, 'r', 1000, { isPidAlive: () => false })).toEqual({
+      status: 'terminal',
+      outcome: 'complete',
+    });
+  });
 });
 
 describe('formatLaunchFailedRun: what the operator needs after a failed launch', () => {

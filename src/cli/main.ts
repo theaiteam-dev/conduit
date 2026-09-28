@@ -1429,7 +1429,8 @@ async function cmdRun(argv: string[], deps: CliDeps): Promise<number> {
   // is not 'running' (an appended pass that failed before its seed
   // transaction reopened the run) is left as it was. Never throws: it runs on
   // the way out of a failure, and an error here must not replace the one that
-  // caused it.
+  // caused it. The record and the release are caught separately, so a failed
+  // record still releases the lease.
   const abandonLaunch = (): void => {
     try {
       if (deps.db.getRun(effectiveRunId)?.status === 'running') {
@@ -1442,7 +1443,15 @@ async function cmdRun(argv: string[], deps: CliDeps): Promise<number> {
         }`,
       );
     }
-    releaseRunLease(deps.db, effectiveRunId, process.pid);
+    try {
+      releaseRunLease(deps.db, effectiveRunId, process.pid);
+    } catch (err) {
+      deps.io.err(
+        `run: could not release the run lease of run ${JSON.stringify(effectiveRunId)}: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
   };
 
   // ── Card seeding (FR-9) ───────────────────────────────────────────────────

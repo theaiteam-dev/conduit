@@ -278,11 +278,13 @@ export function getRunState(
     if (parked !== null) return { status: 'parked', releaseAt: parked.releaseAt, flow: run.flow };
   }
 
-  // A failed launch has no cards, so it would otherwise read as terminal. The
-  // same evidence as the halt below applies: a halted row, or a holder at all.
-  // A live holder is a launch, retry or resume under way, which reads running.
-  if (cards.length === 0 && (run.status === 'halted' || holder !== null)) {
-    return driven ? { status: 'running' } : { status: 'launch_failed', flow: run.flow };
+  // A failed launch has no cards, so it would otherwise read as terminal. A
+  // live holder is a launch, retry or resume under way, which reads running.
+  // It is checked first because isFailedLaunch does not look at the holder of
+  // a halted row.
+  if (cards.length === 0) {
+    if (driven) return { status: 'running' };
+    if (isFailedLaunch(db, run, liveness)) return { status: 'launch_failed', flow: run.flow };
   }
 
   const unfinished = cards.filter((c) => !TERMINAL_STATUSES.has(c.status)).length;

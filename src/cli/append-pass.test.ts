@@ -876,6 +876,75 @@ describe('conduit run: a launch that throws after registering the run', () => {
     throw new Error('boom: harness registry');
   };
 
+  // abandonLaunch's two steps (updateRunStatus, releaseRunLease) both reach
+  // the DB through db.getStateDb().prepare(sql).run(...) — neither is its own
+  // named ConduitDB method, so a proxy on a method name (throwingDb above)
+  // can't target either one alone. This proxies getStateDb() itself and fails
+  // only the statement whose SQL matches `matchSql`, leaving every other
+  // statement (registerRun's, the other of the pair, etc.) to run for real.
+  function dbWithFailingStatement(base: ConduitDB, matchSql: (sql: string) => boolean, err: Error): ConduitDB {
+    return new Proxy(base, {
+      get(target, prop) {
+        if (prop === 'getStateDb') {
+          return () => {
+            const stateDb = target.getStateDb();
+            return new Proxy(stateDb, {
+              get(dbTarget, dbProp) {
+                if (dbProp === 'prepare') {
+                  return (sql: string) => {
+                    if (matchSql(sql)) return { run: () => { throw err; } };
+                    return dbTarget.prepare(sql);
+                  };
+                }
+                const value = Reflect.get(dbTarget, dbProp, dbTarget);
+                return typeof value === 'function' ? value.bind(dbTarget) : value;
+              },
+            });
+          };
+        }
+        const value = Reflect.get(target, prop, target);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    }) as ConduitDB;
+  }
+
+  // releaseRunLease already catches whatever its own UPDATE statement throws
+  // (see run-lock.ts) — that's not the bug under test. The only way it can
+  // throw OUT of abandonLaunch is db.getStateDb() itself failing (a broken DB
+  // connection), which is outside that internal try. This makes getStateDb()
+  // start throwing right after the recording statement (matched by
+  // `matchSql`) has run — i.e. everything up to and including "record the
+  // halt" still works, and only what comes after (the release) hits a dead DB.
+  function dbWhereGetStateDbDiesAfter(base: ConduitDB, matchSql: (sql: string) => boolean, err: Error): ConduitDB {
+    let dead = false;
+    return new Proxy(base, {
+      get(target, prop) {
+        if (prop === 'getStateDb') {
+          return () => {
+            if (dead) throw err;
+            const stateDb = target.getStateDb();
+            return new Proxy(stateDb, {
+              get(dbTarget, dbProp) {
+                if (dbProp === 'prepare') {
+                  return (sql: string) => {
+                    const stmt = dbTarget.prepare(sql);
+                    if (matchSql(sql)) dead = true;
+                    return stmt;
+                  };
+                }
+                const value = Reflect.get(dbTarget, dbProp, dbTarget);
+                return typeof value === 'function' ? value.bind(dbTarget) : value;
+              },
+            });
+          };
+        }
+        const value = Reflect.get(target, prop, target);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    }) as ConduitDB;
+  }
+  const isUpdateRunStatusSql = (sql: string) => sql.includes('SET status = $status');
+
   it('holds the run lease from registration: seeding already runs under it', async () => {
     const flowPath = writeFlow();
     let holderAtSeed: ReturnType<typeof peekRunLeaseHolder> = null;
@@ -967,6 +1036,45 @@ describe('conduit run: a launch that throws after registering the run', () => {
     expect(run.status).toBe('done');
     expect(run.outcome).toBe('complete');
     expect(peekRunLeaseHolder(db, RUN)).toBeNull();
+  });
+
+  it('rejects with the seeding error, and still releases the lease, when recording the halt also fails', async () => {
+    const flowPath = writeFlow();
+    const seedErr = new Error('boom: insertCard failed');
+    const recordErr = new Error('boom: runs table is locked');
+    const deps = makeDeps({
+      db: dbWithFailingStatement(throwingDb(db, 'insertCard', seedErr), isUpdateRunStatusSql, recordErr),
+    });
+
+    await expect(runPass1(flowPath, deps)).rejects.toThrow('boom: insertCard failed');
+
+    expect(io.errors.join('\n')).toContain(
+      `run: could not record the failed launch of run ${JSON.stringify(RUN)}: boom: runs table is locked`,
+    );
+    // The failed recording never reached the row, so it reads however
+    // registerRun left it — but the lease release, which does not depend on
+    // recording having succeeded, still ran.
+    expect(peekRunLeaseHolder(db, RUN)).toBeNull();
+  });
+
+  it('rejects with the seeding error, not the release error, when releasing the lease fails', async () => {
+    const flowPath = writeFlow();
+    const seedErr = new Error('boom: insertCard failed');
+    const releaseErr = new Error('boom: connection reset');
+    const deps = makeDeps({
+      db: dbWhereGetStateDbDiesAfter(throwingDb(db, 'insertCard', seedErr), isUpdateRunStatusSql, releaseErr),
+    });
+
+    await expect(runPass1(flowPath, deps)).rejects.toThrow('boom: insertCard failed');
+
+    expect(io.errors.join('\n')).toContain(
+      `run: could not release the run lease of run ${JSON.stringify(RUN)}: boom: connection reset`,
+    );
+    // Recording the halt happened before the DB died, so it is on record —
+    // unlike the lease, which the dead DB left stuck.
+    const run = db.getRun(RUN)!;
+    expect(run.status).toBe('halted');
+    expect(run.outcome).toBe('halted');
   });
 });
 
