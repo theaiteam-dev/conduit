@@ -19,13 +19,64 @@ claims:
 - **`kind: harness`** — a station whose worker is an external headless agent harness
   (`claude -p`, `codex exec`, or similar) wrapped in Conduit's transform contract. The
   harness owns its own tool loop; Conduit cannot see or gate individual tool calls inside
-  it. This kind makes a **weaker containment claim than the Law**, on purpose, and this
+  it, except through a supervised adapter (see [below](#a-middle-claim-supervised-adapters)).
+  This kind makes a **weaker containment claim than the Law**, on purpose, and this
   document exists so that claim is never implied to be stronger than it is.
 
 If you need per-tool-call pre-execution gating, that's the Tool-Bridge (`kind: agentic`),
 not this. A `kind: harness` station is the pragmatic precursor: it gets the tool loop onto
 the kernel's books (journaled attempts, gate verdicts, rework guards, budgets, binding
 stamps) without building an in-kernel loop first.
+
+## A middle claim: supervised adapters
+
+An adapter that sets `canGatePerCall` runs the harness loop with a callback into the
+kernel, and the kernel decides every tool call before it runs. `agent-sdk` is the shipped
+one: it drives the Claude Code CLI through `@anthropic-ai/claude-agent-sdk` `query()` and
+calls the kernel's gate from `hooks.PreToolUse`
+([#21](https://github.com/theaiteam-dev/conduit/issues/21)). The hook fires for the main
+agent and for subagents, and an `allowedTools` rule does not bypass it.
+
+The claim is a pre-execution decision on each call. It is not the Tool-Bridge: the CLI
+still owns the loop, and the kernel sees one call at a time. The gate
+(`src/worker/harness-gate.ts`) enforces:
+
+- **Tool allowlist.** A tool not in the station's `tools` is denied.
+- **Bash positive allowlist.** Executables come only from `Bash(<exe>)` and
+  `Bash(<exe>:*)` entries. A bare `Bash` entry allows the tool and no executable. A
+  narrower rule such as `Bash(git status:*)` is not widened to `git`. A command
+  containing a shell metacharacter is denied before the allowlist is consulted.
+- **Write ownership.** Write, Edit, MultiEdit and NotebookEdit targets must resolve inside
+  the card's owned paths, with symlinks resolved on both sides, including a write through
+  a dangling symlink. This applies only where the flow sets `defaults.enforce_owned_paths`
+  and the card declares owned paths, the same condition as the other integrity checks.
+- **No network tools.** `WebFetch` and `WebSearch` are always denied.
+- **Human questions hold.** `AskUserQuestion` moves the card to `hold`: the adapter ends
+  the harness process and the executor holds the card without spending an execution
+  attempt. It does not park a live process.
+
+A gate critic on a supervised adapter may write only its verdict file. A waived
+`unrestricted_tools` station reaches the gate as an empty `tools` list, so every tool is
+denied on a supervised adapter.
+
+What it does not cover:
+
+- The arguments of an allowlisted executable. `git -C / ...` and `git config` pass, and a
+  script the agent wrote can then be run.
+- A Bash write that bypasses the path check. The MARK_DONE owned-paths integrity check
+  stays mandatory as the backstop.
+- Reads outside the project root, and a symlink swapped between the check and the write.
+- The input of `Agent` and of any other listed tool that is not a file tool.
+
+The SDK reports a hook denial nowhere (`result.permission_denials` stays empty), so the
+adapter emits a `gate-decision` event for every call the gate sees. It is journaled in
+`harness_events` with the decision, code, tool name, subagent id when there is one, and a
+reason cut to 200 characters. No tool input body is stored. `conduit journal inspect` and
+`tail` print it. A held call ends the process before a result message arrives, so the
+spend of that partial call is not billed.
+
+Every invocation is a fresh session: `agent-sdk` does not resume one, and it does not run
+named agents (`agent`, `pluginDirs`).
 
 ## The containment profile
 

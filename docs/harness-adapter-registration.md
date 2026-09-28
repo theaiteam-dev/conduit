@@ -1,6 +1,6 @@
 # Harness Adapter Registration — Operator Setup Guide
 
-How to register `kind: harness` adapters (`claude-headless`, `codex-exec`) via
+How to register `kind: harness` adapters (`claude-headless`, `codex-exec`, `agent-sdk`) via
 `CONDUIT_HARNESS_*` engine config, for Docker and bare-metal deployments, with
 the recommended minimal env allowlist per adapter and per claude credential
 mode, and how to verify the result with `conduit doctor`.
@@ -43,7 +43,7 @@ warnings `doctor` gives you when something's off.
 | `CONDUIT_HARNESS_<NAME>_MODEL` | No | The adapter's deployment-default model. A station's own `model:` in `flow.yaml` **wins** when both are set — see [Model precedence](#model-precedence-station-wins-over-_model). |
 | `CONDUIT_HARNESS_<NAME>_AGENT` | No, `claude-headless` only | The adapter's default named agent (`<plugin>:<agent>`), passed as `--agent`. A station's own `agent:` wins. The value is trimmed; setting it to an empty or whitespace-only string is a boot error naming the variable, not a silently empty default. See [Named agents and plugin dirs](#named-agents-and-plugin-dirs). |
 | `CONDUIT_HARNESS_<NAME>_PLUGIN_DIRS` | No, `claude-headless` only | Comma-separated **absolute** plugin directories, one `--plugin-dir` each. Absent or empty: no flag. A relative entry is a boot error; a missing or non-directory entry fails when the adapter is built. |
-| `CONDUIT_HARNESS_<NAME>_ISOLATE_CONFIG` | No, `claude-headless` only | `1`/`true` gives the child a run-scoped config dir instead of the operator's `~/.claude`; `0`/`false` or absent keeps today's behaviour. Any other value is a boot error. See [Isolating the child's Claude config](#isolating-the-childs-claude-config-_isolate_config). |
+| `CONDUIT_HARNESS_<NAME>_ISOLATE_CONFIG` | No, `claude-headless` and `agent-sdk` only | `1`/`true` gives the child a run-scoped config dir instead of the operator's `~/.claude`; `0`/`false` or absent keeps today's behaviour. Any other value is a boot error. See [Isolating the child's Claude config](#isolating-the-childs-claude-config-_isolate_config). |
 
 Setting `_AGENT`, `_PLUGIN_DIRS` or `_ISOLATE_CONFIG` for an adapter that does
 not act on it (e.g. `codex-exec`) fails registry construction at boot, naming
@@ -58,6 +58,7 @@ underscore**:
 |---|---|
 | `claude-headless` | `CONDUIT_HARNESS_CLAUDE_HEADLESS_ENV` |
 | `codex-exec` | `CONDUIT_HARNESS_CODEX_EXEC_ENV` |
+| `agent-sdk` | `CONDUIT_HARNESS_AGENT_SDK_ENV` |
 | `my-cool-agent` | `CONDUIT_HARNESS_MY_COOL_AGENT_ENV` |
 
 Because the mapping collapses hyphens and underscores together, two
@@ -640,6 +641,19 @@ CONDUIT_E2E_CLAUDE=1 bun test src/integration/harness-e2e-claude-agent.test.ts
 
 It needs a `.credentials.json` in your Claude config dir (it is symlinked into
 a scratch dir, never copied) and costs two Haiku calls.
+
+## The `agent-sdk` adapter
+
+`agent-sdk` runs the Claude Code CLI through `@anthropic-ai/claude-agent-sdk` so the kernel
+can gate every tool call ([containment profile](harness-containment.md#a-middle-claim-supervised-adapters)).
+
+- It runs the `claude` on `PATH`, resolved to a file, not the binary bundled with the SDK.
+  Set `CONDUIT_HARNESS_AGENT_SDK_COMMAND` to an absolute path to use another. The env
+  allowlist needs `PATH`, and `HOME` for subscription auth unless `_ISOLATE_CONFIG` is on.
+- It supports `_ENV`, `_COMMAND`, `_MODEL` and `_ISOLATE_CONFIG`. `_AGENT` and
+  `_PLUGIN_DIRS` fail registry construction at boot, as they do for `codex-exec`.
+- A station's `tools` list is the gate's allowlist: `Bash` alone allows no executable, so
+  list `Bash(git:*)` style entries for the commands it may run.
 
 ## See also
 
