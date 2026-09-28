@@ -20,6 +20,7 @@ import type { ModelAdapter } from '../worker/adapter';
 import { resolveInputPath, SEED_INPUT } from '../flow/resolve-input';
 import { runTransformStation, coerciveParse, type OutputSchema } from '../worker/transform';
 import type { HarnessAdapter, HarnessResult, MountedInput, UsageReport } from '../worker/harness-adapter';
+import type { HarnessEventSink } from '../worker/harness-events';
 import { usageFromThrow } from '../worker/harness-adapter';
 
 // ---------------------------------------------------------------------------
@@ -295,6 +296,13 @@ export interface HarnessGateConfig {
    * onto CriticUsage for the journal so the definition is not resolved twice.
    */
   agentSha256?: string;
+  /**
+   * Issue #71: the event sink for this critic's one invoke(), already stamped
+   * with the attempt and the invocation id the CALLER minted (the executor
+   * writes the same id on the `<station>.harness-critic` span). Passed
+   * through to the adapter unchanged; omitted means no events are collected.
+   */
+  onEvent?: HarnessEventSink;
   onReject: Lane;
   validBackEdges: ReadonlyArray<{ from: string; to: string }>;
   /**
@@ -373,6 +381,7 @@ export async function runHarnessGateCheck(config: HarnessGateConfig): Promise<Ga
       timeoutMs: config.timeoutMs,
       ...(config.model !== undefined ? { model: config.model } : {}),
       ...(config.agent !== undefined ? { agent: config.agent } : {}),
+      ...(config.onEvent !== undefined ? { onEvent: config.onEvent } : {}),
     });
   } catch (err) {
     // A thrown invocation (timeout/nonzero-exit/untagged) never yields a

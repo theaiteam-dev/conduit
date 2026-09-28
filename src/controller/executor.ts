@@ -49,6 +49,8 @@ import type {
   HarnessRegistry, MountedInput, HarnessResult, KnownUsage, RateLimitSnapshot,
 } from '../worker/harness-adapter';
 import { usageFromThrow, resolveHarnessAgent, DEFAULT_HARNESS_TIMEOUT_MS } from '../worker/harness-adapter';
+import { stampHarnessEvents } from '../worker/harness-events';
+import { createHarnessEventJournalSink } from '../worker/harness-events-journal';
 import { harnessRetryDelayMs } from '../worker/harness-retry';
 import { loadImageInput, hashImageInputs, assertImagePayloadWithinLimits } from '../worker/image-input';
 import type { ImageInput } from '../worker/image-input';
@@ -2803,6 +2805,18 @@ async function runGateCheckOrAdvance(args: GateCheckOrAdvanceArgs): Promise<bool
     // Issue #30: the critic runs after the maker's call, so `currentNow` is
     // stale here; read the clock fresh.
     const criticReadyWaiting = countReadyWaiting(stateDb, runId, cardId, now());
+    // Issue #71: the critic's one invoke() gets its own invocation id, minted
+    // here so the `<station>.harness-critic` span below can carry it. Its rows
+    // are stamped with card.attempt because that is the attempt the
+    // `.harness-critic` span records, and a row always carries the attempt of
+    // the span it joins to. The maker's rows and spans use attemptIndex
+    // (card.attempt + callsMade), so after a maker retry the critic's attempt
+    // is lower than the maker's last call; the invocation id, not the
+    // attempt, is what ties rows to one call. A transform critic never uses it.
+    const criticEvents = stampHarnessEvents(
+      createHarnessEventJournalSink(db, { runId, cardId, station: stationId }),
+      card.attempt,
+    );
     let gateDecision: Awaited<ReturnType<typeof runGateRework>>;
     try {
       gateDecision = await runGateRework({
@@ -2816,6 +2830,7 @@ async function runGateCheckOrAdvance(args: GateCheckOrAdvanceArgs): Promise<bool
         gateConfig: stationConfig.gateCheck,
         adapter: trackingAdapter,
         harnessRegistry,
+        harnessOnEvent: criticEvents.onEvent,
         projectRoot,
         // The critic judges THIS child's work, so it resolves the same
         // card-scoped inputs the maker did (issue #51).
@@ -2865,6 +2880,7 @@ async function runGateCheckOrAdvance(args: GateCheckOrAdvanceArgs): Promise<bool
         station: stationId,
         attempt: card.attempt,
         name: `${stationId}.harness-critic`,
+        invocationId: criticEvents.invocationId,
         // Provenance: the critic's agent and its definition hash. The critic
         // writes no checkpoint, so it has no binding stamp to record.
         ...(gateDecision.criticUsage.agent !== undefined
@@ -3873,6 +3889,13 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
     const outputFile = stationConfig.outputs[0];
     let callsMade = 0;
     let scrapReason = 'harness-invocation-failed';
+    // Issue #71: the journal sink for this station's harness events. Each
+    // invoke() below wraps it with stampHarnessEvents, which mints a fresh
+    // invocation id, so a retry and a rate-limit re-invoke (same attempt, no
+    // callsMade increment) each get their own id. Rows take at_ms from
+    // Date.now(), the same clock that times the call (invokeStartedAt), so
+    // tool-call durations keep millisecond precision.
+    const harnessEventSink = createHarnessEventJournalSink(db, { runId, cardId, station: stationId });
 
     while (callsMade < maxExecutionAttempts) {
       // WI-567: attemptIndex is the PRE-increment call count (mirrors
@@ -3897,6 +3920,11 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
       // backoff sleep. Written on every span this attempt produces.
       const readyWaiting = countReadyWaiting(stateDb, runId, cardId, now());
 
+      // Issue #71: one invocation id per invoke(), stamped on every event row
+      // it produces and on every `<station>.harness` span below that reports
+      // on it, so the rows join to their span.
+      const { invocationId, onEvent } = stampHarnessEvents(harnessEventSink, attemptIndex);
+
       let invokeResult: HarnessResult;
       try {
         // The original adapter-liveness work: stamp fresh liveness progress BEFORE awaiting invoke() too
@@ -3911,6 +3939,7 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
           timeoutMs,
           model: effectiveModel,
           onProgress: stampHarnessActivity,
+          onEvent,
           ...(idleTimeoutMs !== undefined ? { idleTimeoutMs } : {}),
           ...(effectiveAgent !== undefined ? { agent: effectiveAgent } : {}),
         });
@@ -3952,7 +3981,7 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
             parkedJournalUsage = harnessJournalUsage(parkedUsage, effectiveModel);
           }
           db.appendJournalSpan({
-            runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.harness`, ...provenance,
+            runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.harness`, ...provenance, invocationId,
             adapter: harnessAdapter.name, durationMs: Date.now() - invokeStartedAt,
             usageUnknown: !parkedUsageKnown, usage: parkedJournalUsage,
             attributes: {
@@ -4050,7 +4079,7 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
           thrownJournalUsage = harnessJournalUsage(thrownUsage, effectiveModel);
         }
         db.appendJournalSpan({
-          runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.harness`, ...provenance,
+          runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.harness`, ...provenance, invocationId,
           adapter: harnessAdapter.name, durationMs: Date.now() - invokeStartedAt,
           usageUnknown: !thrownUsageKnown, usage: thrownJournalUsage,
           attributes: { outcome: scrapReason, ready_waiting: readyWaiting },
@@ -4132,7 +4161,7 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
           : runOwnedPathsIntegrity(projectRoot, ownedPaths, touchedPaths);
       if (integrityViolation && !integrityViolation.ok) {
         db.appendJournalSpan({
-          runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.harness`, ...provenance,
+          runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.harness`, ...provenance, invocationId,
           adapter: harnessAdapter.name, durationMs, usageUnknown: !usageKnown, usage: journalUsage,
           attributes: { outcome: `integrity_violation: ${describeIntegrity(integrityViolation)}`, ready_waiting: readyWaiting },
         });
@@ -4152,7 +4181,7 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
         callsMade++;
         scrapReason = `harness-output-missing: ${missingOutputs.join(', ')}`;
         db.appendJournalSpan({
-          runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.harness`, ...provenance,
+          runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.harness`, ...provenance, invocationId,
           adapter: harnessAdapter.name, durationMs, usageUnknown: !usageKnown, usage: journalUsage,
           attributes: { outcome: scrapReason, ready_waiting: readyWaiting },
         });
@@ -4174,7 +4203,7 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
         callsMade++;
         scrapReason = `harness-output-unparseable: station '${stationId}' output '${outputFile ?? '(none declared)'}' is not valid JSON`;
         db.appendJournalSpan({
-          runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.harness`, ...provenance,
+          runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.harness`, ...provenance, invocationId,
           adapter: harnessAdapter.name, durationMs, usageUnknown: !usageKnown, usage: journalUsage,
           attributes: { outcome: scrapReason, ready_waiting: readyWaiting },
         });
@@ -4185,7 +4214,7 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
         callsMade++;
         scrapReason = `harness-output-invalid: station '${stationId}': ${validated.error}`;
         db.appendJournalSpan({
-          runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.harness`, ...provenance,
+          runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.harness`, ...provenance, invocationId,
           adapter: harnessAdapter.name, durationMs, usageUnknown: !usageKnown, usage: journalUsage,
           attributes: { outcome: scrapReason, ready_waiting: readyWaiting },
         });
@@ -4222,7 +4251,7 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
         }
       }
       db.appendJournalSpan({
-        runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.harness`, ...provenance,
+        runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.harness`, ...provenance, invocationId,
         adapter: harnessAdapter.name, durationMs, usageUnknown: !usageKnown, usage: journalUsage,
         // Issue #5: the capacity snapshot rides along on the priced row, so
         // "what did this run draw against the plan" is a query rather than an
