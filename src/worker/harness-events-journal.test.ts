@@ -125,6 +125,20 @@ describe('createHarnessEventJournalSink over the recorded run', () => {
     }
   });
 
+  it('stamps at_ms from the injected clock', () => {
+    const db = openConduitDB({ stateDbPath: ':memory:', journalDbPath: ':memory:' });
+    try {
+      let t = 1_700_000_000_123;
+      const sink = createHarnessEventJournalSink(db, SCOPE, () => t++);
+      recordFixture(sink);
+      const rows = db.getHarnessEventsForRun('r1', 'c1');
+      expect(rows[0]!.atMs).toBe(1_700_000_000_123);
+      expect(rows.map((r) => r.atMs)).toEqual(rows.map((r) => r.atMs).sort((a, b) => a - b));
+    } finally {
+      db.close();
+    }
+  });
+
   it('swallows a journal write failure so the harness call cannot fail on it', () => {
     const db = openConduitDB({ stateDbPath: ':memory:', journalDbPath: ':memory:' });
     const sink = createHarnessEventJournalSink(db, SCOPE);

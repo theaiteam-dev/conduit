@@ -448,10 +448,8 @@ CREATE TABLE IF NOT EXISTS harness_events (
   rate_limit_status            TEXT,
   rate_limit_windows_json      TEXT,
   phase                        TEXT,
-  -- When the kernel received the event, epoch milliseconds, read from the
-  -- executor's injected clock. That clock ticks in whole seconds in
-  -- production, so at_ms is second-granular there. Orders events across
-  -- invocations; seq orders them within one.
+  -- When the kernel received the event, epoch milliseconds. Orders events
+  -- across invocations; seq orders them within one.
   at_ms                        INTEGER NOT NULL,
   UNIQUE(run_id, card_id, station, attempt, invocation_id, seq)
 );

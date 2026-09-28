@@ -2810,7 +2810,7 @@ async function runGateCheckOrAdvance(args: GateCheckOrAdvanceArgs): Promise<bool
     // under the maker's attempt, so the id is what tells its rows apart. A
     // transform critic never uses it.
     const criticEvents = stampHarnessEvents(
-      createHarnessEventJournalSink(db, { runId, cardId, station: stationId }, () => now() * 1000),
+      createHarnessEventJournalSink(db, { runId, cardId, station: stationId }),
       card.attempt,
     );
     let gateDecision: Awaited<ReturnType<typeof runGateRework>>;
@@ -3888,12 +3888,10 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
     // Issue #71: the journal sink for this station's harness events. Each
     // invoke() below wraps it with stampHarnessEvents, which mints a fresh
     // invocation id, so a retry and a rate-limit re-invoke (same attempt, no
-    // callsMade increment) each get their own id. Rows take their time from
-    // the executor's injected clock (seconds, hence * 1000), like every other
-    // kernel timestamp, so a test with a fixed clock gets fixed values.
-    const harnessEventSink = createHarnessEventJournalSink(
-      db, { runId, cardId, station: stationId }, () => now() * 1000,
-    );
+    // callsMade increment) each get their own id. Rows take at_ms from
+    // Date.now(), the same clock that times the call (invokeStartedAt), so
+    // tool-call durations keep millisecond precision.
+    const harnessEventSink = createHarnessEventJournalSink(db, { runId, cardId, station: stationId });
 
     while (callsMade < maxExecutionAttempts) {
       // WI-567: attemptIndex is the PRE-increment call count (mirrors
