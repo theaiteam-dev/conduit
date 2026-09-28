@@ -407,6 +407,12 @@ export async function runExecutor(args: RunEngineArgs): Promise<void> {
   let lastAdapterActivityAt = runStartedAt;
   let halted = false;
   let andonTripped = false;
+  // A station's andon trip only ends the tick. The consumption check after the
+  // action batch reads the same tokensSpent and currentNow, so it trips too and
+  // prints the one andon line, with the drain and rate-limit wording (issue #83).
+  const haltOnStationAndon = (): void => {
+    halted = true;
+  };
   // skip_when (issue #32): 'run' decisions memoized for the lifetime of this
   // runExecutor call, keyed by (card, lane, attempt) — see applySkipWhen.
   const skipWhenRunMemo = new Set<string>();
@@ -1206,10 +1212,7 @@ export async function runExecutor(args: RunEngineArgs): Promise<void> {
           wallClockSeconds,
           maxTokens,
           getTokensSpent: () => tokensSpent,
-          onAndonTrip: (reason: string) => {
-            io.err(`andon: run halted — ${reason}`);
-            halted = true;
-          },
+          onAndonTrip: haltOnStationAndon,
           err: io.err,
           harnessRegistry: args.harnessRegistry,
           foldHarnessUsage,
@@ -1270,10 +1273,7 @@ export async function runExecutor(args: RunEngineArgs): Promise<void> {
               wallClockSeconds,
               maxTokens,
               getTokensSpent: () => tokensSpent,
-              onAndonTrip: (reason: string) => {
-                io.err(`andon: run halted — ${reason}`);
-                halted = true;
-              },
+              onAndonTrip: haltOnStationAndon,
               err: io.err,
               harnessRegistry: args.harnessRegistry,
               foldHarnessUsage,

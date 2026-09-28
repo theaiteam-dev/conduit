@@ -128,6 +128,10 @@ describe("harness journey: critic spend trips the run token budget", () => {
     expect(total("research.harness-critic")).toBe(1000);
   });
 
+  test("the halt prints one andon line", () => {
+    expect(run.stderr.split("\n").filter((l) => l.startsWith("andon:"))).toEqual(["andon: run halted — tokens budget exceeded"]);
+  });
+
   // Issue #83: the runs row is status=halted and no process holds the run, but
   // the card is still `ready`, and `run status` used to report `running`.
   test("run status reports the andon-halted run as halted, with its resume command", async () => {
