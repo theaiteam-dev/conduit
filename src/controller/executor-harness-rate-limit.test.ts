@@ -378,15 +378,21 @@ describe('issue #3 — a 429 parks the card rather than scrapping it', () => {
   it('spaces retries by the park interval instead of firing them in seconds', async () => {
     db = openDb();
     const clock = virtualClock(1000);
-    const { adapter } = makeScriptedHarness(rateLimited());
+    const { adapter, calls } = makeScriptedHarness([
+      rateLimited(),
+      { kind: 'ok', output: { summary: 'built the widget' } } as Behavior,
+    ]);
     const registry = createHarnessRegistry([adapter]);
-    const flow = writeHarnessFlow(projectDir, registry, HALT_AT_FIRST_GATE);
+    // A budget that fits the park, so the retry happens (issue #84: a smaller
+    // budget halts the run at its deadline instead).
+    const flow = writeHarnessFlow(projectDir, registry, { maxAttempts: 5, wallClockMinutes: 10 });
     seedCoderCard(db);
 
     await run(flow, registry, clock);
 
     // The issue's journal showed attempts 2, 3 and 4 one second apart. A park
     // moves the clock by the full window before anything is retried.
+    expect(calls.length).toBe(2);
     expect(clock.read() - 1000).toBeGreaterThanOrEqual(300);
   });
 
@@ -642,6 +648,37 @@ describe('issue #7 — the andon halt during a rate-limit park is reported as pa
     expect(card?.status).toBe('ready');
     expect(card?.attempt).toBe(0);
     expect(releaseAt!).toBeGreaterThan(clock.read());
+  });
+});
+
+describe('issue #84 — the wall-clock budget bounds the release-gate sleep', () => {
+  it('wakes at the wall-clock deadline, halts with the card parked, and never re-dispatches', async () => {
+    // A 60s budget and a 300s park (no reset reported). The run loop must wake
+    // at the 60s deadline and let the andon halt it, not sleep the full 300s and
+    // then call the capped harness again.
+    db = openDb();
+    const clock = virtualClock(1000);
+    const { adapter, calls } = makeScriptedHarness(rateLimited());
+    const registry = createHarnessRegistry([adapter]);
+    const flow = writeHarnessFlow(projectDir, registry, { maxAttempts: 5, wallClockMinutes: 1 });
+    seedCoderCard(db);
+    const sleeps: number[] = [];
+    const recording = { ...clock, sleep: async (ms: number) => { sleeps.push(ms); await clock.sleep(ms); } };
+    const errors: string[] = [];
+
+    await run(flow, registry, recording, { io: { out: () => {}, err: (l) => errors.push(l) } });
+
+    expect(calls.length).toBe(1);
+    expect(sleeps).toEqual([60_000]);
+    expect(clock.read()).toBe(1060);
+    const releaseAt = releaseAtOf(db);
+    expect(releaseAt).toBe(1300);
+    const card = getCard(db);
+    expect(card?.lane).toBe('coder');
+    expect(card?.status).toBe('ready');
+    expect(card?.attempt).toBe(0);
+    expect(errors.find((l) => /^andon:/.test(l))).toMatch(/wall_clock budget exceeded while parked behind a provider rate limit/);
+    expect(getRunParkedRelease(db, DEFAULT_RUN_ID, clock.read())?.releaseAt).toBe(1300);
   });
 });
 
