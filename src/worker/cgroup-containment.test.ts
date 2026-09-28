@@ -22,6 +22,7 @@ import {
   detectContainment,
   killCgroup,
   prepareContainedCommand,
+  processStartTime,
   removeCgroup,
   removeCgroupsSync,
   type Containment,
@@ -415,6 +416,97 @@ describe('cgroup cleanup', () => {
       }
       await removeCgroup(stale, 1_000);
     }
+  });
+
+  /** Start a process inside the cgroup at `dir` and wait until the cgroup lists it. */
+  async function spawnInCgroup(dir: string): Promise<ReturnType<typeof Bun.spawn>> {
+    const proc = Bun.spawn(['/bin/sh', '-c', 'echo $$ > "$0" && exec sleep 30', join(dir, 'cgroup.procs')], {
+      detached: true,
+    });
+    const deadline = Date.now() + 3_000;
+    while (!readFileSync(join(dir, 'cgroup.procs'), 'utf-8').trim() && Date.now() < deadline) {
+      await Bun.sleep(10);
+    }
+    return proc;
+  }
+
+  itWithCgroup("detection kills and removes a dead kernel's cgroup whose pid a live process has reused", async () => {
+    if (hostContainment.mechanism !== 'cgroup') throw new Error('unreachable');
+    // The live process stands in for an unrelated process given the dead
+    // kernel's pid: the pid matches the cgroup name, the start time does not.
+    const reuser = Bun.spawn(['sleep', '30']);
+    const startTime = processStartTime(reuser.pid);
+    expect(startTime).toBeDefined();
+    const stale = join(hostContainment.parent, `conduit-${reuser.pid}-${startTime! + 1}-1`);
+    const live = join(hostContainment.parent, `conduit-${reuser.pid}-${startTime!}-1`);
+    mkdirSync(stale);
+    mkdirSync(live);
+    const orphan = await spawnInCgroup(stale);
+    const owned = await spawnInCgroup(live);
+    try {
+      await detectContainment();
+
+      await orphan.exited;
+      expect(orphan.signalCode).toBe('SIGKILL');
+      expect(existsSync(stale)).toBe(false);
+      // The cgroup whose owner is still the process that created it is kept.
+      expect(isAlive(owned.pid)).toBe(true);
+      expect(existsSync(live)).toBe(true);
+      expect(isAlive(reuser.pid)).toBe(true);
+    } finally {
+      for (const pid of [orphan.pid, owned.pid, reuser.pid]) {
+        try {
+          process.kill(pid, 'SIGKILL');
+        } catch {
+          /* already gone */
+        }
+      }
+      killCgroup(stale);
+      killCgroup(live);
+      await Promise.all([removeCgroup(stale, 1_000), removeCgroup(live, 1_000)]);
+    }
+  });
+
+  itWithCgroup('invocation cgroups carry the kernel start time after its pid', () => {
+    if (hostContainment.mechanism !== 'cgroup') throw new Error('unreachable');
+    const prepared = prepareContainedCommand(hostContainment, ['true'], {});
+    try {
+      expect(prepared.cgroup).toMatch(new RegExp(`/conduit-${process.pid}-${processStartTime(process.pid)}-\\d+$`));
+    } finally {
+      removeCgroupsSync([prepared.cgroup!]);
+    }
+  });
+});
+
+describe('processStartTime', () => {
+  it('reads field 22 of /proc/<pid>/stat, even when the command name holds spaces and parentheses', async () => {
+    if (process.platform !== 'linux') return;
+    // A script's comm is its file name, and `a) b (c` would shift every field
+    // after it under a naive split. `read` blocks in the shell itself, so the
+    // comm is not replaced by an exec'd child.
+    const odd = join(scratch, 'a) b (c');
+    writeFileSync(odd, '#!/bin/sh\nread line\n');
+    chmodSync(odd, 0o755);
+    const before = Bun.spawn(['sleep', '30']);
+    const proc = Bun.spawn([odd], { stdin: 'pipe' });
+    const after = Bun.spawn(['sleep', '30']);
+    try {
+      const deadline = Date.now() + 3_000;
+      while (!readFileSync(`/proc/${proc.pid}/stat`, 'utf-8').includes('(a) b (c)') && Date.now() < deadline) {
+        await Bun.sleep(10);
+      }
+      const start = processStartTime(proc.pid);
+      expect(start).toBeGreaterThanOrEqual(processStartTime(before.pid)!);
+      expect(start).toBeLessThanOrEqual(processStartTime(after.pid)!);
+    } finally {
+      for (const p of [before, proc, after]) p.kill('SIGKILL');
+    }
+  });
+
+  it('is undefined for a pid that is not running', async () => {
+    const dead = Bun.spawn(['true']);
+    await dead.exited;
+    expect(processStartTime(dead.pid)).toBeUndefined();
   });
 });
 
