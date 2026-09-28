@@ -58,7 +58,13 @@ function emitCall(call: HarnessInvocation, toolPath: string): void {
   emit({ type: 'lifecycle', phase: 'end', exitCode: 0 });
 }
 
-type MakerStep = 'ok' | 'rate-limited';
+// 'missing' / 'unparseable' / 'invalid' / 'rogue-write' drive the four
+// scrap-outcome spans in executeHarnessStation (integrity_violation,
+// harness-output-missing, harness-output-unparseable, harness-output-invalid).
+// Each still emits a full event burst first (emitCall), so every one of these
+// failing calls leaves its own tool-input-available row to join back to its
+// span's invocation id.
+type MakerStep = 'ok' | 'rate-limited' | 'missing' | 'unparseable' | 'invalid' | 'rogue-write';
 
 function makeMaker(steps: MakerStep[]): { adapter: HarnessAdapter; calls: HarnessInvocation[] } {
   const calls: HarnessInvocation[] = [];
@@ -76,6 +82,27 @@ function makeMaker(steps: MakerStep[]): { adapter: HarnessAdapter; calls: Harnes
       emitCall(call, 'result.json');
       if (step === 'rate-limited') {
         throw Object.assign(new Error('fake: provider rate limit'), { code: 'harness-rate-limited' });
+      }
+      if (step === 'missing') {
+        // Writes nothing at all -- the declared output never lands on disk.
+        return { outputs: [], usage: { tokens: 10, cost: 0.01 } };
+      }
+      if (step === 'unparseable') {
+        writeFileSync(join(process.cwd(), 'result.json'), 'this is not json <<<', 'utf-8');
+        return { outputs: [], usage: { tokens: 10, cost: 0.01 } };
+      }
+      if (step === 'invalid') {
+        // Valid JSON, but missing the required 'summary' field -- fails schema validation.
+        writeFileSync(join(process.cwd(), 'result.json'), JSON.stringify({ notSummary: 'x' }), 'utf-8');
+        return { outputs: [], usage: { tokens: 10, cost: 0.01 } };
+      }
+      if (step === 'rogue-write') {
+        // The declared output is written correctly, but an undeclared file also
+        // lands outside the card's owned_paths -- an integrity violation that
+        // hard-pauses the card before the output is ever inspected.
+        writeFileSync(join(process.cwd(), 'result.json'), JSON.stringify({ summary: 'ok' }), 'utf-8');
+        writeFileSync(join(process.cwd(), 'rogue.txt'), 'unauthorized write', 'utf-8');
+        return { outputs: [], usage: { tokens: 10, cost: 0.01 } };
       }
       writeFileSync(join(process.cwd(), 'result.json'), JSON.stringify({ summary: 'ok' }), 'utf-8');
       return { outputs: [], usage: { tokens: 10, cost: 0.01 } };
@@ -185,6 +212,12 @@ async function run(flow: FlowConfig, registry: HarnessRegistry): Promise<void> {
 const harnessSpans = (d: ConduitDB) =>
   d.getJournalSpansForRun(DEFAULT_RUN_ID, 'entry').filter((s) => s.name === 'coder.harness' || s.name === 'coder.harness-critic');
 
+/** The invocation id on each call's own tool-input-available row, in call order. */
+const toolInputInvocationIds = (d: ConduitDB): string[] =>
+  d.getHarnessEventsForRun(DEFAULT_RUN_ID, 'entry')
+    .filter((r) => r.kind === 'tool-input-available')
+    .map((r) => r.invocationId);
+
 describe('issue #71: the maker path journals its events', () => {
   it('passes onEvent, writes only durable kinds, and stamps the span\'s invocation id on every row', async () => {
     db = openDb();
@@ -233,6 +266,101 @@ describe('issue #71: the maker path journals its events', () => {
     const starts = rows.filter((r) => r.kind === 'lifecycle' && r.phase === 'start');
     expect(starts.map((r) => r.invocationId)).toEqual(spans.map((s) => s.invocationId!));
     expect(starts.map((r) => r.seq)).toEqual([0, 0]);
+  });
+});
+
+describe('issue #71: the scrap-outcome spans still carry the calling invocation id', () => {
+  // Reviewer comment: the executor stamps invocationId on the rate-limit/throw
+  // span and the success span (both covered above) and on four scrap-outcome
+  // spans -- integrity_violation, harness-output-missing,
+  // harness-output-unparseable, harness-output-invalid -- that had no coverage
+  // at all. Each case below drives one of those outcomes with the existing fake
+  // harness, then checks that the failing call's own event rows and its
+  // `coder.harness` span carry the same invocation id, and that a retried
+  // outcome mints a fresh id on every attempt.
+
+  it('stamps invocationId on the harness-output-missing span, fresh on every retry', async () => {
+    db = openDb();
+    const { adapter, calls } = makeMaker(['missing', 'missing', 'missing']);
+    const registry = createHarnessRegistry([adapter]);
+    const flow = writeFlow(projectDir, registry);
+    seedCard(db);
+
+    await run(flow, registry);
+
+    expect(db.getCard(DEFAULT_RUN_ID, 'entry')?.lane).toBe('scrap');
+    expect(calls).toHaveLength(3);
+
+    const spans = harnessSpans(db);
+    expect(spans).toHaveLength(3);
+    expect(spans.every((s) => /harness-output-missing/.test(String(s.attributes.outcome)))).toBe(true);
+
+    // Each call's tool-input-available row lines up with that same call's span.
+    expect(toolInputInvocationIds(db)).toEqual(spans.map((s) => s.invocationId!));
+    // A retry never reuses the previous attempt's invocation id.
+    expect(new Set(spans.map((s) => s.invocationId)).size).toBe(3);
+  });
+
+  it('stamps invocationId on the harness-output-unparseable span, fresh on every retry', async () => {
+    db = openDb();
+    const { adapter, calls } = makeMaker(['unparseable', 'unparseable', 'unparseable']);
+    const registry = createHarnessRegistry([adapter]);
+    const flow = writeFlow(projectDir, registry);
+    seedCard(db);
+
+    await run(flow, registry);
+
+    expect(db.getCard(DEFAULT_RUN_ID, 'entry')?.lane).toBe('scrap');
+    expect(calls).toHaveLength(3);
+
+    const spans = harnessSpans(db);
+    expect(spans).toHaveLength(3);
+    expect(spans.every((s) => /harness-output-unparseable/.test(String(s.attributes.outcome)))).toBe(true);
+
+    expect(toolInputInvocationIds(db)).toEqual(spans.map((s) => s.invocationId!));
+    expect(new Set(spans.map((s) => s.invocationId)).size).toBe(3);
+  });
+
+  it('stamps invocationId on the harness-output-invalid span, fresh on every retry', async () => {
+    db = openDb();
+    const { adapter, calls } = makeMaker(['invalid', 'invalid', 'invalid']);
+    const registry = createHarnessRegistry([adapter]);
+    const flow = writeFlow(projectDir, registry);
+    seedCard(db);
+
+    await run(flow, registry);
+
+    expect(db.getCard(DEFAULT_RUN_ID, 'entry')?.lane).toBe('scrap');
+    expect(calls).toHaveLength(3);
+
+    const spans = harnessSpans(db);
+    expect(spans).toHaveLength(3);
+    expect(spans.every((s) => /harness-output-invalid/.test(String(s.attributes.outcome)))).toBe(true);
+
+    expect(toolInputInvocationIds(db)).toEqual(spans.map((s) => s.invocationId!));
+    expect(new Set(spans.map((s) => s.invocationId)).size).toBe(3);
+  });
+
+  it('stamps invocationId on the integrity_violation span (one call, escalates straight to hold)', async () => {
+    db = openDb();
+    // A rogue write outside owned_paths hard-pauses the card on the FIRST
+    // attempt -- there is no retry loop for this outcome, so this checks the
+    // single call's span against its own event rows rather than a series.
+    const { adapter, calls } = makeMaker(['rogue-write']);
+    const registry = createHarnessRegistry([adapter]);
+    const flow = writeFlow(projectDir, registry);
+    seedCard(db);
+
+    await run(flow, registry);
+
+    expect(db.getCard(DEFAULT_RUN_ID, 'entry')?.lane).toBe('hold');
+    expect(calls).toHaveLength(1);
+
+    const spans = harnessSpans(db);
+    expect(spans).toHaveLength(1);
+    expect(String(spans[0]!.attributes.outcome)).toMatch(/integrity_violation/);
+
+    expect(toolInputInvocationIds(db)).toEqual([spans[0]!.invocationId!]);
   });
 });
 
