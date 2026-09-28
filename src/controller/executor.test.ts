@@ -184,6 +184,7 @@ function makeIO(): { io: { out(l: string): void; err(l: string): void }; lines: 
 interface FlowOpts {
   promptVersion?: string;
   maxTokens?: number;
+  wallClockMinutes?: number;
 }
 
 /**
@@ -194,6 +195,7 @@ interface FlowOpts {
 function setupTransformFlow(dir: string, opts: FlowOpts = {}): FlowConfig {
   const promptVersion = opts.promptVersion ?? '1';
   const maxTokens = opts.maxTokens ?? 100000;
+  const wallClockMinutes = opts.wallClockMinutes ?? 10;
 
   mkdirSync(join(dir, 'prompts'), { recursive: true });
   writeFileSync(join(dir, 'prompts', 'ideate.md'), 'Make an idea from {{context.json}}');
@@ -205,7 +207,7 @@ flow: executor-unit
 project_root: .
 flow_version: 1
 budgets:
-  run: { wall_clock_minutes: 10, max_tokens: ${maxTokens} }
+  run: { wall_clock_minutes: ${wallClockMinutes}, max_tokens: ${maxTokens} }
   per_card: { max_execution_attempts: 4 }
   liveness: { no_progress_minutes: 3 }
 defaults: { cap_policy: scrap, on_dep_scrap: hold }
@@ -674,6 +676,32 @@ describe('runExecutor — andon + liveness halts and contradictory escalation (F
 
     expect(db.getCard(DEFAULT_RUN_ID, 'entry')?.lane).not.toBe('done');
     expect(lines.join(' ')).toMatch(/token|budget|andon/i);
+  });
+
+  it('halts when a station-level trip is on the WALL-CLOCK budget (not tokens) and still prints exactly one andon line (issue #83)', async () => {
+    // wall_clock_minutes=1 (60s). The clock advances 100s per call: runStartedAt
+    // is the first call (t=100), and the dispatching tick's currentNow is the
+    // second (t=200) — elapsed=100s already clears the 60s budget before the
+    // maker's model call even runs, so the STATION's own post-call andon check
+    // (executeTransformStation, not the gate) is what trips, not the tick-level
+    // check that follows the action batch. max_tokens stays at the generous
+    // default so tokens never trips first — this pins the wall_clock path,
+    // which the token test above does not cover.
+    const flow = setupTransformFlow(projectDir, { wallClockMinutes: 1 });
+    db = openDb();
+    seedCard(db, { id: 'entry', lane: 'ideate' });
+    const { adapter } = makeStubAdapter({ gateRejectsBeforePass: 0 });
+    const { io, lines } = makeIO();
+    let t = 0;
+    const now = () => (t += 100);
+
+    await runExecutor({ db, flow, now, adapter, io } as RunEngineArgs);
+
+    expect(db.getCard(DEFAULT_RUN_ID, 'entry')?.lane).not.toBe('done');
+    // haltOnStationAndon takes no reason and never prints (issue #83); only the
+    // tick-level consumption check re-evaluates the same currentNow/tokensSpent
+    // and prints the halt line — exactly once, with the wall_clock wording.
+    expect(lines.filter((l) => l.startsWith('andon:'))).toEqual(['andon: run halted — wall_clock budget exceeded']);
   });
 
   it('halts on a liveness stall (no progress + no active worker) and surfaces the reason', async () => {
