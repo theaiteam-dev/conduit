@@ -4,7 +4,7 @@ missionId: ~
 
 # Conduit — War Room
 
-**Author:** Josh Owens  **Date:** 2026-06-12  **Status:** Draft
+**Author:** Josh Owens  **Date:** 2026-06-12  **Revised:** 2026-09-28 (TUI first, #89)  **Status:** Draft
 
 > Scope note: the War Room is named in the SPEC's lean glossary — *"Genba (the floor) →
 > the War Room — live stream of the journal"* — but has never been specified. This PRD
@@ -187,7 +187,8 @@ projection; its whole value is that what you see *is* the journal.
    displays what the journal stores and adds no new exposure surface (no raw env, no
    request bodies beyond what ingress already persisted).
 6. The full lane graph — parent path, any child band, and the terminal rail — shall be
-   visible without horizontal scrolling at 1280px width for flows of up to 8 stations.
+   visible without horizontal scrolling at 160 terminal columns (TUI) or 1280px width
+   (web) for flows of up to 8 stations.
 
 ### Edge Cases & Error States
 
@@ -236,7 +237,14 @@ projection; its whole value is that what you see *is* the journal.
 
 ## 8. Solution Approach
 
-The War Room is a **local web view served by the kernel binary itself** — a
+**Delivery order (revised 2026-09-28, #89).** The first surface is a terminal UI:
+`conduit watch` renders in the terminal with `@opentui/react` and reads the journal
+directly, with no server. The web view described below comes second and reuses the same
+reader, projection function, and replay logic. It adds the rendering components and the
+server and SSE layer. The TUI visual spec is `design/war-room/`: frames, 160x45 golden
+text and ANSI frames, color tokens, and a cell-grid reference renderer.
+
+The web view is a **local web view served by the kernel binary itself** — a
 `conduit watch` style command alongside the existing CLI, not a separate service. It
 ships in the same Docker image, reads the same mounted volume, and adds no new runtime
 or infrastructure.
@@ -291,7 +299,11 @@ the system's author could not narrate it; the paradigm record is §10):
 
 **Constraints:**
 
-- **Bun-only toolchain** (per ADR-0002/0003): the UI is a static React SPA bundled by
+- **TUI** renders with `@opentui/react` (Bun-native), pinned to an exact version while
+  it is pre-1.0. Tests use `@opentui/react/test-utils`: `captureCharFrame` for text
+  snapshots against `design/war-room/golden/`, `captureSpans` for colors, mock keys and
+  mouse for interaction, and `ManualClock` for countdowns and the watchdog.
+- **Bun-only toolchain** (per ADR-0002/0003): the web UI is a static React SPA bundled by
   Bun's native bundler and served by `Bun.serve()` from the kernel binary. No Node,
   Vite, or Next.js toolchain; no separate deployable. This decision (one binary, no
   second service) should be recorded as an ADR at implementation time.
@@ -352,8 +364,12 @@ the system's author could not narrate it; the paradigm record is §10):
 
 ### Resolved
 
-- [x] **Delivery surface** → local web view (React SPA), not a TUI. It is the demo
-      artifact; the projection contract would have been identical either way (§8, §9).
+- [x] **Delivery surface** → TUI first, web view second (revised 2026-09-28, #89). This
+      was first resolved as web only, because the web view is the demo artifact. It was
+      reversed because flows run on a remote box, where a TUI works over SSH with no port
+      or auth decision; the TUI needs no server layer; and its tests assert on rendered
+      text. A vhs recording of a fixture run serves as the demo. The projection contract
+      is identical for both (§8, §9).
 - [x] **Primary paradigm** → trace waterfall, not a station board. The board prototype
       failed the narration test (the author could not read it); the waterfall passed
       immediately. The journal is a trace; render it as one. Board demoted to a
