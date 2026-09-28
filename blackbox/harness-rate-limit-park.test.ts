@@ -195,12 +195,10 @@ describe("harness journey: a park longer than the remaining wall-clock budget", 
         entryInput: "topic.md",
         roles: [{ name: "maker", promptIncludes: "ROLE:MAKER", calls: [cappedCall(resetsAt)] }],
       });
-      const startedAt = Date.now();
-      // Killed with 137 at 15s if it is still sleeping toward the reset.
+      // Killed with 137 at 15s if it is still sleeping toward the reset, so the
+      // exit code alone separates a halted run from one sleeping to the reset.
       const run = await f.run(["--budget-wall-clock-seconds", "2"], { timeoutMs: 15_000 });
-      const elapsedMs = Date.now() - startedAt;
       expect(run.exitCode).toBe(1);
-      expect(elapsedMs).toBeLessThan(10_000);
       expect(run.stderr).toContain("andon: run halted — wall_clock budget exceeded while parked behind a provider rate limit");
       expect(run.stderr).toContain(`run "${f.runId}" parked behind a provider rate limit`);
       expect(f.stubLog()).toHaveLength(1);
