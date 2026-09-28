@@ -169,7 +169,15 @@ async function main(): Promise<number> {
   const prompt = sep === -1 ? "" : argv.slice(sep + 1).join(" ");
   const model = argValue(argv, "--model");
 
-  const role = scenario.roles.find((r) => prompt.includes(r.promptIncludes));
+  // Every match, not the first: overlapping markers would otherwise run the
+  // wrong role's calls with no signal.
+  const matches = scenario.roles.filter((r) => prompt.includes(r.promptIncludes));
+  if (matches.length > 1) {
+    const markers = matches.map((r) => JSON.stringify(r.promptIncludes)).join(", ");
+    process.stderr.write(`fake-claude: the prompt matches more than one role's promptIncludes: ${markers}\n`);
+    return 65;
+  }
+  const role = matches[0];
   if (!role) {
     process.stderr.write(`fake-claude: no scenario role matches the prompt: ${prompt.slice(0, 200)}\n`);
     return 65;

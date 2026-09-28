@@ -17,6 +17,9 @@ import { join } from "node:path";
 import { isOrphanedStub, pidAlive, startHarnessFlow, waitFor } from "./harness-flow";
 
 const FAKE_CLAUDE = join(import.meta.dir, "fake-claude.ts");
+// A stand-in stub: an idle bun process whose argv carries the fake-claude path.
+// isOrphanedStub() matches on the cmdline, so this is all the pid-matching and
+// kill tests need; the last test below reaps a real fake-claude process.
 const IDLE = "setTimeout(() => {}, 30_000)";
 
 const HANGING_FLOW = `
@@ -122,9 +125,13 @@ describe("startHarnessFlow — stub log and cleanup", () => {
 
   test("cleanup() removes the temp root even when a truncated log line is present", async () => {
     const f = scaffold();
-    appendFileSync(join(f.root, "stub", "invocations.ndjson"), `{"role":"mak`);
-    await f.cleanup();
-    expect(existsSync(f.root)).toBe(false);
+    try {
+      appendFileSync(join(f.root, "stub", "invocations.ndjson"), `{"role":"mak`);
+      await f.cleanup();
+      expect(existsSync(f.root)).toBe(false);
+    } finally {
+      await f.cleanup();
+    }
   });
 
   test("isOrphanedStub() matches a live fake-claude process only", async () => {
