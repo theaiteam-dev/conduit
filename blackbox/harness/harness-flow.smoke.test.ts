@@ -80,6 +80,46 @@ describe("startHarnessFlow — stub log and cleanup", () => {
     }
   });
 
+  test("stubLog() throws on a malformed line that is not the last one", async () => {
+    const f = scaffold();
+    try {
+      const good = JSON.stringify({ role: "maker", call: 2, pid: 999999999 });
+      appendFileSync(join(f.root, "stub", "invocations.ndjson"), `{"role":"mak\n${good}\n`);
+      expect(() => f.stubLog()).toThrow(/invocations\.ndjson line 1/);
+    } finally {
+      await f.cleanup();
+    }
+  });
+
+  test("journalSpans() names the missing journal DB before any run", async () => {
+    const f = scaffold();
+    try {
+      expect(() => f.journalSpans()).toThrow(/journal DB .* does not exist/);
+    } finally {
+      await f.cleanup();
+    }
+  });
+
+  test("ambient CONDUIT_* variables do not reach the binary; opts.env does", async () => {
+    process.env.CONDUIT_BB_AMBIENT_LEAK = "leaked";
+    let f: ReturnType<typeof startHarnessFlow> | undefined;
+    try {
+      f = startHarnessFlow({
+        flowYaml: "name: unused\n",
+        files: {},
+        entryInput: "topic.md",
+        roles: [],
+        env: { CONDUIT_HARNESS_CLAUDE_HEADLESS_MODEL: "from-opts" },
+      });
+      expect(f.env.CONDUIT_BB_AMBIENT_LEAK).toBeUndefined();
+      expect(f.env.CONDUIT_HARNESS_CLAUDE_HEADLESS_MODEL).toBe("from-opts");
+      expect(f.env.PATH).toBe(process.env.PATH!);
+    } finally {
+      delete process.env.CONDUIT_BB_AMBIENT_LEAK;
+      await f?.cleanup();
+    }
+  });
+
   test("cleanup() removes the temp root even when a truncated log line is present", async () => {
     const f = scaffold();
     appendFileSync(join(f.root, "stub", "invocations.ndjson"), `{"role":"mak`);
