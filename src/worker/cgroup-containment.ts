@@ -12,7 +12,8 @@
  *
  * Mechanism, per spawn:
  *
- *   1. Create `conduit-<kernel pid>-<n>` under the kernel's own cgroup. No
+ *   1. Create `conduit-<kernel pid>-<start time>-<n>` under the kernel's own
+ *      cgroup, where the start time is the kernel's, from /proc. No
  *      controllers are enabled, so the cgroup v2 "no internal processes" rule
  *      does not apply and the kernel may stay in the parent.
  *   2. Spawn the command through `/bin/sh -c 'echo $$ > cgroup.procs && exec'`.
@@ -39,7 +40,10 @@ const CGROUP2_SUPER_MAGIC = 0x63677270;
 /** The default cgroup v2 mount point. */
 const DEFAULT_CGROUP_MOUNT = '/sys/fs/cgroup';
 
-/** Prefix of every cgroup the kernel creates; the kernel pid follows it. */
+/**
+ * Prefix of every cgroup the kernel creates; the kernel pid and start time
+ * follow it.
+ */
 const CGROUP_PREFIX = 'conduit-';
 
 /** Upper bound on waiting for a killed cgroup to empty before removing it. */
@@ -102,6 +106,41 @@ function isPidAlive(pid: number): boolean {
     // EPERM: it exists but belongs to someone else.
     return (err as { code?: string }).code === 'EPERM';
   }
+}
+
+/**
+ * The start time of process `pid`, in clock ticks since boot: field 22 of
+ * /proc/<pid>/stat. Unlike a pid, the kernel does not hand the pair
+ * (pid, start time) to another process. Undefined when the process is not
+ * running or /proc cannot be read.
+ */
+export function processStartTime(pid: number): number | undefined {
+  let stat: string;
+  try {
+    stat = readFileSync(`/proc/${pid}/stat`, 'utf-8');
+  } catch {
+    return undefined;
+  }
+  // Field 2 is the command name in parentheses and may itself contain spaces
+  // and parentheses, so count fields from the last `)`: field 3 follows it.
+  const fields = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
+  const value = Number(fields[22 - 3]);
+  return Number.isSafeInteger(value) ? value : undefined;
+}
+
+let ownerTagMemo: string | undefined;
+
+/**
+ * `<pid>-<start time>` of this kernel, the owner part of every cgroup name it
+ * creates. Throws when /proc/self/stat cannot be read; detection checks that
+ * first and falls back to the process-group kill.
+ */
+function ownerTag(): string {
+  if (ownerTagMemo !== undefined) return ownerTagMemo;
+  const startTime = processStartTime(process.pid);
+  if (startTime === undefined) throw new Error('cannot read the start time of this process from /proc/self/stat');
+  ownerTagMemo = `${process.pid}-${startTime}`;
+  return ownerTagMemo;
 }
 
 /** Whether the cgroup at `dir` still holds any process, itself or below. */
@@ -219,10 +258,69 @@ function unifiedCgroupPath(procSelfCgroup: string): string | undefined {
   return undefined;
 }
 
+/** Injectable dependencies of `isOwnerGone`, defaulted to the real ones in production. */
+export interface IsOwnerGoneDeps {
+  /** This kernel's own pid. Defaults to `process.pid`. */
+  selfPid?: number;
+  /**
+   * This kernel's own start time, as read once by the caller (`sweepStaleCgroups`
+   * reads it a single time per sweep rather than once per entry). Defaults to
+   * reading it fresh via `processStartTime(selfPid)`. Undefined when it cannot be
+   * read, which is treated as ambiguous: a name matching this kernel's pid is then
+   * kept rather than reaped.
+   */
+  selfStartTime?: number;
+  /** Whether a pid is currently running. Defaults to the real `isPidAlive`. */
+  isPidAlive?: (pid: number) => boolean;
+  /** A process's start time reader. Defaults to the real `processStartTime`. */
+  processStartTime?: (pid: number) => number | undefined;
+}
+
 /**
- * Kill and remove cgroups a previous kernel left behind: `conduit-<pid>-*`
- * under `parent` whose pid is no longer running. A kernel that was SIGKILLed
- * ran no exit handler, so anything its stations started is still in there.
+ * Whether the kernel that created the cgroup named `name` is gone. The name
+ * carries the owner's pid and start time, so a pid that another process has
+ * since been given does not keep the cgroup alive. That includes this kernel's
+ * own pid: a name with this pid and a different start time was left by an
+ * earlier kernel that held the same pid. A name with no start time
+ * (`conduit-<pid>-<n>`, from a kernel built before issue #81) falls back to
+ * whether the pid is running, as does an owner whose start time cannot be
+ * read. Undefined for a name the kernel did not create.
+ */
+export function isOwnerGone(name: string, deps: IsOwnerGoneDeps = {}): boolean | undefined {
+  const selfPid = deps.selfPid ?? process.pid;
+  // A key present with value `undefined` (the caller read its own start time
+  // and got nothing back) must stay undefined here, not fall through to a
+  // fresh read, so distinguish "omitted" from "provided as undefined".
+  const selfStartTime = 'selfStartTime' in deps ? deps.selfStartTime : processStartTime(selfPid);
+  const isAlive = deps.isPidAlive ?? isPidAlive;
+  const getStartTime = deps.processStartTime ?? processStartTime;
+
+  const match = /^conduit-(\d+)-(?:(\d+)-[^-]+|[^-]+)$/.exec(name);
+  if (match === null) return undefined;
+  const owner = Number(match[1]);
+
+  if (owner === selfPid) {
+    // A legacy name cannot be told apart from this kernel's, so keep it. An
+    // unreadable own start time is ambiguous the same way.
+    if (match[2] === undefined) return false;
+    if (selfStartTime === undefined) return false;
+    return Number(match[2]) !== selfStartTime;
+  }
+
+  if (match[2] === undefined) return !isAlive(owner);
+  const startTime = getStartTime(owner);
+  // An unreadable stat for a pid that still answers kill(0) is another user's
+  // process under a `hidepid` /proc mount. Keep its cgroup: killing a live
+  // kernel's invocation is worse than leaving an orphan for a later sweep.
+  if (startTime === undefined) return !isAlive(owner);
+  return startTime !== Number(match[2]);
+}
+
+/**
+ * Kill and remove cgroups a previous kernel left behind: `conduit-*` under
+ * `parent` whose owner is no longer running (see `isOwnerGone`). A kernel that
+ * was SIGKILLed ran no exit handler, so anything its stations started is still
+ * in there.
  */
 async function sweepStaleCgroups(parent: string): Promise<void> {
   let entries: string[];
@@ -231,12 +329,11 @@ async function sweepStaleCgroups(parent: string): Promise<void> {
   } catch {
     return;
   }
+  // Read once for the whole sweep rather than once per entry.
+  const selfStartTime = processStartTime(process.pid);
   const stale: string[] = [];
   for (const name of entries) {
-    const match = /^conduit-(\d+)-/.exec(name);
-    if (match === null) continue;
-    const owner = Number(match[1]);
-    if (owner === process.pid || isPidAlive(owner)) continue;
+    if (isOwnerGone(name, { selfStartTime }) !== true) continue;
     const dir = join(parent, name);
     killCgroup(dir);
     stale.push(dir);
@@ -283,9 +380,16 @@ export async function detectContainment(options: DetectContainmentOptions = {}):
     return fallback(`${parent} has no cgroup.kill (requires Linux 5.14 or later)`);
   }
 
+  let owner: string;
+  try {
+    owner = ownerTag();
+  } catch (err) {
+    return fallback(errorText(err));
+  }
+
   await sweepStaleCgroups(parent);
 
-  const probe = join(parent, `${CGROUP_PREFIX}${process.pid}-probe`);
+  const probe = join(parent, `${CGROUP_PREFIX}${owner}-probe`);
   try {
     mkdirSync(probe);
   } catch (err) {
@@ -307,7 +411,7 @@ export async function detectContainment(options: DetectContainmentOptions = {}):
     });
 
     // Wait until /proc shows the probe inside the new cgroup, or it exits.
-    const expected = `0::${selfPath === '/' ? '' : selfPath}/${CGROUP_PREFIX}${process.pid}-probe`;
+    const expected = `0::${selfPath === '/' ? '' : selfPath}/${CGROUP_PREFIX}${owner}-probe`;
     const deadline = Date.now() + PROBE_BUDGET_MS;
     let joined = false;
     while (Date.now() < deadline && proc.exitCode === null && proc.signalCode === null) {
@@ -439,7 +543,7 @@ export function prepareContainedCommand(
   }
 
   cgroupSequence += 1;
-  const cgroup = join(containment.parent, `${CGROUP_PREFIX}${process.pid}-${cgroupSequence}`);
+  const cgroup = join(containment.parent, `${CGROUP_PREFIX}${ownerTag()}-${cgroupSequence}`);
   try {
     mkdirSync(cgroup);
   } catch (err) {
