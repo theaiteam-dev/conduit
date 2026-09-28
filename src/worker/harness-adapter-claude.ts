@@ -539,12 +539,15 @@ export function createClaudeHarnessAdapter(config: ClaudeHarnessAdapterConfig): 
       // forwarded, while the retention filter still keeps only the two events
       // parseClaudeStream reads.
       const emit = call.onEvent !== undefined ? createHarnessEventEmitter(call.onEvent) : undefined;
+      // Line ordinal for mapClaudeStreamLine's uuid-less id fallback.
+      let lineIndex = 0;
       const onStdoutLine =
         emit === undefined
           ? () => call.onProgress?.()
           : (line: string) => {
               call.onProgress?.();
-              for (const event of mapClaudeStreamLine(line)) emit(event);
+              for (const event of mapClaudeStreamLine(line, lineIndex)) emit(event);
+              lineIndex += 1;
             };
 
       emit?.({ type: 'lifecycle', phase: 'start' });

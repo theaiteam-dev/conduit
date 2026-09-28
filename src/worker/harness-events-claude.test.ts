@@ -99,6 +99,27 @@ describe('mapClaudeStreamLine: per event class', () => {
     expect(events).toEqual([{ type: 'text-delta', id: 'msg_7:0', delta: 'x' }]);
   });
 
+  it('folds a caller-supplied line ordinal into the message-id fallback, so two uuid-less lines sharing a message id do not collide', () => {
+    const uuidLess = (text: string): string =>
+      line({ type: 'assistant', message: { id: 'msg_7', content: [{ type: 'text', text }] } });
+
+    const first = mapClaudeStreamLine(uuidLess('a'), 0);
+    const second = mapClaudeStreamLine(uuidLess('b'), 1);
+
+    expect(first).toEqual([{ type: 'text-delta', id: 'msg_7@0:0', delta: 'a' }]);
+    expect(second).toEqual([{ type: 'text-delta', id: 'msg_7@1:0', delta: 'b' }]);
+  });
+
+  it('folds the ordinal into the "block" fallback too, when neither uuid nor message id is present', () => {
+    const noId = (text: string): string => line({ type: 'assistant', message: { content: [{ type: 'text', text }] } });
+
+    const first = mapClaudeStreamLine(noId('a'), 0);
+    const second = mapClaudeStreamLine(noId('b'), 1);
+
+    expect(first).toEqual([{ type: 'text-delta', id: 'block@0:0', delta: 'a' }]);
+    expect(second).toEqual([{ type: 'text-delta', id: 'block@1:0', delta: 'b' }]);
+  });
+
   it('a user tool_result becomes tool-output-available with the raw tool_use_result', () => {
     const events = mapClaudeStreamLine(
       line({

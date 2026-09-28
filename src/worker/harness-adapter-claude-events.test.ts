@@ -117,7 +117,41 @@ describe('claude-headless onEvent: a throwing consumer', () => {
 
     expect((result.usage as KnownUsage).cost).toBe(0.0272912);
     expect(seqs.length).toBeGreaterThan(2);
-    expect(seqs.at(-1)).toBe(seqs.length - 1);
+    expect(seqs).toEqual(seqs.map((_, i) => i));
+  });
+});
+
+describe('claude-headless onEvent: malformed stdout lines', () => {
+  it('skips garbage lines without failing the call or perturbing the event stream', async () => {
+    const cleanEvents: HarnessEvent[] = [];
+    const cleanResult = await makeAdapter(playLines(FIXTURE_LINES).run).invoke(
+      invocation({ onEvent: (e) => cleanEvents.push(e) }),
+    );
+
+    // Garbage both before the recorded stream and interleaved mid-stream: an
+    // empty line, unparseable text, a truncated JSON fragment, and a
+    // CLI-style warning banner planted between two real lines.
+    const half = Math.floor(FIXTURE_LINES.length / 2);
+    const messyLines = [
+      '',
+      'not json',
+      '{"type":',
+      ...FIXTURE_LINES.slice(0, half),
+      'WARN: something',
+      ...FIXTURE_LINES.slice(half),
+    ];
+
+    const events: HarnessEvent[] = [];
+    const result = await makeAdapter(playLines(messyLines).run).invoke(
+      invocation({ onEvent: (e) => events.push(e) }),
+    );
+
+    expect(result).toEqual(cleanResult);
+    expect((result.usage as KnownUsage).tokens).toBe(26 + 720 + 58272 + 8919);
+    expect(events.map((e) => e.seq)).toEqual(events.map((_, i) => i));
+    expect(events[0]).toEqual({ type: 'lifecycle', phase: 'start', seq: 0 });
+    expect(events.at(-1)).toEqual({ type: 'lifecycle', phase: 'end', exitCode: 0, seq: events.length - 1 });
+    expect(events.slice(1, -1).map(body)).toEqual(cleanEvents.slice(1, -1).map(body));
   });
 });
 

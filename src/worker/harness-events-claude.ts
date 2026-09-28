@@ -64,12 +64,18 @@ function contentBlocks(event: Json): unknown[] {
   return message.content;
 }
 
-function mapAssistant(event: Json): HarnessEventBody[] {
+function mapAssistant(event: Json, lineIndex?: number): HarnessEventBody[] {
   // Keyed by the LINE, not the message: the CLI writes one line per content
-  // block, and consecutive lines share a message id.
+  // block, and consecutive lines share a message id. A line without a `uuid`
+  // folds in the caller's line ordinal, since its message id is not unique.
   const message = isObject(event.message) ? event.message : {};
+  const messageKey = typeof message.id === 'string' ? message.id : 'block';
   const key =
-    typeof event.uuid === 'string' ? event.uuid : typeof message.id === 'string' ? message.id : 'block';
+    typeof event.uuid === 'string'
+      ? event.uuid
+      : lineIndex !== undefined
+        ? `${messageKey}@${lineIndex}`
+        : messageKey;
   const events: HarnessEventBody[] = [];
   contentBlocks(event).forEach((block, index) => {
     if (!isObject(block)) return;
@@ -136,8 +142,14 @@ function mapRateLimit(event: Json): HarnessEventBody[] {
   ];
 }
 
-/** Map one stream-json line to zero or more events. Never throws. */
-export function mapClaudeStreamLine(line: string): HarnessEventBody[] {
+/**
+ * Map one stream-json line to zero or more events. Never throws.
+ *
+ * `lineIndex` is the line's 0-based ordinal within the invocation. A caller
+ * streaming a whole invocation passes it so a uuid-less assistant line still
+ * gets ids unique to that line.
+ */
+export function mapClaudeStreamLine(line: string, lineIndex?: number): HarnessEventBody[] {
   const trimmed = line.trim();
   if (trimmed.length === 0) return [];
   let event: unknown;
@@ -149,7 +161,7 @@ export function mapClaudeStreamLine(line: string): HarnessEventBody[] {
   if (!isObject(event)) return [];
   switch (event.type) {
     case 'assistant':
-      return mapAssistant(event);
+      return mapAssistant(event, lineIndex);
     case 'user':
       return mapUser(event);
     case 'result':
