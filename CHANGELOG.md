@@ -24,9 +24,25 @@ historical context, not public releases or public repository history.
   call with a `lifecycle` start and one closing phase (`end`, `timeout` or
   `idle-timeout`). Events are numbered by `seq` from 0 within one call; a
   consumer that throws is ignored and cannot fail the call. Retained stdout,
-  `HarnessResult` and the codex adapter are unchanged, and nothing consumes
-  events yet: `stampHarnessEvents`, which stamps `attempt` and a per-call
-  `invocationId` for the executor, is wired by the journal writer in #71.
+  `HarnessResult` and the codex adapter are unchanged. The journal writer
+  below (#71) is the consumer.
+- Harness events in the journal ([#71](https://github.com/theaiteam-dev/conduit/issues/71)).
+  The executor passes an `onEvent` sink on every harness `invoke()`, maker and
+  gate critic, and `stampHarnessEvents` mints one `invocationId` per call, so
+  a rate-limit re-invoke under the same attempt and a critic under the
+  maker's attempt each get their own. A new `harness_events` table in the
+  journal DB, keyed `(run, card, station, attempt, invocation_id, seq)`,
+  keeps `tool-input-available`, `tool-output-available`, `usage`,
+  `rate-limit` and `lifecycle` events; text and reasoning deltas are dropped.
+  Rows carry the tool name, the path touched, `is_error`, a nullable exit
+  code (parsed from a failed Bash call's `Exit code N` string, or the
+  process exit on `lifecycle` end), usage, rate-limit windows and a receive
+  timestamp. No prompt text and no tool input or output body is stored.
+  Harness journal spans gain an `invocation_id` column so rows join to their
+  span. `conduit journal inspect` and `conduit journal tail` print each
+  harness span's rows beneath it, and the rows of a call that has no span
+  yet after the spans, so re-running `tail` follows a live call. Both stay
+  read-only. An existing journal gains the table and column when it opens.
 - One ingress run per external subject
   ([#36](https://github.com/theaiteam-dev/conduit/issues/36)). A webhook
   binding can declare `run_key`, the ordered JSON paths (with alternatives) or

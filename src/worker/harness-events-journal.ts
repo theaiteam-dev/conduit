@@ -16,7 +16,7 @@
  *     flag and, for a failed Bash call, the exit code in its error string.
  */
 
-import type { ConduitDB, HarnessEventRowInput } from '../persistence/db';
+import type { ConduitDB, HarnessEventRowInput, StoredHarnessEvent } from '../persistence/db';
 import type { StampedHarnessEvent } from './harness-events';
 
 /** Which card and station a sink writes for. */
@@ -167,4 +167,36 @@ export function createHarnessEventJournalSink(
       // Dropped by design (see above). The row's seq stays unused, so the gap is visible.
     }
   };
+}
+
+/**
+ * One harness_events row as `conduit journal inspect` and `tail` print it:
+ * receive time, seq, kind, and the columns that kind carries. Read side only.
+ */
+export function formatHarnessEvent(row: StoredHarnessEvent): string {
+  const parts = [new Date(row.atMs).toISOString(), `#${row.seq}`, row.kind];
+  switch (row.kind) {
+    case 'tool-input-available':
+      if (row.toolName !== null) parts.push(row.toolName);
+      if (row.path !== null) parts.push(`path=${row.path}`);
+      break;
+    case 'tool-output-available':
+      parts.push(row.isError === true ? 'error' : 'ok');
+      if (row.exitCode !== null) parts.push(`exit=${row.exitCode}`);
+      if (row.path !== null) parts.push(`path=${row.path}`);
+      break;
+    case 'usage':
+      if (row.tokens !== null) parts.push(`tokens=${row.tokens}`);
+      if (row.costUsd !== null) parts.push(`cost=$${row.costUsd}`);
+      break;
+    case 'rate-limit':
+      if (row.rateLimitStatus !== null) parts.push(`status=${row.rateLimitStatus}`);
+      for (const w of row.rateLimitWindows ?? []) parts.push(`${w.name}=${Math.round(w.utilization * 100)}%`);
+      break;
+    case 'lifecycle':
+      if (row.phase !== null) parts.push(row.phase);
+      if (row.exitCode !== null) parts.push(`exit=${row.exitCode}`);
+      break;
+  }
+  return parts.join(' ');
 }

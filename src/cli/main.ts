@@ -71,6 +71,8 @@ import { socketDialOptions } from '../ingress/socket-proxy';
 import { verifySlackSignature } from '../ingress/adapters/slack-events';
 import type { SocketSeam } from '../ingress/adapters/slack-socket';
 import { parseIngressBinding } from '../ingress/binding';
+import { formatHarnessEvent } from '../worker/harness-events-journal';
+import type { StoredHarnessEvent } from '../persistence/db';
 
 // ---------------------------------------------------------------------------
 // Public interfaces
@@ -2261,8 +2263,34 @@ async function cmdJournal(argv: string[], deps: CliDeps): Promise<number> {
       ? spans.slice(spans.length - JOURNAL_TAIL_DEFAULT)
       : spans;
 
+  // Issue #71: harness events, grouped by the invocation that produced them.
+  // A harness span is followed by its invocation's rows; rows whose
+  // invocation has no span yet (the call is still running, or the kernel
+  // died mid-call) print after the spans. Re-running tail during a live call
+  // therefore shows the rows written so far. READ-ONLY, like the rest.
+  const eventsByInvocation = new Map<string, StoredHarnessEvent[]>();
+  for (const event of deps.db.getHarnessEventsForRun(runId, cardId)) {
+    const rows = eventsByInvocation.get(event.invocationId) ?? [];
+    rows.push(event);
+    eventsByInvocation.set(event.invocationId, rows);
+  }
+  const printEvents = (rows: StoredHarnessEvent[]): void => {
+    for (const row of [...rows].sort((a, b) => a.seq - b.seq)) {
+      deps.io.out(`[${cardId}]   ${formatHarnessEvent(row)}`);
+    }
+  };
+
   for (const span of printable) {
     deps.io.out(`[${span.cardId}] ${span.station}@${span.attempt} ${span.name}`);
+    if (span.invocationId != null) printEvents(eventsByInvocation.get(span.invocationId) ?? []);
+  }
+
+  const spannedInvocations = new Set(spans.map((span) => span.invocationId).filter((id) => id != null));
+  for (const [invocationId, rows] of eventsByInvocation) {
+    if (spannedInvocations.has(invocationId)) continue;
+    const first = rows[0]!;
+    deps.io.out(`[${cardId}] ${first.station}@${first.attempt} invocation ${invocationId} (no span yet)`);
+    printEvents(rows);
   }
 
   // FR-9: `inspect` also renders the card transition log so a human can answer
