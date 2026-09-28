@@ -256,7 +256,7 @@ export function callGateFailClosed(gate: HarnessToolGate, call: GateToolCall): G
   try {
     decision = gate(call);
   } catch (err) {
-    return { decision: 'deny', code: 'gate_error', reason: `gate threw: ${err instanceof Error ? err.message : String(err)}` };
+    return deny('gate_error', `gate threw: ${err instanceof Error ? err.message : String(err)}`);
   }
   if (typeof decision === 'object' && decision !== null) {
     const d = decision as { decision?: unknown; code?: unknown; reason?: unknown };

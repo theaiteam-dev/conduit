@@ -28,6 +28,16 @@ describe('callGateFailClosed', () => {
     expect((out as { reason: string }).reason).toContain('boom');
   });
 
+  it('bounds and cleans a thrown message, since the reason is journaled', () => {
+    const gate: HarnessToolGate = () => {
+      throw new Error(`bad\nline\u0000${'x'.repeat(5000)}`);
+    };
+    const out = callGateFailClosed(gate, call) as { reason: string };
+    expect(out.reason.length).toBeLessThanOrEqual(200);
+    // eslint-disable-next-line no-control-regex
+    expect(out.reason).not.toMatch(/[\u0000-\u001f\u007f-\u009f]/);
+  });
+
   it.each([
     ['undefined', undefined],
     ['null', null],
