@@ -61,7 +61,8 @@ user or CI consumer actually sees, not internal implementation details.
   the suite, the same way `test.yml` does, so CI must take the cgroup branch.
 - `harness-rate-limit-park.test.ts`: a blocking provider rate limit parks the
   card with no attempt consumed, and `run status` reports the run parked with
-  its resume command. Holds a `test.todo` for a wall-clock budget bug (#84).
+  its resume command, including when the park outlasts the wall-clock budget
+  (#84).
 - `no-internal-imports.test.ts` + `harness/import-scan.ts` — the zero-imports
   gate (AC-1): a TypeScript-compiler-API scan that fails if any file under
   `blackbox/` imports anything resolving into `src/`.

@@ -15,9 +15,9 @@
  * never scrapped or held, the stub ran once, and `conduit run status` reports
  * the run parked with the resume command.
  *
- * The todo below pins a kernel bug this journey found: when the call returns
- * BEFORE the wall-clock budget is spent, the run sleeps to the provider reset
- * (up to an hour) instead of halting at its budget.
+ * The last describe pins issue #84: when the call returns BEFORE the
+ * wall-clock budget is spent, the run halts at its budget instead of sleeping
+ * to the provider reset.
  *
  * BLACK-BOX: imports only the harness-flow module + bun:test.
  */
@@ -158,8 +158,8 @@ describe("harness journey: a capped call's spend counts against the run token bu
       entryInput: "topic.md",
       roles: [{ name: "maker", promptIncludes: "ROLE:MAKER", calls: [cappedCall(resetsAt)] }],
     });
-    // Without the fold, nothing trips and the run sleeps toward the reset (#84)
-    // until this timeout kills it with 137.
+    // Without the fold, nothing trips and the run sleeps toward the wall-clock
+    // deadline (2 minutes) until this timeout kills it with 137.
     run = await f.run([], { timeoutMs: 15_000 });
   }, TIMEOUT_MS);
 
@@ -182,17 +182,10 @@ describe("harness journey: a park longer than the remaining wall-clock budget", 
     await f?.cleanup();
   });
 
-  // KERNEL BUG #84 (found by this journey): the wall-clock budget does not bound
-  // the wait on a parked card. Here the capped call returns at once, with the
-  // reset an hour out and `--budget-wall-clock-seconds 2`. In
-  // controller/executor.ts the release-gate branch of the run loop checks the
-  // consumption andon once, finds the budget not yet spent, and then sleeps
-  // the full `release_at - now` (up to MAX_RATE_LIMIT_PARK_SECONDS, one hour).
-  // The run overshoots its wall-clock budget by up to an hour, is never
-  // recorded parked, and, once the reset passes, re-dispatches the card
-  // instead of halting. The sleep should end at the wall-clock deadline when
-  // that comes first. Remove `.todo` once it does.
-  test.todo(
+  // Issue #84: the capped call returns at once, with the reset an hour out and
+  // `--budget-wall-clock-seconds 2`. The release-gate sleep must end at the
+  // wall-clock deadline, not at the reset, so the andon halts the run parked.
+  test(
     "halts at its wall-clock budget and records the run parked",
     async () => {
       const resetsAt = Math.floor(Date.now() / 1000) + 3600;
@@ -202,11 +195,16 @@ describe("harness journey: a park longer than the remaining wall-clock budget", 
         entryInput: "topic.md",
         roles: [{ name: "maker", promptIncludes: "ROLE:MAKER", calls: [cappedCall(resetsAt)] }],
       });
-      // Killed with 137 at 15s if it is still sleeping toward the reset.
+      // Killed with 137 at 15s if it is still sleeping toward the reset, so the
+      // exit code alone separates a halted run from one sleeping to the reset.
       const run = await f.run(["--budget-wall-clock-seconds", "2"], { timeoutMs: 15_000 });
       expect(run.exitCode).toBe(1);
+      expect(run.stderr).toContain("andon: run halted — wall_clock budget exceeded while parked behind a provider rate limit");
       expect(run.stderr).toContain(`run "${f.runId}" parked behind a provider rate limit`);
-      expect((await f.runStatus()).stdout).toContain(`run ${f.runId}: parked`);
+      expect(f.stubLog()).toHaveLength(1);
+      const status = await f.runStatus();
+      expect(status.stdout).toContain(`run ${f.runId}: parked behind a provider rate limit until`);
+      expect(status.stdout).toContain(`conduit resume ${f.flowPath} --run ${f.runId}`);
     },
     TIMEOUT_MS,
   );

@@ -354,15 +354,19 @@ describe('fan-out cache-warming stagger — release_at stamping (v10)', () => {
       ],
     };
     const { io, lines } = makeIO();
+    const sleeps: number[] = [];
     await runExecutor({
       db,
       flow,
       now: advancingClock(1000),
       adapter: makeProposalAdapter(proposal),
       io,
-      sleep: FAST_SLEEP,
+      sleep: async (ms: number) => { sleeps.push(ms); },
     } as RunEngineArgs);
 
+    // No single wait reaches past the 60s budget toward the 100s gate (issue #84).
+    expect(sleeps.length).toBeGreaterThan(0);
+    expect(Math.max(...sleeps)).toBeLessThanOrEqual(60_000);
     // The first (un-gated) child ran; the gated siblings did NOT — the andon halted
     // the run mid-wait rather than sleeping through the budget to the gate.
     expect(db.getCard(DEFAULT_RUN_ID, 'c1')?.lane).toBe('done');

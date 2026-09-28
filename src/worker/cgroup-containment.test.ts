@@ -20,8 +20,10 @@ import {
   createContainmentResolver,
   describeContainment,
   detectContainment,
+  isOwnerGone,
   killCgroup,
   prepareContainedCommand,
+  processStartTime,
   removeCgroup,
   removeCgroupsSync,
   type Containment,
@@ -364,6 +366,77 @@ describe('prepareContainedCommand: the spawn wrapper does not interpolate argv i
   );
 });
 
+describe('isOwnerGone: every branch, with the dependencies injected (no real /proc needed)', () => {
+  it('is undefined for a name this kernel did not create', () => {
+    expect(isOwnerGone('not-a-cgroup-name')).toBeUndefined();
+    expect(isOwnerGone('conduit-not-a-pid-1')).toBeUndefined();
+  });
+
+  it('legacy name (no start time), owner pid alive: kept', () => {
+    const gone = isOwnerGone('conduit-4242-1', { selfPid: 1, isPidAlive: (pid) => pid === 4242 });
+    expect(gone).toBe(false);
+  });
+
+  it('legacy name (no start time), owner pid dead: reaped', () => {
+    const gone = isOwnerGone('conduit-4242-1', { selfPid: 1, isPidAlive: () => false });
+    expect(gone).toBe(true);
+  });
+
+  it('start-time name, owner start time matches: kept', () => {
+    const gone = isOwnerGone('conduit-4242-1000-1', {
+      selfPid: 1,
+      processStartTime: (pid) => (pid === 4242 ? 1000 : undefined),
+    });
+    expect(gone).toBe(false);
+  });
+
+  it('start-time name, owner start time differs (pid was reused): reaped', () => {
+    const gone = isOwnerGone('conduit-4242-1000-1', {
+      selfPid: 1,
+      processStartTime: (pid) => (pid === 4242 ? 9999 : undefined),
+    });
+    expect(gone).toBe(true);
+  });
+
+  it('start-time name, owner stat unreadable but pid answers kill(0) (hidepid): kept', () => {
+    const gone = isOwnerGone('conduit-4242-1000-1', {
+      selfPid: 1,
+      processStartTime: () => undefined,
+      isPidAlive: (pid) => pid === 4242,
+    });
+    expect(gone).toBe(false);
+  });
+
+  it('start-time name, owner stat unreadable and pid dead: reaped', () => {
+    const gone = isOwnerGone('conduit-4242-1000-1', {
+      selfPid: 1,
+      processStartTime: () => undefined,
+      isPidAlive: () => false,
+    });
+    expect(gone).toBe(true);
+  });
+
+  it('self pid, start-time name, start time matches this kernel: kept', () => {
+    const gone = isOwnerGone('conduit-4242-1000-1', { selfPid: 4242, selfStartTime: 1000 });
+    expect(gone).toBe(false);
+  });
+
+  it('self pid, start-time name, start time differs (a previous kernel reused this pid): reaped', () => {
+    const gone = isOwnerGone('conduit-4242-1000-1', { selfPid: 4242, selfStartTime: 2000 });
+    expect(gone).toBe(true);
+  });
+
+  it("self pid, own start time unreadable: kept (ambiguous, not reaped out from under a live kernel)", () => {
+    const gone = isOwnerGone('conduit-4242-1000-1', { selfPid: 4242, selfStartTime: undefined });
+    expect(gone).toBe(false);
+  });
+
+  it('self pid, legacy name (no start time): kept regardless of this kernel\'s start time', () => {
+    const gone = isOwnerGone('conduit-4242-1', { selfPid: 4242, selfStartTime: 1000 });
+    expect(gone).toBe(false);
+  });
+});
+
 describe('cgroup cleanup', () => {
   it('removeCgroupsSync writes cgroup.kill again while a cgroup stays populated', () => {
     // A plain directory standing in for a populated cgroup: rmdir fails
@@ -415,6 +488,148 @@ describe('cgroup cleanup', () => {
       }
       await removeCgroup(stale, 1_000);
     }
+  });
+
+  /** Start a process inside the cgroup at `dir` and wait until the cgroup lists it. */
+  async function spawnInCgroup(dir: string): Promise<ReturnType<typeof Bun.spawn>> {
+    const proc = Bun.spawn(['/bin/sh', '-c', 'echo $$ > "$0" && exec sleep 30', join(dir, 'cgroup.procs')], {
+      detached: true,
+    });
+    const deadline = Date.now() + 3_000;
+    while (!readFileSync(join(dir, 'cgroup.procs'), 'utf-8').trim() && Date.now() < deadline) {
+      await Bun.sleep(10);
+    }
+    return proc;
+  }
+
+  itWithCgroup("detection kills and removes a dead kernel's cgroup whose pid a live process has reused", async () => {
+    if (hostContainment.mechanism !== 'cgroup') throw new Error('unreachable');
+    // The live process stands in for an unrelated process given the dead
+    // kernel's pid: the pid matches the cgroup name, the start time does not.
+    const reuser = Bun.spawn(['sleep', '30']);
+    const startTime = processStartTime(reuser.pid);
+    expect(startTime).toBeDefined();
+    const stale = join(hostContainment.parent, `conduit-${reuser.pid}-${startTime! + 1}-1`);
+    const live = join(hostContainment.parent, `conduit-${reuser.pid}-${startTime!}-1`);
+    mkdirSync(stale);
+    mkdirSync(live);
+    const orphan = await spawnInCgroup(stale);
+    const owned = await spawnInCgroup(live);
+    try {
+      await detectContainment();
+
+      await orphan.exited;
+      expect(orphan.signalCode).toBe('SIGKILL');
+      expect(existsSync(stale)).toBe(false);
+      // The cgroup whose owner is still the process that created it is kept.
+      expect(isAlive(owned.pid)).toBe(true);
+      expect(existsSync(live)).toBe(true);
+      expect(isAlive(reuser.pid)).toBe(true);
+    } finally {
+      for (const pid of [orphan.pid, owned.pid, reuser.pid]) {
+        try {
+          process.kill(pid, 'SIGKILL');
+        } catch {
+          /* already gone */
+        }
+      }
+      killCgroup(stale);
+      killCgroup(live);
+      await Promise.all([removeCgroup(stale, 1_000), removeCgroup(live, 1_000)]);
+    }
+  });
+
+  itWithCgroup('keeps a legacy-named cgroup (no start time) whose owner pid is still alive', async () => {
+    if (hostContainment.mechanism !== 'cgroup') throw new Error('unreachable');
+    // A live process stands in for a still-running kernel whose cgroups
+    // predate issue #81 (no start time in the name).
+    const owner = Bun.spawn(['sleep', '30']);
+    const live = join(hostContainment.parent, `conduit-${owner.pid}-1`);
+    mkdirSync(live);
+    const held = await spawnInCgroup(live);
+    try {
+      await detectContainment();
+
+      expect(existsSync(live)).toBe(true);
+      expect(isAlive(held.pid)).toBe(true);
+    } finally {
+      for (const pid of [held.pid, owner.pid]) {
+        try {
+          process.kill(pid, 'SIGKILL');
+        } catch {
+          /* already gone */
+        }
+      }
+      killCgroup(live);
+      await removeCgroup(live, 1_000);
+    }
+  });
+
+  itWithCgroup("detection reaps a stale cgroup that matches this kernel's own pid but an older start time", async () => {
+    if (hostContainment.mechanism !== 'cgroup') throw new Error('unreachable');
+    // Same pid as this kernel, a start time that is not this kernel's: stands
+    // in for a previous kernel that happened to be given this same pid.
+    const ownStartTime = processStartTime(process.pid);
+    expect(ownStartTime).toBeDefined();
+    const stale = join(hostContainment.parent, `conduit-${process.pid}-${ownStartTime! + 1}-1`);
+    mkdirSync(stale);
+    const orphan = await spawnInCgroup(stale);
+    try {
+      await detectContainment();
+
+      await orphan.exited;
+      expect(orphan.signalCode).toBe('SIGKILL');
+      expect(existsSync(stale)).toBe(false);
+    } finally {
+      try {
+        process.kill(orphan.pid, 'SIGKILL');
+      } catch {
+        /* already gone */
+      }
+      await removeCgroup(stale, 1_000);
+    }
+  });
+
+  itWithCgroup('invocation cgroups carry the kernel start time after its pid', () => {
+    if (hostContainment.mechanism !== 'cgroup') throw new Error('unreachable');
+    const prepared = prepareContainedCommand(hostContainment, ['true'], {});
+    try {
+      expect(prepared.cgroup).toMatch(new RegExp(`/conduit-${process.pid}-${processStartTime(process.pid)}-\\d+$`));
+    } finally {
+      removeCgroupsSync([prepared.cgroup!]);
+    }
+  });
+});
+
+describe('processStartTime', () => {
+  it('reads field 22 of /proc/<pid>/stat, even when the command name holds spaces and parentheses', async () => {
+    if (process.platform !== 'linux') return;
+    // A script's comm is its file name, and `a) b (c` would shift every field
+    // after it under a naive split. `read` blocks in the shell itself, so the
+    // comm is not replaced by an exec'd child.
+    const odd = join(scratch, 'a) b (c');
+    writeFileSync(odd, '#!/bin/sh\nread line\n');
+    chmodSync(odd, 0o755);
+    const before = Bun.spawn(['sleep', '30']);
+    const proc = Bun.spawn([odd], { stdin: 'pipe' });
+    const after = Bun.spawn(['sleep', '30']);
+    try {
+      const deadline = Date.now() + 3_000;
+      while (!readFileSync(`/proc/${proc.pid}/stat`, 'utf-8').includes('(a) b (c)') && Date.now() < deadline) {
+        await Bun.sleep(10);
+      }
+      const start = processStartTime(proc.pid);
+      expect(start).toBeGreaterThanOrEqual(processStartTime(before.pid)!);
+      expect(start).toBeLessThanOrEqual(processStartTime(after.pid)!);
+    } finally {
+      for (const p of [before, proc, after]) p.kill('SIGKILL');
+    }
+  });
+
+  it('is undefined for a pid that is not running', async () => {
+    const dead = Bun.spawn(['true']);
+    await dead.exited;
+    expect(processStartTime(dead.pid)).toBeUndefined();
   });
 });
 

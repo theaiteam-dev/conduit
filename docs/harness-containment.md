@@ -108,7 +108,7 @@ group ([#77](https://github.com/theaiteam-dev/conduit/issues/77)). The runners t
 use two mechanisms together.
 
 **cgroup v2, where the host allows it.** Each invocation, harness or deterministic station,
-runs in its own cgroup, `conduit-<kernel pid>-<n>`, created under the cgroup the kernel
+runs in its own cgroup, `conduit-<kernel pid>-<kernel start time>-<n>`, created under the cgroup the kernel
 itself runs in. The child joins it before it runs: the runner spawns
 `/bin/sh -c 'echo $$ > <cgroup>/cgroup.procs && exec <command>'`, so the command is in the
 cgroup before it can fork. Creating a new session or process group (`setsid`, `nohup`, a
@@ -118,7 +118,10 @@ process group (wall-clock timeout, idle timeout, the post-exit reap, and the ker
 signal and exit handlers), the runner also writes `1` to the cgroup's `cgroup.kill`, which
 SIGKILLs every process in it, and then removes the cgroup. A kernel that is SIGKILLed
 leaves its cgroups behind; the next kernel started in the same cgroup kills whatever is
-still in them and removes them.
+still in them and removes them. It treats a cgroup as left behind when no running process
+has both the pid and the start time in its name, so a dead kernel's cgroup is reaped even
+after another process has been given its pid
+([#81](https://github.com/theaiteam-dev/conduit/issues/81)).
 
 The cgroup does not contain a command that moves itself out on purpose. Descendants run as
 the kernel's user, and that user can write the parent cgroup's `cgroup.procs` (the
