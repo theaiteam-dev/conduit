@@ -1,0 +1,195 @@
+/**
+ * Harness-flow scaffolding — smoke test.
+ *
+ * fake-claude appends to invocations.ndjson from its own process, so a read
+ * that races a write can see a truncated final line. cleanup() reads that log
+ * to find orphaned stubs, and a throw there must not leak the temp root. The
+ * reap itself must kill a live stub and leave a recycled pid alone, including
+ * the real case: a `conduit run` the helper's timeout SIGKILLed, whose own
+ * group kill of the stub never ran.
+ *
+ * BLACK-BOX RULE: zero imports from src/.
+ */
+
+import { describe, expect, test } from "bun:test";
+import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+import { isOrphanedStub, pidAlive, startHarnessFlow, waitFor } from "./harness-flow";
+
+const FAKE_CLAUDE = join(import.meta.dir, "fake-claude.ts");
+// A stand-in stub: an idle bun process whose argv carries the fake-claude path.
+// isOrphanedStub() matches on the cmdline, so this is all the pid-matching and
+// kill tests need; the last test below reaps a real fake-claude process.
+const IDLE = "setTimeout(() => {}, 30_000)";
+
+const HANGING_FLOW = `
+flow: bb-harness-flow-smoke
+project_root: .
+flow_version: 1
+budgets:
+  run: { wall_clock_minutes: 2, max_tokens: 100000 }
+  per_card: { max_execution_attempts: 1 }
+  liveness: { no_progress_minutes: 1 }
+terminal_lanes: [done, scrap, hold]
+stations:
+  - id: research
+    worker:
+      kind: harness
+      harness: claude-headless
+      tools: [Read]
+      prompt_file: prompts/maker.md
+      prompt_version: "1"
+      timeout_seconds: 60
+      output_schema:
+        fields:
+          - { name: summary, type: string, required: true }
+    inputs: [topic.md]
+    outputs: [result.json]
+    next: done
+channels:
+  ingress:
+    type: cli
+`;
+
+/** Is `pid` the leader of its own process group? Field 5 of /proc/<pid>/stat is the pgrp. */
+function leadsOwnGroup(pid: number): boolean {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    return Number(stat.slice(stat.lastIndexOf(")") + 2).split(" ")[2]) === pid;
+  } catch {
+    return false;
+  }
+}
+
+function scaffold() {
+  return startHarnessFlow({
+    flowYaml: "name: unused\n",
+    files: {},
+    entryInput: "topic.md",
+    roles: [],
+  });
+}
+
+describe("startHarnessFlow — stub log and cleanup", () => {
+  test("stubLog() skips a partially written trailing line", async () => {
+    const f = scaffold();
+    try {
+      const logPath = join(f.root, "stub", "invocations.ndjson");
+      mkdirSync(join(f.root, "stub"), { recursive: true });
+      appendFileSync(logPath, `${JSON.stringify({ role: "maker", call: 1, pid: 999999999 })}\n{"role":"mak`);
+      expect(f.stubLog().map((e) => `${e.role}#${e.call}`)).toEqual(["maker#1"]);
+    } finally {
+      await f.cleanup();
+    }
+  });
+
+  test("stubLog() throws on a malformed line that is not the last one", async () => {
+    const f = scaffold();
+    try {
+      const good = JSON.stringify({ role: "maker", call: 2, pid: 999999999 });
+      appendFileSync(join(f.root, "stub", "invocations.ndjson"), `{"role":"mak\n${good}\n`);
+      expect(() => f.stubLog()).toThrow(/invocations\.ndjson line 1/);
+    } finally {
+      await f.cleanup();
+    }
+  });
+
+  test("journalSpans() names the missing journal DB before any run", async () => {
+    const f = scaffold();
+    try {
+      expect(() => f.journalSpans()).toThrow(/journal DB .* does not exist/);
+    } finally {
+      await f.cleanup();
+    }
+  });
+
+  test("ambient CONDUIT_* variables do not reach the binary; opts.env does", async () => {
+    process.env.CONDUIT_BB_AMBIENT_LEAK = "leaked";
+    let f: ReturnType<typeof startHarnessFlow> | undefined;
+    try {
+      f = startHarnessFlow({
+        flowYaml: "name: unused\n",
+        files: {},
+        entryInput: "topic.md",
+        roles: [],
+        env: { CONDUIT_HARNESS_CLAUDE_HEADLESS_MODEL: "from-opts" },
+      });
+      expect(f.env.CONDUIT_BB_AMBIENT_LEAK).toBeUndefined();
+      expect(f.env.CONDUIT_HARNESS_CLAUDE_HEADLESS_MODEL).toBe("from-opts");
+      expect(f.env.PATH).toBe(process.env.PATH!);
+    } finally {
+      delete process.env.CONDUIT_BB_AMBIENT_LEAK;
+      await f?.cleanup();
+    }
+  });
+
+  test("cleanup() removes the temp root even when a truncated log line is present", async () => {
+    const f = scaffold();
+    try {
+      appendFileSync(join(f.root, "stub", "invocations.ndjson"), `{"role":"mak`);
+      await f.cleanup();
+      expect(existsSync(f.root)).toBe(false);
+    } finally {
+      await f.cleanup();
+    }
+  });
+
+  test("isOrphanedStub() matches a live fake-claude process only", async () => {
+    const stub = Bun.spawn([process.execPath, "-e", IDLE, FAKE_CLAUDE]);
+    // The recycled-pid case: a live process that is not a stub.
+    const other = Bun.spawn([process.execPath, "-e", IDLE]);
+    try {
+      await waitFor(() => isOrphanedStub(stub.pid), { timeoutMs: 2_000 });
+      await waitFor(() => readFileSync(`/proc/${other.pid}/cmdline`, "utf8").includes(IDLE), { timeoutMs: 2_000 });
+      expect(isOrphanedStub(other.pid)).toBe(false);
+    } finally {
+      stub.kill("SIGKILL");
+      other.kill("SIGKILL");
+      await Promise.all([stub.exited, other.exited]);
+    }
+    expect(isOrphanedStub(stub.pid)).toBe(false);
+  });
+
+  test("cleanup() kills a stub still running from the log, and leaves other pids alone", async () => {
+    const f = scaffold();
+    // setsid: the harness runner spawns each stub as its own group leader.
+    const stub = Bun.spawn(["setsid", process.execPath, "-e", IDLE, FAKE_CLAUDE]);
+    const other = Bun.spawn([process.execPath, "-e", IDLE]);
+    try {
+      // Poll for group leadership, not the cmdline: setsid's own cmdline
+      // already names fake-claude before it has called setsid().
+      await f.waitFor(() => leadsOwnGroup(stub.pid), { timeoutMs: 2_000 });
+      await f.waitFor(() => readFileSync(`/proc/${other.pid}/cmdline`, "utf8").includes(IDLE), { timeoutMs: 2_000 });
+      const line = (pid: number, call: number) => JSON.stringify({ role: "maker", call, pid }) + "\n";
+      appendFileSync(join(f.root, "stub", "invocations.ndjson"), line(stub.pid, 1) + line(other.pid, 2));
+      await f.cleanup();
+      await f.waitFor(() => !pidAlive(stub.pid), { timeoutMs: 2_000 });
+      expect(pidAlive(other.pid)).toBe(true);
+    } finally {
+      stub.kill("SIGKILL");
+      other.kill("SIGKILL");
+      await Promise.all([stub.exited, other.exited]);
+    }
+  });
+
+  test("cleanup() reaps the stub a timed-out `conduit run` left behind", async () => {
+    const f = startHarnessFlow({
+      flowYaml: HANGING_FLOW,
+      files: { "prompts/maker.md": "ROLE:MAKER Answer topic.md.\n", "topic.md": "What is a kanban card?\n" },
+      entryInput: "topic.md",
+      roles: [{ name: "maker", promptIncludes: "ROLE:MAKER", calls: [{ hang: true }] }],
+    });
+    let pids: number[] = [];
+    try {
+      // The stub hangs well past this, so the helper's timeout SIGKILLs conduit.
+      const run = await f.run([], { timeoutMs: 4_000 });
+      expect(run.exitCode).not.toBe(0);
+      pids = f.stubLog().map((e) => e.pid);
+      expect(pids).toHaveLength(1);
+      expect(isOrphanedStub(pids[0]!)).toBe(true);
+    } finally {
+      await f.cleanup();
+    }
+    await f.waitFor(() => pids.every((pid) => !pidAlive(pid)), { timeoutMs: 2_000 });
+  }, 30_000);
+});
