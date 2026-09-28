@@ -138,9 +138,40 @@ describe("harness journey: a provider rate limit parks the card and the run", ()
     expect(spans[0]!.attributes.outcome).toBe("harness-rate-limited");
     expect(spans[0]!.attributes.rate_limit_release_at).toBe(parkedReleaseAt());
     expect(spans[0]!.attributes.rate_limit_reset_reported).toBe(resetsAt * 1000);
-    // The capped call's reported spend is still billed (issue #26 AC5).
+    // The capped call's reported spend is recorded on its span. Whether it is
+    // counted against the budget is pinned by the next describe.
     expect(spans[0]!.usage_unknown).toBe(0);
     expect(spans[0]!.input_tokens).toBe(10);
+  });
+});
+
+describe("harness journey: a capped call's spend counts against the run token budget", () => {
+  let f: HarnessFlow;
+  let run: CliResult;
+
+  beforeAll(async () => {
+    const resetsAt = Math.floor(Date.now() / 1000) + 3600;
+    f = startHarnessFlow({
+      // 10 tokens: the capped call's 10 in + 5 out crosses it only if the park folds them in.
+      flowYaml: FLOW.replace("max_tokens: 100000", "max_tokens: 10"),
+      files: FILES,
+      entryInput: "topic.md",
+      roles: [{ name: "maker", promptIncludes: "ROLE:MAKER", calls: [cappedCall(resetsAt)] }],
+    });
+    // Without the fold, nothing trips and the run sleeps toward the reset (#84)
+    // until this timeout kills it with 137.
+    run = await f.run([], { timeoutMs: 15_000 });
+  }, TIMEOUT_MS);
+
+  afterAll(async () => {
+    await f?.cleanup();
+  });
+
+  test("the tokens andon trips on the parked call's spend (issue #26 AC5)", () => {
+    expect(run.exitCode).toBe(1);
+    expect(run.stderr).toContain("andon: run halted — tokens budget exceeded while parked behind a provider rate limit");
+    expect(run.stderr).toContain(`run "${f.runId}" parked behind a provider rate limit`);
+    expect(f.stubLog()).toHaveLength(1);
   });
 });
 

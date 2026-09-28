@@ -12,9 +12,9 @@
  */
 
 import { describe, expect, test } from "bun:test";
-import { appendFileSync, existsSync, mkdirSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { isOrphanedStub, pidAlive, startHarnessFlow } from "./harness-flow";
+import { isOrphanedStub, pidAlive, startHarnessFlow, waitFor } from "./harness-flow";
 
 const FAKE_CLAUDE = join(import.meta.dir, "fake-claude.ts");
 const IDLE = "setTimeout(() => {}, 30_000)";
@@ -47,6 +47,16 @@ channels:
   ingress:
     type: cli
 `;
+
+/** Is `pid` the leader of its own process group? Field 5 of /proc/<pid>/stat is the pgrp. */
+function leadsOwnGroup(pid: number): boolean {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    return Number(stat.slice(stat.lastIndexOf(")") + 2).split(" ")[2]) === pid;
+  } catch {
+    return false;
+  }
+}
 
 function scaffold() {
   return startHarnessFlow({
@@ -82,8 +92,8 @@ describe("startHarnessFlow — stub log and cleanup", () => {
     // The recycled-pid case: a live process that is not a stub.
     const other = Bun.spawn([process.execPath, "-e", IDLE]);
     try {
-      await Bun.sleep(100);
-      expect(isOrphanedStub(stub.pid)).toBe(true);
+      await waitFor(() => isOrphanedStub(stub.pid), { timeoutMs: 2_000 });
+      await waitFor(() => readFileSync(`/proc/${other.pid}/cmdline`, "utf8").includes(IDLE), { timeoutMs: 2_000 });
       expect(isOrphanedStub(other.pid)).toBe(false);
     } finally {
       stub.kill("SIGKILL");
@@ -99,7 +109,10 @@ describe("startHarnessFlow — stub log and cleanup", () => {
     const stub = Bun.spawn(["setsid", process.execPath, "-e", IDLE, FAKE_CLAUDE]);
     const other = Bun.spawn([process.execPath, "-e", IDLE]);
     try {
-      await Bun.sleep(100);
+      // Poll for group leadership, not the cmdline: setsid's own cmdline
+      // already names fake-claude before it has called setsid().
+      await f.waitFor(() => leadsOwnGroup(stub.pid), { timeoutMs: 2_000 });
+      await f.waitFor(() => readFileSync(`/proc/${other.pid}/cmdline`, "utf8").includes(IDLE), { timeoutMs: 2_000 });
       const line = (pid: number, call: number) => JSON.stringify({ role: "maker", call, pid }) + "\n";
       appendFileSync(join(f.root, "stub", "invocations.ndjson"), line(stub.pid, 1) + line(other.pid, 2));
       await f.cleanup();

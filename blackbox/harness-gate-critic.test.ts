@@ -130,7 +130,9 @@ describe("harness journey: agentic critic rejects once, then passes", () => {
     expect(out).toContain(`entered_lane: research → done`);
     expect(out).not.toMatch(/→ (scrap|hold)/);
 
-    // The critic spans carry the critic's own usage (issue #26).
+    // Each critic span records the critic's own usage. That the usage is also
+    // counted against the run budget (issue #26) is pinned by the tripping
+    // budget in harness-critic-budget.test.ts, not by these rows.
     const critic = f.journalSpans().filter((s) => s.name === "research.harness-critic");
     expect(critic).toHaveLength(2);
     for (const s of critic) {
