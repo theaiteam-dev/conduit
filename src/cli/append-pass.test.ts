@@ -897,18 +897,38 @@ describe('conduit run: a launch that throws after registering the run', () => {
     expect(peekRunLeaseHolder(db, RUN)).toBeNull();
   });
 
-  it('removes the run row when the seed transaction throws: nothing was seeded, so a retry starts clean', async () => {
+  it('records the run halted with zero cards when the seed transaction throws, and releases the lease', async () => {
     const flowPath = writeFlow();
     const deps = makeDeps({ db: throwingDb(db, 'insertCard', new Error('boom: insertCard failed')) });
     await expect(runPass1(flowPath, deps)).rejects.toThrow('boom: insertCard failed');
 
-    expect(db.getRun(RUN)).toBeNull();
-    expect(getRunState(db, RUN)).toEqual({ status: 'not_found' });
+    const run = db.getRun(RUN)!;
+    expect(run.status).toBe('halted');
+    expect(run.outcome).toBe('halted');
+    expect(cardIds()).toEqual([]);
+    expect(peekRunLeaseHolder(db, RUN)).toBeNull();
+    expect(getRunState(db, RUN)).toEqual({ status: 'launch_failed', flow: flowPath });
+  });
 
-    // The same command then runs, rather than reporting a run that never started.
-    const engine = completingEngine();
-    expect(await runPass1(flowPath, makeDeps({ runEngine: engine.runEngine }))).toBe(0);
-    expect(engine.calls).toHaveLength(1);
+  it('records the run halted with zero cards when there is no input and no runnable card', async () => {
+    const flowPath = writeFlow();
+    expect(await main(['run', flowPath, '--run-id', RUN], makeDeps())).toBe(1);
+
+    const run = db.getRun(RUN)!;
+    expect(run.status).toBe('halted');
+    expect(cardIds()).toEqual([]);
+    expect(peekRunLeaseHolder(db, RUN)).toBeNull();
+  });
+
+  it('prints the launch-failed line on run status', async () => {
+    const flowPath = writeFlow();
+    await expect(
+      runPass1(flowPath, makeDeps({ db: throwingDb(db, 'insertCard', new Error('boom: insertCard failed')) })),
+    ).rejects.toThrow();
+    expect(await main(['run', 'status', '--run', RUN], makeDeps())).toBe(0);
+    expect(io.lines.at(-1)).toBe(
+      `run ${RUN}: launch failed before any card was seeded; re-run the same conduit run command to retry`,
+    );
   });
 
   it('records the run halted and releases the lease when it throws after the entry card is seeded', async () => {
@@ -947,6 +967,138 @@ describe('conduit run: a launch that throws after registering the run', () => {
     expect(run.status).toBe('done');
     expect(run.outcome).toBe('complete');
     expect(peekRunLeaseHolder(db, RUN)).toBeNull();
+  });
+});
+
+// The maintainer's decision on issue #83: a failed launch is recorded, not
+// deleted, so the same `conduit run` command must retry it rather than report
+// the halted row as an existing run. This is also the ingress listener's
+// re-drive: it relaunches a failed event with exactly this argv (flow,
+// --input-inline, --run-id), so this retry is what makes the re-drive seed.
+describe('conduit run: retrying a launch that failed before seeding', () => {
+  function throwingDb(base: ConduitDB, methodName: keyof ConduitDB, err: Error): ConduitDB {
+    return new Proxy(base, {
+      get(target, prop) {
+        if (prop === methodName) return () => { throw err; };
+        const value = Reflect.get(target, prop, target);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    }) as ConduitDB;
+  }
+  async function failFirstLaunch(flowPath: string): Promise<void> {
+    await expect(
+      runPass1(flowPath, makeDeps({ db: throwingDb(db, 'insertCard', new Error('boom: insertCard failed')) })),
+    ).rejects.toThrow('boom: insertCard failed');
+  }
+
+  it('seeds and drives the run when the same command is run again', async () => {
+    const flowPath = writeFlow();
+    await failFirstLaunch(flowPath);
+
+    const engine = completingEngine();
+    expect(await runPass1(flowPath, makeDeps({ runEngine: engine.runEngine }))).toBe(0);
+    expect(engine.calls).toHaveLength(1);
+    expect(cardIds()).toEqual([`entry-${RUN}`]);
+    const run = db.getRun(RUN)!;
+    expect(run.status).toBe('done');
+    expect(run.outcome).toBe('complete');
+    expect(peekRunLeaseHolder(db, RUN)).toBeNull();
+  });
+
+  it('accepts a corrected input on the retry and records its fingerprint', async () => {
+    const flowPath = writeFlow();
+    await failFirstLaunch(flowPath);
+    const firstFingerprint = db.getRun(RUN)!.input_fingerprint;
+
+    const engine = completingEngine();
+    const code = await main(
+      ['run', flowPath, '--run-id', RUN, '--input-inline', '{"n":"corrected"}'],
+      makeDeps({ runEngine: engine.runEngine }),
+    );
+    expect(code).toBe(0);
+    expect(engine.calls).toHaveLength(1);
+    expect(db.getRun(RUN)!.input_fingerprint).not.toBe(firstFingerprint);
+    expect(readFileSync(join(flowRoot, 'in.json'), 'utf-8')).toBe('{"n":"corrected"}');
+  });
+
+  it('refuses the retry as a lease conflict while another live process holds the lease', async () => {
+    const flowPath = writeFlow();
+    await failFirstLaunch(flowPath);
+    db.getStateDb().prepare('UPDATE runs SET holder_pid = $p, lease_acquired_at = 1 WHERE run_id = $r').run({ $p: process.ppid, $r: RUN });
+
+    const engine = completingEngine();
+    expect(await runPass1(flowPath, makeDeps({ runEngine: engine.runEngine }))).toBe(1);
+    expect(engine.calls).toHaveLength(0);
+    expect(io.errors.join('\n')).toContain(`another conduit process (pid ${process.ppid}) is driving run`);
+    expect(db.getRun(RUN)!.status).toBe('halted');
+    expect(cardIds()).toEqual([]);
+  });
+
+  it('still reports a halted run WITH cards as existing, without driving it', async () => {
+    const flowPath = writeFlow();
+    await expect(
+      runPass1(flowPath, makeDeps({ bindHarnessRegistry: () => { throw new Error('boom: harness registry'); } })),
+    ).rejects.toThrow('boom: harness registry');
+    expect(cardIds()).toEqual([`entry-${RUN}`]);
+
+    const engine = completingEngine();
+    expect(await runPass1(flowPath, makeDeps({ runEngine: engine.runEngine }))).toBe(0);
+    expect(engine.calls).toHaveLength(0);
+    expect(io.lines.at(-1)).toContain('halted with 1 unfinished card');
+  });
+
+  it('retries a launch killed before it could record anything: the row reads running with a dead holder', async () => {
+    const flowPath = writeFlow();
+    await failFirstLaunch(flowPath);
+    // What a SIGKILL during seeding leaves: the registration's 'running' row
+    // and its holder, whose process is gone.
+    db.getStateDb()
+      .prepare("UPDATE runs SET status = 'running', outcome = NULL, holder_pid = 999999999, lease_acquired_at = 1 WHERE run_id = $r")
+      .run({ $r: RUN });
+    expect(await main(['run', 'status', '--run', RUN], makeDeps())).toBe(0);
+    expect(io.lines.at(-1)).toContain('launch failed before any card was seeded');
+
+    const engine = completingEngine();
+    expect(await runPass1(flowPath, makeDeps({ runEngine: engine.runEngine }))).toBe(0);
+    expect(engine.calls).toHaveLength(1);
+    expect(db.getRun(RUN)!.status).toBe('done');
+  });
+
+  it('refuses --append-pass on a failed launch, pointing at a plain conduit run', async () => {
+    const flowPath = writeFlow();
+    await failFirstLaunch(flowPath);
+
+    expect(await appendPass(flowPath, makeDeps({ runEngine: completingEngine().runEngine }))).toBe(EXIT_PASS_REFUSED);
+    expect(io.errors.join('\n')).toContain('without --append-pass');
+    expect(cardIds()).toEqual([]);
+    expect(peekRunLeaseHolder(db, RUN)).toBeNull();
+  });
+
+  it('refuses conduit resume of a failed launch rather than recording it complete', async () => {
+    const flowPath = writeFlow();
+    await failFirstLaunch(flowPath);
+
+    const engine = completingEngine();
+    expect(await main(['resume', flowPath, '--run', RUN], makeDeps({ runEngine: engine.runEngine }))).toBe(1);
+    expect(engine.calls).toHaveLength(0);
+    expect(io.errors.join('\n')).toContain('re-run the same conduit run command to retry');
+    expect(db.getRun(RUN)!.status).toBe('halted');
+    expect(peekRunLeaseHolder(db, RUN)).toBeNull();
+
+    // The retry still works afterwards.
+    expect(await runPass1(flowPath, makeDeps({ runEngine: engine.runEngine }))).toBe(0);
+    expect(engine.calls).toHaveLength(1);
+  });
+
+  it('skips a failed launch in a bare resume sweep, with a warning', async () => {
+    const flowPath = writeFlow();
+    await failFirstLaunch(flowPath);
+
+    const engine = completingEngine();
+    expect(await main(['resume', flowPath], makeDeps({ runEngine: engine.runEngine }))).toBe(0);
+    expect(engine.calls).toHaveLength(0);
+    expect(io.errors.join('\n')).toContain(`skipping run ${JSON.stringify(RUN)}`);
+    expect(db.getRun(RUN)!.status).toBe('halted');
   });
 });
 

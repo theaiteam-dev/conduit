@@ -1,4 +1,4 @@
-import type { ConduitDB } from '../persistence/db';
+import type { ConduitDB, RunRecord } from '../persistence/db';
 import type { Status } from '../types/kernel';
 import { isLeaseHolderAlive, peekRunLeaseHolder, type LeaseLiveness } from './run-lock';
 
@@ -20,9 +20,49 @@ export type RunStateResult =
    * #83). `flow` is for the resume command.
    */
   | { status: 'halted'; unfinished: number; flow: string }
+  /**
+   * A launch that failed before seeding any card (issue #83, `isFailedLaunch`):
+   * the run has no cards and nothing drives it. Nothing ran, so there is
+   * nothing to resume; the same `conduit run` command retries it. `flow` is
+   * the recorded flow path.
+   */
+  | { status: 'launch_failed'; flow: string }
   | { status: 'terminal'; outcome: string };
 
 const TERMINAL_STATUSES = new Set(['complete', 'scrapped', 'held']);
+
+/**
+ * Is this run a launch that failed before seeding any card (issue #83)?
+ *
+ * The run has no cards, and either it is recorded halted or it still reads
+ * 'running' with a recorded lease holder that is no longer alive. The first
+ * is a launch that failed and recorded it: `conduit run` records a launch that
+ * fails after registering as halted rather than deleting the row, so the
+ * failure stays visible to `run status`. The second is a launch killed before
+ * it could record anything (SIGKILL, the OOM killer): registration writes the
+ * holder with the row, so its dead pid is left behind. A halted row with no
+ * cards comes from no other path, because every exit that drove the engine
+ * with no card of its own records the run done. A 'running' row with no holder
+ * is not counted: without a holder nothing says whether a launch is still
+ * seeding it.
+ *
+ * The single predicate behind `registerRun`'s retry, `getRunState`'s
+ * `launch_failed`, the append-pass refusal, the resume refusal and the
+ * ingress router's pass-1 relaunch. `liveness` probes the holder; tests inject it.
+ */
+export function isFailedLaunch(db: ConduitDB, run: RunRecord | null, liveness: LeaseLiveness = {}): boolean {
+  if (run === null) return false;
+  if (run.status !== 'halted') {
+    if (run.status !== 'running') return false;
+    const holder = peekRunLeaseHolder(db, run.run_id);
+    if (holder === null || isLeaseHolderAlive(holder, liveness)) return false;
+  }
+  const { n } = db
+    .getStateDb()
+    .prepare('SELECT COUNT(*) AS n FROM cards WHERE run_id = $r')
+    .get({ $r: run.run_id }) as { n: number };
+  return n === 0;
+}
 
 /** The soonest gate among a run's parked cards, when the run halted as parked. */
 export interface ParkedRelease {
@@ -146,6 +186,14 @@ export function formatHaltedRun(runId: string, flow: string, unfinished: number)
   return `halted with ${unfinished} unfinished card${unfinished === 1 ? '' : 's'}; resume with: ${resumeCommand(runId, flow)}`;
 }
 
+/**
+ * The `run status` line for a launch that failed before seeding (issue #83).
+ * The command cannot be printed: the input it was given is not recorded.
+ */
+export function formatLaunchFailedRun(): string {
+  return 'launch failed before any card was seeded; re-run the same conduit run command to retry';
+}
+
 function resumeCommand(runId: string, flow: string): string {
   return `conduit resume ${shellQuote(flow)} --run ${shellQuote(runId)}`;
 }
@@ -228,6 +276,13 @@ export function getRunState(
   if (!driven && run.status === 'halted' && run.outcome === 'parked') {
     const parked = getRunParkedRelease(db, runId, now);
     if (parked !== null) return { status: 'parked', releaseAt: parked.releaseAt, flow: run.flow };
+  }
+
+  // A failed launch has no cards, so it would otherwise read as terminal. The
+  // same evidence as the halt below applies: a halted row, or a holder at all.
+  // A live holder is a launch, retry or resume under way, which reads running.
+  if (cards.length === 0 && (run.status === 'halted' || holder !== null)) {
+    return driven ? { status: 'running' } : { status: 'launch_failed', flow: run.flow };
   }
 
   const unfinished = cards.filter((c) => !TERMINAL_STATUSES.has(c.status)).length;

@@ -17,7 +17,15 @@
  */
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import { openConduitDB, DEFAULT_RUN_ID, type ConduitDB } from '../persistence/db';
-import { getRunState, getRunParkedRelease, formatParkedRun, formatHaltedRun, type RunStateResult } from './run-state';
+import {
+  getRunState,
+  getRunParkedRelease,
+  formatParkedRun,
+  formatHaltedRun,
+  formatLaunchFailedRun,
+  isFailedLaunch,
+  type RunStateResult,
+} from './run-state';
 import { registerRun } from './run-registry';
 import type { Card } from '../types/kernel';
 
@@ -725,6 +733,65 @@ describe('getRunState — halted with unfinished cards (issue #83)', () => {
     expect(created.kind).toBe('created');
     db.insertCard(makeCard('r', 'c1', { status: 'ready' }));
     expect(getRunState(db, 'r', 1000, { isPidAlive: () => false })).toEqual({ status: 'halted', unfinished: 1, flow: 'studio' });
+  });
+});
+
+// A launch that failed before seeding any card is recorded halted with zero
+// cards (issue #83). Reporting it `terminal (outcome=halted)` read as a run
+// that finished, when nothing ran and the same command retries it.
+describe('getRunState: a launch that failed before seeding (issue #83)', () => {
+  const FLOW = '/flows/research.yaml';
+  const failedLaunch = (runId: string) =>
+    db.insertRun({ run_id: runId, flow: FLOW, input_fingerprint: 'fp', status: 'halted', outcome: 'halted' });
+
+  it('reports launch_failed for a halted row with no cards and no holder', () => {
+    failedLaunch('r');
+    expect(getRunState(db, 'r', 1000)).toEqual({ status: 'launch_failed', flow: FLOW });
+  });
+
+  it('reports launch_failed when the recorded holder is dead', () => {
+    failedLaunch('r');
+    holdLease('r', 4242);
+    expect(getRunState(db, 'r', 1000, { isPidAlive: () => false })).toEqual({ status: 'launch_failed', flow: FLOW });
+  });
+
+  it('reports running while a live process holds the lease on the row', () => {
+    failedLaunch('r');
+    holdLease('r', 4242);
+    expect(getRunState(db, 'r', 1000, { isPidAlive: () => true })).toEqual({ status: 'running' });
+  });
+
+  it('reports launch_failed for a zero-card row left running by a dead holder (a launch killed while seeding)', () => {
+    db.insertRun({ run_id: 'r', flow: FLOW, input_fingerprint: 'fp', status: 'running' });
+    holdLease('r', 4242);
+    expect(getRunState(db, 'r', 1000, { isPidAlive: () => false })).toEqual({ status: 'launch_failed', flow: FLOW });
+    expect(isFailedLaunch(db, db.getRun('r'), { isPidAlive: () => false })).toBe(true);
+    expect(isFailedLaunch(db, db.getRun('r'), { isPidAlive: () => true })).toBe(false);
+  });
+
+  it('a halted row with cards is not a failed launch', () => {
+    failedLaunch('r');
+    db.insertCard(makeCard('r', 'c1', { status: 'ready' }));
+    expect(getRunState(db, 'r', 1000).status).toBe('halted');
+    expect(isFailedLaunch(db, db.getRun('r'))).toBe(false);
+  });
+
+  it('a zero-card row still recorded running is not a failed launch', () => {
+    seedRun('r');
+    expect(isFailedLaunch(db, db.getRun('r'))).toBe(false);
+    expect(getRunState(db, 'r', 1000).status).not.toBe('launch_failed');
+  });
+
+  it('isFailedLaunch is false for a missing run', () => {
+    expect(isFailedLaunch(db, null)).toBe(false);
+  });
+});
+
+describe('formatLaunchFailedRun: what the operator needs after a failed launch', () => {
+  it('says nothing was seeded and to re-run the same conduit run command', () => {
+    expect(formatLaunchFailedRun()).toBe(
+      'launch failed before any card was seeded; re-run the same conduit run command to retry',
+    );
   });
 });
 

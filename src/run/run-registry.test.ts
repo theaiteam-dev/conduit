@@ -148,6 +148,9 @@ describe('registerRun — idempotent re-submit returns existing (AC-2)', () => {
 
 describe('registerRun — optional lease holder written with the row', () => {
   const HOLDER = { pid: 4242, acquiredAt: 1_000, startTime: 5_000 };
+  // The registering launch is still running: a zero-card row with a dead
+  // holder would be a killed launch, which registerRun retries.
+  const LIVE_HOLDER = { isPidAlive: () => true, processStartTime: () => 5_000 };
 
   it('writes the holder pid, acquired-at and start time in the created row', () => {
     const result = registerRun(db, 'run-held', 'studio', 'fp', undefined, HOLDER);
@@ -167,14 +170,14 @@ describe('registerRun — optional lease holder written with the row', () => {
 
   it('leaves an existing row and its holder untouched', () => {
     registerRun(db, 'run-held', 'studio', 'fp', undefined, HOLDER);
-    const again = registerRun(db, 'run-held', 'studio', 'fp', undefined, { pid: 9, acquiredAt: 2_000, startTime: 1 });
+    const again = registerRun(db, 'run-held', 'studio', 'fp', undefined, { pid: 9, acquiredAt: 2_000, startTime: 1 }, LIVE_HOLDER);
     expect(again.kind).toBe('existing');
     expect(peekRunLeaseHolder(db, 'run-held')).toEqual({ holderPid: 4242, acquiredAt: 1_000, holderStartTime: 5_000 });
   });
 
   it('leaves a conflicting row and its holder untouched', () => {
     registerRun(db, 'run-held', 'studio', 'fp', undefined, HOLDER);
-    const clash = registerRun(db, 'run-held', 'studio', 'fp-other', undefined, { pid: 9, acquiredAt: 2_000, startTime: 1 });
+    const clash = registerRun(db, 'run-held', 'studio', 'fp-other', undefined, { pid: 9, acquiredAt: 2_000, startTime: 1 }, LIVE_HOLDER);
     expect(clash.kind).toBe('conflict');
     expect(peekRunLeaseHolder(db, 'run-held')).toEqual({ holderPid: 4242, acquiredAt: 1_000, holderStartTime: 5_000 });
   });
@@ -184,6 +187,99 @@ describe('registerRun — optional lease holder written with the row', () => {
     const lease = acquireRunLease(db, 'run-held', 4242, 2_000, { isPidAlive: () => true, processStartTime: () => 5_000 });
     expect(lease).toEqual({ acquired: true });
     expect(peekRunLeaseHolder(db, 'run-held')).toEqual({ holderPid: 4242, acquiredAt: 2_000, holderStartTime: 5_000 });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A failed launch (issue #83): a launch that failed before seeding any card is
+// recorded halted with zero cards. Registering the same run id again retries
+// it in place, because nothing ran that a new input could conflict with.
+// ---------------------------------------------------------------------------
+
+describe('registerRun: a failed launch is retried in place', () => {
+  const CLAIM = { pid: 7777, acquiredAt: 3_000, startTime: 8_000 };
+  const DEAD = { isPidAlive: () => false };
+
+  function failedLaunch(runId: string, holderPid: number | null = 4242): void {
+    registerRun(db, runId, 'studio', 'fp-first', '/projects/a', { pid: 4242, acquiredAt: 1_000, startTime: 5_000 });
+    db.getStateDb()
+      .prepare(
+        `UPDATE runs SET status = 'halted', outcome = 'halted', holder_pid = $p,
+           lease_acquired_at = CASE WHEN $p IS NULL THEN NULL ELSE lease_acquired_at END,
+           holder_start_time = CASE WHEN $p IS NULL THEN NULL ELSE holder_start_time END
+         WHERE run_id = $r`,
+      )
+      .run({ $p: holderPid, $r: runId });
+  }
+
+  it('re-registers a zero-card halted row as a fresh launch with the new claim', () => {
+    failedLaunch('run-f', null);
+    const result = registerRun(db, 'run-f', 'studio', 'fp-first', '/projects/a', CLAIM, DEAD);
+    expect(result).toMatchObject({ kind: 'created', retried: true });
+    const run = db.getRun('run-f')!;
+    expect(run.status).toBe('running');
+    expect(run.outcome).toBeNull();
+    expect(peekRunLeaseHolder(db, 'run-f')).toEqual({ holderPid: 7777, acquiredAt: 3_000, holderStartTime: 8_000 });
+  });
+
+  it('records the new flow, fingerprint and project root: a different input is a retry, not a conflict', () => {
+    failedLaunch('run-f', null);
+    const result = registerRun(db, 'run-f', 'autocut', 'fp-corrected', '/projects/b', CLAIM, DEAD);
+    expect(result).toMatchObject({ kind: 'created', retried: true });
+    const run = db.getRun('run-f')!;
+    expect(run.flow).toBe('autocut');
+    expect(run.input_fingerprint).toBe('fp-corrected');
+    expect(run.project_root).toBe('/projects/b');
+  });
+
+  it('takes over the lease of a dead holder', () => {
+    failedLaunch('run-f', 4242);
+    const result = registerRun(db, 'run-f', 'studio', 'fp-first', '/projects/a', CLAIM, DEAD);
+    expect(result).toMatchObject({ kind: 'created', retried: true });
+    expect(peekRunLeaseHolder(db, 'run-f')?.holderPid).toBe(7777);
+  });
+
+  it('reports existing, leaving the row untouched, while a different live process holds the lease', () => {
+    failedLaunch('run-f', 4242);
+    const before = db.getRun('run-f');
+    const result = registerRun(db, 'run-f', 'studio', 'fp-other', '/projects/a', CLAIM, { isPidAlive: () => true, processStartTime: () => 5_000 });
+    expect(result.kind).toBe('existing');
+    expect(db.getRun('run-f')).toEqual(before);
+  });
+
+  it('a fresh registration reports retried: false', () => {
+    expect(registerRun(db, 'run-new', 'studio', 'fp')).toMatchObject({ kind: 'created', retried: false });
+  });
+
+  it('a halted row WITH cards keeps the existing and conflict answers', () => {
+    failedLaunch('run-c', null);
+    db.insertCard({
+      run_id: 'run-c', id: 'entry-run-c', parent_id: null, lane: 'work', status: 'ready',
+      attempt: 0, wave: 0, owned_paths: [], rework_count: 0,
+    });
+    expect(registerRun(db, 'run-c', 'studio', 'fp-first', '/projects/a', CLAIM, DEAD).kind).toBe('existing');
+    expect(registerRun(db, 'run-c', 'studio', 'fp-other', '/projects/a', CLAIM, DEAD).kind).toBe('conflict');
+    expect(db.getRun('run-c')!.status).toBe('halted');
+  });
+
+  it('a zero-card row still recorded running by a live holder (a launch still seeding) is not retried', () => {
+    registerRun(db, 'run-live', 'studio', 'fp-first', undefined, { pid: 4242, acquiredAt: 1_000, startTime: 5_000 });
+    const LIVE = { isPidAlive: () => true, processStartTime: () => 5_000 };
+    expect(registerRun(db, 'run-live', 'studio', 'fp-first', undefined, CLAIM, LIVE).kind).toBe('existing');
+    expect(registerRun(db, 'run-live', 'studio', 'fp-other', undefined, CLAIM, LIVE).kind).toBe('conflict');
+    expect(peekRunLeaseHolder(db, 'run-live')?.holderPid).toBe(4242);
+  });
+
+  it('retries a zero-card row left running by a dead holder: a launch killed before it could record anything', () => {
+    registerRun(db, 'run-killed', 'studio', 'fp-first', undefined, { pid: 4242, acquiredAt: 1_000, startTime: 5_000 });
+    const result = registerRun(db, 'run-killed', 'studio', 'fp-first', undefined, CLAIM, DEAD);
+    expect(result).toMatchObject({ kind: 'created', retried: true });
+    expect(peekRunLeaseHolder(db, 'run-killed')?.holderPid).toBe(7777);
+  });
+
+  it('does not retry a zero-card row recorded running with no holder: nothing says its launch ended', () => {
+    registerRun(db, 'run-bare', 'studio', 'fp-first');
+    expect(registerRun(db, 'run-bare', 'studio', 'fp-first', undefined, CLAIM, DEAD).kind).toBe('existing');
   });
 });
 

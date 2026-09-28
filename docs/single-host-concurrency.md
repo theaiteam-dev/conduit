@@ -36,7 +36,12 @@ per-run advisory lease:
 - The first `conduit run`/`resume` for a given run id acquires the lease (`holder_pid`,
   `lease_acquired_at` and `holder_start_time` on the `runs` table). `conduit run` takes it in
   the same insert that registers the run, so a launch killed before its engine starts still
-  leaves a holder behind, and `conduit run status` reports that run as halted.
+  leaves a holder behind, and `conduit run status` reports that run as halted. A launch that
+  fails after registering records the run halted and releases the lease; the row is kept, not
+  deleted. When it failed (or was killed) before seeding its entry card, the run has no cards,
+  `conduit run status` reports the launch as failed, and running the same `conduit run
+  --run-id` command again retries it in place, in one transaction that refuses the retry as a
+  lease conflict while another live process holds the lease.
 - A second process invoked against the **same run id** fails fast — exit code 1, with a clear
   message naming the run id and the holding pid — instead of racing the first process or
   silently corrupting shared run state.

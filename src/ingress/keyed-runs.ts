@@ -8,7 +8,8 @@
  * accepted event does next, decided here for the hot accept path, the re-drive
  * sweeps, and the pending drain alike:
  *
- *   - no run yet                  → launch pass 1 (`conduit run --run-id`).
+ *   - no run yet, or a launch     → launch pass 1 (`conduit run --run-id`).
+ *     that failed before seeding
  *   - a pass is in flight         → fold the event into the run's PENDING pass
  *     (a launch or resume holds    ('coalesced'). Six events during one pass
  *     one of the run's slots, a    produce ONE trailing pass, not six. The
@@ -52,6 +53,7 @@
  */
 import type { ConduitDB, IngressEventRecord, KeyedRunRecord } from '../persistence/db';
 import { isLeaseHolderAlive, peekRunLeaseHolder } from '../run/run-lock';
+import { isFailedLaunch } from '../run/run-state';
 import {
   checkRunAppendable,
   nextPassNumber,
@@ -160,7 +162,10 @@ function decide(deps: KeyedRunDeps, keyed: KeyedRunRecord, beforeEventId: string
   if (why !== null) return { kind: 'in_flight', why };
 
   const run = db.getRun(keyed.run_id);
-  if (run === null) return { kind: 'launch', pass: 1 };
+  // A launch that failed before seeding (issue #83) left a halted row with no
+  // cards. Pass 1 never ran, so it is launched again as pass 1: a plain
+  // `conduit run --run-id` retries that row in place.
+  if (run === null || isFailedLaunch(db, run)) return { kind: 'launch', pass: 1 };
   if (run.status === 'halted' && run.outcome === 'parked') return { kind: 'parked' };
 
   const appendable = checkRunAppendable(db, keyed.run_id, Math.floor(deps.now() / 1000));

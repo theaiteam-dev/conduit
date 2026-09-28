@@ -794,6 +794,24 @@ describe('restart and re-drive', () => {
     expect(stampedInput(0)).toMatchObject({ pass: 1 });
   });
 
+  it('re-drives a first event whose launch failed before seeding as pass 1 again, not as a refused pass', async () => {
+    // Issue #83: a launch that failed before seeding any card leaves the run
+    // halted with zero cards. There is no pass to follow, and a plain
+    // `conduit run --run-id` retries it, so the router launches pass 1.
+    db.upsertKeyedRun({ runId: RUN, flowId: FLOW_ID, flowPath: FLOW_PATH, runKey: ['acme/widgets', '7'], maxPasses: undefined });
+    acceptRow('ev-first', NOW - 10, { round: 1 });
+    db.markIngressFailed('ev-first');
+    db.insertRun({ run_id: RUN, flow: FLOW_PATH, input_fingerprint: 'fp', status: 'halted', outcome: 'halted' });
+
+    await boot(makeFlow(keyedIngress()));
+
+    expect(launches).toHaveLength(1);
+    expect(launches[0]!.appendPass).toBeUndefined();
+    expect(launches[0]!.passEvents).toEqual(['ev-first']);
+    expect(stampedInput(0)).toMatchObject({ pass: 1 });
+    expect(db.getIngressLog({ outcome: 'run_not_appendable' })).toHaveLength(0);
+  });
+
   it('folds a second event for a run whose first event is still queued, instead of queueing both', async () => {
     const listener = await boot(
       makeFlow(keyedIngress()),

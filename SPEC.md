@@ -590,7 +590,10 @@ concluded: for an unattended loop that is an ordinary bad outcome, and `conduit 
 cannot bring a scrapped card to `done`, so refusing would block the subject for good. A
 run the andon halted with unfinished cards, a run whose driver died, a run holding a card
 for a human, and a parked run are refused, never reopened; each still has work a resume
-finishes, and a parked run is resumed by the parked-run machinery, not by a pass. Checkpoints, outbox keys, rework counters, and
+finishes, and a parked run is resumed by the parked-run machinery, not by a pass. A run
+whose first launch failed before seeding any card (no cards, recorded halted or left
+`running` by a dead lease holder) is refused too: it has no pass to follow, and a plain
+`conduit run` with the same run id retries that launch in place. Checkpoints, outbox keys, rework counters, and
 journal spans are all keyed per card, so a pass never replays or collides with an earlier
 pass. The run token budget is a ceiling over all passes together: `--append-pass` caps a
 pass at what earlier passes left and refuses one when nothing is left, and `conduit
@@ -604,7 +607,7 @@ rework guard: it bounds how often the subject may re-enter the line, not how oft
 may be reworked inside a pass.
 
 The listener routes an accepted keyed event by the state of its run (ingress/keyed-runs.ts):
-no run yet launches pass 1; a concluded run takes a new pass; a pass in flight, a parked
+no run yet, or a run whose launch failed before seeding, launches pass 1; a concluded run takes a new pass; a pass in flight, a parked
 run, or a run holding a card for a human **coalesces** the event into the run's single
 pending pass, which launches once the run is free (the in-flight pass exits, or the
 resume finishes), so N events during one pass cost one trailing pass rather than N; a run at `max_passes`, stopped with unfinished cards, or crashed mid-pass
