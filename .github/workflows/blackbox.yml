@@ -47,5 +47,20 @@ jobs:
       - name: Black-box typecheck
         run: bun run typecheck:blackbox
 
+      # Issue #77, as in test.yml's Test step: harness-idle-timeout.test.ts
+      # proves a harness call's setsid descendant (Claude Code's Bash tool
+      # starts every command in a new session) dies with the call. Only a
+      # cgroup can do that, and the runner's own cgroup belongs to root, so the
+      # step creates one owned by the runner user and moves its shell into it
+      # before the suite starts. CONDUIT_REQUIRE_CGROUP_CONTAINMENT makes that
+      # journey fail, naming the `conduit doctor` line, instead of skipping the
+      # assertion if the runner image ever stops allowing this.
       - name: Black-box test
-        run: bun run test:blackbox
+        env:
+          CONDUIT_REQUIRE_CGROUP_CONTAINMENT: '1'
+        run: |
+          cg=/sys/fs/cgroup/conduit-ci
+          sudo mkdir -p "$cg"
+          sudo chown -R "$(id -u):$(id -g)" "$cg"
+          echo $$ | sudo tee "$cg/cgroup.procs" > /dev/null
+          bun run test:blackbox

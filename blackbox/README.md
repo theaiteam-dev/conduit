@@ -18,6 +18,50 @@ user or CI consumer actually sees, not internal implementation details.
 - `fault-*.test.ts` — fault variants of the golden journey (see "The standing
   rule" below). `fault-stalled-slack.test.ts` (WI-680) is the first shipped
   example.
+- `harness/fake-claude.ts`: a scenario-driven stand-in for the headless
+  Claude Code CLI. The harness-flow journeys point the shipped
+  `claude-headless` adapter at it through engine config
+  (`CONDUIT_HARNESS_CLAUDE_HEADLESS_COMMAND`). It reads a scenario JSON file
+  named by `FAKE_CLAUDE_SCENARIO` (on the adapter's env allowlist), picks a
+  role by a substring of the prompt, and uses a per-role counter file so call 1
+  and call 2 can behave differently. Per call it can write files, emit
+  stream-json lines (system/init, assistant tool_use, user tool_result,
+  `rate_limit_event`, `result` with usage and `total_cost_usd`), delay, exit
+  with a given code, go silent for the idle timeout, and spawn a `setsid`
+  sleeper that writes its pid. Every invocation appends its argv, cwd and pid
+  to a log. The stream shapes are copied from the recorded CLI fixture
+  (`fixtures/harness/claude-stream-json.ndjson`), not imported.
+- `harness/harness-flow.ts`: `startHarnessFlow()`, the scaffolding for
+  `kind: harness` journeys. It writes a temp project (flow.yaml, prompts,
+  inputs), temp state and journal DBs, the fake-claude scenario and a
+  `#!/bin/sh` wrapper that execs it with the running bun binary (the adapter
+  scrubs the child env, so `bun` may not be on its PATH). It runs the real
+  `conduit run`, `conduit run status`, `conduit journal inspect` and
+  `conduit doctor` as subprocesses. No Slack or listener. `journalSpans()` is
+  a read-only journal DB read for span usage columns, which no CLI prints.
+- `harness-happy-path.test.ts`: one harness maker writes its declared output
+  and the card reaches `done`; checks exit code, `run status` occupancy, the
+  `<station>.harness` span and its usage, and the argv the kernel passed.
+- `harness-gate-critic.test.ts`: a harness maker gated by an agentic
+  (`check.critic.harness`) critic. The critic rejects then passes, and the
+  card goes back through the maker to `done`; a second case always rejects
+  and the per-gate `rework_cap` scraps the card.
+- `harness-critic-budget.test.ts`: the run token budget counts the critic's
+  spend (issue #26). Maker alone is under budget, maker plus critic is over,
+  and the run halts on the tokens andon; a control run with more budget
+  completes. Holds a `test.todo` for a `run status` bug (see the file).
+- `harness-idle-timeout.test.ts`: `worker.idle_timeout_seconds` kills a
+  silent call, which is retried up to `max_execution_attempts` and then
+  scrapped as `harness-idle-timeout`. A `setsid` sleeper spawned by the stub
+  must be dead after the run when `conduit doctor` reports cgroup
+  containment; under the process-group fallback that one assertion is skipped
+  with a logged reason, or fails when `CONDUIT_REQUIRE_CGROUP_CONTAINMENT=1`.
+  `blackbox.yml` sets that variable and creates a runner-owned cgroup before
+  the suite, the same way `test.yml` does, so CI must take the cgroup branch.
+- `harness-rate-limit-park.test.ts`: a blocking provider rate limit parks the
+  card with no attempt consumed, and `run status` reports the run parked with
+  its resume command. Holds a `test.todo` for a wall-clock budget bug (see
+  the file).
 - `no-internal-imports.test.ts` + `harness/import-scan.ts` — the zero-imports
   gate (AC-1): a TypeScript-compiler-API scan that fails if any file under
   `blackbox/` imports anything resolving into `src/`.
