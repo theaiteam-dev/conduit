@@ -126,6 +126,18 @@ export function pidAlive(pid: number): boolean {
   }
 }
 
+/**
+ * Should cleanup() reap `pid`? Only a live process whose cmdline names
+ * fake-claude, so a pid the OS recycled for something else is left alone.
+ */
+export function isOrphanedStub(pid: number): boolean {
+  try {
+    return pidAlive(pid) && readFileSync(`/proc/${pid}/cmdline`, "utf8").includes(FAKE_CLAUDE);
+  } catch {
+    return false;
+  }
+}
+
 export function startHarnessFlow(opts: HarnessFlowOptions): HarnessFlow {
   if (process.platform !== "linux") {
     throw new Error(`blackbox harness-flow journeys require Linux (got '${process.platform}'; see blackbox/README.md)`);
@@ -260,13 +272,10 @@ export function startHarnessFlow(opts: HarnessFlowOptions): HarnessFlow {
       }
       try {
         // A stub still running here was orphaned by a conduit process the
-        // timeout above killed (its own group kill never ran). Match on the
-        // cmdline so a recycled pid is left alone.
+        // timeout above killed (its own group kill never ran).
         for (const { pid } of stubLog()) {
           try {
-            if (pidAlive(pid) && readFileSync(`/proc/${pid}/cmdline`, "utf8").includes(FAKE_CLAUDE)) {
-              process.kill(-pid, "SIGKILL");
-            }
+            if (isOrphanedStub(pid)) process.kill(-pid, "SIGKILL");
           } catch {
             /* already gone */
           }

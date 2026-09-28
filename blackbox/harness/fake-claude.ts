@@ -24,7 +24,7 @@
  * being on the scrubbed child PATH.
  */
 
-import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync, writeSync } from "node:fs";
+import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, writeFileSync, writeSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 
 export interface FakeClaudeUsage {
@@ -91,7 +91,7 @@ export interface FakeClaudeRole {
 }
 
 export interface FakeClaudeScenario {
-  /** Directory holding one `<role>.count` file per role. */
+  /** Directory holding one `<role>.<n>` claim file per call made. */
   stateDir: string;
   /** NDJSON invocation log. */
   logPath: string;
@@ -124,14 +124,21 @@ function argValue(argv: string[], flag: string): string | null {
   return argv[i + 1]!;
 }
 
-/** Next 1-based call number for `role`, persisted across invocations. */
+/**
+ * Next 1-based call number for `role`, persisted across invocations. Each call
+ * claims `<role>.<n>` with an exclusive create, so concurrent invocations of
+ * one role cannot both claim the same number.
+ */
 function nextCallNumber(stateDir: string, role: string): number {
   mkdirSync(stateDir, { recursive: true });
-  const counter = join(stateDir, `${role}.count`);
-  const prev = existsSync(counter) ? Number(readFileSync(counter, "utf8").trim()) || 0 : 0;
-  const next = prev + 1;
-  writeFileSync(counter, String(next));
-  return next;
+  for (let n = 1; ; n++) {
+    try {
+      closeSync(openSync(join(stateDir, `${role}.${n}`), "wx"));
+      return n;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+    }
+  }
 }
 
 function spawnSetsidSleeper(pidFile: string): void {
