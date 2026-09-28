@@ -96,7 +96,7 @@ function tryRealpath(absPath: string): string | null {
  * even when the leaf does not exist yet — putting owned and touched paths on the
  * same canonical footing.
  */
-function resolveOwnedPath(absPath: string): string {
+export function resolveOwnedPath(absPath: string): string {
   // Fast path: the whole path already exists on disk.
   const direct = tryRealpath(absPath);
   if (direct !== null) return direct;
@@ -120,7 +120,7 @@ function resolveOwnedPath(absPath: string): string {
 }
 
 /** True when `target` is equal to `ownedDir` or is contained within it. */
-function isContainedIn(target: string, ownedDir: string): boolean {
+export function isContainedIn(target: string, ownedDir: string): boolean {
   return target === ownedDir || target.startsWith(ownedDir + '/');
 }
 
