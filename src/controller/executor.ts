@@ -927,7 +927,12 @@ export async function runExecutor(args: RunEngineArgs): Promise<void> {
       // ends at the soonest gate (from the MIN(release_at) query below) or at the
       // wall-clock deadline, whichever comes first, floored at 1s: a gate past the
       // deadline wakes the loop at the deadline so the andon halts the run there
-      // (issue #84). The executor derives the wait here rather than from
+      // (issue #84). The deadline is only used when it's a finite number: a
+      // flow.yaml value the loader doesn't validate (e.g. a non-numeric
+      // wall_clock_minutes) can make wallClockSeconds NaN, and capping by a NaN
+      // deadline turns the whole wait into NaN, which is a sleep that fires
+      // immediately rather than a wait for the gate (PR #87 review). The
+      // executor derives the wait here rather than from
       // plan.nextWakeSeconds (which the run loop drives with busy/idleWakeSeconds=0).
       // The sleep is injectable (default setTimeout): production advances the wall
       // clock past the gate; a test injects a fast sleep so its advancing clock
@@ -958,7 +963,8 @@ export async function runExecutor(args: RunEngineArgs): Promise<void> {
           halted = true;
           break;
         }
-        const wakeAt = Math.min(releaseGate.soonest, runStartedAt + wallClockSeconds);
+        const deadline = runStartedAt + wallClockSeconds;
+        const wakeAt = Number.isFinite(deadline) ? Math.min(releaseGate.soonest, deadline) : releaseGate.soonest;
         const waitSeconds = Math.max(1, wakeAt - currentNow);
         await sleep(waitSeconds * 1000);
         continue;

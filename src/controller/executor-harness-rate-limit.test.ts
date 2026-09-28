@@ -680,6 +680,68 @@ describe('issue #84 — the wall-clock budget bounds the release-gate sleep', ()
     expect(errors.find((l) => /^andon:/.test(l))).toMatch(/wall_clock budget exceeded while parked behind a provider rate limit/);
     expect(getRunParkedRelease(db, DEFAULT_RUN_ID, clock.read())?.releaseAt).toBe(1300);
   });
+
+  it('does not busy-spin when wall_clock_minutes is not a finite number (PR #87 review)', async () => {
+    // flow.yaml passes budgets through src/flow/load.ts unvalidated, so a YAML
+    // string like "ten" for wall_clock_minutes reaches executor.ts's
+    // `(... ?? 10) * 60` arithmetic and produces NaN there, not undefined
+    // (undefined can't reach it — the ?? default catches that case). Before the
+    // fix, `Math.min(releaseGate.soonest, runStartedAt + NaN)` is NaN, so the
+    // wait is `Math.max(1, NaN - currentNow)` = NaN and `sleep(NaN)` fires
+    // immediately: the release-gate branch spins instead of sleeping to the
+    // gate, and the wall-clock andon (elapsed >= NaN is always false) never
+    // halts it either.
+    db = openDb();
+    const clock = virtualClock(1000);
+    const { adapter, calls } = makeScriptedHarness(rateLimited());
+    const registry = createHarnessRegistry([adapter]);
+    const flow = writeHarnessFlow(projectDir, registry, {
+      maxAttempts: 20,
+      wallClockMinutes: 'ten' as unknown as number,
+    });
+    seedCoderCard(db);
+    const sleeps: number[] = [];
+    let sleepCount = 0;
+    const recording = {
+      ...clock,
+      sleep: async (ms: number) => {
+        sleepCount++;
+        // Safety valve: the pre-fix code computes a NaN wake time, and
+        // `sleep(NaN)` resolves immediately without waiting for anything — so
+        // a NaN sleep must NOT advance the virtual clock either (that's the
+        // real bug: nothing is actually waited on). With the clock frozen the
+        // release gate never closes and this would otherwise spin forever.
+        // Bail out loudly instead of hanging the test.
+        if (sleepCount > 20) {
+          throw new Error(
+            `spun past 20 sleeps without the run settling; recorded so far: ${JSON.stringify(sleeps)}`,
+          );
+        }
+        sleeps.push(ms);
+        if (Number.isFinite(ms)) {
+          await clock.sleep(ms);
+        }
+      },
+    };
+
+    await run(flow, registry, recording);
+
+    // Every recorded sleep is the park interval (the default rate-limit
+    // window), never NaN.
+    expect(sleeps.length).toBeGreaterThan(0);
+    expect(sleeps.every((ms) => Number.isFinite(ms))).toBe(true);
+    expect(new Set(sleeps)).toEqual(new Set([300_000]));
+    // No attempt was ever spent parking, and since the wall-clock andon can
+    // never trip on a NaN budget, the only thing that bounds the parks is the
+    // consecutive-park cap (issue #16): the 12th park escalates straight to
+    // hold instead of sleeping toward a 13th call, so there is one fewer
+    // recorded sleep than harness call.
+    expect(calls.length).toBe(12);
+    expect(sleeps.length).toBe(11);
+    const card = getCard(db);
+    expect(card?.lane).toBe('hold');
+    expect(card?.status).toBe('held');
+  });
 });
 
 // ---------------------------------------------------------------------------
