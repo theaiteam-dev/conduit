@@ -288,6 +288,10 @@ async function expectReaped(
   }
 
   const before = grandchildren.map(({ sentinel }) => sentinelMtime(projectRoot, sentinel));
+  // A missing sentinel would make the stall comparison below pass vacuously.
+  grandchildren.forEach(({ label }, i) => {
+    expect(before[i], `${label}: sentinel was never created`).toBeDefined();
+  });
   await sleep(STALL_WINDOW_MS);
   grandchildren.forEach(({ label, sentinel }, i) => {
     expect(sentinelMtime(projectRoot, sentinel), `${label}: sentinel still advancing`).toBe(before[i]);

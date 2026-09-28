@@ -113,7 +113,11 @@ function isPopulated(dir: string): boolean {
   }
 }
 
-/** Cgroup dirs `killCgroup` has already warned about a non-ENOENT write failure for. */
+/**
+ * Cgroup dirs `killCgroup` has already warned about a non-ENOENT write
+ * failure for. An entry is dropped once its cgroup is gone, so the set holds
+ * only cgroups that still exist.
+ */
 const warnedKillFailures = new Set<string>();
 
 /**
@@ -162,9 +166,13 @@ export async function removeCgroup(dir: string, budgetMs: number = REMOVE_BUDGET
   for (;;) {
     try {
       rmdirSync(dir);
+      warnedKillFailures.delete(dir);
       return;
     } catch (err) {
-      if ((err as { code?: string }).code === 'ENOENT') return;
+      if ((err as { code?: string }).code === 'ENOENT') {
+        warnedKillFailures.delete(dir);
+        return;
+      }
       if (Date.now() >= deadline) return;
     }
     if (isPopulated(dir)) killCgroup(dir);
@@ -187,9 +195,13 @@ export function removeCgroupsSync(dirs: readonly string[], budgetMs: number = 25
     pending = pending.filter((dir) => {
       try {
         rmdirSync(dir);
+        warnedKillFailures.delete(dir);
         return false;
       } catch (err) {
-        if ((err as { code?: string }).code === 'ENOENT') return false;
+        if ((err as { code?: string }).code === 'ENOENT') {
+          warnedKillFailures.delete(dir);
+          return false;
+        }
         if (isPopulated(dir)) killCgroup(dir);
         return true;
       }

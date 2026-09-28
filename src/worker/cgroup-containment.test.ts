@@ -289,6 +289,24 @@ describe('killCgroup', () => {
     expect(warnings.length).toBe(1);
   });
 
+  it('forgets a cgroup once it is removed, so a later cgroup at the same path warns again', async () => {
+    const dir = join(scratch, 'fake-cgroup-reused');
+    const failingKill = () => {
+      mkdirSync(dir);
+      mkdirSync(join(dir, 'cgroup.kill'));
+    };
+    const warnings: string[] = [];
+
+    failingKill();
+    killCgroup(dir, (m) => warnings.push(m));
+    rmSync(dir, { recursive: true });
+    await removeCgroup(dir);
+
+    failingKill();
+    killCgroup(dir, (m) => warnings.push(m));
+    expect(warnings.length).toBe(2);
+  });
+
   it('never throws even when the warn sink itself throws', () => {
     const dir = join(scratch, 'fake-cgroup-2');
     mkdirSync(dir);
