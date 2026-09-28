@@ -7,7 +7,7 @@
  * call that produced them. Both are additive: a journal written before this
  * change opens, keeps its rows, and reads their invocation id back as NULL.
  */
-import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
+import { describe, it, expect, beforeEach, afterEach, spyOn } from 'bun:test';
 import { Database } from 'bun:sqlite';
 import { join } from 'node:path';
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -119,6 +119,25 @@ describe('harness_events on a fresh journal', () => {
       expect(db.getHarnessEventsForRun('r1', 'c1')).toHaveLength(0);
       expect(db.getHarnessEventsForRun('r2', 'c1')).toHaveLength(1);
     } finally {
+      db.close();
+    }
+  });
+
+  it('prepares its INSERT once and reuses it across events (events arrive per stdout line)', () => {
+    const prepareSpy = spyOn(Database.prototype, 'prepare');
+    const db = memDb();
+    try {
+      const before = prepareSpy.mock.calls.length;
+      db.appendHarnessEvent(row({ seq: 0, kind: 'lifecycle', phase: 'start' }));
+      db.appendHarnessEvent(row({ seq: 1, kind: 'lifecycle', phase: 'end' }));
+      db.appendHarnessEvent({ ...row({ seq: 2, kind: 'lifecycle', phase: 'end' }), invocationId: 'inv-b' });
+      const insertCalls = prepareSpy.mock.calls
+        .slice(before)
+        .filter(([sql]) => typeof sql === 'string' && sql.includes('INSERT OR IGNORE INTO harness_events'));
+      expect(insertCalls).toHaveLength(1);
+      expect(db.getHarnessEventsForRun('r1', 'c1')).toHaveLength(3);
+    } finally {
+      prepareSpy.mockRestore();
       db.close();
     }
   });

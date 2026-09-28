@@ -169,6 +169,20 @@ export function createHarnessEventJournalSink(
   };
 }
 
+// C0 controls (including \n \r \t), DEL, and C1 controls.
+const CONTROL_CHARS = /[\x00-\x1F\x7F-\x9F]/;
+
+/**
+ * A harness-supplied string, safe to print on one line. The harness process
+ * chooses this text (a tool's path argument, a phase name, ...), so it is
+ * printed verbatim only when it has no control characters; otherwise it is
+ * quoted and escaped via JSON.stringify so a newline or other control
+ * character cannot make one event look like more than one journal line.
+ */
+function renderHarnessString(value: string): string {
+  return CONTROL_CHARS.test(value) ? JSON.stringify(value) : value;
+}
+
 /**
  * One harness_events row as `conduit journal inspect` and `tail` print it:
  * receive time, seq, kind, and the columns that kind carries. Read side only.
@@ -177,24 +191,25 @@ export function formatHarnessEvent(row: StoredHarnessEvent): string {
   const parts = [new Date(row.atMs).toISOString(), `#${row.seq}`, row.kind];
   switch (row.kind) {
     case 'tool-input-available':
-      if (row.toolName !== null) parts.push(row.toolName);
-      if (row.path !== null) parts.push(`path=${row.path}`);
+      if (row.toolName !== null) parts.push(renderHarnessString(row.toolName));
+      if (row.path !== null) parts.push(`path=${renderHarnessString(row.path)}`);
       break;
     case 'tool-output-available':
       parts.push(row.isError === true ? 'error' : 'ok');
       if (row.exitCode !== null) parts.push(`exit=${row.exitCode}`);
-      if (row.path !== null) parts.push(`path=${row.path}`);
+      if (row.path !== null) parts.push(`path=${renderHarnessString(row.path)}`);
       break;
     case 'usage':
       if (row.tokens !== null) parts.push(`tokens=${row.tokens}`);
       if (row.costUsd !== null) parts.push(`cost=$${row.costUsd}`);
       break;
     case 'rate-limit':
-      if (row.rateLimitStatus !== null) parts.push(`status=${row.rateLimitStatus}`);
-      for (const w of row.rateLimitWindows ?? []) parts.push(`${w.name}=${Math.round(w.utilization * 100)}%`);
+      if (row.rateLimitStatus !== null) parts.push(`status=${renderHarnessString(row.rateLimitStatus)}`);
+      for (const w of row.rateLimitWindows ?? [])
+        parts.push(`${renderHarnessString(w.name)}=${Math.round(w.utilization * 100)}%`);
       break;
     case 'lifecycle':
-      if (row.phase !== null) parts.push(row.phase);
+      if (row.phase !== null) parts.push(renderHarnessString(row.phase));
       if (row.exitCode !== null) parts.push(`exit=${row.exitCode}`);
       break;
   }

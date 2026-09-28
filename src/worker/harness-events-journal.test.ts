@@ -18,7 +18,8 @@ import { tmpdir } from 'node:os';
 import { openConduitDB } from '../persistence/db';
 import { mapClaudeStreamLine } from './harness-events-claude';
 import { createHarnessEventEmitter, stampHarnessEvents, type StampedHarnessEvent } from './harness-events';
-import { createHarnessEventJournalSink, exitCodeFromToolOutput, harnessEventRow, pathFromToolInput } from './harness-events-journal';
+import type { StoredHarnessEvent } from '../persistence/db';
+import { createHarnessEventJournalSink, exitCodeFromToolOutput, formatHarnessEvent, harnessEventRow, pathFromToolInput } from './harness-events-journal';
 
 const FIXTURE = join(import.meta.dir, '..', '..', 'fixtures', 'harness', 'claude-stream-json.ndjson');
 const fixtureLines = (): string[] => readFileSync(FIXTURE, 'utf8').split('\n').filter((l) => l.length > 0);
@@ -186,5 +187,55 @@ describe('exitCodeFromToolOutput', () => {
   it('is undefined for a clean call or an error that names no exit code', () => {
     expect(exitCodeFromToolOutput(false, { stdout: 'Exit code 9' }, 'Exit code 9')).toBeUndefined();
     expect(exitCodeFromToolOutput(true, 'Error: file not found', 'File does not exist.')).toBeUndefined();
+  });
+});
+
+/** A StoredHarnessEvent with every column null, so a test only sets what it needs. */
+function storedEvent(over: Partial<StoredHarnessEvent> & Pick<StoredHarnessEvent, 'kind'>): StoredHarnessEvent {
+  return {
+    runId: 'r1', cardId: 'c1', station: 'coder', attempt: 0, invocationId: 'inv-a', seq: 0, atMs: 5,
+    toolCallId: null, toolName: null, path: null, exitCode: null, isError: null,
+    tokens: null, breakdown: null, costUsd: null, rateLimitStatus: null, rateLimitWindows: null, phase: null,
+    ...over,
+  };
+}
+
+describe('formatHarnessEvent', () => {
+  it('renders an ordinary path unchanged', () => {
+    const line = formatHarnessEvent(
+      storedEvent({ kind: 'tool-input-available', toolName: 'Read', path: 'src/a.ts' }),
+    );
+    expect(line).toContain('path=src/a.ts');
+    expect(line.split('\n')).toHaveLength(1);
+  });
+
+  it('escapes a harness-supplied path containing a newline so the row stays one line', () => {
+    const line = formatHarnessEvent(
+      storedEvent({ kind: 'tool-input-available', toolName: 'Read', path: '\n[card] fake span' }),
+    );
+    // One physical line: no bare newline made it into the output.
+    expect(line.split('\n')).toHaveLength(1);
+    // The path is still recoverable, just escaped (JSON.stringify quotes and escapes it).
+    expect(line).toContain(`path=${JSON.stringify('\n[card] fake span')}`);
+  });
+
+  it('escapes control characters in other harness-supplied fields (toolName, phase, rateLimitStatus, window name)', () => {
+    expect(formatHarnessEvent(storedEvent({ kind: 'tool-input-available', toolName: 'Read\nEvil' }))).toContain(
+      JSON.stringify('Read\nEvil'),
+    );
+    expect(formatHarnessEvent(storedEvent({ kind: 'lifecycle', phase: 'end\r\ninjected' }))).toContain(
+      JSON.stringify('end\r\ninjected'),
+    );
+    expect(
+      formatHarnessEvent(storedEvent({ kind: 'rate-limit', rateLimitStatus: 'allowed\nwarning' })),
+    ).toContain(JSON.stringify('allowed\nwarning'));
+    expect(
+      formatHarnessEvent(
+        storedEvent({
+          kind: 'rate-limit',
+          rateLimitWindows: [{ name: 'five_hour\nfake', utilization: 0.5, resetsAtMs: 5 }],
+        }),
+      ),
+    ).toContain(JSON.stringify('five_hour\nfake'));
   });
 });

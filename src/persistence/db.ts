@@ -10,7 +10,7 @@
  *                  fan-out scale (journal, work_summaries).
  */
 
-import { Database } from 'bun:sqlite';
+import { Database, type Statement } from 'bun:sqlite';
 import type { Card, Status } from '../types/kernel';
 import { withBusyRetry } from './busy-retry';
 import type { RateLimitWindow, UsageBreakdown } from '../worker/harness-adapter';
@@ -421,9 +421,11 @@ CREATE TABLE IF NOT EXISTS ingress_log (
 -- rate-limit and lifecycle are written; text and reasoning deltas never are.
 -- No prompt text and no tool output bodies: a tool call is recorded by name,
 -- the path it touched and, for a failed Bash call, the exit code parsed from
--- its error string. Keyed by invocation, not attempt, because a rate-limit
--- park re-invokes under the same attempt and a gate critic runs under the
--- maker's; seq restarts at 0 per invocation. A replayed key is ignored.
+-- its error string. Unique per (run, card, station, attempt, invocation_id,
+-- seq): invocation_id is in the key because a rate-limit park re-invokes
+-- under the same attempt and a gate critic runs under the maker's, so attempt
+-- alone does not identify one call; seq restarts at 0 per invocation. A
+-- replayed key is ignored.
 -- Created via IF NOT EXISTS so JOURNAL_DDL self-heals an older journal.
 CREATE TABLE IF NOT EXISTS harness_events (
   id                           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1291,6 +1293,11 @@ class ConduitDBImpl implements ConduitDB {
     private readonly journalDb: Database,
   ) {}
 
+  // Lazily prepared and reused across calls: harness events arrive one per
+  // stdout line during a call's drain, so re-preparing the INSERT on every
+  // row would recompile the same statement on the hot path.
+  private harnessEventInsert: Statement | null = null;
+
   insertCard(card: Card): void {
     this.stateDb
       .prepare(
@@ -1632,18 +1639,20 @@ class ConduitDBImpl implements ConduitDB {
   }
 
   appendHarnessEvent(event: HarnessEventRowInput): void {
-    const insert = this.journalDb.prepare(
-      `INSERT OR IGNORE INTO harness_events
-         (run_id, card_id, station, attempt, invocation_id, seq, kind,
-          tool_call_id, tool_name, path, exit_code, is_error,
-          tokens, input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens, cost_usd,
-          rate_limit_status, rate_limit_windows_json, phase, at_ms)
-       VALUES
-         ($run_id, $card_id, $station, $attempt, $invocation_id, $seq, $kind,
-          $tool_call_id, $tool_name, $path, $exit_code, $is_error,
-          $tokens, $input_tokens, $output_tokens, $cache_read_input_tokens, $cache_creation_input_tokens, $cost_usd,
-          $rate_limit_status, $rate_limit_windows_json, $phase, $at_ms)`,
-    );
+    const insert =
+      this.harnessEventInsert ??
+      (this.harnessEventInsert = this.journalDb.prepare(
+        `INSERT OR IGNORE INTO harness_events
+           (run_id, card_id, station, attempt, invocation_id, seq, kind,
+            tool_call_id, tool_name, path, exit_code, is_error,
+            tokens, input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens, cost_usd,
+            rate_limit_status, rate_limit_windows_json, phase, at_ms)
+         VALUES
+           ($run_id, $card_id, $station, $attempt, $invocation_id, $seq, $kind,
+            $tool_call_id, $tool_name, $path, $exit_code, $is_error,
+            $tokens, $input_tokens, $output_tokens, $cache_read_input_tokens, $cache_creation_input_tokens, $cost_usd,
+            $rate_limit_status, $rate_limit_windows_json, $phase, $at_ms)`,
+      ));
     const params = {
       $run_id: event.runId,
       $card_id: event.cardId,

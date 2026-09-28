@@ -2287,6 +2287,11 @@ async function cmdJournal(argv: string[], deps: CliDeps): Promise<number> {
     if (span.invocationId != null) printEvents(eventsByInvocation.get(span.invocationId) ?? []);
   }
 
+  // Built from the full `spans` list, not `printable`: an invocation whose
+  // span exists but fell outside the tail window is still spanned, so its
+  // rows are hidden along with that span rather than falling into the
+  // `(no span)` pass below. `(no span)` stays reserved for an invocation
+  // whose span truly does not exist yet (or never will).
   const spannedInvocations = new Set(spans.map((span) => span.invocationId).filter((id) => id != null));
   for (const [invocationId, rows] of eventsByInvocation) {
     if (spannedInvocations.has(invocationId)) continue;

@@ -164,4 +164,27 @@ describe('journal tail follows a live attempt', () => {
     const inspectLines = await journal('inspect');
     expect(inspectLines.some((l) => l.includes('#0 lifecycle start'))).toBe(true);
   });
+
+  it('hides the events of a truncated span without mislabeling them (no span), while a truly spanless invocation still gets that label', async () => {
+    // inv-old has a span, but that span is pushed out of the tail window below.
+    db.appendHarnessEvent(event('inv-old', 0, { kind: 'lifecycle', phase: 'start' }));
+    span('coder.harness', 'inv-old');
+    for (let i = 0; i < 20; i++) span(`span.${i}`);
+    // inv-spanless has no span at all, ever.
+    db.appendHarnessEvent(event('inv-spanless', 0, { kind: 'lifecycle', phase: 'start' }));
+
+    const lines = await journal('tail');
+
+    // The truncated span's events are gone, and not relabeled (no span).
+    expect(lines.some((l) => l.includes('inv-old'))).toBe(false);
+    expect(lines.some((l) => l.includes('#0 lifecycle start') && l.includes('inv-old'))).toBe(false);
+
+    // The genuinely spanless invocation still prints under (no span).
+    const header = lines.findIndex((l) => l.includes('inv-spanless') && l.includes('(no span)'));
+    expect(header).toBeGreaterThanOrEqual(0);
+    expect(lines[header + 1]).toContain('#0 lifecycle start');
+
+    // Pinning existing behaviour, not new behaviour: this test is expected to
+    // pass immediately (see Fix A / issue #71 review notes).
+  });
 });
