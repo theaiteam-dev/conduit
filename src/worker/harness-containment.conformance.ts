@@ -49,15 +49,16 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { HarnessAdapter } from './harness-adapter';
 import { resolveContainment, type Containment } from './cgroup-containment';
+import {
+  PID_FILE,
+  SENTINEL_FILE,
+  SETSID_PID_FILE,
+  SETSID_SENTINEL_FILE,
+  setsidContainmentRequired,
+} from './containment-fixture-files';
 
 /** Absolute path of the stand-in binary every conformance call spawns. */
 export const CONTAINMENT_FIXTURE = join(import.meta.dir, 'containment-fixture.sh');
-
-/** Files the fixture writes into its working directory. */
-const PID_FILE = 'containment.pid';
-const SENTINEL_FILE = 'containment.sentinel';
-const SETSID_PID_FILE = 'containment.setsid.pid';
-const SETSID_SENTINEL_FILE = 'containment.setsid.sentinel';
 
 /** The fixture's two grandchildren: the pid file and sentinel each one writes. */
 const GRANDCHILDREN = [
@@ -68,12 +69,8 @@ const GRANDCHILDREN = [
 /** The containment the runners resolve on this host, through the same resolver. */
 export const hostContainment: Containment = await resolveContainment();
 
-/**
- * Whether the suite requires the setsid grandchild to die. False only on a
- * host without cgroup containment that CI has not told to insist on it.
- */
-export const requiresSetsidContainment =
-  hostContainment.mechanism === 'cgroup' || process.env.CONDUIT_REQUIRE_CGROUP_CONTAINMENT === '1';
+/** Whether the suite requires the setsid grandchild to die on this host. */
+export const requiresSetsidContainment = setsidContainmentRequired(hostContainment);
 
 /** The grandchildren every reaping assertion covers on this host. */
 const REQUIRED_GRANDCHILDREN = requiresSetsidContainment ? GRANDCHILDREN : GRANDCHILDREN.slice(0, 1);
@@ -223,20 +220,12 @@ interface SentinelWatch {
   advanced: boolean;
   /**
    * The setsid grandchild's session id, read from /proc the first time it
-   * came back defined during the loop, i.e. while the grandchild was
-   * confirmed still running (before any kill the spawn path issues on its
-   * way to settling `invocation`). Undefined if it was never readable during
-   * the loop, or read but never resolved to a defined sid.
+   * came back defined during the loop, i.e. while the grandchild was still
+   * running. Undefined when the grandchild was already gone at every poll
+   * that could read its pid: /proc has no entry for a dead process, so this
+   * says nothing about its session.
    */
   setsidSidWhileRunning: number | undefined;
-  /**
-   * Whether the setsid grandchild's pid file was readable at least once
-   * during the loop. False only means the invocation settled before the
-   * loop's first poll, so nothing about the grandchild was observed while it
-   * ran; that is the one case genuinely ambiguous about its session, as
-   * opposed to a pid that was readable but never yielded a sid.
-   */
-  setsidPidReadableWhileRunning: boolean;
 }
 
 /**
@@ -249,7 +238,6 @@ async function watchSentinelAdvance(projectRoot: string, settled: () => boolean)
   const first = new Map<string, number>();
   const advanced = new Set<string>();
   let setsidSidWhileRunning: number | undefined;
-  let setsidPidReadableWhileRunning = false;
   while (!settled()) {
     for (const { sentinel } of REQUIRED_GRANDCHILDREN) {
       const now = sentinelMtime(projectRoot, sentinel);
@@ -260,17 +248,14 @@ async function watchSentinelAdvance(projectRoot: string, settled: () => boolean)
     }
     if (setsidSidWhileRunning === undefined) {
       const pid = recordedSetsidPid(projectRoot);
-      if (pid !== undefined) {
-        setsidPidReadableWhileRunning = true;
-        setsidSidWhileRunning = sessionId(pid);
-      }
+      if (pid !== undefined) setsidSidWhileRunning = sessionId(pid);
     }
     if (advanced.size === REQUIRED_GRANDCHILDREN.length) {
-      return { advanced: true, setsidSidWhileRunning, setsidPidReadableWhileRunning };
+      return { advanced: true, setsidSidWhileRunning };
     }
     await sleep(20);
   }
-  return { advanced: false, setsidSidWhileRunning, setsidPidReadableWhileRunning };
+  return { advanced: false, setsidSidWhileRunning };
 }
 
 /** The fixture arguments that make it exit with `code` once its grandchild is running. */
@@ -348,19 +333,9 @@ interface ObservedRun {
    * The setsid grandchild's session id, sampled inside the watch loop while
    * the invocation was still running. Equal to its pid when it leads its own
    * session, which is what makes it escape a process-group kill. Undefined
-   * either because the pid was never readable while running (see
-   * `setsidPidReadableWhileRunning`) or because it was readable but /proc
-   * never resolved a session id for it.
+   * when the grandchild was already dead at every poll that read its pid.
    */
   setsidSidWhileRunning: number | undefined;
-  /**
-   * Whether the setsid grandchild's pid file was readable at least once
-   * while the invocation was still running. False means the invocation
-   * settled before the watch loop ever polled, so nothing about the
-   * grandchild's session was observed in time: the one genuinely ambiguous
-   * case, as opposed to a pid that was readable but never yielded a sid.
-   */
-  setsidPidReadableWhileRunning: boolean;
 }
 
 async function runAndObserve(spawnPath: ContainmentSpawnPath, projectRoot: string): Promise<ObservedRun> {
@@ -382,7 +357,6 @@ async function runAndObserve(spawnPath: ContainmentSpawnPath, projectRoot: strin
     grandchildPid: recordedPid(projectRoot),
     setsidPid: recordedSetsidPid(projectRoot),
     setsidSidWhileRunning: watch.setsidSidWhileRunning,
-    setsidPidReadableWhileRunning: watch.setsidPidReadableWhileRunning,
   };
 }
 
@@ -445,23 +419,13 @@ export function describeContainmentConformance(
           // it while it ran (the pid file outlives the process).
           expect(run.setsidPid, 'setsid grandchild: no pid recorded').toBeDefined();
           const setsidPid = run.setsidPid!;
+          // Its session is checked whenever a poll caught it alive. A
+          // grandchild the spawn path had already killed by then has no /proc
+          // entry, which says nothing about its session; the pid file above
+          // and the sentinel advance still show it started and ran.
           if (run.setsidSidWhileRunning !== undefined) {
             expect(run.setsidSidWhileRunning).toBe(setsidPid);
-          } else if (run.setsidPidReadableWhileRunning) {
-            // Its pid was readable at least once while it was still
-            // running, so we had a real chance to read its session and
-            // never got one. That is not the same as the invocation
-            // settling before our first poll (handled below), so it does
-            // not get the benefit of the doubt.
-            expect(
-              run.setsidSidWhileRunning,
-              'setsid grandchild: pid was readable while the invocation ran, but its session id was never read (expected it to equal its pid)',
-            ).toBeDefined();
           }
-          // Else: the invocation settled before the watch loop's first poll,
-          // so nothing about the grandchild's session was observed in time.
-          // Genuinely ambiguous; the pid-recorded assertion above still holds
-          // it accountable for having started at all.
         }
 
         await expectGrandchildReaped(projectRoot);

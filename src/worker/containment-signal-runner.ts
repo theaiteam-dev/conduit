@@ -8,7 +8,7 @@
  * signal or exit handling can end the station. Prints `ready` once the
  * fixture has recorded every grandchild it will ever record: the plain one
  * always, and the setsid one too wherever this host requires cgroup
- * containment (the same `requiresSetsidContainment` the conformance suite
+ * containment (the same `setsidContainmentRequired` the conformance suite
  * uses), since that is exactly what `expectGrandchildReaped` will demand
  * back in the test. Printing `ready` (and, with `exit`, calling
  * process.exit(0)) any earlier risks the setsid grandchild never having been
@@ -22,7 +22,8 @@ import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { runDeterministic } from './deterministic';
 import { runHarnessProcess } from './harness-runner';
-import { requiresSetsidContainment } from './harness-containment.conformance';
+import { resolveContainment } from './cgroup-containment';
+import { PID_FILE, SETSID_PID_FILE, setsidContainmentRequired } from './containment-fixture-files';
 
 const [runner, projectRoot, mode] = process.argv.slice(2);
 if ((runner !== 'deterministic' && runner !== 'harness') || projectRoot === undefined) {
@@ -32,10 +33,13 @@ if ((runner !== 'deterministic' && runner !== 'harness') || projectRoot === unde
 
 const fixture = join(import.meta.dir, 'containment-fixture.sh');
 const timeoutMs = 600_000;
+// The runners resolve containment through the same memoized resolver, so this
+// adds no second probe.
+const requiresSetsidContainment = setsidContainmentRequired(await resolveContainment());
 
 function grandchildrenRecorded(): boolean {
-  if (!existsSync(join(projectRoot, 'containment.pid'))) return false;
-  if (requiresSetsidContainment && !existsSync(join(projectRoot, 'containment.setsid.pid'))) return false;
+  if (!existsSync(join(projectRoot, PID_FILE))) return false;
+  if (requiresSetsidContainment && !existsSync(join(projectRoot, SETSID_PID_FILE))) return false;
   return true;
 }
 
