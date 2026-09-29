@@ -220,6 +220,8 @@ export function createAgentSdkHarnessAdapter(config: AgentSdkHarnessAdapterConfi
           // The SDK's own signal fires after its stdin-EOF grace; the kill is what ends the tree. The SDK
           // may spawn more than once per invocation, so it ends every child, not only this one.
           opts.signal.addEventListener('abort', killAll, { once: true });
+          // A signal that aborted before this spawn never fires the listener, so end the child now.
+          if (opts.signal.aborted) killAll();
           return child as unknown as SpawnedProcess;
         };
 

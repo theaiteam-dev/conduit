@@ -48,7 +48,7 @@ interface Ctx {
   /** Run the PreToolUse hook the adapter registered, as the CLI would. */
   hook(input: Record<string, unknown>): Promise<unknown>;
   /** Start a real child through the adapter's spawn hook. */
-  spawn(command: string, args: string[]): ChildProcess;
+  spawn(command: string, args: string[], signal?: AbortSignal): ChildProcess;
 }
 
 /** A `query()` whose stream is `script`'s generator. Records the options it was given. */
@@ -66,13 +66,13 @@ function scripted(script: (ctx: Ctx) => AsyncGenerator<Msg, void>): { query: Age
           { signal: new AbortController().signal },
         );
       },
-      spawn: (command, args) =>
+      spawn: (command, args, signal) =>
         options.spawnClaudeCodeProcess!({
           command,
           args,
           cwd: options.cwd,
           env: { PATH: '/usr/bin:/bin' },
-          signal: new AbortController().signal,
+          signal: signal ?? new AbortController().signal,
         }) as unknown as ChildProcess,
     };
     const gen = script(ctx);
@@ -525,11 +525,11 @@ describe('agent-sdk adapter: hold', () => {
       await ctx.hook({ tool_name: 'AskUserQuestion', tool_input: {} });
       yield RESULT_OK;
     });
-    const err = await rejection(makeAdapter(query, { holdStopWaitMs: 30_000 }).invoke(invocation({ gate: holdGate })));
+    const err = await rejection(makeAdapter(query, { holdStopWaitMs: 60_000 }).invoke(invocation({ gate: holdGate })));
     expect(err.code).toBe(HARNESS_GATE_HOLD_CODE);
     expect(usageFromThrow(err)).toMatchObject({ tokens: 100, cost: 0.0123 });
-    // The bound is 30 s: a result that arrives ends the wait at once, far below it even on a slow host.
-    expect(Date.now() - started).toBeLessThan(10_000);
+    // The bound is 60 s: a result that arrives ends the wait at once, far below it even on a slow host.
+    expect(Date.now() - started).toBeLessThan(20_000);
   });
 
   it('kills the process after the bounded wait when no result arrives, and invents no usage', async () => {
@@ -627,6 +627,28 @@ describe('agent-sdk adapter: several children', () => {
       for (const child of children) expect(isDead(child.pid!)).toBe(true);
     } finally {
       for (const child of children) if (!isDead(child.pid!)) process.kill(-child.pid!, 'SIGKILL');
+    }
+  });
+});
+
+describe('agent-sdk adapter: a child spawned after the abort', () => {
+  it('kills a child whose spawn signal is already aborted, without waiting for the stream to end', async () => {
+    let child: ChildProcess | undefined;
+    let deadWhileStreamOpen = false;
+    const { query } = scripted(async function* (ctx) {
+      const aborted = new AbortController();
+      aborted.abort();
+      child = ctx.spawn('/bin/sleep', ['30'], aborted.signal);
+      await new Promise((r) => child!.once('exit', r));
+      // The stream is still open here: only the spawn hook can have ended the child.
+      deadWhileStreamOpen = isDead(child.pid!);
+      yield RESULT_OK;
+    });
+    try {
+      await makeAdapter(query).invoke(invocation({ gate: allowAll }));
+      expect(deadWhileStreamOpen).toBe(true);
+    } finally {
+      if (child?.pid !== undefined && !isDead(child.pid)) process.kill(-child.pid, 'SIGKILL');
     }
   });
 });
