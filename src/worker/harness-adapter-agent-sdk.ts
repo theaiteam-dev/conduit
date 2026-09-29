@@ -97,7 +97,7 @@ function fail(reason: string, code?: string, detail?: Record<string, unknown>): 
  * never a shell function. A path containing '/' must be absolute: a relative one would resolve
  * against whatever cwd the kernel happens to have, so it is refused, with its own message.
  */
-function resolveExecutable(
+export function resolveExecutable(
   command: string,
   sourceEnv: Record<string, string | undefined>,
 ): { path: string } | { error: string } {

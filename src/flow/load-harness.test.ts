@@ -61,6 +61,8 @@ import {
   type FlowValidationError,
 } from './load';
 import {
+  bindHarnessDefinitionsForIntrospection,
+  buildHarnessDefinitionRegistry,
   createHarnessRegistry,
   makeFakeHarnessAdapter,
   type HarnessAdapter,
@@ -428,6 +430,38 @@ describe('issue #21 — a per-call gating adapter needs a tools list (HARNESS_GA
         extraFiles: CODER_PROMPT,
       }),
     );
+  });
+});
+
+describe('issue #21 — the shipped codex-app-server adapter is a per-call gating adapter at load', () => {
+  const shipped = (): HarnessRegistry =>
+    bindHarnessDefinitionsForIntrospection(
+      buildHarnessDefinitionRegistry([{ name: 'codex-app-server', envAllowlist: [] }]),
+    );
+  const harness = 'harness: codex-app-server';
+
+  it('rejects a station with no tools list and one that waives it', () => {
+    expect(errorCodes(loadHarness(harnessFlow({ harnessLine: harness, toolsLine: '' }), { registry: shipped(), extraFiles: CODER_PROMPT }))).toContain(
+      'HARNESS_GATED_ADAPTER_NEEDS_TOOLS',
+    );
+    expect(
+      errorCodes(
+        loadHarness(harnessFlow({ harnessLine: harness, toolsLine: 'tools: [Write]', waiverLine: 'unrestricted_tools: true' }), {
+          registry: shipped(),
+          extraFiles: CODER_PROMPT,
+        }),
+      ),
+    ).toContain('HARNESS_GATED_ADAPTER_NEEDS_TOOLS');
+  });
+
+  it('accepts a station that lists Bash executables and the write tools', () => {
+    const flow = expectOk(
+      loadHarness(harnessFlow({ harnessLine: harness, toolsLine: 'tools: [Write, Edit, "Bash(cat:*)"]' }), {
+        registry: shipped(),
+        extraFiles: CODER_PROMPT,
+      }),
+    );
+    expect(flow.stations.coder!.tools).toEqual(['Write', 'Edit', 'Bash(cat:*)']);
   });
 });
 
