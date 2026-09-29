@@ -55,9 +55,9 @@ still owns the loop, and the kernel sees one call at a time. The gate
   the harness process and the executor holds the card without spending an execution
   attempt. It does not park a live process.
 
-A gate critic on a supervised adapter may write only its verdict file. A waived
-`unrestricted_tools` station reaches the gate as an empty `tools` list, so every tool is
-denied on a supervised adapter.
+A gate critic on a supervised adapter may write only its verdict file. A station on a
+supervised adapter must list its tools: an empty list, or `unrestricted_tools: true`, would
+deny every tool, so the loader rejects both (`HARNESS_GATED_ADAPTER_NEEDS_TOOLS`).
 
 What it does not cover:
 
