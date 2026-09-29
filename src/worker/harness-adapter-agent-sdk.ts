@@ -388,7 +388,9 @@ export function createAgentSdkHarnessAdapter(config: AgentSdkHarnessAdapterConfi
             ]);
             // An uncleared timer would hold the process open for EXIT_WAIT_MS after every call.
             clearTimeout(exitWait);
-            exitCode ??= childExit;
+            // A nonzero code from any child wins over an earlier clean or unknown one.
+            if (childExit !== undefined && childExit !== 0) exitCode = childExit;
+            else exitCode ??= childExit;
             untrackProcessGroup(child.pid);
             if (child.cgroup !== undefined) await removeCgroup(child.cgroup);
           }
