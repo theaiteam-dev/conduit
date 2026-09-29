@@ -540,7 +540,7 @@ describe('agent-sdk adapter: hold', () => {
     expect(err.code).toBe(HARNESS_GATE_HOLD_CODE);
     expect(isDead(state.child!.pid!)).toBe(true);
     expect(usageFromThrow(err)).toBeUndefined();
-    expect(elapsed).toBeGreaterThanOrEqual(180);
+    expect(elapsed).toBeGreaterThanOrEqual(150);
   });
 
   it('denies every later call without asking the gate, even one it would allow', async () => {

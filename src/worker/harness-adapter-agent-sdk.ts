@@ -155,17 +155,18 @@ export function createAgentSdkHarnessAdapter(config: AgentSdkHarnessAdapterConfi
       const containment = config.containment ?? (await resolveContainment());
       const model = call.model ?? config.model;
 
+      // Built before the dir exists: nothing between the dir's creation and the try below can throw.
+      const baseEnv = buildHarnessChildEnv(config.envAllowlist, sourceEnv);
       // Throws before anything is spawned when the child could not authenticate.
       const configDir =
         config.isolateConfig === true ? createRunScopedClaudeConfigDir(sourceEnv, config.envAllowlist) : undefined;
       const env: Record<string, string> = {
-        ...buildHarnessChildEnv(config.envAllowlist, sourceEnv),
+        ...baseEnv,
         ...(configDir !== undefined ? { CLAUDE_CONFIG_DIR: configDir } : {}),
       };
 
       // Every throw from here on, including one while building the options, must remove the dir.
       try {
-
         const emit = call.onEvent !== undefined ? createHarnessEventEmitter(call.onEvent) : undefined;
         const abortController = new AbortController();
         // Mutated from callbacks, so held in an object: a bare `let` would be narrowed to its initial value.
