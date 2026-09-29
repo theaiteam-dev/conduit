@@ -374,13 +374,13 @@ default changed correctly re-invokes rather than silently skipping.
 
 ## Named agents and plugin dirs
 
-A `claude-headless` station can run a named Claude Code agent out of a plugin
-directory the deployment supplies, without that plugin being installed in
-anyone's user config:
-
 Only `claude-headless` runs named agents. An `agent:` (or `check.critic.agent`) on an
 `agent-sdk` or `codex-exec` station is refused at load, and holds the card if it
 reaches dispatch, rather than being ignored.
+
+A `claude-headless` station can run a named Claude Code agent out of a plugin
+directory the deployment supplies, without that plugin being installed in
+anyone's user config:
 
 ```sh
 export CONDUIT_HARNESS_CLAUDE_HEADLESS_PLUGIN_DIRS=/opt/conduit/plugins
