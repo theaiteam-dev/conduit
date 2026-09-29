@@ -18,7 +18,10 @@ import type { ModelAdapter } from '../worker/adapter';
 import { resolveHarnessAgent, type HarnessRegistry } from '../worker/harness-adapter';
 import type { HarnessEventSink } from '../worker/harness-events';
 import { DEFAULT_RUN_ID, type ConduitDB, type StoredCardLogEntry } from '../persistence/db';
-import { runGateCheck, runHarnessGateCheck, computeFindingsHash, type CriticUsage } from '../quality/gate';
+import {
+  runGateCheck, runHarnessGateCheck, computeFindingsHash, HARNESS_CRITIC_VERDICT_FILE, type CriticUsage,
+} from '../quality/gate';
+import { createHarnessToolGate } from '../worker/harness-gate';
 import { renderPrompt } from '../flow/render';
 
 /** Default wall-clock bound for an agentic (harness) critic invocation (WI-570). */
@@ -128,6 +131,11 @@ export interface GateReworkInput {
  * findings array; those branches are fail-closed, not missing-data.
  */
 export type GateReworkDecision =
+  /**
+   * Issue #21: the critic's tool gate held it for a human. No verdict exists,
+   * so the executor moves the card to `hold` and writes no gate_verdict row.
+   */
+  | { action: 'hold'; reason: string; attempt: number; criticUsage?: CriticUsage }
   | { action: 'pass'; verdict: 'pass'; findings: string[]; returnTo: null; attempt: number; criticUsage?: CriticUsage }
   | { action: 'rework'; verdict: 'reject'; findings: string[]; returnTo: string; attempt: number; criticUsage?: CriticUsage }
   | {
@@ -279,6 +287,17 @@ export async function runGateRework(input: GateReworkInput): Promise<GateReworkD
           model: criticModel,
           ...(criticAgent !== undefined ? { agent: criticAgent, agentSha256: criticAgentSha256 } : {}),
           ...(harnessOnEvent !== undefined ? { onEvent: harnessOnEvent } : {}),
+          // Issue #21: an adapter that gates per call gets a critic gate that may write only the
+          // verdict file, so the critic cannot change anything it is judging.
+          ...(resolved.adapter.canGatePerCall === true
+            ? {
+                gate: createHarnessToolGate({
+                  projectRoot,
+                  tools: gateConfig.criticTools ?? [],
+                  ownedPaths: [HARNESS_CRITIC_VERDICT_FILE],
+                }),
+              }
+            : {}),
           onReject: gateConfig.onReject,
           validBackEdges,
           tools: gateConfig.criticTools,
@@ -315,6 +334,9 @@ export async function runGateRework(input: GateReworkInput): Promise<GateReworkD
         attempt,
         criticUsage: gateDecision.criticUsage,
       };
+
+    case 'hold':
+      return { action: 'hold', reason: gateDecision.reason, attempt, criticUsage: gateDecision.criticUsage };
 
     case 'scrapped':
       // No critic output, so findings are empty. a pre-public engine review (@queso finding

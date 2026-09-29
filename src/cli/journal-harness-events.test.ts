@@ -128,6 +128,28 @@ describe('journal inspect prints harness events under their span', () => {
   });
 });
 
+describe('journal prints gate decisions (issue #21)', () => {
+  it('prints a gate-decision row under its span and under a span-less invocation', async () => {
+    db.appendHarnessEvent(event('inv-sdk', 0, { kind: 'lifecycle', phase: 'start' }));
+    db.appendHarnessEvent(
+      event('inv-sdk', 1, { kind: 'gate-decision', toolCallId: 't1', toolName: 'Bash', decision: 'deny', gateCode: 'not_allowlisted', reason: 'rm is not allowed' }),
+    );
+    span('coder.harness', 'inv-sdk');
+    db.appendHarnessEvent(
+      event('inv-live', 0, { kind: 'gate-decision', toolCallId: 't2', toolName: 'Write', decision: 'hold', gateCode: 'needs_human', agentId: 'sub-3' }),
+    );
+
+    for (const sub of ['inspect', 'tail'] as const) {
+      const lines = await journal(sub);
+      const spanned = lines.findIndex((l) => l.endsWith(' coder.harness'));
+      expect(lines[spanned + 2]).toContain('#1 gate-decision deny Bash code=not_allowlisted reason=rm is not allowed');
+      const header = lines.findIndex((l) => l.includes('inv-live') && l.includes('(no span)'));
+      expect(header).toBeGreaterThan(spanned);
+      expect(lines[header + 1]).toContain('#0 gate-decision hold Write code=needs_human agent=sub-3');
+    }
+  });
+});
+
 describe('journal tail follows a live attempt', () => {
   it('shows the rows of a call with no span yet, picks up new rows, then files them under the span', async () => {
     span('coder.harness', 'inv-earlier');

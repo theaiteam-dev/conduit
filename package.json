@@ -44,6 +44,7 @@
     "typescript": "^5.4.5"
   },
   "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "0.3.284",
     "@terrastruct/d2": "^0.1.33",
     "picocolors": "^1.1.1",
     "table": "^6.9.0",

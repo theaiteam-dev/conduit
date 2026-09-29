@@ -77,6 +77,7 @@ function registryOf(
   specs: Array<{
     name: string;
     canRestrictTools?: boolean;
+    canGatePerCall?: boolean;
     canExpressTools?: (tools: readonly string[]) => boolean;
     binaryPresent?: boolean;
   }>,
@@ -372,6 +373,61 @@ describe('WI-563 AC3 — tools allowlist expressibility + unrestricted waiver (N
     // can surface it as a warning; the declared allowlist is preserved too.
     expect(flow.stations.coder!.unrestricted_tools).toBe(true);
     expect(flow.stations.coder!.tools).toEqual(['Read', 'Write', 'Bash']);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Issue #21 — an adapter that gates per call denies every unlisted tool, so a
+// station with no tools list, or one that waives the list, fails at load.
+// ---------------------------------------------------------------------------
+
+describe('issue #21 — a per-call gating adapter needs a tools list (HARNESS_GATED_ADAPTER_NEEDS_TOOLS)', () => {
+  const gating = (): HarnessRegistry => registryOf([{ name: 'claude-headless', canGatePerCall: true }]);
+
+  it('rejects unrestricted_tools: true', () => {
+    const result = loadHarness(
+      harnessFlow({ toolsLine: 'tools: [Read, Write]', waiverLine: 'unrestricted_tools: true' }),
+      { registry: gating(), extraFiles: CODER_PROMPT },
+    );
+    expect(errorCodes(result)).toContain('HARNESS_GATED_ADAPTER_NEEDS_TOOLS');
+    expect(JSON.stringify(result)).toContain('unrestricted_tools: true has no effect');
+    // The list is present and governs, so the message must not claim the station can do nothing.
+    expect(JSON.stringify(result)).not.toContain('can do nothing');
+  });
+
+  it('says a waiver with no tools list leaves the station unable to do anything', () => {
+    const result = loadHarness(
+      harnessFlow({ toolsLine: '', waiverLine: 'unrestricted_tools: true' }),
+      { registry: gating(), extraFiles: CODER_PROMPT },
+    );
+    expect(errorCodes(result)).toContain('HARNESS_GATED_ADAPTER_NEEDS_TOOLS');
+    expect(JSON.stringify(result)).toContain('can do nothing');
+  });
+
+  it('rejects a station that declares no tools list', () => {
+    const result = loadHarness(harnessFlow({ toolsLine: '' }), { registry: gating(), extraFiles: CODER_PROMPT });
+    expect(errorCodes(result)).toContain('HARNESS_GATED_ADAPTER_NEEDS_TOOLS');
+  });
+
+  it('accepts a station that lists its tools', () => {
+    const flow = expectOk(
+      loadHarness(harnessFlow({ toolsLine: 'tools: [Read, Write, "Bash(git:*)"]' }), {
+        registry: gating(),
+        extraFiles: CODER_PROMPT,
+      }),
+    );
+    expect(flow.stations.coder!.tools).toEqual(['Read', 'Write', 'Bash(git:*)']);
+  });
+
+  it('leaves an adapter that does not gate per call alone, waiver and empty list included', () => {
+    const registry = registryOf([{ name: 'claude-headless', canRestrictTools: false }]);
+    expectOk(loadHarness(harnessFlow({ toolsLine: '' }), { registry, extraFiles: CODER_PROMPT }));
+    expectOk(
+      loadHarness(harnessFlow({ toolsLine: 'tools: [Read, Write]', waiverLine: 'unrestricted_tools: true' }), {
+        registry,
+        extraFiles: CODER_PROMPT,
+      }),
+    );
   });
 });
 
