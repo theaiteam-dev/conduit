@@ -258,7 +258,9 @@ text and ANSI frames, color tokens, and a cell-grid reference renderer.
 
 `conduit watch` is a command in the existing kernel binary, not a separate service. It
 ships in the same Docker image, reads the same mounted volume, and adds no new runtime
-or infrastructure. The web view, when it comes, is served by the same binary.
+or infrastructure. The web view, when it comes, is served by the same binary under a
+distinct invocation, `conduit watch --web`, so that plain `conduit watch` never opens a
+port.
 
 The data model is a **shared core**, built once around a single projection function,
 *the* War Room in code form:
@@ -398,8 +400,9 @@ None open. Three were settled on 2026-09-29 (see Resolved).
       immediately. The journal is a trace; render it as one. Board demoted to a
       possible future secondary view for high-WIP flows (§8).
 - [x] **Where the process lives** → a `conduit watch` command in the existing kernel
-      binary. No separate service (§9). In the web view it also serves the SPA and the event
-      stream; the TUI serves nothing.
+      binary. No separate service (§9). Plain `conduit watch` is the TUI and serves nothing.
+      The web view is `conduit watch --web`, which also serves the SPA and the event
+      stream.
 - [x] **Transport** (web view only, 2026-09-29) → one-directional SSE via reactiveSWR,
       single-cache-key reducer shape; replay re-folds locally without SSE (§9). The TUI
       reads the journal in-process and has no transport.

@@ -97,7 +97,7 @@ function build(cfg,ph){
  x+=1;[['working',tally.work,G],['waiting',tally.wait,MU],['held',tally.held,AM],['done',tally.done,MU],['scrap',tally.scrap,CO]].forEach(([k,v,c])=>{x=g.t(x,1,String(v),v?c:DI,null,1);x=g.t(x+1,1,k,DI);x+=1;});
  const el='T+'+clk(now);g.put(W-4-el.length,1,'│',BD);g.t(W-2-el.length,1,el,FG,null,1);
  const CX0=dr?24:30,CX1=dr?86:142,CW=CX1-CX0,SX=dr?87:144,MR=dr?98:158,TMAX=CX0-2-13;
- const nowX=now/B>=0.7?Math.round(now*(CW-2)/B):CW-4,s=nowX/now,E=m=>Math.round(m*s*8),bcol=Math.floor(B*s),showB=bcol<CW;
+ const nowX=now/B>=0.7?Math.min(CW-2,Math.round(now*(CW-2)/B)):CW-4,s=nowX/now,E=m=>Math.round(m*s*8),bcol=Math.floor(B*s),showB=bcol<CW;
  let lx=CX0;ST.forEach(([n,c])=>{lx=g.t(lx,3,n,c,null,1)+2;});
  const AY=4;
  const nl=el;g.t(CX0+nowX-nl.length+1,AY,nl,G,null,1);
@@ -119,7 +119,7 @@ function build(cfg,ph){
    g.put(CX0+nowX,y,'│',G,base,1);if(showB)g.put(CX0+bcol,y,'│',CO,base,1);
    return;
   }
-  const isP=i===0,st=isP?{s:'wait'}:stateOf(c,t),done=st.s==='done'||st.s==='scrap';
+  const isP=i===0,st0=stateOf(c,t),st=isP&&st0.s==='wait'?{s:'awaiting_children'}:st0,done=st.s==='done'||st.s==='scrap';
   g.t(2,y,isP?'┌─':'├─',BD,base);
   const idc=st.s==='work'?G:st.s==='held'?AM:st.s==='scrap'?CO:st.s==='done'?DI:MU;
   g.t(5,y,c.id,sel&&st.s==='done'?FG:idc,base,st.s==='done'?0:1);
@@ -151,6 +151,7 @@ function build(cfg,ph){
   else if(st.s==='held'){const dl=c.held[2];
    if(now<dl)g.t(SX,y,` HELD ${clk(dl-now)} `,'#000000',AM,1);
    else g.t(SX,y,`OVERDUE +${clk(now-dl)}`,blink?'#000000':CO,blink?CO:BG,1);}
+  else if(st.s==='awaiting_children')g.t(SX,y,'awaiting',MU,base);
   else if(st.s==='done')g.t(SX,y,'✓ '+ev(c.done),DI,base);
   else if(st.s==='scrap')g.t(SX,y,' SCRAP ','#000000',CO,1);
  });
@@ -187,7 +188,7 @@ function build(cfg,ph){
  }
  g.bgr(1,W-2,42,BAR);
  const SB=cfg.sel==='WI-209'
-  ?[S('WI-209',FG,1),S(' migration-0042',MU),S(' │ ',BD),S('HELD',AM,1),S(' human decision · approve migration 0042',MU),S(' │ ',BD),S('held since '+clk(29)+' · timeout '+clk(53),MU),S(' │ ',BD),S('OVERDUE +'+clk(now-53),CO,1)]
+  ?[S('WI-209',FG,1),S(' migration-0042',MU),S(' │ ',BD),S('HELD',AM,1),S(' human decision · approve migration 0042',MU),S(' │ ',BD),S('held since '+clk(29)+' · timeout '+clk(53)+' · on_timeout not recorded',MU),S(' │ ',BD),S('OVERDUE +'+clk(now-53),CO,1)]
   :[S('WI-204',FG,1),S(' parse-range',MU),S(' │ ',BD),S('implement',ST[2][1],1),S(' attempt #6 · '+clk(t-32)+' · rework 2/3',MU),S(' │ ',BD),S('$6.20 · 639.8k tok',MU),S(' │ ',BD),S('last call ',DI),S('Bash npx tsc --noEmit',FG),S(' running',G)];
  g.segs(2,42,SB.map(p=>({...p,bg:BAR})));
  let fx=g.t(2,43,' LIVE ','#000000',G,1)+2;
