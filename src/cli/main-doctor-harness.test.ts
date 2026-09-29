@@ -169,7 +169,7 @@ describe('conduit doctor — registered harness adapter listing (AC1)', () => {
   });
 });
 
-describe('conduit doctor — per-call gating adapters (issue #21)', () => {
+describe('conduit doctor: per-call gating adapters (issue #21)', () => {
   it('lists codex-app-server with its probe result and gatesPerCall=yes, and no other adapter grows the token', async () => {
     const registry = defRegistry([
       { name: 'codex-app-server', envAllowlist: ['HOME', 'PATH'] },

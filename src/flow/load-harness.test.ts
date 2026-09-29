@@ -433,7 +433,7 @@ describe('issue #21 — a per-call gating adapter needs a tools list (HARNESS_GA
   });
 });
 
-describe('issue #21 — the shipped codex-app-server adapter is a per-call gating adapter at load', () => {
+describe('issue #21: the shipped codex-app-server adapter is a per-call gating adapter at load', () => {
   const shipped = (): HarnessRegistry =>
     bindHarnessDefinitionsForIntrospection(
       buildHarnessDefinitionRegistry([{ name: 'codex-app-server', envAllowlist: [] }]),
