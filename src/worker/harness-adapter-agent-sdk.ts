@@ -72,12 +72,19 @@ export interface AgentSdkHarnessAdapterConfig {
   query?: AgentSdkQueryFn;
   /** Injected binary-presence probe, for tests. */
   probe?: () => Promise<BinaryProbe>;
+  /** Wait after a gate hold for the CLI to emit its result before it is killed, in ms. For tests; defaults to HOLD_STOP_WAIT_MS. */
+  holdStopWaitMs?: number;
   /** Injected containment mechanism, for tests. Defaults to the process-wide detection. */
   containment?: Containment;
 }
 
 /** Longest wait for the killed CLI's `exit` event before the adapter gives up on it. */
 const EXIT_WAIT_MS = 5_000;
+/**
+ * Longest wait, after a gate hold, for the CLI to stop by itself and emit its result message. Measured
+ * live at about 15 ms with `continue: false`; after this the process is killed as on a timeout.
+ */
+const HOLD_STOP_WAIT_MS = 5_000;
 /** Bytes of the child's stderr kept for rate-limit detection and error detail. */
 const STDERR_TAIL_BYTES = 2_000;
 
@@ -148,11 +155,12 @@ export function createAgentSdkHarnessAdapter(config: AgentSdkHarnessAdapterConfi
       const st: {
         active: ActiveChild | undefined;
         held: { code: string; reason: string; toolName: string } | undefined;
+        holdTimer: ReturnType<typeof setTimeout> | undefined;
         stderrTail: string;
         timedOut: boolean;
         idledOut: boolean;
         finished: boolean;
-      } = { active: undefined, held: undefined, stderrTail: '', timedOut: false, idledOut: false, finished: false };
+      } = { active: undefined, held: undefined, holdTimer: undefined, stderrTail: '', timedOut: false, idledOut: false, finished: false };
       const killAll = (): void => {
         if (st.active !== undefined) killContained(st.active.pid, st.active.cgroup);
       };
@@ -197,9 +205,32 @@ export function createAgentSdkHarnessAdapter(config: AgentSdkHarnessAdapterConfi
       };
 
       // The gate. Absent, every call is denied: an adapter that can gate must never run ungated.
+      // After the first hold every later call is denied without asking the gate, so nothing the model
+      // does while the CLI stops can run.
+      const deny = (reason: string) => ({
+        hookSpecificOutput: {
+          hookEventName: 'PreToolUse' as const,
+          permissionDecision: 'deny' as const,
+          permissionDecisionReason: reason,
+        },
+      });
       const preToolUse: HookCallback = async (input, toolUseId) => {
         if (input.hook_event_name !== 'PreToolUse') return { continue: true };
         const toolCallId = toolUseId ?? input.tool_use_id;
+        const emitDecision = (decision: GateDecision): void =>
+          emit?.({
+            type: 'gate-decision',
+            toolCallId,
+            toolName: input.tool_name,
+            decision: decision.decision === 'hold' ? 'deny' : decision.decision,
+            ...(decision.decision !== 'allow' ? { code: decision.code, reason: decision.reason } : {}),
+            ...(input.agent_id !== undefined ? { agentId: input.agent_id } : {}),
+          });
+        if (st.held !== undefined) {
+          const later: GateDecision = { decision: 'deny', code: 'needs_human', reason: 'an earlier call was held for a human' };
+          emitDecision(later);
+          return deny(later.reason);
+        }
         const decision: GateDecision =
           call.gate !== undefined
             ? callGateFailClosed(call.gate, {
@@ -210,32 +241,34 @@ export function createAgentSdkHarnessAdapter(config: AgentSdkHarnessAdapterConfi
                 ...(input.agent_type !== undefined ? { agentType: input.agent_type } : {}),
               })
             : { decision: 'deny', code: 'gate_error', reason: 'no tool gate was supplied for this invocation' };
-        emit?.({
-          type: 'gate-decision',
-          toolCallId,
-          toolName: input.tool_name,
-          decision: decision.decision,
-          ...(decision.decision !== 'allow' ? { code: decision.code, reason: decision.reason } : {}),
-          ...(input.agent_id !== undefined ? { agentId: input.agent_id } : {}),
-        });
+        if (decision.decision === 'hold') {
+          // The hold itself is journaled as a hold, not the deny the model sees.
+          emit?.({
+            type: 'gate-decision',
+            toolCallId,
+            toolName: input.tool_name,
+            decision: 'hold',
+            code: decision.code,
+            reason: decision.reason,
+            ...(input.agent_id !== undefined ? { agentId: input.agent_id } : {}),
+          });
+        } else {
+          emitDecision(decision);
+        }
         // Allow returns no permissionDecision, so the SDK's normal permission flow continues and
         // `allowedTools` decides. Returning 'allow' here would grant what no rule granted.
         if (decision.decision === 'allow') return { continue: true };
-        if (decision.decision === 'hold' && st.held === undefined) {
+        if (decision.decision === 'hold') {
           st.held = { code: decision.code, reason: decision.reason, toolName: input.tool_name };
-          // After the deny has been returned: end the process, gracefully then by force.
-          setImmediate(() => {
+          // Stop the CLI gracefully so it still emits its result message, which carries the call's
+          // usage and cost. If it has not ended by itself after HOLD_STOP_WAIT_MS, kill it.
+          st.holdTimer = setTimeout(() => {
             abortController.abort();
             killAll();
-          });
+          }, config.holdStopWaitMs ?? HOLD_STOP_WAIT_MS);
+          return { continue: false, stopReason: decision.reason, ...deny(decision.reason) };
         }
-        return {
-          hookSpecificOutput: {
-            hookEventName: 'PreToolUse',
-            permissionDecision: 'deny',
-            permissionDecisionReason: decision.reason,
-          },
-        };
+        return deny(decision.reason);
       };
 
       const options: Options = {
@@ -317,6 +350,7 @@ export function createAgentSdkHarnessAdapter(config: AgentSdkHarnessAdapterConfi
         } finally {
           st.finished = true;
           clearTimeout(timer);
+          if (st.holdTimer !== undefined) clearTimeout(st.holdTimer);
           if (idleTimer !== undefined) clearTimeout(idleTimer);
           try {
             stream?.close?.();

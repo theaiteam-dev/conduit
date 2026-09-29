@@ -72,8 +72,10 @@ The SDK reports a hook denial nowhere (`result.permission_denials` stays empty),
 adapter emits a `gate-decision` event for every call the gate sees. It is journaled in
 `harness_events` with the decision, code, tool name, subagent id when there is one, and a
 reason cut to 200 characters. No tool input body is stored. `conduit journal inspect` and
-`tail` print it. A held call ends the process before a result message arrives, so the
-spend of that partial call is not billed.
+`tail` print it. A hold answers the call with a deny and `continue: false`, so the CLI stops and emits its
+result message (about 15 ms in a live run), and the thrown error carries that call's usage
+and cost. Every later call is denied without asking the gate. If no result arrives within 5
+seconds the process is killed, and the error then carries no usage.
 
 Every invocation is a fresh session: `agent-sdk` does not resume one, and it does not run
 named agents (`agent`, `pluginDirs`).

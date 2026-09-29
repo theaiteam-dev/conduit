@@ -23,6 +23,7 @@ import {
   createHarnessRegistry, type HarnessAdapter, type HarnessInvocation, type HarnessRegistry, type UsageReport,
 } from '../worker/harness-adapter';
 import { HARNESS_GATE_HOLD_CODE } from '../worker/harness-gate';
+import { createAgentSdkHarnessAdapter, type AgentSdkQueryFn } from '../worker/harness-adapter-agent-sdk';
 
 const throwingModel: ModelAdapter = {
   async call() {
@@ -104,7 +105,7 @@ function makeCritic(opts: { canGatePerCall?: boolean; hold?: UsageReport } = {})
 function writeFlow(
   dir: string,
   registry: HarnessRegistry,
-  opts: { critic?: boolean; maxTokens?: number; enforceOwnedPaths?: boolean } = {},
+  opts: { critic?: boolean; maxTokens?: number; enforceOwnedPaths?: boolean; harness?: string } = {},
 ): FlowConfig {
   mkdirSync(join(dir, 'prompts'), { recursive: true });
   writeFileSync(join(dir, 'prompts', 'coder.md'), 'TASK: {{task.json}}');
@@ -133,7 +134,7 @@ stations:
   - id: coder
     worker:
       kind: harness
-      harness: fake-harness
+      harness: ${opts.harness ?? 'fake-harness'}
       model: sonnet
       prompt_file: prompts/coder.md
       prompt_version: "1"
@@ -351,5 +352,45 @@ describe('issue #21: the executor builds the gate from the station, the card and
     expect(gate(write('verdict.json'))).toEqual({ decision: 'allow' });
     expect(gate(write(join(dir, 'verdict.json')))).toEqual({ decision: 'allow' });
     expect(gate(write('result.json'))).toMatchObject({ decision: 'deny', code: 'path_escape' });
+  });
+});
+
+describe('issue #21: the whole hold path through the real agent-sdk adapter with a fake SDK stream', () => {
+  it('bills the result the CLI emits after the hold: hold, recovered usage, fold and andon', async () => {
+    db = openDb();
+    let queries = 0;
+    const query: AgentSdkQueryFn = ({ options }) => {
+      queries += 1;
+      return {
+        async *[Symbol.asyncIterator]() {
+          const hook = options.hooks!.PreToolUse![0]!.hooks[0]!;
+          await hook(
+            { hook_event_name: 'PreToolUse', session_id: 's', transcript_path: '', cwd: '', tool_use_id: 'tu-1', tool_name: 'AskUserQuestion', tool_input: {} } as never,
+            'tu-1',
+            { signal: new AbortController().signal },
+          );
+          yield {
+            type: 'result', subtype: 'success', is_error: false, total_cost_usd: 0.1,
+            usage: { input_tokens: 40, output_tokens: 60, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+            modelUsage: {},
+          } as never;
+        },
+      };
+    };
+    const adapter = createAgentSdkHarnessAdapter({
+      projectRoot: dir, envAllowlist: [], command: '/bin/sh', sourceEnv: {}, query,
+      containment: { mechanism: 'process-group', reason: 'unit test' },
+    });
+    const registry = createHarnessRegistry([adapter]);
+    seedCard(db, 'entry');
+    seedCard(db, 'entry2');
+    const err = await run(writeFlow(dir, registry, { maxTokens: 50, harness: 'agent-sdk' }), registry);
+
+    expect(getCard(db, 'entry')?.lane).toBe('hold');
+    expect(getCard(db, 'entry')?.status).toBe('held');
+    // The 100 recovered tokens tripped the 50-token budget: the second card never dispatched.
+    expect(err.join('\n')).toMatch(/andon/i);
+    expect(queries).toBe(1);
+    expect(getCard(db, 'entry2')?.lane).toBe('coder');
   });
 });

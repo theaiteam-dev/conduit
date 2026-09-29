@@ -451,35 +451,106 @@ describe('agent-sdk adapter: the tool gate', () => {
 
 describe('agent-sdk adapter: hold', () => {
   const holdGate: HarnessToolGate = () => ({ decision: 'hold', code: 'needs_human', reason: 'asks a human' });
-
-  it('denies the call, kills the process and throws the hold code', async () => {
-    let child: ChildProcess | undefined;
-    let answer: unknown;
+  /** A stream that started a child and waits for it to be killed, as a CLI that never answers does. */
+  const stuckAfterHold = () => {
+    const state: { child?: ChildProcess; answer?: unknown } = {};
     const { query } = scripted(async function* (ctx) {
-      child = ctx.spawn('/bin/sleep', ['30']);
-      answer = await ctx.hook({ tool_name: 'AskUserQuestion', tool_input: {} });
-      await new Promise((r) => child!.once('exit', r));
+      state.child = ctx.spawn('/bin/sleep', ['30']);
+      state.answer = await ctx.hook({ tool_name: 'AskUserQuestion', tool_input: {} });
+      await new Promise((r) => state.child!.once('exit', r));
       throw new Error('Claude Code process terminated by signal SIGKILL');
     });
+    return { query, state };
+  };
+
+  it('answers the held call with a deny that also stops the CLI', async () => {
+    const { query, state } = stuckAfterHold();
     const { events, onEvent } = collect();
-    const err = await rejection(makeAdapter(query).invoke(invocation({ gate: holdGate, onEvent })));
+    const err = await rejection(makeAdapter(query, { holdStopWaitMs: 100 }).invoke(invocation({ gate: holdGate, onEvent })));
     expect(err.code).toBe(HARNESS_GATE_HOLD_CODE);
     expect(err.message).toContain('needs_human');
-    expect(answer).toMatchObject({ hookSpecificOutput: { permissionDecision: 'deny' } });
-    expect(isDead(child!.pid!)).toBe(true);
+    expect(state.answer).toMatchObject({
+      continue: false,
+      stopReason: 'asks a human',
+      hookSpecificOutput: { permissionDecision: 'deny' },
+    });
     expect(events.find((e) => e.type === 'gate-decision')).toMatchObject({ decision: 'hold', code: 'needs_human' });
-    // No result message arrived, so there is no figure to recover, and none is invented.
-    expect(usageFromThrow(err)).toBeUndefined();
   });
 
-  it('carries usage on the hold throw when a result message had already arrived', async () => {
+  it('bills the call when the CLI emits its result after the hold', async () => {
+    const started = Date.now();
     const { query } = scripted(async function* (ctx) {
-      yield RESULT_OK;
       await ctx.hook({ tool_name: 'AskUserQuestion', tool_input: {} });
+      yield RESULT_OK;
     });
     const err = await rejection(makeAdapter(query).invoke(invocation({ gate: holdGate })));
     expect(err.code).toBe(HARNESS_GATE_HOLD_CODE);
     expect(usageFromThrow(err)).toMatchObject({ tokens: 100, cost: 0.0123 });
+    // The default bound is 5 s: a result that arrives ends the wait at once.
+    expect(Date.now() - started).toBeLessThan(2_000);
+  });
+
+  it('kills the process after the bounded wait when no result arrives, and invents no usage', async () => {
+    const { query, state } = stuckAfterHold();
+    const started = Date.now();
+    const err = await rejection(makeAdapter(query, { holdStopWaitMs: 200 }).invoke(invocation({ gate: holdGate })));
+    const elapsed = Date.now() - started;
+    expect(err.code).toBe(HARNESS_GATE_HOLD_CODE);
+    expect(isDead(state.child!.pid!)).toBe(true);
+    expect(usageFromThrow(err)).toBeUndefined();
+    expect(elapsed).toBeGreaterThanOrEqual(180);
+    expect(elapsed).toBeLessThan(2_000);
+  });
+
+  it('denies every later call without asking the gate, even one it would allow', async () => {
+    let asked = 0;
+    const gate: HarnessToolGate = () => (asked++ === 0 ? { decision: 'hold', code: 'needs_human', reason: 'asks a human' } : { decision: 'allow' });
+    let later: unknown;
+    const { query } = scripted(async function* (ctx) {
+      await ctx.hook({ tool_name: 'AskUserQuestion', tool_input: {} });
+      later = await ctx.hook({ tool_name: 'Read', tool_input: { file_path: 'a' } });
+      yield RESULT_OK;
+    });
+    const { events, onEvent } = collect();
+    const err = await rejection(makeAdapter(query).invoke(invocation({ gate, onEvent })));
+    expect(err.code).toBe(HARNESS_GATE_HOLD_CODE);
+    expect(asked).toBe(1);
+    expect(later).toMatchObject({ hookSpecificOutput: { permissionDecision: 'deny' } });
+    expect(later).not.toHaveProperty('continue', true);
+    const decisions = events.filter((e) => e.type === 'gate-decision');
+    expect(decisions[1]).toMatchObject({ toolName: 'Read', decision: 'deny', code: 'needs_human' });
+  });
+
+  it('still throws the hold code when the stream errors after the hold', async () => {
+    const { query } = scripted(async function* (ctx) {
+      await ctx.hook({ tool_name: 'AskUserQuestion', tool_input: {} });
+      yield RESULT_OK;
+      throw new Error('Claude Code returned an error result: something else');
+    });
+    const err = await rejection(makeAdapter(query).invoke(invocation({ gate: holdGate })));
+    expect(err.code).toBe(HARNESS_GATE_HOLD_CODE);
+  });
+
+  it('keeps the wall-clock timer running during the wait, and the hold still wins', async () => {
+    const { query, state } = stuckAfterHold();
+    const started = Date.now();
+    const err = await rejection(
+      makeAdapter(query, { holdStopWaitMs: 10_000 }).invoke(invocation({ gate: holdGate, timeoutMs: 250 })),
+    );
+    expect(err.code).toBe(HARNESS_GATE_HOLD_CODE);
+    expect(isDead(state.child!.pid!)).toBe(true);
+    expect(Date.now() - started).toBeLessThan(3_000);
+  });
+
+  it('keeps the idle timer running during the wait, and the hold still wins', async () => {
+    const { query, state } = stuckAfterHold();
+    const started = Date.now();
+    const err = await rejection(
+      makeAdapter(query, { holdStopWaitMs: 10_000 }).invoke(invocation({ gate: holdGate, idleTimeoutMs: 250 })),
+    );
+    expect(err.code).toBe(HARNESS_GATE_HOLD_CODE);
+    expect(isDead(state.child!.pid!)).toBe(true);
+    expect(Date.now() - started).toBeLessThan(3_000);
   });
 });
 
