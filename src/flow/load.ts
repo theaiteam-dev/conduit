@@ -1601,6 +1601,24 @@ function collectErrors(
               `set unrestricted_tools: true to waive this check`,
           });
         }
+        // Issue #21: a per-call gating adapter denies every tool the station does not list, so an
+        // empty list (which is also how the waiver reaches the gate) leaves it unable to do anything,
+        // including writing its own outputs[0]. Reject that at load rather than at first dispatch.
+        if (resolved.adapter.canGatePerCall === true && (waived || tools.length === 0)) {
+          errors.push({
+            code: 'HARNESS_GATED_ADAPTER_NEEDS_TOOLS',
+            message:
+              tools.length === 0
+                ? `Station '${station.id}' uses adapter '${resolved.adapter.name}', which gates every tool ` +
+                  `call against the station's tools list and denies any tool not listed, so ` +
+                  `${waived ? 'unrestricted_tools: true has no effect and ' : ''}a station with no tools list ` +
+                  `can do nothing. List the tools it needs (at least Write, for its output file)`
+                : `Station '${station.id}' uses adapter '${resolved.adapter.name}', which gates every tool ` +
+                  `call against the station's tools list, so unrestricted_tools: true has no effect there and ` +
+                  `the tools list alone governs. Remove unrestricted_tools and keep the tools the station needs, ` +
+                  `or use an adapter that does not gate per call`,
+          });
+        }
       }
     }
   }

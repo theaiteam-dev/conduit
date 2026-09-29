@@ -82,7 +82,7 @@ interface ClaudeModelUsageEntry {
   cacheCreationInputTokens?: number;
 }
 
-interface ClaudeResultPayload {
+export interface ClaudeResultPayload {
   type?: string;
   subtype?: string;
   is_error?: boolean;
@@ -252,7 +252,7 @@ export function dominantModel(
  * success path: the caller there still `fail()`s on a missing/malformed usage
  * object, exactly as before this helper existed.
  */
-function buildKnownUsage(
+export function buildKnownUsage(
   payload: ClaudeResultPayload | null,
   rateLimit: RateLimitSnapshot | undefined,
 ): KnownUsage | undefined {

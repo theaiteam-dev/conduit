@@ -15,10 +15,12 @@
  * subprocess harness (HEARTBEAT/MARK_DONE) — do not confuse the two.
  */
 
+import { createAgentSdkHarnessAdapter } from './harness-adapter-agent-sdk';
 import { createClaudeHarnessAdapter } from './harness-adapter-claude';
 import { createCodexHarnessAdapter } from './harness-adapter-codex';
 import type { HarnessAdapterConfigDef } from './harness-config';
 import type { HarnessEventSink } from './harness-events';
+import type { HarnessToolGate } from './harness-gate';
 import type { HarnessCommand, HarnessRunnerConfig, HarnessSpawnResult } from './harness-runner';
 
 /** A declared input mounted into the harness invocation's working directory. */
@@ -77,6 +79,13 @@ export interface HarnessInvocation {
    * adapter that runs named agents pushes it as its own flag (`--agent`).
    */
   agent?: string;
+  /**
+   * Per-call pre-execution gate (issue #21), built by the executor for this
+   * invocation. An adapter with `canGatePerCall` calls it, through
+   * `callGateFailClosed`, before every tool call and enforces the answer. An
+   * adapter without the flag ignores it and keeps its boundary-control profile.
+   */
+  gate?: HarnessToolGate;
 }
 
 /**
@@ -240,6 +249,13 @@ export interface HarnessAdapter {
    */
   readonly canRestrictTools: boolean;
   /**
+   * Static capability flag (issue #21): whether this adapter consults
+   * `HarnessInvocation.gate` before every tool call inside the harness loop.
+   * Absent means false. The loop is still the harness's own, so this is a
+   * pre-execution decision on each call and not the Law-grade Tool-Bridge.
+   */
+  readonly canGatePerCall?: boolean;
+  /**
    * Per-list expressibility negotiation (the original per-list tool-expression work): can this adapter enforce
    * THIS specific allowlist? Adapters whose containment surface is a
    * capability lattice rather than a per-tool-name flag (codex-exec's OS
@@ -361,6 +377,8 @@ export interface HarnessAdapterDefinition {
   readonly name: string;
   readonly reportsUsage: boolean;
   readonly canRestrictTools: boolean;
+  /** Per-call gate capability passthrough (issue #21) — see HarnessAdapter.canGatePerCall. */
+  readonly canGatePerCall?: boolean;
   /** Per-list expressibility passthrough (the original per-list tool-expression work) — see HarnessAdapter.canExpressTools. */
   canExpressTools?(tools: readonly string[]): boolean;
   readonly envAllowlist: readonly string[];
@@ -407,13 +425,14 @@ const ADAPTER_SPECIFIC_OPTIONS: ReadonlyArray<{
 }> = [
   { field: 'agent', suffix: 'AGENT', adapters: ['claude-headless'] },
   { field: 'pluginDirs', suffix: 'PLUGIN_DIRS', adapters: ['claude-headless'] },
-  { field: 'isolateConfig', suffix: 'ISOLATE_CONFIG', adapters: ['claude-headless'] },
+  { field: 'isolateConfig', suffix: 'ISOLATE_CONFIG', adapters: ['claude-headless', 'agent-sdk'] },
 ];
 
 /** Every adapter the engine ships, keyed by the name a config def can name. */
 const SHIPPED_HARNESS_FACTORIES: Record<string, (config: ShippedAdapterFactoryConfig) => HarnessAdapter> = {
   'claude-headless': createClaudeHarnessAdapter,
   'codex-exec': createCodexHarnessAdapter,
+  'agent-sdk': createAgentSdkHarnessAdapter,
 };
 
 /**
@@ -491,6 +510,7 @@ export function buildHarnessDefinitionRegistry(
       name: configDef.name,
       reportsUsage: identityAdapter.reportsUsage,
       canRestrictTools: identityAdapter.canRestrictTools,
+      ...(identityAdapter.canGatePerCall !== undefined ? { canGatePerCall: identityAdapter.canGatePerCall } : {}),
       envAllowlist: [...configDef.envAllowlist],
       command: configDef.command,
       probeBinary: () => identityAdapter.probeBinary(),
@@ -572,6 +592,7 @@ export function bindHarnessDefinitionsForIntrospection(
         name: def.name,
         reportsUsage: def.reportsUsage,
         canRestrictTools: def.canRestrictTools,
+        ...(def.canGatePerCall !== undefined ? { canGatePerCall: def.canGatePerCall } : {}),
         // Load-time validation judges per-list expressibility (the original per-list tool-expression work), so
         // the introspection binding must carry it — omitting it here would
         // silently demote a lattice adapter back to its conservative boolean.
@@ -605,6 +626,8 @@ export interface FakeHarnessAdapterConfig {
   name?: string;
   reportsUsage?: boolean;
   canRestrictTools?: boolean;
+  /** Per-call gate capability fake (issue #21); absent = does not gate. */
+  canGatePerCall?: boolean;
   /** Per-list expressibility fake (the original per-list tool-expression work); absent = boolean-only adapter. */
   canExpressTools?: (tools: readonly string[]) => boolean;
   binaryPresent?: boolean;
@@ -619,6 +642,7 @@ export function makeFakeHarnessAdapter(config: FakeHarnessAdapterConfig = {}): {
     name = 'fake-harness',
     reportsUsage = true,
     canRestrictTools = true,
+    canGatePerCall,
     canExpressTools,
     binaryPresent = true,
     results = [],
@@ -629,6 +653,7 @@ export function makeFakeHarnessAdapter(config: FakeHarnessAdapterConfig = {}): {
     name,
     reportsUsage,
     canRestrictTools,
+    ...(canGatePerCall !== undefined ? { canGatePerCall } : {}),
     ...(canExpressTools !== undefined ? { canExpressTools } : {}),
     async probeBinary(): Promise<BinaryProbe> {
       return { present: binaryPresent };

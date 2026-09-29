@@ -421,7 +421,8 @@ CREATE TABLE IF NOT EXISTS ingress_log (
 
 -- harness_events (issue #71): the durable events of one harness invoke() call,
 -- one row per event. Only tool-input-available, tool-output-available, usage,
--- rate-limit and lifecycle are written; text and reasoning deltas never are.
+-- rate-limit, lifecycle and gate-decision are written; text and reasoning
+-- deltas never are.
 -- No prompt text and no tool output bodies: a tool call is recorded by name,
 -- the path it touched and, for a failed Bash call, the exit code parsed from
 -- its error string. Unique per (run, card, station, attempt, invocation_id,
@@ -455,6 +456,16 @@ CREATE TABLE IF NOT EXISTS harness_events (
   rate_limit_status            TEXT,
   rate_limit_windows_json      TEXT,
   phase                        TEXT,
+  -- gate-decision (issue #21): the per-call tool gate's answer for one tool
+  -- call. tool_name and tool_call_id name the call. This layer stores what it
+  -- is given: the writer (harnessEventRow in harness-events-journal.ts)
+  -- truncates reason and strips control characters, and a test pins that. It
+  -- never carries a tool input body. agent_id is set only for a call made
+  -- inside a subagent.
+  decision                     TEXT,
+  gate_code                    TEXT,
+  agent_id                     TEXT,
+  reason                       TEXT,
   -- When the kernel received the event, epoch milliseconds. Orders events
   -- across invocations; seq orders them within one.
   at_ms                        INTEGER NOT NULL,
@@ -661,7 +672,8 @@ export type PersistedHarnessEventKind =
   | 'tool-output-available'
   | 'usage'
   | 'rate-limit'
-  | 'lifecycle';
+  | 'lifecycle'
+  | 'gate-decision';
 
 /** Input shape for appendHarnessEvent. Fields a kind does not carry are omitted. */
 export interface HarnessEventRowInput {
@@ -693,6 +705,11 @@ export interface HarnessEventRowInput {
   rateLimitWindows?: RateLimitWindow[];
   /** On lifecycle: start, end, timeout or idle-timeout. */
   phase?: string;
+  /** On gate-decision (issue #21): the gate's answer, its code, the subagent id, and a sanitised reason. */
+  decision?: string;
+  gateCode?: string;
+  agentId?: string;
+  reason?: string;
 }
 
 /** A harness_events row as read back. Absent fields read as null. */
@@ -716,6 +733,10 @@ export interface StoredHarnessEvent {
   rateLimitStatus: string | null;
   rateLimitWindows: RateLimitWindow[] | null;
   phase: string | null;
+  decision: string | null;
+  gateCode: string | null;
+  agentId: string | null;
+  reason: string | null;
 }
 
 /** One harness span's timing, as read by getHarnessTimingsForRun. */
@@ -1017,6 +1038,10 @@ interface RawHarnessEventRow {
   rate_limit_status: string | null;
   rate_limit_windows_json: string | null;
   phase: string | null;
+  decision: string | null;
+  gate_code: string | null;
+  agent_id: string | null;
+  reason: string | null;
   at_ms: number;
 }
 
@@ -1665,12 +1690,12 @@ class ConduitDBImpl implements ConduitDB {
            (run_id, card_id, station, attempt, invocation_id, seq, kind,
             tool_call_id, tool_name, path, exit_code, is_error,
             tokens, input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens, cost_usd,
-            rate_limit_status, rate_limit_windows_json, phase, at_ms)
+            rate_limit_status, rate_limit_windows_json, phase, decision, gate_code, agent_id, reason, at_ms)
          VALUES
            ($run_id, $card_id, $station, $attempt, $invocation_id, $seq, $kind,
             $tool_call_id, $tool_name, $path, $exit_code, $is_error,
             $tokens, $input_tokens, $output_tokens, $cache_read_input_tokens, $cache_creation_input_tokens, $cost_usd,
-            $rate_limit_status, $rate_limit_windows_json, $phase, $at_ms)`,
+            $rate_limit_status, $rate_limit_windows_json, $phase, $decision, $gate_code, $agent_id, $reason, $at_ms)`,
       ));
     const params = {
       $run_id: event.runId,
@@ -1694,6 +1719,10 @@ class ConduitDBImpl implements ConduitDB {
       $rate_limit_status: event.rateLimitStatus ?? null,
       $rate_limit_windows_json: event.rateLimitWindows === undefined ? null : JSON.stringify(event.rateLimitWindows),
       $phase: event.phase ?? null,
+      $decision: event.decision ?? null,
+      $gate_code: event.gateCode ?? null,
+      $agent_id: event.agentId ?? null,
+      $reason: event.reason ?? null,
       $at_ms: event.atMs,
     };
     withBusyRetry(() => insert.run(params));
@@ -1705,7 +1734,7 @@ class ConduitDBImpl implements ConduitDB {
         `SELECT run_id, card_id, station, attempt, invocation_id, seq, kind,
                 tool_call_id, tool_name, path, exit_code, is_error,
                 tokens, input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens, cost_usd,
-                rate_limit_status, rate_limit_windows_json, phase, at_ms
+                rate_limit_status, rate_limit_windows_json, phase, decision, gate_code, agent_id, reason, at_ms
          FROM harness_events
          WHERE run_id = $run_id AND card_id = $card_id
          ORDER BY id ASC`,
@@ -1742,6 +1771,10 @@ class ConduitDBImpl implements ConduitDB {
           ? null
           : (parseColumn(r.card_id, 'rate_limit_windows_json', r.rate_limit_windows_json) as RateLimitWindow[]),
       phase: r.phase,
+      decision: r.decision,
+      gateCode: r.gate_code,
+      agentId: r.agent_id,
+      reason: r.reason,
     }));
   }
 
@@ -3030,6 +3063,15 @@ export function openConduitDB({
     // span written before it has no recorded invocation. The harness_events
     // table itself needs no step here; JOURNAL_DDL below creates it.
     'ALTER TABLE journal ADD COLUMN invocation_id TEXT',
+    // Issue #21: the gate-decision columns of harness_events. Nullable, no
+    // backfill: a row written before them is not a gate-decision row. A fresh
+    // journal has no table yet ('no such table' is tolerated) and JOURNAL_DDL
+    // below creates it with the columns. The journal DB carries no version
+    // number, so this ladder is its migration; SCHEMA_VERSION is the state DB's.
+    'ALTER TABLE harness_events ADD COLUMN decision TEXT',
+    'ALTER TABLE harness_events ADD COLUMN gate_code TEXT',
+    'ALTER TABLE harness_events ADD COLUMN agent_id TEXT',
+    'ALTER TABLE harness_events ADD COLUMN reason TEXT',
   ]) {
     try {
       journalDb.exec(column);

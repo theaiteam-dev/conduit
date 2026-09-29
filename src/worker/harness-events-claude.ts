@@ -143,6 +143,28 @@ function mapRateLimit(event: Json): HarnessEventBody[] {
 }
 
 /**
+ * Map one already-parsed stream message to zero or more events. Never throws.
+ * The Agent SDK's `query()` yields these objects directly (issue #21), so it
+ * calls this instead of `mapClaudeStreamLine`. `lineIndex` has the same
+ * meaning as there: the message's 0-based ordinal within the invocation.
+ */
+export function mapClaudeStreamMessage(event: unknown, lineIndex?: number): HarnessEventBody[] {
+  if (!isObject(event)) return [];
+  switch (event.type) {
+    case 'assistant':
+      return mapAssistant(event, lineIndex);
+    case 'user':
+      return mapUser(event);
+    case 'result':
+      return mapResult(event);
+    case 'rate_limit_event':
+      return mapRateLimit(event);
+    default:
+      return [];
+  }
+}
+
+/**
  * Map one stream-json line to zero or more events. Never throws.
  *
  * `lineIndex` is the line's 0-based ordinal within the invocation. A caller
@@ -158,17 +180,5 @@ export function mapClaudeStreamLine(line: string, lineIndex?: number): HarnessEv
   } catch {
     return [];
   }
-  if (!isObject(event)) return [];
-  switch (event.type) {
-    case 'assistant':
-      return mapAssistant(event, lineIndex);
-    case 'user':
-      return mapUser(event);
-    case 'result':
-      return mapResult(event);
-    case 'rate_limit_event':
-      return mapRateLimit(event);
-    default:
-      return [];
-  }
+  return mapClaudeStreamMessage(event, lineIndex);
 }

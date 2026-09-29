@@ -22,6 +22,7 @@ import { runTransformStation, coerciveParse, type OutputSchema } from '../worker
 import type { HarnessAdapter, HarnessResult, MountedInput, UsageReport } from '../worker/harness-adapter';
 import type { HarnessEventSink } from '../worker/harness-events';
 import { usageFromThrow } from '../worker/harness-adapter';
+import { HARNESS_GATE_HOLD_CODE, type HarnessToolGate } from '../worker/harness-gate';
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -109,7 +110,13 @@ export type GateDecision =
    * convention in executor.ts) so a failure names its own suspect instead of
    * forcing a blind bisect across models.
    */
-  | { action: 'scrapped'; reason: string; criticUsage?: CriticUsage };
+  | { action: 'scrapped'; reason: string; criticUsage?: CriticUsage }
+  /**
+   * Issue #21: the critic's per-call tool gate returned `hold`, so the adapter
+   * ended the call for a human. Not a verdict and not a failed attempt: the
+   * executor moves the card to the `hold` lane, after billing `criticUsage`.
+   */
+  | { action: 'hold'; reason: string; criticUsage?: CriticUsage };
 
 // ---------------------------------------------------------------------------
 // computeFindingsHash — deterministic, order-insensitive
@@ -250,7 +257,7 @@ export async function runGateCheck(config: GateConfig): Promise<GateDecision> {
  * than as a returned model payload, since a harness invocation is bounded and
  * opaque, not a typed call/response.
  */
-const HARNESS_CRITIC_VERDICT_FILE = 'verdict.json';
+export const HARNESS_CRITIC_VERDICT_FILE = 'verdict.json';
 
 /** Everything a harness-driven (agentic) gate check needs at runtime. */
 export interface HarnessGateConfig {
@@ -303,6 +310,11 @@ export interface HarnessGateConfig {
    * through to the adapter unchanged; omitted means no events are collected.
    */
   onEvent?: HarnessEventSink;
+  /**
+   * Per-call tool gate for this critic's invoke() (issue #21). Passed through
+   * to an adapter that gates per call; an adapter that does not ignores it.
+   */
+  gate?: HarnessToolGate;
   onReject: Lane;
   validBackEdges: ReadonlyArray<{ from: string; to: string }>;
   /**
@@ -382,6 +394,7 @@ export async function runHarnessGateCheck(config: HarnessGateConfig): Promise<Ga
       ...(config.model !== undefined ? { model: config.model } : {}),
       ...(config.agent !== undefined ? { agent: config.agent } : {}),
       ...(config.onEvent !== undefined ? { onEvent: config.onEvent } : {}),
+      ...(config.gate !== undefined ? { gate: config.gate } : {}),
     });
   } catch (err) {
     // A thrown invocation (timeout/nonzero-exit/untagged) never yields a
@@ -392,16 +405,20 @@ export async function runHarnessGateCheck(config: HarnessGateConfig): Promise<Ga
     // issue #26 AC5: a thrown invocation was still billed for whatever it did
     // before it died. usageFromThrow is the ONE reader for usage attached to a
     // harness throw — never cast and reach for `.usage` directly here.
+    const failedUsage: CriticUsage = {
+      adapterName: config.harnessAdapter.name,
+      ...(config.model !== undefined ? { model: config.model } : {}),
+      ...criticAgentProvenance(config),
+      durationMs: Date.now() - invokeStartedAt,
+      usage: usageFromThrow(err) ?? { unknown: true },
+    };
+    if ((err as { code?: string }).code === HARNESS_GATE_HOLD_CODE) {
+      return { action: 'hold', reason: (err as Error).message || String(err), criticUsage: failedUsage };
+    }
     return {
       action: 'scrapped',
       reason: `harness-critic-invoke-failed: ${(err as Error).message ?? String(err)}`,
-      criticUsage: {
-        adapterName: config.harnessAdapter.name,
-        ...(config.model !== undefined ? { model: config.model } : {}),
-        ...criticAgentProvenance(config),
-        durationMs: Date.now() - invokeStartedAt,
-        usage: usageFromThrow(err) ?? { unknown: true },
-      },
+      criticUsage: failedUsage,
     };
   }
 

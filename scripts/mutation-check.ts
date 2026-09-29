@@ -95,7 +95,7 @@ const MUTANTS: Mutant[] = [
     file: 'src/controller/executor.ts',
     find: 'foldHarnessUsage(usage.tokens);',
     replace: '/* MUTATION-CHECK: gate-critic fold deleted */',
-    guards: ['src/controller/executor-harness-gate.test.ts'],
+    guards: ['src/controller/executor-harness-gate.test.ts', 'src/controller/executor-harness-gate-hold.test.ts'],
     why:
       "a harness gate critic's spend never reaches the run/wave budget — issue " +
       "#26's original bug. The verdict and the journal row stay correct, so " +
@@ -117,7 +117,7 @@ const MUTANTS: Mutant[] = [
     file: 'src/controller/executor.ts',
     find: 'foldHarnessUsage(thrownUsage.tokens);',
     replace: '/* MUTATION-CHECK: maker-throw fold deleted */',
-    guards: ['src/controller/executor-harness-journal.test.ts'],
+    guards: ['src/controller/executor-harness-journal.test.ts', 'src/controller/executor-harness-gate-hold.test.ts'],
     why:
       'a maker invocation that threw AFTER being billed (a timeout, most ' +
       'often) costs real money and counts as zero. This is the mutant that ' +

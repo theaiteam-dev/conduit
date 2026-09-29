@@ -19,7 +19,10 @@ import { openConduitDB } from '../persistence/db';
 import { mapClaudeStreamLine } from './harness-events-claude';
 import { createHarnessEventEmitter, stampHarnessEvents, type StampedHarnessEvent } from './harness-events';
 import type { StoredHarnessEvent } from '../persistence/db';
-import { createHarnessEventJournalSink, exitCodeFromToolOutput, formatHarnessEvent, harnessEventRow, pathFromToolInput } from './harness-events-journal';
+import {
+  createHarnessEventJournalSink, exitCodeFromToolOutput, formatHarnessEvent, harnessEventRow, pathFromToolInput,
+  sanitizeGateReason,
+} from './harness-events-journal';
 
 const FIXTURE = join(import.meta.dir, '..', '..', 'fixtures', 'harness', 'claude-stream-json.ndjson');
 const fixtureLines = (): string[] => readFileSync(FIXTURE, 'utf8').split('\n').filter((l) => l.length > 0);
@@ -196,6 +199,7 @@ function storedEvent(over: Partial<StoredHarnessEvent> & Pick<StoredHarnessEvent
     runId: 'r1', cardId: 'c1', station: 'coder', attempt: 0, invocationId: 'inv-a', seq: 0, atMs: 5,
     toolCallId: null, toolName: null, path: null, exitCode: null, isError: null,
     tokens: null, breakdown: null, costUsd: null, rateLimitStatus: null, rateLimitWindows: null, phase: null,
+    decision: null, gateCode: null, agentId: null, reason: null,
     ...over,
   };
 }
@@ -237,5 +241,118 @@ describe('formatHarnessEvent', () => {
         }),
       ),
     ).toContain(JSON.stringify('five_hour\nfake'));
+  });
+});
+
+describe('gate-decision rows (issue #21)', () => {
+  const stamp = { seq: 4, attempt: 1, invocationId: 'inv-g' };
+
+  it('maps an allow to a row with the tool, decision and call id, and no code or reason', () => {
+    expect(
+      harnessEventRow({ type: 'gate-decision', toolName: 'Read', toolCallId: 'tu-1', decision: 'allow', ...stamp }, SCOPE, 9),
+    ).toEqual({
+      ...SCOPE, attempt: 1, invocationId: 'inv-g', seq: 4, kind: 'gate-decision', atMs: 9,
+      toolCallId: 'tu-1', toolName: 'Read', decision: 'allow',
+    });
+  });
+
+  it('maps a deny with its code, subagent id and reason', () => {
+    const row = harnessEventRow(
+      { type: 'gate-decision', toolName: 'Bash', decision: 'deny', code: 'not_allowlisted', reason: 'rm is not allowed', agentId: 'sub-7', ...stamp },
+      SCOPE,
+      9,
+    );
+    expect(row).toMatchObject({ decision: 'deny', gateCode: 'not_allowlisted', reason: 'rm is not allowed', agentId: 'sub-7' });
+  });
+
+  it('strips control characters from the reason and cuts it to 200 characters', () => {
+    const row = harnessEventRow(
+      { type: 'gate-decision', toolName: 'Bash', decision: 'deny', code: 'gate_error', reason: `a\nb\x00c\x7fd${'x'.repeat(500)}`, ...stamp },
+      SCOPE,
+      9,
+    );
+    expect(row?.reason).toBe(`abcd${'x'.repeat(196)}`);
+    expect(row?.reason).toHaveLength(200);
+    expect(sanitizeGateReason('line1\r\nline2\u0085')).toBe('line1line2');
+  });
+
+  it('round-trips through the journal DB, in order with the other kinds, and keeps no input body', () => {
+    const db = openConduitDB({ stateDbPath: ':memory:', journalDbPath: ':memory:' });
+    try {
+      const sink = createHarnessEventJournalSink(db, SCOPE, () => 77);
+      const { onEvent } = stampHarnessEvents(sink, 2);
+      const emit = createHarnessEventEmitter(onEvent);
+      emit({ type: 'lifecycle', phase: 'start' });
+      emit({ type: 'gate-decision', toolName: 'Bash', toolCallId: 'tu-2', decision: 'hold', code: 'needs_human', reason: 'asks a human', agentId: 'sub-1' });
+      const rows = db.getHarnessEventsForRun('r1', 'c1');
+      expect(rows.map((r) => r.kind)).toEqual(['lifecycle', 'gate-decision']);
+      expect(rows[1]).toMatchObject({
+        attempt: 2, seq: 1, toolName: 'Bash', toolCallId: 'tu-2', decision: 'hold', gateCode: 'needs_human',
+        reason: 'asks a human', agentId: 'sub-1', atMs: 77,
+      });
+      expect(rows[0]).toMatchObject({ decision: null, gateCode: null, agentId: null, reason: null });
+    } finally {
+      db.close();
+    }
+  });
+
+  it('adds the columns to a journal whose harness_events table predates them', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'conduit-harness-events-migrate-'));
+    const journalPath = join(dir, 'journal.sqlite');
+    try {
+      const first = openConduitDB({ stateDbPath: join(dir, 'state.sqlite'), journalDbPath: journalPath });
+      first.close();
+      // Rebuild the table as the previous release created it: no gate-decision columns.
+      const raw = new Database(journalPath);
+      raw.exec('DROP TABLE harness_events');
+      raw.exec(`CREATE TABLE harness_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL, card_id TEXT NOT NULL, station TEXT NOT NULL,
+        attempt INTEGER NOT NULL, invocation_id TEXT NOT NULL, seq INTEGER NOT NULL, kind TEXT NOT NULL,
+        tool_call_id TEXT, tool_name TEXT, path TEXT, exit_code INTEGER, is_error INTEGER, tokens INTEGER,
+        input_tokens INTEGER, output_tokens INTEGER, cache_read_input_tokens INTEGER, cache_creation_input_tokens INTEGER,
+        cost_usd REAL, rate_limit_status TEXT, rate_limit_windows_json TEXT, phase TEXT, at_ms INTEGER NOT NULL,
+        UNIQUE(run_id, card_id, station, attempt, invocation_id, seq))`);
+      raw.exec(
+        "INSERT INTO harness_events (run_id, card_id, station, attempt, invocation_id, seq, kind, phase, at_ms) VALUES ('r1','c1','coder',0,'old',0,'lifecycle','start',1)",
+      );
+      raw.close();
+
+      const db = openConduitDB({ stateDbPath: join(dir, 'state.sqlite'), journalDbPath: journalPath });
+      try {
+        const sink = createHarnessEventJournalSink(db, SCOPE);
+        sink({
+          type: 'gate-decision', toolName: 'Bash', decision: 'deny', code: 'not_allowlisted', reason: 'rm is not allowed',
+          agentId: 'sub-1', seq: 0, attempt: 0, invocationId: 'new',
+        });
+        const rows = db.getHarnessEventsForRun('r1', 'c1');
+        expect(rows.map((r) => [r.invocationId, r.kind])).toEqual([
+          ['old', 'lifecycle'],
+          ['new', 'gate-decision'],
+        ]);
+        // The legacy row reads every added column as null; the new row round-trips them.
+        expect(rows[0]).toMatchObject({ decision: null, gateCode: null, agentId: null, reason: null });
+        expect(rows[1]).toMatchObject({
+          decision: 'deny', gateCode: 'not_allowlisted', agentId: 'sub-1', reason: 'rm is not allowed',
+        });
+      } finally {
+        db.close();
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('prints the decision, tool, code, subagent and reason on one line', () => {
+    const line = formatHarnessEvent(
+      storedEvent({ kind: 'gate-decision', decision: 'deny', toolName: 'Bash', gateCode: 'not_allowlisted', agentId: 'sub-7', reason: 'rm is not allowed' }),
+    );
+    expect(line).toContain('gate-decision deny Bash code=not_allowlisted agent=sub-7 reason=rm is not allowed');
+    expect(formatHarnessEvent(storedEvent({ kind: 'gate-decision', decision: 'allow', toolName: 'Read' }))).toMatch(/gate-decision allow Read$/);
+  });
+
+  it('escapes control characters that reached a stored row from an older writer', () => {
+    const line = formatHarnessEvent(storedEvent({ kind: 'gate-decision', decision: 'deny', toolName: 'Bash\nEvil', reason: 'a\nb' }));
+    expect(line.split('\n')).toHaveLength(1);
+    expect(line).toContain(JSON.stringify('Bash\nEvil'));
   });
 });

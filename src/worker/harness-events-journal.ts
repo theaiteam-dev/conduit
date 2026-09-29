@@ -9,7 +9,7 @@
  * What is kept is fixed by the War Room rule that the journal is the one
  * source of truth and holds no transcripts:
  *   - Only `tool-input-available`, `tool-output-available`, `usage`,
- *     `rate-limit` and `lifecycle` are written. `text-delta`,
+ *     `rate-limit`, `lifecycle` and `gate-decision` are written. `text-delta`,
  *     `reasoning-delta` and `tool-input-start` are dropped.
  *   - No prompt text, no tool input body, no tool output body. A tool call is
  *     recorded by its name and the path it touched; a result by its error
@@ -48,6 +48,21 @@ function pathFromToolResult(toolUseResult: unknown): string | undefined {
   if (!isObject(toolUseResult)) return undefined;
   const value = toolUseResult.filePath;
   return typeof value === 'string' && value.length > 0 ? value : undefined;
+}
+
+/** Longest reason stored for a gate decision (issue #21). */
+const GATE_REASON_MAX = 200;
+
+// C0 controls (including \n \r \t), DEL, and C1 controls.
+const CONTROL_CHARS_ALL = /[\x00-\x1F\x7F-\x9F]/g;
+
+/**
+ * A gate-supplied string as stored: control characters removed, then cut to
+ * 200 characters. The gate never puts a Bash command in a reason, and the
+ * journal keeps no tool input body, so this is a bound and not the only guard.
+ */
+export function sanitizeGateReason(text: string): string {
+  return text.replace(CONTROL_CHARS_ALL, '').slice(0, GATE_REASON_MAX);
 }
 
 const EXIT_CODE_PREFIX = /^(?:Error: )?Exit code (\d+)\b/;
@@ -145,6 +160,17 @@ export function harnessEventRow(
     case 'reasoning-delta':
     case 'tool-input-start':
       return null;
+    case 'gate-decision':
+      return {
+        ...base,
+        kind: event.type,
+        ...(event.toolCallId !== undefined ? { toolCallId: event.toolCallId } : {}),
+        toolName: event.toolName,
+        decision: event.decision,
+        ...(event.code !== undefined ? { gateCode: sanitizeGateReason(event.code) } : {}),
+        ...(event.agentId !== undefined ? { agentId: sanitizeGateReason(event.agentId) } : {}),
+        ...(event.reason !== undefined ? { reason: sanitizeGateReason(event.reason) } : {}),
+      };
   }
 }
 
@@ -211,6 +237,13 @@ export function formatHarnessEvent(row: StoredHarnessEvent): string {
     case 'lifecycle':
       if (row.phase !== null) parts.push(renderHarnessString(row.phase));
       if (row.exitCode !== null) parts.push(`exit=${row.exitCode}`);
+      break;
+    case 'gate-decision':
+      if (row.decision !== null) parts.push(renderHarnessString(row.decision));
+      if (row.toolName !== null) parts.push(renderHarnessString(row.toolName));
+      if (row.gateCode !== null) parts.push(`code=${renderHarnessString(row.gateCode)}`);
+      if (row.agentId !== null) parts.push(`agent=${renderHarnessString(row.agentId)}`);
+      if (row.reason !== null) parts.push(`reason=${renderHarnessString(row.reason)}`);
       break;
   }
   return parts.join(' ');

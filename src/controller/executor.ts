@@ -49,6 +49,7 @@ import type {
   HarnessRegistry, MountedInput, HarnessResult, KnownUsage, RateLimitSnapshot,
 } from '../worker/harness-adapter';
 import { usageFromThrow, resolveHarnessAgent, DEFAULT_HARNESS_TIMEOUT_MS } from '../worker/harness-adapter';
+import { HARNESS_GATE_HOLD_CODE, createHarnessToolGate } from '../worker/harness-gate';
 import { stampHarnessEvents } from '../worker/harness-events';
 import { createHarnessEventJournalSink } from '../worker/harness-events-journal';
 import { harnessRetryDelayMs } from '../worker/harness-retry';
@@ -2920,6 +2921,18 @@ async function runGateCheckOrAdvance(args: GateCheckOrAdvanceArgs): Promise<bool
       });
     }
 
+    // Issue #21: the critic's tool gate held it for a human. Its spend is folded above, so the card
+    // leaves the station now, before any verdict row is written for a check that gave no verdict.
+    // This runs before the andon check so that an over-budget critic still leaves a held card.
+    if (gateDecision.action === 'hold') {
+      escalateToHold(
+        stateDb, db, cardId, stationId, card,
+        `harness tool gate held the critic of station '${stationId}' for a human: ${gateDecision.reason}`,
+        err, runId, true,
+      );
+      return false;
+    }
+
     // Andon check after gate model call.
     const andon2 = checkConsumptionAndon(
       { runStartedAt, now: currentNow, tokensSpent: getTokensSpent() },
@@ -3967,6 +3980,22 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
           onEvent,
           ...(idleTimeoutMs !== undefined ? { idleTimeoutMs } : {}),
           ...(effectiveAgent !== undefined ? { agent: effectiveAgent } : {}),
+          // Issue #21: an adapter that gates per call gets this invocation's gate. Owned paths are
+          // enforced by the gate only where the flow opted in AND the card declares some, the same
+          // condition as runOwnedPathsIntegrity (empty owned_paths is an opt-out there, so passing []
+          // here would deny every write on a card the integrity check leaves unenforced). The
+          // post-invoke check below stays the backstop.
+          ...(harnessAdapter.canGatePerCall === true
+            ? {
+                gate: createHarnessToolGate({
+                  projectRoot,
+                  tools: stationConfig.tools ?? [],
+                  ...(flow.defaults?.enforceOwnedPaths === true && (card.owned_paths ?? []).length > 0
+                    ? { ownedPaths: card.owned_paths }
+                    : {}),
+                }),
+              }
+            : {}),
         });
       } catch (invokeErr) {
         // WI-567 FR-8 fix: stamp fresh liveness progress even on a thrown
@@ -4067,18 +4096,23 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
           return false;
         }
 
-        callsMade++;
+        // Issue #21: a gate `hold` asks a human. It is not a failed attempt, so it spends none
+        // (callsMade stays put), and the card leaves the station below, after its spend is billed.
+        const code = (invokeErr as { code?: string }).code;
+        const gateHeld = code === HARNESS_GATE_HOLD_CODE;
+        if (!gateHeld) callsMade++;
         // Adapter-throw classification follows the transform/openai-adapter
         // precedent (transform.ts branches on err.code === 'vision-unsupported').
         // An UNTAGGED throw still scraps under a generic named reason — loud,
         // never a silent failure to classify.
-        const code = (invokeErr as { code?: string }).code;
         // Issue #31: an idle kill is retried like a wall-clock timeout (it
         // spends an execution attempt and gets the same backoff below), but
         // has its own scrap reason so a card that exhausts its attempts names
         // which bound killed it.
         scrapReason =
-          code === 'harness-timeout'
+          gateHeld
+            ? 'harness-gate-hold'
+            : code === 'harness-timeout'
             ? 'harness-timeout'
             : code === 'harness-idle-timeout'
               ? 'harness-idle-timeout'
@@ -4110,6 +4144,16 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
           usageUnknown: !thrownUsageKnown, usage: thrownJournalUsage,
           attributes: { outcome: scrapReason, ready_waiting: readyWaiting },
         });
+        if (gateHeld) {
+          // The pending outbox intent of an effectful station is left as it is: the call was ended
+          // mid-run, so its side effects are unknown, and a human resolves it (as on a rate-limit hold).
+          escalateToHold(
+            stateDb, db, cardId, stationId, card,
+            `harness tool gate held station '${stationId}' for a human: ${(invokeErr as Error).message}`,
+            err, runId, true,
+          );
+          return false;
+        }
         // Issue #3: back off before the next attempt. Without this,
         // max_execution_attempts doubled as the wall-clock retry policy and any
         // persistent-but-temporary fault burned the whole budget in seconds.

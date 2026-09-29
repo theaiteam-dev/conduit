@@ -62,7 +62,7 @@ docker build -t conduit-engine:1.0.0 .
 > | `FROM oven/bun:1.3.11-slim` | Pinned Bun runtime — see [§7](#7-bump-the-bun-version) to change it |
 > | Create `conduit` user/group | Least-privilege execution — the container never runs as root |
 > | `WORKDIR /app` | Relative paths such as `examples/branching/flow.yaml` resolve here |
-> | `COPY package.json bun.lock ./` + `bun install` | Dependency layer cached independently of source changes |
+> | `COPY package.json bun.lock ./` + `bun install --omit=optional` | Dependency layer cached independently of source changes. Optional dependencies are skipped: they are the Agent SDK's bundled platform binaries, which the `agent-sdk` adapter does not use |
 > | `COPY . .` | Full source tree — `.dockerignore` strips secrets and state (see [§3](#3-run-a-single-container-engine)) |
 > | `RUN mkdir -p /data && chown conduit:conduit /data` | Mount point for `conduit.sqlite`; must be writable by the non-root user |
 > | `USER conduit` | Drop privileges before the ENTRYPOINT |

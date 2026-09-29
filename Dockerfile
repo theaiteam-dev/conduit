@@ -12,7 +12,9 @@ WORKDIR /app
 # Install runtime dependencies before copying source — this layer is cached
 # as long as package.json and bun.lock are unchanged, giving faster rebuilds.
 COPY package.json bun.lock ./
-RUN bun install --frozen-lockfile --production
+# --omit=optional skips the Agent SDK's bundled platform binaries (about 460 MB). The
+# agent-sdk adapter runs the `claude` on PATH, not the bundled one.
+RUN bun install --frozen-lockfile --production --omit=optional
 
 # Copy the source tree. .dockerignore excludes .env, .git, node_modules, and
 # local sqlite state files so no secret or local state enters any image layer.
