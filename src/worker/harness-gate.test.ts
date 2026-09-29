@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach } from 'bun:test';
-import { mkdtempSync, mkdirSync, symlinkSync, writeFileSync, rmSync, realpathSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, symlinkSync, unlinkSync, writeFileSync, rmSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { checkCommandAllowed } from './deterministic';
@@ -250,6 +250,21 @@ describe('createHarnessToolGate write ownership', () => {
     const gate = createHarnessToolGate({ projectRoot: f.root, tools: TOOLS, ownedPaths: ['later/dir'] });
     expect(write(gate, join(f.root, 'later', 'dir', 'x')).decision).toBe('allow');
     expect(write(gate, join(f.root, 'later', 'other')).decision).toBe('deny');
+  });
+
+  // Behavioural stand-in for a resolver spy (resolveOwnedPath is imported
+  // directly, so it cannot be spied on): owned paths are canonicalized once at
+  // build time, so re-pointing an owned-path symlink afterwards changes nothing.
+  it('canonicalizes owned paths once, at build time', () => {
+    const f = fixture();
+    const alias = join(f.root, 'alias');
+    symlinkSync(f.owned, alias);
+    const gate = createHarnessToolGate({ projectRoot: f.root, tools: TOOLS, ownedPaths: ['alias'] });
+    unlinkSync(alias);
+    symlinkSync(f.outside, alias);
+    expect(write(gate, join(f.owned, 'x')).decision).toBe('allow');
+    expect(write(gate, join(f.outside, 'x'))).toMatchObject({ decision: 'deny', code: 'path_escape' });
+    expect(write(gate, join(alias, 'x'))).toMatchObject({ decision: 'deny', code: 'path_escape' });
   });
 
   it('resolves a symlinked owned path the same way as the target', () => {

@@ -192,20 +192,20 @@ function checkWritePath(
   toolName: string,
   input: unknown,
   projectRoot: string,
-  ownedPaths: readonly string[] | undefined,
+  canonicalOwned: readonly string[] | undefined,
 ): GateDecision {
   const fields = input as { file_path?: unknown; notebook_path?: unknown } | null | undefined;
   const path = toolName === 'NotebookEdit' ? fields?.notebook_path : fields?.file_path;
   if (typeof path !== 'string' || path === '' || path.includes('\0')) {
     return deny('malformed_input', `${toolName} input has no usable path`);
   }
-  if (ownedPaths === undefined) return { decision: 'allow' };
+  if (canonicalOwned === undefined) return { decision: 'allow' };
 
   const abs = resolve(projectRoot, path);
   const escape = deny('path_escape', `${toolName} path ${JSON.stringify(path.slice(0, 120))} is outside the owned paths`);
   if (hasDanglingSymlink(abs)) return escape;
   const target = resolveOwnedPath(abs);
-  const inside = ownedPaths.some((owned) => isContainedIn(target, resolveOwnedPath(resolve(projectRoot, owned))));
+  const inside = canonicalOwned.some((owned) => isContainedIn(target, owned));
   return inside ? { decision: 'allow' } : escape;
 }
 
@@ -216,12 +216,18 @@ function checkWritePath(
  * yields a decision, and anything unexpected is a deny. Subagent calls
  * (`agentId` set) get the same checks as main-thread calls.
  *
+ * Owned paths are canonicalized once here, at build time, so a call resolves
+ * only its own candidate path. A symlink re-pointed after the gate is built
+ * does not move the owned boundary. Absent `ownedPaths` stays absent (not
+ * enforced) and an empty array stays empty (every write denied).
+ *
  * Reads are not confined to the project root here. Write ownership, the Bash
  * allowlist and the tool allowlist are enforced; read confinement is a later
  * slice.
  */
 export function createHarnessToolGate(config: HarnessGateConfig): HarnessToolGate {
   const { names, bashExecutables } = parseTools(config.tools);
+  const canonicalOwned = config.ownedPaths?.map((owned) => resolveOwnedPath(resolve(config.projectRoot, owned)));
   return (call) => {
     try {
       const toolName: unknown = call.toolName;
@@ -237,7 +243,7 @@ export function createHarnessToolGate(config: HarnessGateConfig): HarnessToolGat
       }
       if (toolName === 'Bash') return checkBash(call.input, bashExecutables);
       if (WRITE_TOOLS.has(toolName)) {
-        return checkWritePath(toolName, call.input, config.projectRoot, config.ownedPaths);
+        return checkWritePath(toolName, call.input, config.projectRoot, canonicalOwned);
       }
       return { decision: 'allow' };
     } catch {
