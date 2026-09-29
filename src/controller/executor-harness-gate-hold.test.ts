@@ -78,7 +78,7 @@ function makeMaker(opts: { canGatePerCall?: boolean; hold?: UsageReport | 'no-us
 }
 
 /** A critic that throws the hold code, or writes a pass verdict. */
-function makeCritic(opts: { canGatePerCall?: boolean; hold?: UsageReport } = {}): Fake {
+function makeCritic(opts: { canGatePerCall?: boolean; hold?: UsageReport; holdMessage?: string } = {}): Fake {
   const calls: HarnessInvocation[] = [];
   const adapter: HarnessAdapter = {
     name: 'claude-critic',
@@ -91,7 +91,7 @@ function makeCritic(opts: { canGatePerCall?: boolean; hold?: UsageReport } = {})
     async invoke(call) {
       calls.push(call);
       if (opts.hold !== undefined) {
-        throw Object.assign(new Error('agent-sdk: the tool gate held the card on AskUserQuestion (needs_human)'), {
+        throw Object.assign(new Error(opts.holdMessage ?? 'agent-sdk: the tool gate held the card on AskUserQuestion (needs_human)'), {
           code: HARNESS_GATE_HOLD_CODE,
           usage: opts.hold,
         });
@@ -306,6 +306,19 @@ describe('issue #21: a gate hold moves the card to hold', () => {
     expect(critic.calls).toHaveLength(1);
     expect(maker.calls).toHaveLength(1);
     expect(getCard(db, 'entry2')?.lane).toBe('coder');
+  });
+
+  it('gives a held critic whose error has an empty message a readable reason', async () => {
+    db = openDb();
+    const maker = makeMaker();
+    const critic = makeCritic({ canGatePerCall: true, hold: { tokens: 1, cost: 0.001 }, holdMessage: '' });
+    const registry = createHarnessRegistry([maker.adapter, critic.adapter]);
+    seedCard(db, 'entry');
+    await run(writeFlow(dir, registry, { critic: true }), registry);
+
+    expect(getCard(db, 'entry')?.lane).toBe('hold');
+    const reasons = db.getCardLog('entry').filter((e) => e.kind === 'terminal').map((e) => (e as { reason: string }).reason);
+    expect(reasons.join('\n')).toMatch(/held the critic of station '[^']+' for a human: \S/);
   });
 
   it('holds a card whose critic is held on a rework pass, spending no attempt and no second rework', async () => {

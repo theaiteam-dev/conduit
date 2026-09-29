@@ -1615,8 +1615,8 @@ function collectErrors(
                   `can do nothing. List the tools it needs (at least Write, for its output file)`
                 : `Station '${station.id}' uses adapter '${resolved.adapter.name}', which gates every tool ` +
                   `call against the station's tools list, so unrestricted_tools: true has no effect there and ` +
-                  `the tools list alone governs. Remove unrestricted_tools, or drop the list and use an adapter ` +
-                  `that does not gate per call`,
+                  `the tools list alone governs. Remove unrestricted_tools and keep the tools the station needs, ` +
+                  `or use an adapter that does not gate per call`,
           });
         }
       }

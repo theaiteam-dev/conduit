@@ -413,7 +413,7 @@ export async function runHarnessGateCheck(config: HarnessGateConfig): Promise<Ga
       usage: usageFromThrow(err) ?? { unknown: true },
     };
     if ((err as { code?: string }).code === HARNESS_GATE_HOLD_CODE) {
-      return { action: 'hold', reason: (err as Error).message ?? String(err), criticUsage: failedUsage };
+      return { action: 'hold', reason: (err as Error).message || String(err), criticUsage: failedUsage };
     }
     return {
       action: 'scrapped',
