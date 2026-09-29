@@ -1,6 +1,6 @@
 # Harness Adapter Registration — Operator Setup Guide
 
-How to register `kind: harness` adapters (`claude-headless`, `codex-exec`, `agent-sdk`) via
+How to register `kind: harness` adapters (`claude-headless`, `codex-exec`, `agent-sdk`, `codex-app-server`) via
 `CONDUIT_HARNESS_*` engine config, for Docker and bare-metal deployments, with
 the recommended minimal env allowlist per adapter and per claude credential
 mode, and how to verify the result with `conduit doctor`.
@@ -46,8 +46,10 @@ warnings `doctor` gives you when something's off.
 | `CONDUIT_HARNESS_<NAME>_ISOLATE_CONFIG` | No, `claude-headless` and `agent-sdk` only | `1`/`true` gives the child a run-scoped config dir instead of the operator's `~/.claude`; `0`/`false` or absent keeps today's behaviour. Any other value is a boot error. See [Isolating the child's Claude config](#isolating-the-childs-claude-config-_isolate_config). |
 
 Setting `_AGENT`, `_PLUGIN_DIRS` or `_ISOLATE_CONFIG` for an adapter that does
-not act on it (e.g. `codex-exec`) fails registry construction at boot, naming
-the adapter and the variable, rather than being ignored.
+not act on it (e.g. `codex-exec`, or `codex-app-server`, which always runs
+with a run-scoped `CODEX_HOME` and so has nothing to switch) fails registry
+construction at boot, naming the adapter and the variable, rather than being
+ignored.
 
 ### Deriving `<NAME>` from an adapter name
 
@@ -59,6 +61,7 @@ underscore**:
 | `claude-headless` | `CONDUIT_HARNESS_CLAUDE_HEADLESS_ENV` |
 | `codex-exec` | `CONDUIT_HARNESS_CODEX_EXEC_ENV` |
 | `agent-sdk` | `CONDUIT_HARNESS_AGENT_SDK_ENV` |
+| `codex-app-server` | `CONDUIT_HARNESS_CODEX_APP_SERVER_ENV` |
 | `my-cool-agent` | `CONDUIT_HARNESS_MY_COOL_AGENT_ENV` |
 
 Because the mapping collapses hyphens and underscores together, two
@@ -228,6 +231,8 @@ failure, not a containment change — but it's easy to get right:
 | `claude-headless`, **subscription auth** | `HOME,PATH` | Credentials live under `$HOME/.claude` — no separate credential variable needed. This is the mode the Phase-1 exit-criterion evidence run (below) exercises. |
 | `claude-headless`, **API-key auth** | `HOME,PATH,ANTHROPIC_API_KEY` | |
 | `codex-exec` | **Assumed — verify in your deployment.** `HOME,PATH` is a reasonable starting point, but codex's exact minimum has not been verified against a live run in this mission (no consumer currently depends on it). |
+| `codex-app-server`, **subscription login** | `PATH` | The adapter links `auth.json` from `$CODEX_HOME` or `$HOME/.codex` (read from the engine's own env) into a run-scoped `CODEX_HOME`, so `HOME` is not needed. It is not injected either: add it only if the model's commands need it. `PATH` is the engine's own when the allowlist omits it. A live run with `PATH` alone passed. |
+| `codex-app-server`, **API key** | `PATH,OPENAI_API_KEY` (or `CODEX_API_KEY`) | Only when there is no `auth.json`. The key is not run against a live call here. |
 
 **`conduit doctor`'s binary probe does NOT validate your allowlist.** The
 probe resolves the configured command against the *engine's own* `PATH`
@@ -375,7 +380,7 @@ default changed correctly re-invokes rather than silently skipping.
 ## Named agents and plugin dirs
 
 Only `claude-headless` runs named agents. An `agent:` (or `check.critic.agent`) on an
-`agent-sdk` or `codex-exec` station is refused at load, and holds the card if it
+`agent-sdk`, `codex-exec` or `codex-app-server` station is refused at load, and holds the card if it
 reaches dispatch, rather than being ignored.
 
 A `claude-headless` station can run a named Claude Code agent out of a plugin
@@ -658,6 +663,31 @@ can gate every tool call ([containment profile](harness-containment.md#a-middle-
   `_PLUGIN_DIRS` fail registry construction at boot, as they do for `codex-exec`.
 - A station's `tools` list is the gate's allowlist: `Bash` alone allows no executable, so
   list `Bash(git:*)` style entries for the commands it may run.
+
+## The `codex-app-server` adapter
+
+`codex-app-server` runs `codex app-server` and answers its approval requests from the kernel's
+gate ([containment profile](harness-containment.md#the-codex-app-server-adapter)).
+
+- It runs the `codex` on `PATH`, resolved to a file. Set `CONDUIT_HARNESS_CODEX_APP_SERVER_COMMAND`
+  to an absolute path to use another. Codex must be logged in (`codex login`) or an
+  `OPENAI_API_KEY` or `CODEX_API_KEY` allowlisted.
+- It supports `_ENV`, `_COMMAND` and `_MODEL`. `_AGENT`, `_PLUGIN_DIRS` and `_ISOLATE_CONFIG`
+  fail registry construction at boot.
+- A station's `tools` list is the gate's allowlist. Codex reads files with shell commands, so
+  list `Bash(cat:*)` style entries for what it may run (`Read`, `Glob` and `Grep` entries have no
+  effect), and `Write` and `Edit` for the files it may patch: a patch that adds a file is a
+  `Write`, one that changes a file is an `Edit`. `unrestricted_tools` and an empty list are
+  refused at load, as for `agent-sdk`.
+- Its usage has tokens and no cost (`cost` is 0). A call the gate holds reports the usage Codex
+  had reported before the hold, so the call in flight is not counted.
+
+`conduit doctor` lists it with `gatesPerCall=yes`. The opt-in live test runs three short calls
+(allow, deny, hold) with the operator's login:
+
+```sh
+CONDUIT_E2E_CODEX_APP_SERVER=1 bun test src/integration/harness-e2e-codex-app-server.test.ts
+```
 
 ## See also
 

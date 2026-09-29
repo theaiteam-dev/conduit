@@ -31,11 +31,15 @@ stamps) without building an in-kernel loop first.
 ## A middle claim: supervised adapters
 
 An adapter that sets `canGatePerCall` runs the harness loop with a callback into the
-kernel, and the kernel decides every tool call before it runs. `agent-sdk` is the shipped
-one: it drives the Claude Code CLI through `@anthropic-ai/claude-agent-sdk` `query()` and
-calls the kernel's gate from `hooks.PreToolUse`
-([#21](https://github.com/theaiteam-dev/conduit/issues/21)). The hook fires for the main
-agent and for subagents, and an `allowedTools` rule does not bypass it.
+kernel, and the kernel decides every tool call before it runs. Two are shipped
+([#21](https://github.com/theaiteam-dev/conduit/issues/21)):
+
+- `agent-sdk` drives the Claude Code CLI through `@anthropic-ai/claude-agent-sdk` `query()`
+  and calls the kernel's gate from `hooks.PreToolUse`. The hook fires for the main agent and
+  for subagents, and an `allowedTools` rule does not bypass it.
+- `codex-app-server` drives `codex app-server` and answers Codex's approval requests from the
+  gate. See [the Codex adapter](#the-codex-app-server-adapter) below for how Codex's tools
+  map onto the gate, and for what is not gated.
 
 The claim is a pre-execution decision on each call. It is not the Tool-Bridge: the CLI
 still owns the loop, and the kernel sees one call at a time. The gate
@@ -79,6 +83,73 @@ seconds the process is killed, and the error then carries no usage.
 
 Every invocation is a fresh session: `agent-sdk` does not resume one, and it does not run
 named agents (`agent`, `pluginDirs`).
+
+### The `codex-app-server` adapter
+
+Codex has no hook that runs before a tool. It has an approval policy instead: under
+`untrusted`, `codex app-server` sends the client a request before every shell command and
+every patch, including the commands a subagent runs and the nested commands issued by its
+`exec` code-mode tool, and it waits for the answer. The adapter sets `untrusted` on the
+thread and again on every turn (the policy can be overridden per turn), answers each request
+from the gate, and never sends `acceptForSession` or an amendment decision, since those let
+later calls skip the gate. It answers only `accept`, `decline` or `cancel`.
+
+How each request reaches the gate:
+
+- **Shell commands** go to the gate as a `Bash` call. Codex shows the command as a string such
+  as `/usr/bin/zsh -lc 'cat a.txt'`. The adapter removes the shell wrapper and gates the
+  script, so the station lists `Bash(cat:*)` for `cat a.txt`. Codex has no Read, Glob or Grep
+  tool: it reads files through shell commands, and those entries in `tools` have no effect
+  here. A string the adapter cannot read as a word list is declined. A working directory
+  outside the project root is declined before the gate is asked, because the gate does not
+  see it.
+- **Patches** carry no paths in the request. The adapter takes them from the `fileChange` item
+  Codex announced just before, and gates every path: an added file as `Write`, an updated
+  file as `Edit`, a delete as `Write`, and a move as `Edit` on the source and `Write` on the
+  destination. One denied path declines the whole patch. A request with no announced item, or
+  one that asks for a session-wide write grant, is declined. A station that lets the model
+  patch files lists `Write` and `Edit`.
+- **MCP tool approvals** go to the gate as `mcp__<server>__<tool>`, which the gate always
+  denies.
+- **Any other request** (`item/permissions/requestApproval`, `item/tool/requestUserInput`,
+  a dynamic tool call, a token refresh) is answered with a JSON-RPC error and journaled as a
+  deny. The adapter never leaves a request waiting and never accepts one it does not
+  understand. `AskUserQuestion` has no Codex counterpart, so with the shipped gate a Codex
+  call is never held: `hold` is reachable only through a custom gate.
+
+A decline gives the model no reason, and it tries other ways. Every retry is gated again.
+After the first hold, every request is declined without asking the gate, and the hold is
+answered with `cancel`, which denies the call and interrupts the turn. Codex reports no token
+usage for an interrupted call, so the usage on a held call is what Codex had reported before
+it, and the model call in flight when the hold began is not counted. If the turn has not ended
+5 seconds after a hold, the process is killed.
+
+What it does not cover, beyond the gaps listed above for every gated adapter:
+
+- **The sandbox does not confine anything on a host without `bwrap`.** The adapter sends
+  `workspace-write` (read-only would stop a station from writing its output, and
+  `danger-full-access` is never sent). On the host where this was checked, `bwrap` was not
+  installed, and a command the gate had allowed wrote a file outside the project root. The gate
+  and the MARK_DONE integrity check are the enforcement there. Behavior with `bwrap` present was
+  not observed.
+- **Ungated built-in tools.** Web search runs without an approval request, so the adapter
+  passes `-c web_search="disabled"`. It also turns off the other built-ins that do not ask
+  (`apps`, `browser_use`, `computer_use`, `image_generation`, `view_image` and the plugin
+  features, listed in `CODEX_APP_SERVER_ARGS`). With those flags a model asked to list its tools
+  named neither `list_mcp_resources` nor `read_mcp_resource`, which ran ungated without them.
+  That is the model's own report from one codex version. A tool that a newer Codex adds without an
+  approval request would not be gated.
+- **Subagent creation** is not asked. The commands a subagent runs are, and carry the
+  subagent's thread id as `agentId`.
+- **Usage carries no cost.** Codex reports tokens only, so `cost` is 0, as for `codex-exec`.
+
+The app-server starts detached, in its own cgroup where the host allows it, and is killed with
+`killContained` on a timeout, an idle timeout, a hold and every other exit. Codex starts each
+command in its own session, so the group kill alone would leave one running. The child gets a
+run-scoped `CODEX_HOME` holding an empty `config.toml` and a link to the operator's
+`auth.json`, so the operator's Codex configuration, skills, plugins and MCP servers do not
+reach it. The directory is removed on every exit path. The child's env is the allowlist plus
+`PATH` and `CODEX_HOME`. Every invocation is a fresh, ephemeral thread.
 
 ## The containment profile
 
@@ -287,8 +358,15 @@ What isolation does **not** fence, stated so the claim stays narrow:
   not follow the symlink, so a token refreshed inside the child is discarded with the
   run-scoped dir and the operator's file keeps the old token. A long-lived
   `CLAUDE_CODE_OAUTH_TOKEN` on the allowlist avoids this.
-- **`codex-exec`.** No equivalent fence exists for codex yet; its allowlisted `HOME`
+- **`codex-exec`.** No equivalent fence exists for codex-exec yet; its allowlisted `HOME`
   still exposes the operator's codex configuration.
+- **`codex-app-server`.** It is always constructed, with no opt-out: every invocation gets a
+  `CODEX_HOME` holding an empty `config.toml` and a symlink to the operator's `auth.json`, and
+  `HOME` reaches the child only when the allowlist names it. The link is used instead of a copy
+  so that a refreshed login token is written to the operator's file if Codex rewrites
+  `auth.json` in place. Whether it does was not observed, because no token refresh happened in
+  any run. If Codex replaces the file instead, the link is lost with the directory, as for
+  Claude above. An allowlisted `OPENAI_API_KEY` or `CODEX_API_KEY` avoids the question.
 
 ## Network posture: full egress in v1
 
