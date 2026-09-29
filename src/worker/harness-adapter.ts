@@ -19,6 +19,7 @@ import { createAgentSdkHarnessAdapter } from './harness-adapter-agent-sdk';
 import { createClaudeHarnessAdapter } from './harness-adapter-claude';
 import { createCodexAppServerHarnessAdapter } from './harness-adapter-codex-app-server';
 import { createCodexHarnessAdapter } from './harness-adapter-codex';
+import { createOpenCodeHarnessAdapter } from './harness-adapter-opencode';
 import type { HarnessAdapterConfigDef } from './harness-config';
 import type { HarnessEventSink } from './harness-events';
 import type { HarnessToolGate } from './harness-gate';
@@ -435,6 +436,7 @@ const SHIPPED_HARNESS_FACTORIES: Record<string, (config: ShippedAdapterFactoryCo
   'codex-exec': createCodexHarnessAdapter,
   'agent-sdk': createAgentSdkHarnessAdapter,
   'codex-app-server': createCodexAppServerHarnessAdapter,
+  opencode: createOpenCodeHarnessAdapter,
 };
 
 /**

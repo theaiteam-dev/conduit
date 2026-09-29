@@ -405,8 +405,9 @@ type Outcome =
 /**
  * Start `spec` detached, in its own cgroup where the host has one, and tracked
  * for the kernel's signal handlers. Lines are delivered as they complete.
+ * `label` prefixes the spawn error. The opencode adapter uses this too.
  */
-function containedSpawn(containment: Containment): AppServerSpawn {
+export function containedSpawn(containment: Containment, label = 'codex-app-server'): AppServerSpawn {
   return (spec, handlers) => {
     const contained = prepareContainedCommand(containment, [spec.command, ...spec.args], { cwd: spec.cwd, env: spec.env });
     let child: ChildProcess;
@@ -424,7 +425,7 @@ function containedSpawn(containment: Containment): AppServerSpawn {
     }
     if (child.pid === undefined) {
       if (contained.cgroup !== undefined) void removeCgroup(contained.cgroup);
-      throw new Error(`codex-app-server: failed to spawn '${spec.command}'`);
+      throw new Error(`${label}: failed to spawn '${spec.command}'`);
     }
     const pid = child.pid;
     const cgroup = contained.cgroup;

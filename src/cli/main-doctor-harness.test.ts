@@ -186,6 +186,27 @@ describe('conduit doctor: per-call gating adapters (issue #21)', () => {
     expect(plainLine).not.toContain('gatesPerCall');
   });
 
+  it('lists opencode with its probe result and gatesPerCall=yes', async () => {
+    const registry = defRegistry([{ name: 'opencode', envAllowlist: ['HOME', 'PATH'] }]);
+    const code = await main(['doctor'], makeDeps(registry));
+
+    expect(code).toBe(0);
+    const line = io.lines.find((l) => l.includes("harness 'opencode'"));
+    expect(line).toContain('gatesPerCall=yes');
+    expect(line).toContain('reportsUsage=true');
+    expect(line).toContain('/opt/bin/agent');
+  });
+
+  it('reports a missing opencode binary as a failure', async () => {
+    const registry = defRegistry(
+      [{ name: 'opencode', envAllowlist: ['HOME', 'PATH'] }],
+      async () => ({ present: false, detail: "'opencode' was not found on PATH" }),
+    );
+    const code = await main(['doctor'], makeDeps(registry));
+    expect(code).toBe(1);
+    expect(allOutput()).toContain("'opencode' was not found on PATH");
+  });
+
   it('reports a missing codex binary as a failure', async () => {
     const registry = defRegistry(
       [{ name: 'codex-app-server', envAllowlist: ['HOME', 'PATH'] }],

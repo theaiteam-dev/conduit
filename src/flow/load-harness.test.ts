@@ -465,6 +465,38 @@ describe('issue #21: the shipped codex-app-server adapter is a per-call gating a
   });
 });
 
+describe('issue #21: the shipped opencode adapter is a per-call gating adapter at load', () => {
+  const shipped = (): HarnessRegistry =>
+    bindHarnessDefinitionsForIntrospection(
+      buildHarnessDefinitionRegistry([{ name: 'opencode', envAllowlist: [] }]),
+    );
+  const harness = 'harness: opencode';
+
+  it('rejects a station with no tools list and one that waives it', () => {
+    expect(errorCodes(loadHarness(harnessFlow({ harnessLine: harness, toolsLine: '' }), { registry: shipped(), extraFiles: CODER_PROMPT }))).toContain(
+      'HARNESS_GATED_ADAPTER_NEEDS_TOOLS',
+    );
+    expect(
+      errorCodes(
+        loadHarness(harnessFlow({ harnessLine: harness, toolsLine: 'tools: [Write]', waiverLine: 'unrestricted_tools: true' }), {
+          registry: shipped(),
+          extraFiles: CODER_PROMPT,
+        }),
+      ),
+    ).toContain('HARNESS_GATED_ADAPTER_NEEDS_TOOLS');
+  });
+
+  it('accepts a station that lists Bash executables and the write tools', () => {
+    const flow = expectOk(
+      loadHarness(harnessFlow({ harnessLine: harness, toolsLine: 'tools: [Write, Edit, "Bash(cat:*)"]' }), {
+        registry: shipped(),
+        extraFiles: CODER_PROMPT,
+      }),
+    );
+    expect(flow.stations.coder!.tools).toEqual(['Write', 'Edit', 'Bash(cat:*)']);
+  });
+});
+
 // ---------------------------------------------------------------------------
 // WI-595 — the GATE CRITIC's tools allowlist is threaded into its harness
 // invocation (gate.ts), so a critic adapter that cannot restrict tools must
