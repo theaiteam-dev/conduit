@@ -31,7 +31,7 @@ stamps) without building an in-kernel loop first.
 ## A middle claim: supervised adapters
 
 An adapter that sets `canGatePerCall` runs the harness loop with a callback into the
-kernel, and the kernel decides every tool call before it runs. Two are shipped
+kernel, and the kernel decides every tool call before it runs. Three are shipped
 ([#21](https://github.com/theaiteam-dev/conduit/issues/21)):
 
 - `agent-sdk` drives the Claude Code CLI through `@anthropic-ai/claude-agent-sdk` `query()`
@@ -40,6 +40,8 @@ kernel, and the kernel decides every tool call before it runs. Two are shipped
 - `codex-app-server` drives `codex app-server` and answers Codex's approval requests from the
   gate. See [the Codex adapter](#the-codex-app-server-adapter) below for how Codex's tools
   map onto the gate, and for what is not gated.
+- `opencode` drives `opencode serve` over HTTP and answers its `permission.asked` events from
+  the gate. See [the opencode adapter](#the-opencode-adapter) below.
 
 The claim is a pre-execution decision on each call. It is not the Tool-Bridge: the CLI
 still owns the loop, and the kernel sees one call at a time. The gate
@@ -150,6 +152,105 @@ run-scoped `CODEX_HOME` holding an empty `config.toml` and a link to the operato
 `auth.json`, so the operator's Codex configuration, skills, plugins and MCP servers do not
 reach it. The directory is removed on every exit path. The child's env is the allowlist plus
 `PATH` and `CODEX_HOME`. Every invocation is a fresh, ephemeral thread.
+
+### The `opencode` adapter
+
+The adapter runs one `opencode serve` per invocation and starts it with the permission
+`{"*":"ask"}`, so every builtin tool call raises a `permission.asked` event and waits for a
+reply. It reads the event stream (SSE) and answers each ask from the gate. It uses raw HTTP,
+not the `@opencode-ai/sdk` package, because that package's types differ from the 1.15.10
+server (`permission.updated` there, `permission.asked` here). It sends `once` or `reject` and
+nothing else. `always` would persist for the rest of the server's life, so no code path can
+send it. A reject carries the gate's reason as its message, so the model can try another way.
+
+An ask names a category (`bash`, `edit`, `read`, ...), not a tool, and not the absolute path.
+The real tool name and input are on the matching `message.part.updated` tool part, joined by
+`callID`, which can arrive after the ask. The adapter waits up to 3 seconds for it, re-fetches
+the message once, and rejects the ask if the part is still missing. How each category reaches
+the gate:
+
+- **`bash`** goes to the gate as `Bash` with the command from the tool part. The ask's
+  `patterns` are the parsed sub-commands (`ls && echo hi` gives `["ls","echo hi"]`), so they
+  are only a cross-check: one pattern must equal the command, several must all appear in it.
+  A mismatch is rejected. A `workdir` outside the project root is rejected.
+- **`edit`** covers write, edit, multiedit and apply_patch. `write` is `Write`, `edit` and
+  `multiedit` are `Edit`. A patch is gated once per file from the ask's `metadata.files`
+  (add: `Write`, update: `Edit`, delete: `Write`, move: `Edit` on the source and `Write` on the
+  destination), and one denied path rejects the whole patch. A patch with no file list, or an
+  unknown file type, is rejected. A move needs a `movePath`.
+- **`read`** is `Read`, **`glob`** is `Glob`, **`grep`** is `Grep`. **`list`** is gated as
+  `Glob`; the `list` tool was not in the live tool set, so its ask shape is assumed. Every path
+  must resolve, symlinks followed, inside the project root, or the ask is rejected before the
+  gate sees it. The gate itself does not confine reads.
+- **`webfetch`** is `WebFetch`, **`websearch`** and `codesearch` are `WebSearch`. The gate
+  denies all three.
+- **`task`** is `Agent`. **`todowrite`** is `TodoWrite` and **`skill`** is `Skill`: the gate
+  allows them only when the station's `tools` list names them.
+- **`external_directory`** is always rejected and the gate is not asked. It is the route to
+  files outside the project root, and nothing in `tools` can open it.
+- **`question`** is always a hold. **`lsp`**, **`doom_loop`** and any category the adapter does
+  not know, an MCP tool included, are rejected as `tool_not_allowed` without asking the gate.
+  MCP tools were not run: no MCP server is configured, so none should exist.
+
+A station's `tools` list is the gate's allowlist, as for `agent-sdk`: list `Read`, `Glob`,
+`Grep`, `Write`, `Edit` and `Bash(<exe>:*)` entries, and `Agent` for subagents. `unrestricted_tools`
+and an empty list are refused at load.
+
+Subagents. The `task` tool creates a child session (`session.created` with a `parentID`). The
+adapter tracks the session tree from that event. Asks from a child arrive on the same stream
+and get the same checks, with the child's session id as `agentId` (observed live). An ask from a
+session outside the tree is rejected.
+
+Hold. Aborting at the ask loses the usage of the step in flight, so the order is: reject the
+ask, deny every later ask without asking the gate, wait until the message that owns the call
+reports tokens or the session goes idle, then `POST /session/:id/abort` and end. The wait is
+bounded at 5 seconds. Then the session is aborted and the server killed anyway. The thrown
+error carries the usage summed so far, and a live hold returned non-zero usage. The question
+tool exists only with `OPENCODE_ENABLE_QUESTION_TOOL`, which is never set. A `question.asked`
+that arrives anyway is rejected (`POST /question/:id/reject`) and held.
+
+Usage is the last value per assistant message id, summed over every session in the tree. Cost
+is what opencode reports: it was present for OpenAI and was not looked at for other providers.
+A model or provider opencode has no price for reports 0.
+
+Errors. A 401 or a `ProviderAuthError` is a `harness-nonzero-exit` classified as an
+authentication failure. An `APIError` with status 429, or rate-limit wording on a retryable
+error, or a `session.status` of type `retry` with rate-limit wording, is `harness-rate-limited`;
+the adapter aborts the session on the retry status instead of waiting out opencode's backoff.
+That rate-limit shape is inferred from the schema: no live run hit a provider limit. HTTP 426
+(free `opencode/*` models need opencode 1.18 or newer) and a server that dies before the session
+is idle are `harness-nonzero-exit`. An abort the adapter sent is not an error. The wall-clock
+timeout and an idle timeout (no event other than a heartbeat) kill the server and throw
+`harness-timeout` and `harness-idle-timeout`.
+
+What it does not cover, beyond the gaps listed above for every gated adapter:
+
+- **Tool asks are the only gate.** A builtin that raised no ask would run ungated. None was
+  seen with `"*":"ask"`.
+- **A model call opencode makes for itself** (a title, for instance) is not a tool call.
+- **`tool.execute.before`.** A plugin hook that runs inside the server would be stricter and
+  fires in subagents, but it needs `OPENCODE_PURE` off, so the adapter does not use it.
+- **`always` persistence** is mitigated by never sending it and by the fresh run-scoped data
+  directory, not by the server.
+- **A free-text tool result** is opencode's, not the gate's. The journal keeps the tool name,
+  the path and an error flag or exit code, never the body.
+
+The server starts detached, in its own cgroup where the host allows it, and is killed with
+`killContained` on a timeout, an idle timeout, a hold and every other exit. opencode runs bash
+commands in their own session, which survives a group kill, so the cgroup is the boundary that
+reaches them. The server binds `127.0.0.1` on a random port and requires HTTP Basic auth with a
+random per-invocation password on every request, the event stream included. The adapter refuses
+a server that reports any other address.
+
+The child gets four run-scoped XDG directories (config, data, state, cache), removed on every
+exit path, and `OPENCODE_DISABLE_PROJECT_CONFIG`, `_CLAUDE_CODE`, `_EXTERNAL_SKILLS`,
+`_DEFAULT_PLUGINS` and `OPENCODE_PURE` set to 1. With these, `AGENTS.md` in the project, project
+MCP servers and project plugins did not load. Its env is the allowlist plus `PATH` and those
+variables. `HOME` is not injected: live calls ran without it. Credentials are the `auth.json`
+entry for the model's provider only, passed as `OPENCODE_AUTH_CONTENT`, and never logged or
+journaled. A call fails before spawning if that provider has no entry and no allowlisted
+provider variable. An OAuth entry is copied, so a token the child refreshes is discarded with
+the directory. Every invocation is a fresh session. The model must be set as `provider/model`.
 
 ## The containment profile
 
@@ -367,6 +468,10 @@ What isolation does **not** fence, stated so the claim stays narrow:
   `auth.json` in place. Whether it does was not observed, because no token refresh happened in
   any run. If Codex replaces the file instead, the link is lost with the directory, as for
   Claude above. An allowlisted `OPENAI_API_KEY` or `CODEX_API_KEY` avoids the question.
+- **`opencode`.** It is always constructed, with no opt-out: the four XDG directories are
+  run-scoped and only the model provider's credential entry is passed in, as
+  `OPENCODE_AUTH_CONTENT`. A credential the child refreshes is not written back to the
+  operator's `auth.json`.
 
 ## Network posture: full egress in v1
 
