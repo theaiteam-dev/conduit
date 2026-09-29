@@ -4,7 +4,7 @@ missionId: ~
 
 # Conduit — War Room
 
-**Author:** Josh Owens  **Date:** 2026-06-12  **Status:** Draft
+**Author:** Josh Owens  **Date:** 2026-06-12  **Revised:** 2026-09-28 (TUI first, #89)  **Status:** Draft
 
 > Scope note: the War Room is named in the SPEC's lean glossary — *"Genba (the floor) →
 > the War Room — live stream of the journal"* — but has never been specified. This PRD
@@ -133,7 +133,12 @@ projection; its whole value is that what you see *is* the journal.
 - **Multi-run / fleet dashboard** — comparing runs, run history lists across flows.
   Single run first; fleet view is a later PRD informed by this one.
 - **Authentication, multi-user hosting, remote access** — this renders local state for
-  the operator who owns the volume. Hosting is a product decision for another day.
+  the operator who owns the volume. The TUI reaches a remote box over SSH or
+  `docker exec -it`, so it opens no port and needs no auth decision. Hosting is a
+  product decision for another day.
+- **The web view in the first delivery**: it follows the TUI as its own PRD and reuses
+  the shared core (§8).
+- **A run picker**: v1 is one journal, one run.
 - **Kaizen analytics** — chronic-edge mining, cost trends, mutation proposals. The
   War Room *feeds* the schema for that work; it does not do it.
 - **Flow editing / run control** (pause, scrap, retry buttons) — write paths, all of
@@ -170,6 +175,11 @@ projection; its whole value is that what you see *is* the journal.
 12. Replay mode shall reconstruct a run from its journal alone, support play/pause/step/
     scrub, and clearly label itself as replay (including runs that ended in a crash —
     the view shows last recorded state, not an invented terminal).
+14. The kernel shall write a run-level heartbeat entry to the journal at a fixed interval
+    while a run is active, so the War Room can tell a crashed kernel (heartbeat stopped)
+    from a slow one (heartbeat current, no card activity). The heartbeat is the first
+    schema-gap item and is a kernel write; the War Room only reads it. The interval is
+    chosen at implementation.
 13. Where the journal lacks a datum the UI is designed to show, the War Room shall
     render an explicit "not recorded" marker — never a guess or a blank — and shall log
     the gap (datum, journal location, run) to a schema-gap list.
@@ -187,13 +197,16 @@ projection; its whole value is that what you see *is* the journal.
    displays what the journal stores and adds no new exposure surface (no raw env, no
    request bodies beyond what ingress already persisted).
 6. The full lane graph — parent path, any child band, and the terminal rail — shall be
-   visible without horizontal scrolling at 1280px width for flows of up to 8 stations.
+   visible without horizontal scrolling at 160 terminal columns (TUI) or 1280px width
+   (web) for flows of up to 8 stations.
 
 ### Edge Cases & Error States
 
 - **Run crashed mid-flight**: journal ends without terminals. Render last known state
-  with an explicit staleness indicator ("no journal activity for N min; kernel not
-  observed") — do not infer completion or failure.
+  with an explicit staleness indicator ("no journal activity for N min") — do not infer
+  completion or failure. With the heartbeat (FR-14) the indicator says whether the
+  kernel is still beating. For a journal with no heartbeat entries it says "kernel not
+  observed".
 - **Kernel resumes a watched run**: checkpoint-skipped stations produce no new work
   events. The view must make skip-on-resume legible (a station satisfied by checkpoint,
   not re-executed) rather than appearing frozen — if the journal cannot distinguish
@@ -236,27 +249,39 @@ projection; its whole value is that what you see *is* the journal.
 
 ## 8. Solution Approach
 
-The War Room is a **local web view served by the kernel binary itself** — a
-`conduit watch` style command alongside the existing CLI, not a separate service. It
+**Delivery order (revised 2026-09-28, #89).** The first surface is a terminal UI:
+`conduit watch` renders in the terminal with `@opentui/react` and reads the journal
+directly, with no server. The web view described below comes second and reuses the same
+reader, projection function, and replay logic. It adds the rendering components and the
+server and SSE layer. The TUI visual spec is `design/war-room/`: frames, 160x45 golden
+text and ANSI frames, color tokens, and a cell-grid reference renderer.
+
+`conduit watch` is a command in the existing kernel binary, not a separate service. It
 ships in the same Docker image, reads the same mounted volume, and adds no new runtime
-or infrastructure.
+or infrastructure. The web view, when it comes, is served by the same binary under a
+distinct invocation, `conduit watch --web`, so that plain `conduit watch` never opens a
+port.
 
-The data model is **snapshot plus live tail**, built around a single shared projection
-function — *the* War Room, in code form:
+The data model is a **shared core**, built once around a single projection function,
+*the* War Room in code form:
 
-- One pure function folds journal events into the rendered run state
-  (`events → reduce → view state`). It is the only place view state is derived.
-- **Snapshot**: on load (and on any reconnect), the client fetches the current run state,
-  computed server-side by running that same function over the journal.
-- **Live**: the watch process tails the journal and streams new events to the browser;
-  each event folds into the displayed state through the same function.
-- **Replay**: the client fetches a raw event range and scrubs through it by re-folding
-  locally — same function, no streaming involved.
+- **Reader**: a read-only journal and state DB reader that loads the current state and
+  follows new rows by sequence number.
+- **Projection**: one pure function folds journal events into the rendered run state
+  (`events → reduce → view state`). It is the only place view state is derived. The June
+  prototype's sketch at `design/warroom-prototype/lib/warroom-data.ts` is the starting
+  point, with its types reconciled against `src/types/kernel.ts`.
+- **Live**: the reader follows the journal and each new row folds into the displayed
+  state through the projection.
+- **Replay**: events up to a chosen point, re-folded through the same function.
+- **Not recorded**: a gap in the journal renders as "not recorded" and is logged to the
+  schema-gap list (FR-13).
 
-Because snapshot, live, and replay are all the one function, the §7 principles (pure
-projection, replay ≡ live, restart-identical rendering) are structural properties rather
-than conventions. Reconnect gaps self-heal: a dropped connection triggers a fresh
-snapshot fetch rather than requiring missed-event bookkeeping.
+Because live and replay are the one function, the §7 principles (pure projection,
+replay ≡ live, restart-identical rendering) are structural properties rather than
+conventions. The TUI has no server, so it has no snapshot or reconnect protocol: a
+restart re-reads the journal and re-folds it. The web view adds a snapshot fetch and a
+reconnect path on top of the same core.
 
 The primary view is a **trace waterfall**, validated through two prototype rounds (a
 kanban-style station board was prototyped first and failed the legibility test — even
@@ -273,8 +298,9 @@ the system's author could not narrate it; the paradigm record is §10):
   compress, never scroll — with a minimum segment width so nothing vanishes. The
   wall-clock budget renders as a red boundary line that enters the viewport once the
   run passes ~70% of budget: approaching the wall is geometry, not a number. Detail
-  recovery is drag-to-zoom with a transient minimap (full run + viewport) and a
-  "fit all" snap-back; zoom chrome is invisible unless zoomed.
+  recovery is zoom on the time axis (drag in the web view) with a transient minimap
+  (full run + viewport) and a "fit all" snap-back; zoom chrome is invisible unless
+  zoomed.
 - **Live is the default; replay is a mode.** The footer is a slim strip — latest-event
   ticker plus a LIVE badge. Entering replay reveals the scrubber and flips the badge;
   the two are never visible together, and **every** header element (meters, elapsed,
@@ -283,7 +309,11 @@ the system's author could not narrate it; the paradigm record is §10):
 - **Terminal aesthetic.** Monospace throughout, TUI-bordered panels, pure-black
   ground, saturated color slabs (engineers are the audience; the product is
   CLI-first). Both andons live in the header as bracketed meters; card drill-down is a
-  side panel showing the card's journal events as colored log lines.
+  side panel showing the card's journal events as colored log lines. In the TUI it is a
+  60-column scrolling drawer. There is no hover: the selected row's details go in a
+  status line. Keys: j/k select, enter opens the drawer, t toggles tool-call ticks for
+  the current harness attempt, r enters replay, esc closes. Mouse clicks work on rows
+  and ticks.
 - The station board from the first prototype round survives as a candidate *secondary*
   view for high-WIP flows (a future PRD), not part of v1.
 
@@ -291,14 +321,20 @@ the system's author could not narrate it; the paradigm record is §10):
 
 **Constraints:**
 
-- **Bun-only toolchain** (per ADR-0002/0003): the UI is a static React SPA bundled by
+- **TUI** renders with `@opentui/react` (Bun-native), pinned to an exact version while
+  it is pre-1.0. Tests use `@opentui/react/test-utils`: `captureCharFrame` for text
+  snapshots against `design/war-room/golden/`, `captureSpans` for colors, mock keys and
+  mouse for interaction, and `ManualClock` for countdowns and the watchdog.
+- **Bun-only toolchain** (per ADR-0002/0003): the TUI is TypeScript run by Bun, with no
+  `Bun.serve` endpoints, no SSE, and no listening port. The web UI is a static React SPA bundled by
   Bun's native bundler and served by `Bun.serve()` from the kernel binary. No Node,
   Vite, or Next.js toolchain; no separate deployable. This decision (one binary, no
   second service) should be recorded as an ADR at implementation time.
-- **Transport is one-directional SSE.** Chosen over WebSocket deliberately: the browser
+- **Web view only: transport is one-directional SSE.** Chosen over WebSocket deliberately: the browser
   has no channel to send commands back, which makes the no-write-path rule (§7) an
   architectural property instead of a convention. The only client-initiated calls are
-  read-only snapshot/range fetches.
+  read-only snapshot/range fetches. The TUI has no transport and listens on nothing, so
+  the no-write-path rule holds there for the same reason.
 - **Visual language is terminal/TUI** (s-tui / btop energy): pure black `#000` ground,
   monospace everywhere, saturated color slabs. Color encodes **station identity** on
   waterfall segments (a healthy card walks the spectrum left→right; a broken hue order
@@ -308,8 +344,8 @@ the system's author could not narrate it; the paradigm record is §10):
 
 **Dependencies:**
 
-- **[reactiveSWR](https://github.com/queso/reactiveSWR)** (our own library) is the
-  SSE-to-client bridge: its server channel handles wire format, heartbeats, connection
+- **[reactiveSWR](https://github.com/queso/reactiveSWR)** (our own library), for the web
+  view only. The TUI does not use it. It is the SSE-to-client bridge: its server channel handles wire format, heartbeats, connection
   tracking, and cleanup inside `Bun.serve`; its EventEmitter adapter bridges the journal
   tailer; SWR's revalidate-on-reconnect provides the snapshot self-healing in §8; its
   connection-status hook drives the LIVE/stale indicator. **Shape constraint:** the
@@ -322,11 +358,12 @@ the system's author could not narrate it; the paradigm record is §10):
 
 **Integration points:**
 
-- The existing CLI (new `watch` command), the Docker image (one exposed port), and the
+- The existing CLI (new `watch` command), the Docker image (one exposed port for the web
+  view, none for the TUI), and the
   journal schema (every gap found per FR-13 feeds the kaizen-pipe PRD).
-- The connection-status / kernel-liveness distinction: SSE heartbeats tell the browser
-  the *watch process* is alive; only a journal-level signal can say the *kernel* is
-  alive (see the heartbeat open question below).
+- The connection-status / kernel-liveness distinction: in the web view, SSE heartbeats
+  tell the browser the *watch process* is alive. In either surface, only a journal-level
+  heartbeat (FR-14) can say the *kernel* is alive.
 
 ## 10. Risks & Open Questions
 
@@ -336,29 +373,36 @@ the system's author could not narrate it; the paradigm record is §10):
 | Journal gaps are larger than expected — the UI is mostly "not recorded" | Medium | War Room ships hollow; kaizen schema work balloons | That discovery is a stated goal (§4); timebox the first pass, fix the top gaps in the journal, then finish the UI against the improved schema |
 | Read contention with a live kernel on one SQLite volume | Low | Lag or kernel slowdown | Kernel-writes-take-priority NFR; the journal/state split and WAL already exist for this reason — validate, don't redesign |
 | Scope creep toward run control (pause/retry/select buttons) | High | Write path sneaks in; second source of truth follows | The stop rule (§7) plus explicit out-of-scope listing; any control surface is its own PRD |
-| Replay diverges from live rendering | Low | Trust in the projection collapses | Same-code-path principle (§7); single shared projection function (§8); replay-fidelity metric (§4) |
-| Journal event bursts race the client cache update (a tick can append several rows back-to-back; folding must apply N sequential reducer steps, not lose updates) | Medium | Board renders a state the journal never contained | Add an interleaving/burst test to reactiveSWR before adoption; snapshot refetch is the recovery path either way |
+| Replay diverges from live rendering | Low | Trust in the projection collapses | Same-code-path principle (§7); single shared projection function (§8); replay-fidelity metric (§4); core test that replay equals live |
+| Journal event bursts fold incorrectly (a tick can append several rows back-to-back; the reader must hand the projection every row in sequence order and the projection must apply N sequential steps, not lose updates) | Medium | The screen shows a state the journal never contained | Core test: a burst of rows written in one tick folds to the same view as the same rows folded one at a time. Re-reading from sequence 0 is the recovery path. The web view adds the same test for its reactiveSWR cache before adoption |
 
 ### Open Questions
 
-- [ ] Run identity: today one state DB ≈ one run lineage. Does the War Room need a
-      run-selection affordance now, or does single-journal = single-run hold until the
-      fleet-view PRD?
-- [ ] Should replay be exportable (a shareable recording of a run) for launch material,
-      or is screen-capture enough for now?
-- [ ] Does the journal need a run-level "kernel heartbeat" entry so the staleness
-      indicator (crashed vs. slow) can be precise? Candidate first schema-gap item —
-      SSE heartbeats only prove the watch process is alive, not the kernel (§9).
+None open. Three were settled on 2026-09-29 (see Resolved).
 
 ### Resolved
 
-- [x] **Delivery surface** → local web view (React SPA), not a TUI. It is the demo
-      artifact; the projection contract would have been identical either way (§8, §9).
+- [x] **Run identity** (2026-09-29) → the simple choice: one journal is one run, with no
+      run picker in v1. Several flows may run at once; picking among them waits for the
+      fleet-view PRD.
+- [x] **Replay export** (2026-09-29) → screen capture is enough. A vhs recording of a
+      fixture run is the launch demo. No export format.
+- [x] **Kernel heartbeat** (2026-09-29) → yes. The kernel writes a run-level heartbeat
+      entry to the journal (FR-14). It is the first schema-gap item.
+- [x] **Delivery surface** → TUI first, web view second (revised 2026-09-28, #89). This
+      was first resolved as web only, because the web view is the demo artifact. It was
+      reversed because flows run on a remote box, where a TUI works over SSH with no port
+      or auth decision; the TUI needs no server layer; and its tests assert on rendered
+      text. A vhs recording of a fixture run serves as the demo. The projection contract
+      is identical for both (§8, §9).
 - [x] **Primary paradigm** → trace waterfall, not a station board. The board prototype
       failed the narration test (the author could not read it); the waterfall passed
       immediately. The journal is a trace; render it as one. Board demoted to a
       possible future secondary view for high-WIP flows (§8).
 - [x] **Where the process lives** → a `conduit watch` command in the existing kernel
-      binary, serving the SPA and the event stream itself. No separate service (§9).
-- [x] **Transport** → one-directional SSE via reactiveSWR, single-cache-key reducer
-      shape; replay re-folds locally without SSE (§9).
+      binary. No separate service (§9). Plain `conduit watch` is the TUI and serves nothing.
+      The web view is `conduit watch --web`, which also serves the SPA and the event
+      stream.
+- [x] **Transport** (web view only, 2026-09-29) → one-directional SSE via reactiveSWR,
+      single-cache-key reducer shape; replay re-folds locally without SSE (§9). The TUI
+      reads the journal in-process and has no transport.
