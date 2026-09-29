@@ -50,6 +50,21 @@ export type HarnessEventBody =
       breakdown: UsageBreakdown;
       costUsd?: number;
     }
+  /**
+   * The per-call gate's answer for one tool call (issue #21). Emitted for every
+   * call the gate sees, allowed or not, since the SDK reports a hook denial
+   * nowhere else (`result.permission_denials` stays empty for it).
+   * `agentId` is set when the call came from inside a subagent.
+   */
+  | {
+      type: 'gate-decision';
+      toolCallId?: string;
+      toolName: string;
+      decision: 'allow' | 'deny' | 'hold';
+      code?: string;
+      reason?: string;
+      agentId?: string;
+    }
   | { type: 'rate-limit'; status?: string; usingOverage?: boolean; windows: RateLimitWindow[] }
   | {
       type: 'lifecycle';
