@@ -320,12 +320,20 @@ describe('gate-decision rows (issue #21)', () => {
       const db = openConduitDB({ stateDbPath: join(dir, 'state.sqlite'), journalDbPath: journalPath });
       try {
         const sink = createHarnessEventJournalSink(db, SCOPE);
-        sink({ type: 'gate-decision', toolName: 'Read', decision: 'allow', seq: 0, attempt: 0, invocationId: 'new' });
+        sink({
+          type: 'gate-decision', toolName: 'Bash', decision: 'deny', code: 'not_allowlisted', reason: 'rm is not allowed',
+          agentId: 'sub-1', seq: 0, attempt: 0, invocationId: 'new',
+        });
         const rows = db.getHarnessEventsForRun('r1', 'c1');
-        expect(rows.map((r) => [r.invocationId, r.kind, r.decision])).toEqual([
-          ['old', 'lifecycle', null],
-          ['new', 'gate-decision', 'allow'],
+        expect(rows.map((r) => [r.invocationId, r.kind])).toEqual([
+          ['old', 'lifecycle'],
+          ['new', 'gate-decision'],
         ]);
+        // The legacy row reads every added column as null; the new row round-trips them.
+        expect(rows[0]).toMatchObject({ decision: null, gateCode: null, agentId: null, reason: null });
+        expect(rows[1]).toMatchObject({
+          decision: 'deny', gateCode: 'not_allowlisted', agentId: 'sub-1', reason: 'rm is not allowed',
+        });
       } finally {
         db.close();
       }
