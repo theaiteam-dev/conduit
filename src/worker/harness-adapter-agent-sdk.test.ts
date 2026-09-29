@@ -112,8 +112,9 @@ const isDead = (pid: number): boolean => {
   try {
     process.kill(pid, 0);
     return false;
-  } catch {
-    return true;
+  } catch (err) {
+    // EPERM means the process exists under another user, so it is not dead.
+    return (err as NodeJS.ErrnoException).code === 'ESRCH';
   }
 };
 

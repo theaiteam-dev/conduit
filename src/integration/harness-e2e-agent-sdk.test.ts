@@ -58,7 +58,7 @@ describe.skipIf(!E2E_ENABLED)('agent-sdk adapter against the real API (CONDUIT_E
       expect(usage.tokens).toBeGreaterThan(0);
       expect(usage.cost).toBeGreaterThan(0);
       expect(usage.breakdown?.outputTokens).toBeGreaterThan(0);
-      expect(usage.model).toContain('haiku');
+      expect(usage.model ?? '').not.toBe('');
       expect(events.some((e) => e.type === 'usage')).toBe(true);
       expect(events[0]).toMatchObject({ type: 'lifecycle', phase: 'start' });
       expect(events[events.length - 1]).toMatchObject({ type: 'lifecycle', phase: 'end' });

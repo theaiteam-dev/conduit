@@ -457,9 +457,11 @@ CREATE TABLE IF NOT EXISTS harness_events (
   rate_limit_windows_json      TEXT,
   phase                        TEXT,
   -- gate-decision (issue #21): the per-call tool gate's answer for one tool
-  -- call. tool_name and tool_call_id name the call. reason is truncated and
-  -- stripped of control characters before it is stored; it never carries a
-  -- tool input body. agent_id is set only for a call made inside a subagent.
+  -- call. tool_name and tool_call_id name the call. This layer stores what it
+  -- is given: the writer (harnessEventRow in harness-events-journal.ts)
+  -- truncates reason and strips control characters, and a test pins that. It
+  -- never carries a tool input body. agent_id is set only for a call made
+  -- inside a subagent.
   decision                     TEXT,
   gate_code                    TEXT,
   agent_id                     TEXT,
