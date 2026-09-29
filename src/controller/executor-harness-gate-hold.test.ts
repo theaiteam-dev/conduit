@@ -22,6 +22,7 @@ import type { ModelAdapter } from '../worker/adapter';
 import {
   createHarnessRegistry, type HarnessAdapter, type HarnessInvocation, type HarnessRegistry, type UsageReport,
 } from '../worker/harness-adapter';
+import { countGateReworks } from '../quality/rework';
 import { HARNESS_GATE_HOLD_CODE } from '../worker/harness-gate';
 import { createAgentSdkHarnessAdapter, type AgentSdkQueryFn } from '../worker/harness-adapter-agent-sdk';
 
@@ -305,6 +306,60 @@ describe('issue #21: a gate hold moves the card to hold', () => {
     expect(critic.calls).toHaveLength(1);
     expect(maker.calls).toHaveLength(1);
     expect(getCard(db, 'entry2')?.lane).toBe('coder');
+  });
+
+  it('holds a card whose critic is held on a rework pass, spending no attempt and no second rework', async () => {
+    db = openDb();
+    const maker = makeMaker();
+    // Attempt on the card at each critic call, so the hold is compared with the pass before it.
+    const attemptAtCall: number[] = [];
+    const criticCalls: HarnessInvocation[] = [];
+    const critic: HarnessAdapter = {
+      name: 'claude-critic',
+      reportsUsage: true,
+      canRestrictTools: true,
+      canGatePerCall: true,
+      async probeBinary() {
+        return { present: true };
+      },
+      async invoke(call) {
+        criticCalls.push(call);
+        attemptAtCall.push(getCard(db!)!.attempt);
+        if (criticCalls.length === 1) {
+          writeFileSync(
+            join(process.cwd(), 'verdict.json'),
+            JSON.stringify({ verdict: 'reject', findings: ['summary too short'] }),
+            'utf-8',
+          );
+          return { outputs: [], usage: { tokens: 0, cost: 0 } };
+        }
+        // The rework pass: the gate holds the critic for a human.
+        throw Object.assign(new Error('agent-sdk: the tool gate held the card on AskUserQuestion (needs_human)'), {
+          code: HARNESS_GATE_HOLD_CODE,
+          usage: { tokens: 0, cost: 0 },
+        });
+      },
+    };
+    const registry = createHarnessRegistry([maker.adapter, critic]);
+    seedCard(db, 'entry');
+    await run(writeFlow(dir, registry, { critic: true }), registry);
+
+    // Reject, back-edge to the maker, maker reruns, critic is held: two critic calls, two maker calls.
+    expect(criticCalls).toHaveLength(2);
+    expect(maker.calls).toHaveLength(2);
+    const card = getCard(db)!;
+    expect(card.lane).toBe('hold');
+    expect(card.status).toBe('held');
+    // The hold spent no execution attempt: the card sits where it was when the held critic was called.
+    expect(card.attempt).toBe(attemptAtCall[1]!);
+    // Only the first pass's reject counted as a rework, and it wrote the only verdict row.
+    const log = db.getCardLog('entry');
+    expect(countGateReworks(db.getCardLogForRun(DEFAULT_RUN_ID, 'entry'), 'coder')).toBe(1);
+    expect(log.filter((e) => e.kind === 'gate_verdict')).toHaveLength(1);
+    const reasons = log.filter((e) => e.kind === 'terminal').map((e) => (e as { reason: string }).reason);
+    expect(reasons.join('\n')).toContain('held the critic');
+    // Held for a human, not scrapped.
+    expect(log.some((e) => e.kind === 'entered_lane' && (e as { destLane?: string }).destLane === 'scrap')).toBe(false);
   });
 });
 

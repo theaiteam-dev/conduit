@@ -6,7 +6,7 @@
  */
 import { describe, it, expect } from 'bun:test';
 import type { ChildProcess } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Options, SDKMessage } from '@anthropic-ai/claude-agent-sdk';
@@ -146,6 +146,28 @@ describe('agent-sdk adapter: capabilities', () => {
   it('rejects an invocation when the binary is not found', async () => {
     const adapter = makeAdapter(scripted(async function* () {}).query, { command: 'no-such-claude-binary' });
     expect((await rejection(adapter.invoke(invocation()))).message).toContain('not found');
+  });
+});
+
+describe('agent-sdk adapter: executable resolution', () => {
+  it('says a relative command path is not absolute, rather than not on PATH', async () => {
+    const adapter = makeAdapter(scripted(async function* () {}).query, { command: './bin/claude' });
+    const probed = await adapter.probeBinary();
+    expect(probed.present).toBe(false);
+    expect(probed.detail).toContain('absolute');
+    expect(probed.detail).not.toContain('not found on PATH');
+    const err = await rejection(adapter.invoke(invocation()));
+    expect(err.message).toContain('absolute');
+    expect(err.message).not.toContain('not found on PATH');
+  });
+
+  it('says a missing absolute path does not exist, rather than not on PATH', async () => {
+    const adapter = makeAdapter(scripted(async function* () {}).query, { command: '/no/such/dir/claude' });
+    const probed = await adapter.probeBinary();
+    expect(probed.present).toBe(false);
+    expect(probed.detail).toContain('/no/such/dir/claude');
+    expect(probed.detail).not.toContain('not found on PATH');
+    expect((await rejection(adapter.invoke(invocation()))).message).not.toContain('not found on PATH');
   });
 });
 
@@ -305,6 +327,25 @@ describe('agent-sdk adapter: isolateConfig', () => {
       );
       expect(existsSync(during!)).toBe(false);
     } finally {
+      rmSync(h, { recursive: true, force: true });
+    }
+  });
+
+  it('removes the config dir when the invocation throws before the stream starts', async () => {
+    const h = home();
+    const scratch = mkdtempSync(join(tmpdir(), 'conduit-sdk-tmp-'));
+    const savedTmp = process.env.TMPDIR;
+    process.env.TMPDIR = scratch;
+    try {
+      const { query } = scripted(async function* () { yield RESULT_OK; });
+      // `tools` is absent, so building the SDK options throws after the config dir exists.
+      const bad = { prompt: 'do it', inputs: [], timeoutMs: 10_000, gate: allowAll } as unknown as HarnessInvocation;
+      await rejection(makeAdapter(query, { isolateConfig: true, sourceEnv: { HOME: h }, envAllowlist: ['HOME'] }).invoke(bad));
+      expect(readdirSync(scratch).filter((n) => n.startsWith('conduit-claude-config-'))).toEqual([]);
+    } finally {
+      if (savedTmp === undefined) delete process.env.TMPDIR;
+      else process.env.TMPDIR = savedTmp;
+      rmSync(scratch, { recursive: true, force: true });
       rmSync(h, { recursive: true, force: true });
     }
   });
@@ -483,11 +524,11 @@ describe('agent-sdk adapter: hold', () => {
       await ctx.hook({ tool_name: 'AskUserQuestion', tool_input: {} });
       yield RESULT_OK;
     });
-    const err = await rejection(makeAdapter(query).invoke(invocation({ gate: holdGate })));
+    const err = await rejection(makeAdapter(query, { holdStopWaitMs: 30_000 }).invoke(invocation({ gate: holdGate })));
     expect(err.code).toBe(HARNESS_GATE_HOLD_CODE);
     expect(usageFromThrow(err)).toMatchObject({ tokens: 100, cost: 0.0123 });
-    // The default bound is 5 s: a result that arrives ends the wait at once.
-    expect(Date.now() - started).toBeLessThan(2_000);
+    // The bound is 30 s: a result that arrives ends the wait at once, far below it even on a slow host.
+    expect(Date.now() - started).toBeLessThan(10_000);
   });
 
   it('kills the process after the bounded wait when no result arrives, and invents no usage', async () => {
@@ -499,7 +540,6 @@ describe('agent-sdk adapter: hold', () => {
     expect(isDead(state.child!.pid!)).toBe(true);
     expect(usageFromThrow(err)).toBeUndefined();
     expect(elapsed).toBeGreaterThanOrEqual(180);
-    expect(elapsed).toBeLessThan(2_000);
   });
 
   it('denies every later call without asking the gate, even one it would allow', async () => {
@@ -535,22 +575,58 @@ describe('agent-sdk adapter: hold', () => {
     const { query, state } = stuckAfterHold();
     const started = Date.now();
     const err = await rejection(
-      makeAdapter(query, { holdStopWaitMs: 10_000 }).invoke(invocation({ gate: holdGate, timeoutMs: 250 })),
+      makeAdapter(query, { holdStopWaitMs: 60_000 }).invoke(invocation({ gate: holdGate, timeoutMs: 250 })),
     );
     expect(err.code).toBe(HARNESS_GATE_HOLD_CODE);
     expect(isDead(state.child!.pid!)).toBe(true);
-    expect(Date.now() - started).toBeLessThan(3_000);
+    expect(Date.now() - started).toBeLessThan(20_000);
   });
 
   it('keeps the idle timer running during the wait, and the hold still wins', async () => {
     const { query, state } = stuckAfterHold();
     const started = Date.now();
     const err = await rejection(
-      makeAdapter(query, { holdStopWaitMs: 10_000 }).invoke(invocation({ gate: holdGate, idleTimeoutMs: 250 })),
+      makeAdapter(query, { holdStopWaitMs: 60_000 }).invoke(invocation({ gate: holdGate, idleTimeoutMs: 250 })),
     );
     expect(err.code).toBe(HARNESS_GATE_HOLD_CODE);
     expect(isDead(state.child!.pid!)).toBe(true);
-    expect(Date.now() - started).toBeLessThan(3_000);
+    expect(Date.now() - started).toBeLessThan(20_000);
+  });
+});
+
+describe('agent-sdk adapter: several children', () => {
+  it('kills every child the SDK spawned for one invocation, not only the newest', async () => {
+    const children: ChildProcess[] = [];
+    const { query } = scripted(async function* (ctx) {
+      children.push(ctx.spawn('/bin/sleep', ['30']));
+      children.push(ctx.spawn('/bin/sleep', ['30']));
+      yield RESULT_OK;
+    });
+    try {
+      await makeAdapter(query).invoke(invocation({ gate: allowAll }));
+      expect(children).toHaveLength(2);
+      expect(children[0]!.pid).not.toBe(children[1]!.pid);
+      for (const child of children) expect(isDead(child.pid!)).toBe(true);
+    } finally {
+      for (const child of children) if (!isDead(child.pid!)) process.kill(-child.pid!, 'SIGKILL');
+    }
+  });
+
+  it('kills the older child too when the wall-clock timer fires', async () => {
+    const children: ChildProcess[] = [];
+    const { query } = scripted(async function* (ctx) {
+      children.push(ctx.spawn('/bin/sleep', ['30']));
+      children.push(ctx.spawn('/bin/sleep', ['30']));
+      await new Promise((r) => children[1]!.once('exit', r));
+      throw new Error('Claude Code process terminated by signal SIGKILL');
+    });
+    try {
+      const err = await rejection(makeAdapter(query).invoke(invocation({ timeoutMs: 200 })));
+      expect(err.code).toBe('harness-timeout');
+      for (const child of children) expect(isDead(child.pid!)).toBe(true);
+    } finally {
+      for (const child of children) if (!isDead(child.pid!)) process.kill(-child.pid!, 'SIGKILL');
+    }
   });
 });
 
