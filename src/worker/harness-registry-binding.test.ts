@@ -340,4 +340,27 @@ describe('buildHarnessDefinitionRegistry — two-phase config + binding', () => 
       expect(error).toContain('whatever');
     });
   });
+
+  // Issue #21: the agent-sdk adapter acts on _ISOLATE_CONFIG only. A registry that did not list it
+  // for the adapter would reject the option; one that listed it for named agents would drop them.
+  describe('adapter-specific options on agent-sdk', () => {
+    const sdkDef = (over: Partial<HarnessAdapterConfigDef> = {}): HarnessAdapterConfigDef => ({
+      name: 'agent-sdk',
+      envAllowlist: ['HOME', 'PATH'],
+      ...over,
+    });
+
+    it('accepts isolateConfig and binds an adapter', () => {
+      const registry = buildHarnessDefinitionRegistry([sdkDef({ isolateConfig: true })]);
+      const adapter = expectOk(registry.resolve('agent-sdk'));
+      expect(adapter.bind('/tmp').name).toBe('agent-sdk');
+    });
+
+    it.each([
+      ['pluginDirs', { pluginDirs: ['/opt/plugins'] }],
+      ['agent', { agent: 'team:coder' }],
+    ] as const)('rejects %s rather than dropping it', (_name, over) => {
+      expect(() => buildHarnessDefinitionRegistry([sdkDef(over)])).toThrow('does not support');
+    });
+  });
 });
