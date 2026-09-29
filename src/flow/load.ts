@@ -1608,10 +1608,15 @@ function collectErrors(
           errors.push({
             code: 'HARNESS_GATED_ADAPTER_NEEDS_TOOLS',
             message:
-              `Station '${station.id}' uses adapter '${resolved.adapter.name}', which gates every tool ` +
-              `call against the station's tools list and denies any tool not listed, so ` +
-              `${waived ? 'unrestricted_tools: true has no effect and ' : ''}a station with no tools list ` +
-              `can do nothing. List the tools it needs (at least Write, for its output file)`,
+              tools.length === 0
+                ? `Station '${station.id}' uses adapter '${resolved.adapter.name}', which gates every tool ` +
+                  `call against the station's tools list and denies any tool not listed, so ` +
+                  `${waived ? 'unrestricted_tools: true has no effect and ' : ''}a station with no tools list ` +
+                  `can do nothing. List the tools it needs (at least Write, for its output file)`
+                : `Station '${station.id}' uses adapter '${resolved.adapter.name}', which gates every tool ` +
+                  `call against the station's tools list, so unrestricted_tools: true has no effect there and ` +
+                  `the tools list alone governs. Remove unrestricted_tools, or drop the list and use an adapter ` +
+                  `that does not gate per call`,
           });
         }
       }

@@ -391,6 +391,17 @@ describe('issue #21 — a per-call gating adapter needs a tools list (HARNESS_GA
     );
     expect(errorCodes(result)).toContain('HARNESS_GATED_ADAPTER_NEEDS_TOOLS');
     expect(JSON.stringify(result)).toContain('unrestricted_tools: true has no effect');
+    // The list is present and governs, so the message must not claim the station can do nothing.
+    expect(JSON.stringify(result)).not.toContain('can do nothing');
+  });
+
+  it('says a waiver with no tools list leaves the station unable to do anything', () => {
+    const result = loadHarness(
+      harnessFlow({ toolsLine: '', waiverLine: 'unrestricted_tools: true' }),
+      { registry: gating(), extraFiles: CODER_PROMPT },
+    );
+    expect(errorCodes(result)).toContain('HARNESS_GATED_ADAPTER_NEEDS_TOOLS');
+    expect(JSON.stringify(result)).toContain('can do nothing');
   });
 
   it('rejects a station that declares no tools list', () => {
