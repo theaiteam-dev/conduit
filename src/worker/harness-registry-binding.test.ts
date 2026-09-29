@@ -356,10 +356,10 @@ describe('buildHarnessDefinitionRegistry — two-phase config + binding', () => 
       expect(adapter.bind('/tmp').name).toBe('agent-sdk');
     });
 
-    it.each([
+    it.each<[string, Partial<HarnessAdapterConfigDef>]>([
       ['pluginDirs', { pluginDirs: ['/opt/plugins'] }],
       ['agent', { agent: 'team:coder' }],
-    ] as const)('rejects %s rather than dropping it', (_name, over) => {
+    ])('rejects %s rather than dropping it', (_name, over) => {
       expect(() => buildHarnessDefinitionRegistry([sdkDef(over)])).toThrow('does not support');
     });
   });
