@@ -19,6 +19,9 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:f
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
+/** Roots createRunScopedOpenCodeDirs returned and removeRunScopedOpenCodeDirs has not yet removed. */
+const createdRoots = new Set<string>();
+
 /** The XDG variables the child is pointed at, all under one run-scoped directory. */
 export interface RunScopedOpenCodeDirs {
   root: string;
@@ -39,7 +42,7 @@ export function createRunScopedOpenCodeDirs(): RunScopedOpenCodeDirs {
       mkdirSync(path);
       return path;
     };
-    return {
+    const dirs = {
       root,
       env: {
         XDG_CONFIG_HOME: dir('config'),
@@ -48,15 +51,27 @@ export function createRunScopedOpenCodeDirs(): RunScopedOpenCodeDirs {
         XDG_CACHE_HOME: dir('cache'),
       },
     };
+    createdRoots.add(root);
+    return dirs;
   } catch (err) {
     rmSync(root, { recursive: true, force: true });
     throw err;
   }
 }
 
-/** Delete a directory made by createRunScopedOpenCodeDirs. */
+/**
+ * Delete a directory made by createRunScopedOpenCodeDirs.
+ * Throws, deleting nothing, for a root this module did not create or has already removed.
+ * Throws when the directory survives removal, and keeps the root registered so a retry can succeed.
+ */
 export function removeRunScopedOpenCodeDirs(dirs: RunScopedOpenCodeDirs): void {
-  rmSync(dirs.root, { recursive: true, force: true });
+  const root = dirs.root;
+  if (!createdRoots.has(root)) {
+    throw new Error(`refusing to remove '${root}': not a run-scoped opencode directory`);
+  }
+  rmSync(root, { recursive: true, force: true });
+  if (existsSync(root)) throw new Error(`could not remove run-scoped opencode directory '${root}'`);
+  createdRoots.delete(root);
 }
 
 /** The operator's `auth.json` as the kernel sees it: $XDG_DATA_HOME, else $HOME/.local/share. */
@@ -83,18 +98,19 @@ export const OPENCODE_PROVIDER_ENV_VARS: Readonly<Record<string, readonly string
 
 /** Split `provider/model`. The model id may itself contain slashes (`openrouter/anthropic/claude`). */
 export function splitOpenCodeModel(model: string | undefined): { providerID: string; modelID: string } | { error: string } {
-  if (model === undefined || model.trim() === '') {
+  const trimmed = model?.trim();
+  if (trimmed === undefined || trimmed === '') {
     return {
       error:
         'no model is configured: set the station model or CONDUIT_HARNESS_OPENCODE_MODEL to ' +
         '`provider/model` (there is no safe default)',
     };
   }
-  const slash = model.indexOf('/');
-  if (slash <= 0 || slash === model.length - 1) {
-    return { error: `model ${JSON.stringify(model.slice(0, 80))} is not in the form provider/model` };
+  const slash = trimmed.indexOf('/');
+  if (slash <= 0 || slash === trimmed.length - 1) {
+    return { error: `model ${JSON.stringify(trimmed.slice(0, 80))} is not in the form provider/model` };
   }
-  return { providerID: model.slice(0, slash), modelID: model.slice(slash + 1) };
+  return { providerID: trimmed.slice(0, slash), modelID: trimmed.slice(slash + 1) };
 }
 
 /**

@@ -3,7 +3,7 @@
  * and the per-invocation XDG directories.
  */
 import { describe, it, expect, afterAll, afterEach } from 'bun:test';
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -37,6 +37,10 @@ describe('splitOpenCodeModel', () => {
   it('splits at the first slash', () => {
     expect(splitOpenCodeModel('openai/gpt-4.1-mini')).toEqual({ providerID: 'openai', modelID: 'gpt-4.1-mini' });
     expect(splitOpenCodeModel('openrouter/anthropic/claude')).toEqual({ providerID: 'openrouter', modelID: 'anthropic/claude' });
+  });
+
+  it('trims the value before splitting', () => {
+    expect(splitOpenCodeModel('  openai/gpt-x ')).toEqual({ providerID: 'openai', modelID: 'gpt-x' });
   });
 
   it('errors for an absent, blank, provider-less or model-less value', () => {
@@ -100,6 +104,36 @@ describe('run-scoped directories', () => {
       expect(path.startsWith(dirs.root)).toBe(true);
     }
     expect(Object.keys(dirs.env).sort()).toEqual(['XDG_CACHE_HOME', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_STATE_HOME']);
+    removeRunScopedOpenCodeDirs(dirs);
+    expect(existsSync(dirs.root)).toBe(false);
+  });
+
+  it('refuses a directory it did not create and leaves it in place', () => {
+    const foreign = mkdtempSync(join(tmpdir(), 'conduit-opencode-'));
+    made.push(foreign);
+    writeFileSync(join(foreign, 'keep.txt'), 'x');
+    expect(() => removeRunScopedOpenCodeDirs({ root: foreign, env: {} as never })).toThrow(/run-scoped/);
+    expect(existsSync(join(foreign, 'keep.txt'))).toBe(true);
+  });
+
+  it('refuses a second removal of the same dirs', () => {
+    const dirs = createRunScopedOpenCodeDirs();
+    removeRunScopedOpenCodeDirs(dirs);
+    expect(() => removeRunScopedOpenCodeDirs(dirs)).toThrow(/run-scoped/);
+  });
+
+  // chmod does not stop root, so the failure cannot be simulated there.
+  it.skipIf(process.getuid?.() === 0)('throws on a failed removal and keeps the root removable by a retry', () => {
+    const dirs = createRunScopedOpenCodeDirs();
+    made.push(dirs.root);
+    writeFileSync(join(dirs.env.XDG_DATA_HOME, 'f'), 'x');
+    chmodSync(dirs.env.XDG_DATA_HOME, 0o500);
+    try {
+      expect(() => removeRunScopedOpenCodeDirs(dirs)).toThrow();
+      expect(existsSync(dirs.root)).toBe(true);
+    } finally {
+      chmodSync(dirs.env.XDG_DATA_HOME, 0o700);
+    }
     removeRunScopedOpenCodeDirs(dirs);
     expect(existsSync(dirs.root)).toBe(false);
   });

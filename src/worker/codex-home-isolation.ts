@@ -96,6 +96,7 @@ export function removeRunScopedCodexHome(dir: string): void {
   if (!createdHomes.has(dir)) {
     throw new Error(`refusing to remove '${dir}': not a run-scoped codex home`);
   }
-  createdHomes.delete(dir);
   rmSync(dir, { recursive: true, force: true });
+  // Forgotten only after a successful removal, so a failed one can be retried.
+  createdHomes.delete(dir);
 }

@@ -1173,7 +1173,12 @@ export function createOpenCodeHarnessAdapter(config: OpenCodeHarnessAdapterConfi
           withUsage,
         );
       } finally {
-        removeRunScopedOpenCodeDirs(dirs);
+        // A throw here would replace the call's own result or error, so report it and move on.
+        try {
+          removeRunScopedOpenCodeDirs(dirs);
+        } catch (err) {
+          process.stderr.write(`opencode: ${err instanceof Error ? err.message : String(err)}\n`);
+        }
       }
     },
   };

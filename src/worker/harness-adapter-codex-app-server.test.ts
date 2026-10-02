@@ -180,7 +180,10 @@ const CMD = (command: string, extra: Json = {}): Json => ({
   kind: 'command', threadId: 'thr-root', turnId: 'turn-1', itemId: 'item-1', command, cwd: ROOT, commandActions: [], ...extra,
 });
 const wrap = (script: string): string => `/usr/bin/zsh -lc '${script}'`;
-const decisionOf = (m: Json): unknown => m.result?.decision ?? m.result?.action;
+/** Command and file-change approvals answer `{ decision }`. */
+const decisionOf = (m: Json): unknown => m.result?.decision;
+/** MCP elicitations answer `{ action }`. */
+const actionOf = (m: Json): unknown => m.result?.action;
 
 /** Run a scenario that sends one request per entry, records the client's answers, then completes the turn. */
 async function answers(
@@ -857,17 +860,17 @@ describe('codex-app-server adapter: only accept, decline and cancel are ever sen
   it('never sends acceptForSession or an amendment decision, whatever the gate answers', async () => {
     let n = 0;
     const gate = spyGate((c) => (c.toolName === 'Bash' && n++ % 3 === 0 ? { decision: 'allow' } : deny())).gate;
+    const requestsSent: Array<[string, Json]> = [
+      ['item/commandExecution/requestApproval', { ...CMD(wrap('cat a')), availableDecisions: ['accept', { acceptWithExecpolicyAmendment: { execpolicy_amendment: ['cat'] } }, 'acceptForSession'], proposedExecpolicyAmendment: ['cat'], proposedNetworkPolicyAmendments: [{ host: 'x', action: 'allow' }] }],
+      ['item/commandExecution/requestApproval', CMD(wrap('rm x'))],
+      ['item/fileChange/requestApproval', { threadId: 'thr-root', turnId: 'turn-1', itemId: 'fc-1', reason: null, grantRoot: null }],
+      ['mcpServer/elicitation/request', { threadId: 'thr-root', serverName: 's', message: 'tool "t"' }],
+      ['item/permissions/requestApproval', { threadId: 'thr-root' }],
+      ['item/commandExecution/requestApproval', CMD(wrap('cat b'))],
+    ];
     const server = fakeServer(async (p) => {
       p.started({ type: 'fileChange', id: 'fc-1', changes: [{ path: '/p/a', kind: { type: 'add' }, diff: '' }], status: 'inProgress' });
-      const requests: Array<[string, Json]> = [
-        ['item/commandExecution/requestApproval', { ...CMD(wrap('cat a')), availableDecisions: ['accept', { acceptWithExecpolicyAmendment: { execpolicy_amendment: ['cat'] } }, 'acceptForSession'], proposedExecpolicyAmendment: ['cat'], proposedNetworkPolicyAmendments: [{ host: 'x', action: 'allow' }] }],
-        ['item/commandExecution/requestApproval', CMD(wrap('rm x'))],
-        ['item/fileChange/requestApproval', { threadId: 'thr-root', turnId: 'turn-1', itemId: 'fc-1', reason: null, grantRoot: null }],
-        ['mcpServer/elicitation/request', { threadId: 'thr-root', serverName: 's', message: 'tool "t"' }],
-        ['item/permissions/requestApproval', { threadId: 'thr-root' }],
-        ['item/commandExecution/requestApproval', CMD(wrap('cat b'))],
-      ];
-      for (const [m, params] of requests) await p.request(m, params);
+      for (const [m, params] of requestsSent) await p.request(m, params);
       p.completeTurn();
     });
     await adapterWith(server).invoke(invocation({ gate }));
@@ -877,10 +880,12 @@ describe('codex-app-server adapter: only accept, decline and cancel are ever sen
     expect(text).not.toContain('acceptForSession');
     expect(text).not.toContain('Amendment');
     expect(text).not.toContain('execpolicy');
-    for (const m of responses) {
-      const d = m.result?.decision ?? m.result?.action;
-      if (m.error === undefined) expect(['accept', 'decline', 'cancel']).toContain(d);
-    }
+    const kinds = requestsSent.map(([method]) => method);
+    responses.forEach((m, i) => {
+      if (m.error !== undefined) return;
+      const d = kinds[i] === 'mcpServer/elicitation/request' ? actionOf(m) : decisionOf(m);
+      expect(['accept', 'decline', 'cancel']).toContain(d as string);
+    });
   });
 });
 

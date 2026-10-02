@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'bun:test';
-import { existsSync, lstatSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -88,6 +88,24 @@ describe('createRunScopedCodexHome', () => {
     expect(existsSync(inner)).toBe(true);
   });
 
+  // chmod does not stop root, so the failure cannot be simulated there.
+  it.skipIf(process.getuid?.() === 0)('keeps the dir removable by a second call after a failed removal', () => {
+    const { env } = operator('{}');
+    const dir = createRunScopedCodexHome(env, []);
+    cleanup.push(dir);
+    mkdirSync(join(dir, 'sub'));
+    writeFileSync(join(dir, 'sub', 'f'), 'x');
+    chmodSync(join(dir, 'sub'), 0o500);
+    try {
+      expect(() => removeRunScopedCodexHome(dir)).toThrow();
+      expect(existsSync(dir)).toBe(true);
+    } finally {
+      chmodSync(join(dir, 'sub'), 0o700);
+    }
+    removeRunScopedCodexHome(dir);
+    expect(existsSync(dir)).toBe(false);
+  });
+
   it('refuses a prefix-matching dir under the temp dir that this module did not create', () => {
     const foreign = mkdtempSync(join(tmpdir(), PREFIX));
     cleanup.push(foreign);
@@ -137,7 +155,10 @@ describe('createRunScopedCodexHome', () => {
     const proc = Bun.spawnSync([process.execPath, '-e', script], {
       env: { ...process.env, TMPDIR: tmp, CHI_ENV: JSON.stringify(env) },
     });
-    const out = JSON.parse(proc.stdout.toString().trim().split('\n').pop()!) as { msg: string; left: string[] };
+    if (proc.exitCode !== 0) throw new Error(`child exited ${proc.exitCode}: ${proc.stderr.toString()}`);
+    const lines = proc.stdout.toString().trim();
+    if (lines === '') throw new Error(`child printed nothing: ${proc.stderr.toString()}`);
+    const out = JSON.parse(lines.split('\n').pop()!) as { msg: string; left: string[] };
     expect(out.msg).toContain('simulated');
     expect(out.left).toEqual([]);
   });

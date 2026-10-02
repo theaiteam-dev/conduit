@@ -979,7 +979,12 @@ export function createCodexAppServerHarnessAdapter(config: CodexAppServerHarness
           withUsage,
         );
       } finally {
-        removeRunScopedCodexHome(codexHome);
+        // A throw here would replace the call's own result or error, so report it and move on.
+        try {
+          removeRunScopedCodexHome(codexHome);
+        } catch (err) {
+          process.stderr.write(`codex-app-server: ${err instanceof Error ? err.message : String(err)}\n`);
+        }
       }
     },
   };
