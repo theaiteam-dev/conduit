@@ -251,6 +251,8 @@ function parseUsage(info: Json): MessageUsage | undefined {
   const cacheWrite = num(cache.write) ?? 0;
   return {
     cost: num(info.cost) ?? 0,
+    // opencode stores input, output, reasoning and cache as disjoint parts (input excludes cache,
+    // output excludes reasoning), so their sum is the total when it is absent.
     total: num(tokens.total) ?? input + output + reasoning + cacheRead + cacheWrite,
     input, output, reasoning, cacheRead, cacheWrite,
     model: str(info.modelID),
@@ -933,6 +935,8 @@ export function createOpenCodeHarnessAdapter(config: OpenCodeHarnessAdapterConfi
           killAll();
           finish({ kind: 'timeout' });
         }, call.timeoutMs);
+        // One-shot counterpart: runHarnessProcess (worker/harness-runner.ts) has the same idle guard. It cannot drive a
+        // long-lived session, so both exist: a change to idle-timeout semantics must be made in both.
         let idleTimer: ReturnType<typeof setTimeout> | undefined;
         const resetIdleTimer = (): void => {
           if (call.idleTimeoutMs === undefined || st.finished) return;
@@ -1084,7 +1088,8 @@ export function createOpenCodeHarnessAdapter(config: OpenCodeHarnessAdapterConfi
             tokens += u.total;
             cost += u.cost;
             input += u.input;
-            // Reasoning tokens are counted in `total` and reported apart from `output`.
+            // opencode reports reasoning apart from output. outputTokens follows the claude and codex
+            // adapters, where output includes reasoning.
             output += u.output + u.reasoning;
             cacheRead += u.cacheRead;
             cacheWrite += u.cacheWrite;

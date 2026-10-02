@@ -34,6 +34,10 @@ const E2E_ENABLED = !!process.env.CONDUIT_E2E_CODEX_APP_SERVER && Bun.which('cod
 const MODEL = process.env.CONDUIT_E2E_CODEX_APP_SERVER_MODEL ?? 'gpt-5.6-luna';
 const TIMEOUT_MS = 120_000;
 
+function isDeniedTxtBash(call: GateToolCall): boolean {
+  return call.toolName === 'Bash' && String((call.input as { command?: unknown }).command).includes('denied.txt');
+}
+
 function adapterFor(projectRoot: string) {
   return createCodexAppServerHarnessAdapter({ projectRoot, envAllowlist: ['PATH'], model: MODEL });
 }
@@ -68,6 +72,7 @@ describe.skipIf(!E2E_ENABLED)('codex-app-server adapter against the real API (CO
     const root = realpathSync(mkdtempSync(join(tmpdir(), 'conduit-e2e-codex-app-')));
     try {
       const events: HarnessEvent[] = [];
+      const seen: GateToolCall[] = [];
       await adapterFor(root).invoke({
         prompt:
           'Run this exact shell command: echo denied > denied.txt . ' +
@@ -75,9 +80,14 @@ describe.skipIf(!E2E_ENABLED)('codex-app-server adapter against the real API (CO
         inputs: [],
         tools: ['Bash'],
         timeoutMs: TIMEOUT_MS,
-        gate: (call) => ({ decision: 'deny', code: 'not_allowlisted', reason: `no ${call.toolName}` }),
+        gate: (call) => {
+          seen.push(call);
+          return { decision: 'deny', code: 'not_allowlisted', reason: `no ${call.toolName}` };
+        },
         onEvent: (e) => events.push(e),
       });
+      // The model must have actually attempted the write, else absence of the file proves nothing.
+      expect(seen.some(isDeniedTxtBash)).toBe(true);
       expect(existsSync(join(root, 'denied.txt'))).toBe(false);
       const decisions = events.filter((e) => e.type === 'gate-decision');
       expect(decisions.length).toBeGreaterThan(0);
@@ -91,22 +101,28 @@ describe.skipIf(!E2E_ENABLED)('codex-app-server adapter against the real API (CO
     const root = realpathSync(mkdtempSync(join(tmpdir(), 'conduit-e2e-codex-app-')));
     try {
       const events: HarnessEvent[] = [];
+      const seen: GateToolCall[] = [];
       let error: (Error & { code?: string }) | undefined;
       try {
         await adapterFor(root).invoke({
-          prompt: 'Run this exact shell command: touch held.txt . Then say done.',
+          prompt: 'Run this exact shell command: echo denied > denied.txt . Then say done.',
           inputs: [],
           tools: ['Bash'],
           timeoutMs: TIMEOUT_MS,
-          gate: () => ({ decision: 'hold', code: 'needs_human', reason: 'ask a human' }),
+          gate: (call) => {
+            seen.push(call);
+            return { decision: 'hold', code: 'needs_human', reason: 'ask a human' };
+          },
           onEvent: (e) => events.push(e),
         });
       } catch (err) {
         error = err as Error & { code?: string };
       }
       expect(error?.code).toBe(HARNESS_GATE_HOLD_CODE);
-      expect(existsSync(join(root, 'held.txt'))).toBe(false);
+      expect(existsSync(join(root, 'denied.txt'))).toBe(false);
       expect(events.some((e) => e.type === 'gate-decision' && e.decision === 'hold')).toBe(true);
+      // The hold ends the call, so the held call is the last one the gate saw and must be the Bash write.
+      expect(isDeniedTxtBash(seen[seen.length - 1]!)).toBe(true);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

@@ -837,11 +837,11 @@ describe('opencode adapter: mapping asks to the gate', () => {
     const o = await run(async (s) => {
       const pending = s.ask({ permission: 'bash', patterns: ['cat a.txt'], tool: { messageID: 'msg_1', callID: 'c1' } });
       s.part({ callID: 'c1', tool: 'bash', status: 'pending', input: {} });
-      await Bun.sleep(40);
+      await Bun.sleep(150);
       s.part({ callID: 'c1', tool: 'bash', status: 'running', input: { command: 'cat a.txt' } });
       expect((await pending)?.reply).toBe('once');
       finish(s);
-    }, { gate: gateFor(tools) });
+    }, { gate: gateFor(tools), config: { toolPartWaitMs: 5_000 } });
     expect(o.gateCalls[0]?.input).toEqual({ command: 'cat a.txt' });
   });
 
@@ -962,9 +962,8 @@ describe('opencode adapter: question tool and hold', () => {
     const o = await run(async (s) => {
       s.assistant('msg_1', { cost: 0.001, tokens: USAGE_1 });
       s.emit('question.asked', { id: 'que_1', sessionID: s.sessionID, questions: [], tool: { messageID: 'msg_1', callID: 'q1' } });
-      await Bun.sleep(20);
       s.emit('question.asked', { id: 'que_2', sessionID: s.sessionID, questions: [], tool: { messageID: 'msg_1', callID: 'q2' } });
-    }, { fake: { rejectDelayMs: { que_1: 120 } } });
+    }, { fake: { rejectDelayMs: { que_1: 400 } }, config: { holdStopWaitMs: 5_000 } });
     expect(o.error?.code).toBe(HARNESS_GATE_HOLD_CODE);
     const tl = o.fake.state.timeline;
     const firstDone = tl.indexOf('done /question/que_1/reject');
@@ -1005,11 +1004,11 @@ describe('opencode adapter: question tool and hold', () => {
       expect(first?.reply).toBe('reject');
       const second = await s.bash('c2', 'cat a.txt');
       expect(second?.reply).toBe('reject');
-      await Bun.sleep(60);
+      await Bun.sleep(300);
       abortBeforeUsage = s.requests.some((r) => r.path.endsWith('/abort'));
       s.mark('usage');
       s.assistant('msg_1', { cost: 0.003, tokens: USAGE_1 });
-    }, { gate });
+    }, { gate, config: { holdStopWaitMs: 5_000 } });
     expect(gateCount).toBe(1);
     expect(abortBeforeUsage).toBe(false);
     expect(o.error?.code).toBe(HARNESS_GATE_HOLD_CODE);
@@ -1051,7 +1050,7 @@ describe('opencode adapter: question tool and hold', () => {
     const o = await run(async (s) => {
       s.assistant('msg_0', { cost: 0.001, tokens: { total: 50, input: 20, output: 30, reasoning: 0, cache: { read: 0, write: 0 } } });
       await s.ask({ permission: 'question', patterns: ['*'], tool: null });
-      await Bun.sleep(60);
+      await Bun.sleep(300);
       abortBeforeUsage = s.requests.some((r) => r.path.endsWith('/abort'));
       s.assistant('msg_1', { cost: 0.003, tokens: USAGE_1 });
       s.idle();
@@ -1124,7 +1123,20 @@ describe('opencode adapter: sessions and usage', () => {
       s.assistant('m1', { tokens: { input: 10, output: 20, reasoning: 5, cache: { read: 30, write: 1 } } });
       s.idle();
     });
-    expect((o.result!.usage as KnownUsage).tokens).toBe(66);
+    const usage = o.result!.usage as KnownUsage;
+    // input excludes cache and output excludes reasoning in opencode, so the parts add up.
+    expect(usage.tokens).toBe(66);
+    expect(usage.breakdown).toEqual({ inputTokens: 10, outputTokens: 25, cacheReadInputTokens: 30, cacheCreationInputTokens: 1 });
+  });
+
+  it('folds reasoning into outputTokens and keeps the reported total', async () => {
+    const o = await run((s) => {
+      s.assistant('m1', { tokens: { total: 100, input: 10, output: 20, reasoning: 7, cache: { read: 60, write: 3 } } });
+      s.idle();
+    });
+    const usage = o.result!.usage as KnownUsage;
+    expect(usage.tokens).toBe(100);
+    expect(usage.breakdown).toEqual({ inputTokens: 10, outputTokens: 27, cacheReadInputTokens: 60, cacheCreationInputTokens: 3 });
   });
 
   it('completes with an empty output list, as the other supervised adapters do', async () => {
@@ -1206,7 +1218,7 @@ describe('opencode adapter: failures', () => {
   it('keeps waiting through a retry status that is not a rate limit', async () => {
     const o = await run(async (s) => {
       s.status({ type: 'retry', attempt: 1, message: 'Service Unavailable', next: Date.now() + 10 });
-      await Bun.sleep(30);
+      await Bun.sleep(100);
       finish(s);
     });
     expect(o.error).toBeUndefined();
@@ -1312,11 +1324,11 @@ describe('opencode adapter: timeouts and containment', () => {
 
   it('kills the server and throws harness-idle-timeout when only heartbeats arrive', async () => {
     const o = await run(async (s) => {
-      for (let i = 0; i < 20; i++) {
+      for (let i = 0; i < 50; i++) {
         s.heartbeat();
-        await Bun.sleep(30);
+        await Bun.sleep(20);
       }
-    }, { invocation: { timeoutMs: 5_000, idleTimeoutMs: 200 } });
+    }, { invocation: { timeoutMs: 5_000, idleTimeoutMs: 500 } });
     expect(o.error?.code).toBe('harness-idle-timeout');
     expect(o.events[o.events.length - 1]).toMatchObject({ type: 'lifecycle', phase: 'idle-timeout' });
   });
@@ -1324,14 +1336,15 @@ describe('opencode adapter: timeouts and containment', () => {
   it('does not idle out while real events keep arriving, and reports progress', async () => {
     let progress = 0;
     const o = await run(async (s) => {
-      for (let i = 0; i < 8; i++) {
+      // The run outlasts the idle timeout, so only a reset on each event lets it finish.
+      for (let i = 0; i < 40; i++) {
         s.assistant('m1', { tokens: USAGE_1 });
-        await Bun.sleep(50);
+        await Bun.sleep(20);
       }
       s.idle();
-    }, { invocation: { timeoutMs: 5_000, idleTimeoutMs: 250, onProgress: () => { progress += 1; } } });
+    }, { invocation: { timeoutMs: 5_000, idleTimeoutMs: 500, onProgress: () => { progress += 1; } } });
     expect(o.error).toBeUndefined();
-    expect(progress).toBeGreaterThan(4);
+    expect(progress).toBeGreaterThan(20);
   });
 
   it('kills the contained process exactly through kill and close on every exit path', async () => {

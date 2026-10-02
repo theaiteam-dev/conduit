@@ -753,6 +753,8 @@ export function createCodexAppServerHarnessAdapter(config: CodexAppServerHarness
           killAll();
           finish({ kind: 'timeout' });
         }, call.timeoutMs);
+        // One-shot counterpart: runHarnessProcess (worker/harness-runner.ts) has the same idle guard. It cannot drive a
+        // long-lived session, so both exist: a change to idle-timeout semantics must be made in both.
         let idleTimer: ReturnType<typeof setTimeout> | undefined;
         const resetIdleTimer = (): void => {
           if (call.idleTimeoutMs === undefined || st.finished) return;

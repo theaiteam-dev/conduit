@@ -74,13 +74,13 @@ export type ContainedSpawn = (spec: ContainedSpawnSpec, handlers: ContainedProce
 export function containedSpawn(
   containment: Containment,
   label = 'harness',
-  seams: { exitWaitMs?: number; kill?: (pid: number, cgroup: string | undefined) => void } = {},
+  seams: { exitWaitMs?: number; kill?: (pid: number, cgroup: string | undefined) => void; spawn?: typeof nodeSpawn } = {},
 ): ContainedSpawn {
   return (spec, handlers) => {
     const contained = prepareContainedCommand(containment, [spec.command, ...spec.args], { cwd: spec.cwd, env: spec.env });
     let child: ChildProcess;
     try {
-      child = nodeSpawn(contained.argv[0]!, contained.argv.slice(1), {
+      child = (seams.spawn ?? nodeSpawn)(contained.argv[0]!, contained.argv.slice(1), {
         cwd: spec.cwd,
         env: spec.env,
         // setsid(): the child leads its own session and group, so its pid addresses the whole group.
@@ -98,6 +98,14 @@ export function containedSpawn(
     const pid = child.pid;
     const cgroup = contained.cgroup;
     trackProcessGroup(pid, cgroup);
+    let released = false;
+    // Idempotent: the error handler and close() both release, and only the first does anything.
+    const release = async (): Promise<void> => {
+      if (released) return;
+      released = true;
+      untrackProcessGroup(pid);
+      if (cgroup !== undefined) await removeCgroup(cgroup);
+    };
     const killTree = seams.kill ?? killContained;
     const kill = (): void => killTree(pid, cgroup);
 
@@ -121,6 +129,13 @@ export function containedSpawn(
         done();
       });
       child.once('error', () => {
+        // Best effort: end whatever started, and do not leave the group tracked with no close() coming.
+        try {
+          kill();
+        } catch {
+          /* already gone */
+        }
+        void release().catch(() => {});
         done();
         reportExit();
       });
@@ -171,8 +186,7 @@ export function containedSpawn(
         clearTimeout(wait);
         // A process still alive stays tracked so the kernel's signal handlers can reap it. The stale-cgroup sweep handles its cgroup.
         if (won !== 'exited') return;
-        untrackProcessGroup(pid);
-        if (cgroup !== undefined) await removeCgroup(cgroup);
+        await release();
       },
     };
   };

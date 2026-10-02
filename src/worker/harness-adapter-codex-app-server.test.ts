@@ -953,7 +953,7 @@ describe('codex-app-server adapter: hold', () => {
     const server = fakeServer(async (p) => {
       await p.request('item/commandExecution/requestApproval', CMD(wrap('cat a.txt')));
     });
-    const err = await rejection(adapterWith(server, { holdStopWaitMs: 5_000 }).invoke(invocation({ gate: () => hold, timeoutMs: 80 })));
+    const err = await rejection(adapterWith(server, { holdStopWaitMs: 5_000 }).invoke(invocation({ gate: () => hold, timeoutMs: 500 })));
     expect(err.code).toBe(HARNESS_GATE_HOLD_CODE);
   });
 
@@ -1170,7 +1170,7 @@ describe('codex-app-server adapter: timeouts', () => {
 
   it('recovers the usage reported before a timeout', async () => {
     const server = fakeServer((p) => p.usage('thr-root', USAGE_A));
-    const err = await rejection(adapterWith(server).invoke(invocation({ timeoutMs: 80 })));
+    const err = await rejection(adapterWith(server).invoke(invocation({ timeoutMs: 500 })));
     expect(err.code).toBe('harness-timeout');
     expect(err.usage).toMatchObject({ tokens: 120 });
   });
@@ -1184,13 +1184,15 @@ describe('codex-app-server adapter: timeouts', () => {
 
   it('resets the idle timer on every line', async () => {
     const server = fakeServer(async (p) => {
-      for (let i = 0; i < 4; i++) {
+      // 40 lines x 20 ms gaps = 800 ms in all, well past one 500 ms idle window, so a timer that did not
+      // reset on each line would trip. Each gap is 25x under the window, so a loaded runner cannot trip a correct one.
+      for (let i = 0; i < 40; i++) {
         p.notify('thread/status/changed', { threadId: 'thr-root', status: { type: 'active' } });
-        await new Promise((r) => setTimeout(r, 40));
+        await new Promise((r) => setTimeout(r, 20));
       }
       p.completeTurn();
     });
-    const out = await adapterWith(server).invoke(invocation({ timeoutMs: 5_000, idleTimeoutMs: 100 }));
+    const out = await adapterWith(server).invoke(invocation({ timeoutMs: 5_000, idleTimeoutMs: 500 }));
     expect(out.outputs).toEqual([]);
   });
 
