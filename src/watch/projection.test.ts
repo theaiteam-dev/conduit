@@ -1,7 +1,15 @@
 import { describe, expect, test } from 'bun:test';
 import { emptyContext } from './context';
 import { deriveView, emptyFold, foldEvents, formatDuration, replay, type DeriveInput } from './projection';
-import { SCENARIO_NOW, SCENARIO_RUN, scenarioContext, scenarioEvents, scenarioSnapshot } from './scenario';
+import {
+  SCENARIO_NOW,
+  SCENARIO_RUN,
+  STALE_NOW,
+  idleSnapshot,
+  scenarioContext,
+  scenarioEvents,
+  scenarioSnapshot,
+} from './scenario';
 import { formatGapReport, JOURNAL_SCHEMA_GAPS } from './schema-gaps';
 
 const live: DeriveInput = {
@@ -52,6 +60,42 @@ describe('deriveView, live', () => {
   test('no budget in the flow renders the spend without a fraction', () => {
     const v = deriveView(fold, { ...live, context: { ...scenarioContext, maxTokens: null } });
     expect(v.tokens).toEqual({ fraction: null, text: '861.8k no budget' });
+  });
+});
+
+describe('watchdog meter follows the kernel liveness rule', () => {
+  test('a working card keeps it calm however old the newest span is', () => {
+    const v = deriveView(fold, { ...live, nowSec: STALE_NOW });
+    expect(v.watchdog).toEqual({ fraction: null, text: 'worker active', inactive: true });
+  });
+
+  test('an idle run with an old span fills past the window', () => {
+    const v = deriveView(fold, { ...live, snapshot: idleSnapshot(), nowSec: STALE_NOW });
+    expect(v.watchdog).toEqual({ fraction: 1.5, text: '15:00' });
+  });
+
+  test('a card gated behind release_at keeps it calm, including on the tick the gate opens', () => {
+    for (const releaseAt of [STALE_NOW + 60, STALE_NOW]) {
+      const v = deriveView(fold, { ...live, snapshot: idleSnapshot(releaseAt), nowSec: STALE_NOW });
+      expect(v.watchdog).toEqual({ fraction: null, text: 'waiting', inactive: true });
+    }
+    const opened = deriveView(fold, { ...live, snapshot: idleSnapshot(STALE_NOW - 1), nowSec: STALE_NOW });
+    expect(opened.watchdog.fraction).toBe(1.5);
+  });
+
+  test('a run that is not running has no watchdog', () => {
+    const snapshot = { ...idleSnapshot(), run: { ...scenarioSnapshot.run!, status: 'complete' } };
+    expect(deriveView(fold, { ...live, snapshot, nowSec: STALE_NOW }).watchdog).toEqual({
+      fraction: null,
+      text: 'run complete',
+      inactive: true,
+    });
+  });
+
+  test('replay renders it not recorded and logs the gap', () => {
+    const v = replay(scenarioEvents, scenarioEvents.length, live);
+    expect(v.watchdog).toEqual({ fraction: null, text: 'not recorded' });
+    expect(v.gaps).toContain('worker-activity-history');
   });
 });
 

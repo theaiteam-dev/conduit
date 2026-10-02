@@ -9,7 +9,16 @@ import { testRender } from '@opentui/react/test-utils';
 import { WatchApp, staticStore } from './app';
 import { COLORS, stationHue } from './palette';
 import { deriveView, emptyFold, foldEvents, type WatchView } from './projection';
-import { SCENARIO_NOW, SCENARIO_RUN, scenarioContext, scenarioEvents, scenarioSnapshot } from './scenario';
+import {
+  SCENARIO_NOW,
+  SCENARIO_RUN,
+  STALE_NOW,
+  idleSnapshot,
+  scenarioContext,
+  scenarioEvents,
+  scenarioSnapshot,
+} from './scenario';
+import type { StateSnapshot } from './events';
 
 type Setup = Awaited<ReturnType<typeof testRender>>;
 let setup: Setup | null = null;
@@ -24,13 +33,13 @@ afterEach(async () => {
   }
 });
 
-function scenarioView(): WatchView {
+function scenarioView(snapshot: StateSnapshot = scenarioSnapshot, nowSec = SCENARIO_NOW): WatchView {
   return deriveView(foldEvents(emptyFold(), scenarioEvents), {
     runId: SCENARIO_RUN,
     mode: 'live',
     context: scenarioContext,
-    snapshot: scenarioSnapshot,
-    nowSec: SCENARIO_NOW,
+    snapshot,
+    nowSec,
   });
 }
 
@@ -76,7 +85,7 @@ describe('conduit watch screen', () => {
     expect(header).toContain('CONDUIT');
     expect(header).toContain('WALL ██▋░░░░░ 33%');
     expect(header).toContain('QUOTA 5h ██████▉░ 86%');
-    expect(header).toContain('WATCHDOG █▋░░░░░░ 02:00');
+    expect(header).toContain('WATCHDOG worker active');
     expect(header).toContain('1 working 0 waiting 1 held 1 done 1 scrap');
     expect(header).toContain('T+47:00');
   });
@@ -117,6 +126,28 @@ describe('conduit watch screen', () => {
     const s = await render(scenarioView());
     expect(spansWith(s, 'HELD 30:20')[0]!.bg).toBe(COLORS.held);
     expect(spansWith(s, '86%')[0]!.fg).toBe(COLORS.meterLoud);
+  });
+
+  test('watchdog: a long-running working card with an old span stays calm', async () => {
+    const s = await render(scenarioView(scenarioSnapshot, STALE_NOW));
+    expect(s.captureCharFrame().split('\n')[1]).toContain('WATCHDOG worker active');
+    const text = spansWith(s, 'worker active')[0]!;
+    expect(text.fg).toBe(COLORS.textDim);
+    expect(spansWith(s, '15:00').some((sp) => sp.fg === COLORS.meterLoud)).toBe(false);
+  });
+
+  test('watchdog: an idle run with an old span fills with the loud color', async () => {
+    const s = await render(scenarioView(idleSnapshot(), STALE_NOW));
+    expect(s.captureCharFrame().split('\n')[1]).toContain('WATCHDOG ████████ 15:00');
+    const bar = spansWith(s, '████████').find((sp) => sp.text === '████████')!;
+    expect(bar.fg).toBe(COLORS.meterLoud);
+    expect(spansWith(s, ' 15:00').some((sp) => sp.fg === COLORS.meterLoud)).toBe(true);
+  });
+
+  test('watchdog: a release_at-gated card stays calm', async () => {
+    const s = await render(scenarioView(idleSnapshot(STALE_NOW + 300), STALE_NOW));
+    expect(s.captureCharFrame().split('\n')[1]).toContain('WATCHDOG waiting');
+    expect(spansWith(s, 'waiting').find((sp) => sp.text === 'waiting')!.fg).toBe(COLORS.textDim);
   });
 
   test('j and k move the selection and the status line follows it', async () => {

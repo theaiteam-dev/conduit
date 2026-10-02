@@ -301,11 +301,15 @@ export interface DeriveInput {
   nowSec: number;
 }
 
-/** A header meter. `fraction` null means "not recorded". */
+/**
+ * A header meter. `fraction` null means "not recorded", unless `inactive` is
+ * set: then the meter does not apply right now and renders as plain text.
+ */
 export interface Meter {
   fraction: number | null;
   /** The value text shown after the bar. */
   text: string;
+  inactive?: boolean;
 }
 
 export type RowState =
@@ -490,6 +494,45 @@ function treeOrder(ids: string[], parentOf: Map<string, string | null>): { id: s
   return out;
 }
 
+/**
+ * The liveness watchdog meter, built from the conditions the kernel's
+ * `checkLiveness` (src/control/watchdog.ts) trips on, so it fills only when
+ * the kernel could declare a stall:
+ *
+ *   - a worker holds a card (status claimed/working/done_pending_ack, or an
+ *     active_workers row): no trip, the meter reads "worker active";
+ *   - a ready card is gated behind release_at >= now (the kernel's
+ *     hasReleaseGatedCards): no trip, the meter reads "waiting";
+ *   - otherwise it fills with the age of the newest journal span against
+ *     no_progress_minutes.
+ *
+ * A harness maker writes its span only when the call returns, so span age
+ * alone would climb through every long healthy call. The kernel's other
+ * progress input, the time of the last lane change, is not recorded
+ * (`card-log-timestamp`), so span age is the only progress clock available.
+ * Replay has no state DB for the past, so it renders "not recorded".
+ */
+function watchdogMeter(fold: Fold, input: DeriveInput, snapshot: StateSnapshot | null, gaps: Set<SchemaGapId>): Meter {
+  if (input.mode === 'replay' || snapshot === null) {
+    gaps.add('worker-activity-history');
+    return { fraction: null, text: NOT_RECORDED };
+  }
+  const run = snapshot.run;
+  if (run !== null && run.status !== 'running') {
+    return { fraction: null, text: `run ${run.status}`, inactive: true };
+  }
+  const now = input.nowSec;
+  const working = snapshot.cards.some(
+    (c) => c.workerStartedAt !== null || c.status === 'claimed' || c.status === 'working' || c.status === 'done_pending_ack',
+  );
+  if (working) return { fraction: null, text: 'worker active', inactive: true };
+  const gated = snapshot.cards.some((c) => c.status === 'ready' && c.releaseAt !== null && c.releaseAt >= now);
+  if (gated) return { fraction: null, text: 'waiting', inactive: true };
+  if (fold.newestSpanAt === null) return { fraction: null, text: NOT_RECORDED };
+  const age = Math.max(0, now - fold.newestSpanAt);
+  return { fraction: ratio(age, input.context.livenessSec), text: formatDuration(age) };
+}
+
 export function deriveView(fold: Fold, input: DeriveInput): WatchView {
   const { context, snapshot, mode } = input;
   const gaps = new Set<SchemaGapId>(['card-log-timestamp', 'kernel-heartbeat']);
@@ -560,13 +603,7 @@ export function deriveView(fold: Fold, input: DeriveInput): WatchView {
     gaps.add('plan-quota');
   }
 
-  let watchdog: Meter;
-  if (fold.newestSpanAt !== null && nowSec !== null) {
-    const age = Math.max(0, nowSec - fold.newestSpanAt);
-    watchdog = { fraction: ratio(age, context.livenessSec), text: formatDuration(age) };
-  } else {
-    watchdog = { fraction: null, text: NOT_RECORDED };
-  }
+  const watchdog = watchdogMeter(fold, input, snapshot, gaps);
 
   // ── Rows ───────────────────────────────────────────────────────────────
   const snapCards = new Map<string, CardSnapshot>((snapshot?.cards ?? []).map((c) => [c.id, c]));

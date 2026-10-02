@@ -76,6 +76,9 @@ export const notRecorded = (text = NOT_RECORDED): Segment => ({ text, fg: COLORS
 
 /** An 8-cell meter, loud at 80% or more (design README). */
 export function meterSegments(label: string, meter: Meter): Segment[] {
+  if (meter.inactive === true) {
+    return [normal(`${label} `), dim(meter.text)];
+  }
   if (meter.fraction === null) {
     return [normal(`${label} `), notRecorded(meter.text)];
   }

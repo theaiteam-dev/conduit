@@ -20,6 +20,7 @@ export type SchemaGapId =
   | 'card-title'
   | 'status-history'
   | 'deterministic-span'
+  | 'worker-activity-history'
   | 'flow-at-run'
   | 'hold-timeout-policy'
   | 'finding-severity';
@@ -40,8 +41,8 @@ export const JOURNAL_SCHEMA_GAPS: readonly SchemaGap[] = [
     datum: 'when a card entered a lane',
     location: 'card_log (no time column)',
     renders:
-      'no time axis; a done card shows ✓ without a duration; the watchdog meter measures ' +
-      'the age of the newest journal span instead of time since the last lane change',
+      'no time axis; a done card shows ✓ without a duration; when no worker is active the ' +
+      'watchdog meter measures the age of the newest journal span instead of time since the last lane change',
   },
   {
     id: 'cross-table-order',
@@ -86,6 +87,12 @@ export const JOURNAL_SCHEMA_GAPS: readonly SchemaGap[] = [
     datum: 'a span for each deterministic station execution',
     location: 'journal (deterministic stations write none)',
     renders: 'no last-call detail for a card at a deterministic station',
+  },
+  {
+    id: 'worker-activity-history',
+    datum: 'whether a worker held a card, or a card was release-gated, at a past point in the run',
+    location: 'active_workers and cards.release_at hold the present only; the journal records neither over time',
+    renders: 'in replay the WATCHDOG meter reads "not recorded"',
   },
   {
     id: 'flow-at-run',

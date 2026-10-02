@@ -93,3 +93,20 @@ function build(): WatchEvent[] {
 }
 
 export const scenarioEvents: readonly WatchEvent[] = build();
+
+/**
+ * The scenario's state DB with WI-204 no longer held by a worker: `ready`,
+ * with an optional release gate. Every other card is terminal, held or
+ * awaiting, so nothing else counts as worker activity.
+ */
+export function idleSnapshot(releaseAt: number | null = null): StateSnapshot {
+  return {
+    ...scenarioSnapshot,
+    cards: scenarioSnapshot.cards.map((c) =>
+      c.id === 'WI-204' ? { ...c, status: 'ready', workerStartedAt: null, releaseAt } : c,
+    ),
+  };
+}
+
+/** 15 minutes after the newest span (1_002_700), past the 10-minute liveness window. */
+export const STALE_NOW = 1_003_600;
