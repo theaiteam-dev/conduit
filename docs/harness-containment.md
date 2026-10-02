@@ -140,7 +140,8 @@ What it does not cover, beyond the gaps listed above for every gated adapter:
   features, listed in `CODEX_APP_SERVER_ARGS`). With those flags a model asked to list its tools
   named neither `list_mcp_resources` nor `read_mcp_resource`, which ran ungated without them.
   That is the model's own report from one codex version. A tool that a newer Codex adds without an
-  approval request would not be gated.
+  approval request would not be gated. The list was checked against codex-cli 0.159.1, and
+  `conduit doctor` shows the installed version and notes when it differs.
 - **Subagent creation** is not asked. The commands a subagent runs are, and carry the
   subagent's thread id as `agentId`.
 - **Usage carries no cost.** Codex reports tokens only, so `cost` is 0, as for `codex-exec`.

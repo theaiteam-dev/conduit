@@ -62,13 +62,52 @@ describe('containedSpawn real children', () => {
       { command: 'sh', args: ['-c', 'sleep 30 & echo $!'], cwd: ROOT, env: ENV },
       { onLine(line) { descendant = Number(line); }, onStderr() {}, onExit: () => { exits.push(Date.now() - t0); } },
     );
-    await new Promise((r) => setTimeout(r, 1700));
+    // Poll rather than sleep a fixed time: a slow spawn only makes onExit later.
+    for (let i = 0; i < 100 && exits.length === 0; i++) await new Promise((r) => setTimeout(r, 50));
     expect(exits.length).toBe(1);
     expect(exits[0]!).toBeGreaterThanOrEqual(950);
     await proc.close();
     expect(exits.length).toBe(1);
     // Reap the real descendant: the kill seam above was a no-op.
     if (descendant !== undefined && descendant > 0) process.kill(descendant, 'SIGKILL');
+  });
+
+  // The no-op kill leaves the backgrounded descendant alive holding the pipe past the close grace.
+  const heldPipe = async (script: string) => {
+    const events: string[] = [];
+    let descendant: number | undefined;
+    let exits = 0;
+    const proc = containedSpawn(containment, 'test', { kill: () => {} })(
+      { command: 'sh', args: ['-c', script], cwd: ROOT, env: ENV },
+      {
+        onLine(line) {
+          if (descendant === undefined) descendant = Number(line);
+          else events.push(`line:${line}`);
+        },
+        onStderr() {},
+        onExit: () => { exits++; events.push('exit'); },
+      },
+    );
+    for (let i = 0; i < 100 && exits === 0; i++) await new Promise((r) => setTimeout(r, 50));
+    // The descendant writes ~0.5s after the grace-timer exit.
+    await new Promise((r) => setTimeout(r, 1000));
+    await proc.close();
+    if (descendant !== undefined && descendant > 0) {
+      try { process.kill(descendant, 'SIGKILL'); } catch { /* already gone */ }
+    }
+    return { events, exits };
+  };
+
+  it('delivers no line after onExit when a descendant writes after the close grace', async () => {
+    const { events, exits } = await heldPipe('(sleep 1.5; echo late) & echo $!; echo first');
+    expect(exits).toBe(1);
+    expect(events).toEqual(['line:first', 'exit']);
+  });
+
+  it('flushes a final unterminated line before onExit when a descendant holds the pipe', async () => {
+    const { events, exits } = await heldPipe('(sleep 1.5; echo late) & echo $!; printf partial');
+    expect(exits).toBe(1);
+    expect(events).toEqual(['line:partial', 'exit']);
   });
 
   it('reassembles a multi-byte character split across chunks and a final unterminated line', async () => {

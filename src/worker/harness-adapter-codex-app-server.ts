@@ -92,6 +92,8 @@ export interface CodexAppServerHarnessAdapterConfig {
   spawn?: ContainedSpawn;
   /** Injected binary-presence probe, for tests. */
   probe?: () => Promise<BinaryProbe>;
+  /** Injected `--version` runner, for tests. Takes the resolved binary path, returns its stdout or undefined on failure. */
+  readVersion?: (binaryPath: string) => Promise<string | undefined>;
   /** Wait after a gate hold for the turn to end before the process is killed, in ms. For tests; defaults to HOLD_STOP_WAIT_MS. */
   holdStopWaitMs?: number;
   /** Injected containment mechanism, for tests. Defaults to the process-wide detection. */
@@ -102,6 +104,37 @@ export interface CodexAppServerHarnessAdapterConfig {
 const HOLD_STOP_WAIT_MS = 5_000;
 /** Bytes of the child's stderr kept for error detail. */
 const STDERR_TAIL_BYTES = 2_000;
+
+/** Longest wait for `codex --version` during the probe, in ms. */
+const VERSION_PROBE_TIMEOUT_MS = 5_000;
+/** The codex version the ungated built-in list below was checked against. */
+export const UNGATED_FEATURES_CHECKED_VERSION = '0.159.1';
+
+/** Run `<binary> --version` with a bounded wait. Undefined when it fails, times out or prints nothing. */
+async function runVersionCommand(binaryPath: string, sourceEnv: Record<string, string | undefined>): Promise<string | undefined> {
+  try {
+    const proc = Bun.spawn([binaryPath, '--version'], {
+      stdout: 'pipe', stderr: 'ignore', stdin: 'ignore',
+      env: { PATH: sourceEnv.PATH ?? '/usr/bin:/bin', HOME: sourceEnv.HOME ?? '/' },
+      timeout: VERSION_PROBE_TIMEOUT_MS, killSignal: 'SIGKILL',
+    });
+    const out = await new Response(proc.stdout).text();
+    if ((await proc.exited) !== 0) return undefined;
+    return out.trim() === '' ? undefined : out.trim();
+  } catch {
+    return undefined;
+  }
+}
+
+/** The probe detail: the path, the version when known, and a note when it differs from the checked one. */
+export function describeCodexProbe(path: string, version: string | undefined): string {
+  if (version === undefined) return path;
+  const number = /\d+\.\d+\.\d+\S*/.exec(version)?.[0];
+  const note = number !== undefined && number === UNGATED_FEATURES_CHECKED_VERSION
+    ? ''
+    : `, ungated built-ins checked against ${UNGATED_FEATURES_CHECKED_VERSION}`;
+  return `${path} (${version}${note})`;
+}
 
 /**
  * Built-in tools that do not ask for approval, turned off with `-c`. Web search
@@ -383,9 +416,9 @@ export function createCodexAppServerHarnessAdapter(config: CodexAppServerHarness
     config.probe ??
     (async (): Promise<BinaryProbe> => {
       const resolved = resolveExecutable(command, sourceEnv);
-      return 'path' in resolved
-        ? { present: true, detail: resolved.path }
-        : { present: false, detail: resolved.error };
+      if (!('path' in resolved)) return { present: false, detail: resolved.error };
+      const version = await (config.readVersion ?? ((p) => runVersionCommand(p, sourceEnv)))(resolved.path).catch(() => undefined);
+      return { present: true, detail: describeCodexProbe(resolved.path, version) };
     });
 
   return {

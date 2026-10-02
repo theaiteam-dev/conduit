@@ -16,6 +16,7 @@ import {
   createCodexAppServerHarnessAdapter,
   splitShellWords,
   unwrapShellCommand,
+  UNGATED_FEATURES_CHECKED_VERSION,
   type CodexAppServerHarnessAdapterConfig,
 } from './harness-adapter-codex-app-server';
 import type { ContainedProcessHandlers, ContainedSpawn, ContainedSpawnSpec } from './harness-contained-spawn';
@@ -220,6 +221,37 @@ describe('codex-app-server adapter: capabilities', () => {
     const probe = await missing.probeBinary();
     expect(probe.present).toBe(false);
     expect(probe.detail).toContain('no-such-codex-binary');
+  });
+
+  it('includes the codex version in the probe detail', async () => {
+    const a = createCodexAppServerHarnessAdapter({
+      projectRoot: ROOT, envAllowlist: [], command: process.execPath,
+      readVersion: async () => `codex-cli ${UNGATED_FEATURES_CHECKED_VERSION}`,
+    });
+    const probe = await a.probeBinary();
+    expect(probe.detail).toBe(`${process.execPath} (codex-cli ${UNGATED_FEATURES_CHECKED_VERSION})`);
+  });
+
+  it('notes the checked version when the installed one differs', async () => {
+    const a = createCodexAppServerHarnessAdapter({
+      projectRoot: ROOT, envAllowlist: [], command: process.execPath, readVersion: async () => 'codex-cli 9.9.9',
+    });
+    expect((await a.probeBinary()).detail).toBe(
+      `${process.execPath} (codex-cli 9.9.9, ungated built-ins checked against ${UNGATED_FEATURES_CHECKED_VERSION})`,
+    );
+  });
+
+  it('falls back to the path when the version command fails or throws', async () => {
+    for (const readVersion of [async () => undefined, async () => { throw new Error('boom'); }]) {
+      const a = createCodexAppServerHarnessAdapter({ projectRoot: ROOT, envAllowlist: [], command: process.execPath, readVersion });
+      const probe = await a.probeBinary();
+      expect(probe).toEqual({ present: true, detail: process.execPath });
+    }
+  });
+
+  it('reads a real version from the default runner', async () => {
+    const a = createCodexAppServerHarnessAdapter({ projectRoot: ROOT, envAllowlist: [], command: process.execPath });
+    expect((await a.probeBinary()).detail).toMatch(/^\S+ \(\d+\.\d+\.\d+/);
   });
 
   it('rejects an invocation before spawning when the binary is not found', async () => {

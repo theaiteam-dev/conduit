@@ -113,10 +113,24 @@ export function containedSpawn(
     let exitSignal: string | undefined;
     let exitReported = false;
     let closeGrace: ReturnType<typeof setTimeout> | undefined;
+    const decoder = new StringDecoder('utf8');
+    let carry = '';
+    // Set once exit is reported: nothing is delivered after onExit.
+    let ended = false;
+    const flushTail = (): void => {
+      if (ended) return;
+      carry += decoder.end();
+      const tail = carry;
+      carry = '';
+      if (tail.length > 0) handlers.onLine(tail);
+    };
     const reportExit = (): void => {
       if (exitReported) return;
       exitReported = true;
       if (closeGrace !== undefined) clearTimeout(closeGrace);
+      // The grace timer can fire with the stream still open: deliver the buffered tail first.
+      flushTail();
+      ended = true;
       handlers.onExit(exitCode, exitSignal);
     };
     const exited = new Promise<void>((done) => {
@@ -142,24 +156,22 @@ export function containedSpawn(
     });
     child.once('close', reportExit);
 
-    const decoder = new StringDecoder('utf8');
-    let carry = '';
     child.stdout?.on('data', (chunk: Buffer) => {
+      if (ended) return;
       carry += decoder.write(chunk);
       let newline = carry.indexOf('\n');
       while (newline >= 0) {
         const line = carry.slice(0, newline);
         carry = carry.slice(newline + 1);
         if (line.length > 0) handlers.onLine(line);
+        if (ended) return;
         newline = carry.indexOf('\n');
       }
     });
-    child.stdout?.on('end', () => {
-      carry += decoder.end();
-      if (carry.length > 0) handlers.onLine(carry);
-      carry = '';
+    child.stdout?.on('end', flushTail);
+    child.stderr?.on('data', (chunk: Buffer) => {
+      if (!ended) handlers.onStderr(chunk.toString('utf-8'));
     });
-    child.stderr?.on('data', (chunk: Buffer) => handlers.onStderr(chunk.toString('utf-8')));
     child.stdin?.on('error', () => {
       /* the process is gone: the exit handler reports it */
     });
