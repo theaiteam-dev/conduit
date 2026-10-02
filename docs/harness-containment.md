@@ -153,6 +153,12 @@ run-scoped `CODEX_HOME` holding an empty `config.toml` and a link to the operato
 reach it. The directory is removed on every exit path. The child's env is the allowlist plus
 `PATH` and `CODEX_HOME`. Every invocation is a fresh, ephemeral thread.
 
+The run-scoped directory is created by `mkdtemp` with mode 0700, as `conduit-codex-home-*` in
+the temp dir. Only `removeRunScopedCodexHome` removes it, so a kernel killed by SIGKILL or a
+crash between creation and removal leaves it behind, and nothing sweeps it. What remains is an
+empty `config.toml` and a link to `auth.json`, not a copy of the credentials. It is safe to
+delete `conduit-codex-home-*` directories when no conduit run is active.
+
 ### The `opencode` adapter
 
 The adapter runs one `opencode serve` per invocation and starts it with the permission

@@ -1396,6 +1396,46 @@ describe('opencode adapter: events', () => {
     ]);
   });
 
+  it('emits one output, after the input, for a part already settled when its ask is processed', async () => {
+    const o = await run(async (s) => {
+      s.part({ callID: 'c1', tool: 'bash', status: 'error', input: { command: 'ls' }, metadata: { exit: 2 } });
+      s.part({ callID: 'c2', tool: 'read', status: 'completed', input: { filePath: join(ROOT, 'a.txt') } });
+      await s.ask({ permission: 'bash', patterns: ['ls'], tool: { messageID: 'msg_1', callID: 'c1' } });
+      await s.ask({ permission: 'read', patterns: ['a.txt'], tool: { messageID: 'msg_1', callID: 'c2' } });
+      // A later update for the same call must not emit a second output.
+      s.part({ callID: 'c1', tool: 'bash', status: 'error', input: { command: 'ls' }, metadata: { exit: 2 } });
+      finish(s);
+    });
+    for (const id of ['c1', 'c2']) {
+      const mine = o.events.filter((e) => 'toolCallId' in e && e.toolCallId === id && (e.type === 'tool-input-available' || e.type === 'tool-output-available'));
+      expect(mine.map((e) => e.type)).toEqual(['tool-input-available', 'tool-output-available']);
+    }
+    expect(o.events.filter((e) => e.type === 'tool-output-available')).toMatchObject([
+      { toolCallId: 'c1', output: 'Exit code 2', isError: true },
+      { toolCallId: 'c2', output: '', isError: false },
+    ]);
+  });
+
+  it('emits the output for a part first seen settled through the message re-fetch', async () => {
+    const o = await run(async (s) => {
+      await s.ask({ permission: 'bash', patterns: ['ls'], tool: { messageID: 'msg_1', callID: 'c1' } });
+      finish(s);
+    }, {
+      gate: gateFor(['Bash(ls:*)']),
+      fake: {
+        messageBody: (_session, messageID) => ({
+          info: { id: messageID },
+          parts: [{ type: 'tool', tool: 'bash', callID: 'c1', messageID, sessionID: 'ses_root', state: { status: 'completed', input: { command: 'ls' }, metadata: { exit: 1 } } }],
+        }),
+      },
+    });
+    const mine = o.events.filter((e) => e.type === 'tool-input-available' || e.type === 'tool-output-available');
+    expect(mine).toMatchObject([
+      { type: 'tool-input-available', toolCallId: 'c1' },
+      { type: 'tool-output-available', toolCallId: 'c1', output: 'Exit code 1', isError: true },
+    ]);
+  });
+
   it('journals only the file path of an edit, and one input event per patched file', async () => {
     const a = join(ROOT, 'out', 'a');
     const b = join(ROOT, 'out', 'b');

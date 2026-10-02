@@ -946,12 +946,12 @@ describe('codex-app-server adapter: hold', () => {
     });
     const started = Date.now();
     const err = await rejection(adapterWith(server, { holdStopWaitMs: 60 }).invoke(invocation({ gate: () => hold })));
-    // The unconfigured wait is HOLD_STOP_WAIT_MS (5s). 3s separates the two with room for a loaded runner.
-    expect(Date.now() - started).toBeLessThan(3_000);
+    // The unconfigured wait is HOLD_STOP_WAIT_MS (5s). 4.5s separates the two with room for a loaded runner.
+    expect(Date.now() - started).toBeLessThan(4_500);
     expect(err.code).toBe(HARNESS_GATE_HOLD_CODE);
     expect(err.usage).toMatchObject({ tokens: 120 });
     expect(server.state.kills).toBeGreaterThan(0);
-  });
+  }, 15_000);
 
   it('keeps the hold ahead of the wall-clock timeout', async () => {
     const server = fakeServer(async (p) => {

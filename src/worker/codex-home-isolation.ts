@@ -15,6 +15,11 @@
  * `auth.json` in place (which updates the target through the link) or replaces
  * it (which does not) has not been observed here, because no refresh happened
  * in any run.
+ *
+ * Only removeRunScopedCodexHome deletes the directory, so a kernel killed
+ * between creation and removal leaves a `conduit-codex-home-*` directory in the
+ * temp dir (an empty config.toml and the link, no credentials copy). Nothing
+ * sweeps it, and it is safe to delete when no conduit run is active.
  */
 
 import { existsSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';

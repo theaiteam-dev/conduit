@@ -549,6 +549,23 @@ export function createOpenCodeHarnessAdapter(config: OpenCodeHarnessAdapterConfi
         };
 
         // ---- tool parts ---------------------------------------------------
+        /** The output row for a settled call whose input row is out, once. Runs from both orders: part settles after the input, or before it. */
+        const emitOutput = (callID: string): void => {
+          const stored = toolParts.get(callID);
+          if (stored === undefined || (stored.status !== 'completed' && stored.status !== 'error')) return;
+          if (!emittedInputs.has(callID) || emittedOutputs.has(callID)) return;
+          emittedOutputs.add(callID);
+          const exit = num(stored.metadata.exit);
+          const isError = stored.status === 'error' || (exit !== undefined && exit !== 0);
+          emit?.({
+            type: 'tool-output-available',
+            toolCallId: callID,
+            // The output body is not carried. A failed command's exit code is, in the form the journal reads.
+            output: exit !== undefined && exit !== 0 ? `Exit code ${exit}` : '',
+            isError,
+          });
+        };
+
         const recordToolPart = (part: Json): void => {
           const callID = str(part.callID);
           const state = isObject(part.state) ? part.state : undefined;
@@ -566,19 +583,7 @@ export function createOpenCodeHarnessAdapter(config: OpenCodeHarnessAdapterConfi
             const waiting = partWaiters.get(callID);
             partWaiters.delete(callID);
             waiting?.forEach((wake) => wake());
-            if ((status === 'completed' || status === 'error') && emittedInputs.has(callID) && !emittedOutputs.has(callID)) {
-              emittedOutputs.add(callID);
-              const stored = toolParts.get(callID)!;
-              const exit = num(stored.metadata.exit);
-              const isError = status === 'error' || (exit !== undefined && exit !== 0);
-              emit?.({
-                type: 'tool-output-available',
-                toolCallId: callID,
-                // The output body is not carried. A failed command's exit code is, in the form the journal reads.
-                output: exit !== undefined && exit !== 0 ? `Exit code ${exit}` : '',
-                isError,
-              });
-            }
+            emitOutput(callID);
           }
         };
 
@@ -630,6 +635,7 @@ export function createOpenCodeHarnessAdapter(config: OpenCodeHarnessAdapterConfi
           if (callID === undefined || emittedInputs.has(callID)) return;
           emittedInputs.add(callID);
           for (const c of calls) emit?.({ type: 'tool-input-available', toolCallId: callID, toolName: c.toolName, input: c.input });
+          emitOutput(callID);
         };
 
         // ---- asks ---------------------------------------------------------
