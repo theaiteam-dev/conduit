@@ -628,6 +628,20 @@ describe('codex-app-server adapter: file change approvals', () => {
     ]);
   });
 
+  for (const type of ['add', 'delete']) {
+    it(`declines a ${type} that carries a move_path, without asking the gate`, async () => {
+      const spy = spyGate();
+      const r = await answers([['item/fileChange/requestApproval', FILE_REQ()]], spy.gate, {
+        setup: announce([
+          change('/p/out/ok.txt', { type: 'add' }),
+          change('/p/out/a.txt', { type, move_path: '/p/elsewhere/a.txt' }),
+        ]),
+      });
+      expect(spy.calls).toEqual([]);
+      expect(decisionOf(r.answers[0]!)).toBe('decline');
+    });
+  }
+
   it('declines the whole request when any one path is denied, and gates every path', async () => {
     const spy = spyGate((c) => ((c.input as Json).file_path === '/p/bad.txt' ? deny('path_escape') : { decision: 'allow' }));
     const r = await answers([['item/fileChange/requestApproval', FILE_REQ()]], spy.gate, {

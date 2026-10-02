@@ -1011,6 +1011,21 @@ describe('opencode adapter: question tool and hold', () => {
     expect(o.fake.state.kills).toBeGreaterThanOrEqual(1);
   });
 
+  it('a hold with no messageID does not abort on an earlier step that already reported usage', async () => {
+    let abortBeforeUsage = true;
+    const o = await run(async (s) => {
+      s.assistant('msg_0', { cost: 0.001, tokens: { total: 50, input: 20, output: 30, reasoning: 0, cache: { read: 0, write: 0 } } });
+      await s.ask({ permission: 'question', patterns: ['*'], tool: null });
+      await Bun.sleep(60);
+      abortBeforeUsage = s.requests.some((r) => r.path.endsWith('/abort'));
+      s.assistant('msg_1', { cost: 0.003, tokens: USAGE_1 });
+      s.idle();
+    }, { gate: allowAll, config: { holdStopWaitMs: 2_000 } });
+    expect(abortBeforeUsage).toBe(false);
+    expect(o.error?.code).toBe(HARNESS_GATE_HOLD_CODE);
+    expect(o.error?.usage).toMatchObject({ tokens: 1050 });
+  });
+
   it('a hold error message names the tool and the code', async () => {
     const o = await run(async (s) => {
       await s.bash('c1', 'rm x');

@@ -44,7 +44,7 @@
  * Hold. Rejecting a call at the ask and aborting at once loses the usage of the
  * step in flight, so the order is: reject the ask, deny every later ask without
  * asking the gate, wait (bounded) until the message that owns the call reports
- * tokens or the session goes idle, then `POST /session/:id/abort`. The thrown
+ * tokens (an ask with no messageID waits for idle or the bound) or the session goes idle, then `POST /session/:id/abort`. The thrown
  * error carries the usage summed so far. The question tool exists only with
  * `OPENCODE_ENABLE_QUESTION_TOOL`, which is never set. A `question.asked` that
  * arrives anyway is rejected and held, and so is a `question` permission ask.
@@ -394,7 +394,6 @@ export function createOpenCodeHarnessAdapter(config: OpenCodeHarnessAdapterConfi
         const toolParts = new Map<string, ToolPart>();
         const partWaiters = new Map<string, Array<() => void>>();
         const usageByMessage = new Map<string, MessageUsage>();
-        const lastAssistantBySession = new Map<string, string>();
         const errorMessages = new Set<string>();
         const errors: SeenError[] = [];
         const emittedInputs = new Set<string>();
@@ -484,7 +483,7 @@ export function createOpenCodeHarnessAdapter(config: OpenCodeHarnessAdapterConfi
         const beginHold = (decision: GateDecision & { decision: 'hold' }, toolName: string, ctx: AskContext): void => {
           st.held = {
             code: decision.code, reason: decision.reason, toolName, sessionID: ctx.sessionID,
-            messageID: ctx.messageID ?? lastAssistantBySession.get(ctx.sessionID), replied: false,
+            messageID: ctx.messageID, replied: false,
           };
           st.holdTimer = setTimeout(() => void abortThenFinish({ kind: 'held' }, ctx.sessionID), config.holdStopWaitMs ?? HOLD_STOP_WAIT_MS);
         };
@@ -863,7 +862,6 @@ export function createOpenCodeHarnessAdapter(config: OpenCodeHarnessAdapterConfi
               if (info === undefined || sessionID === undefined || !sessions.has(sessionID) || info.role !== 'assistant') break;
               const id = str(info.id);
               if (id === undefined) break;
-              if (!lastAssistantBySession.has(sessionID) || !usageByMessage.has(id)) lastAssistantBySession.set(sessionID, id);
               const usage = parseUsage(info);
               if (usage !== undefined) usageByMessage.set(id, usage);
               if (info.error !== undefined) recordError(info.error, id);

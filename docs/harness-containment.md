@@ -108,8 +108,8 @@ How each request reaches the gate:
 - **Patches** carry no paths in the request. The adapter takes them from the `fileChange` item
   Codex announced just before, and gates every path: an added file as `Write`, an updated
   file as `Edit`, a delete as `Write`, and a move as `Edit` on the source and `Write` on the
-  destination. One denied path declines the whole patch. A request with no announced item, or
-  one that asks for a session-wide write grant, is declined. A station that lets the model
+  destination. One denied path declines the whole patch. A request with no announced item, an
+  add or delete that carries a `move_path`, or one that asks for a session-wide write grant, is declined. A station that lets the model
   patch files lists `Write` and `Edit`.
 - **MCP tool approvals** go to the gate as `mcp__<server>__<tool>`, which the gate always
   denies.

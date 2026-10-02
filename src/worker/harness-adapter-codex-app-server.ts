@@ -19,7 +19,8 @@
  *     from the `item/started` item of type `fileChange` that precedes it, and
  *     every path is gated (add: Write, update: Edit, delete: Write, a move:
  *     Edit on the source and Write on the destination). One denied path denies
- *     the request. A request with no announced item is denied.
+ *     the request. A request with no announced item is denied, and so is an
+ *     item whose add or delete carries a move_path.
  *   - `mcpServer/elicitation/request`: gated as `mcp__<server>__<tool>`, which
  *     the gate denies, and answered with `decline`.
  *   - Any other server request is answered with a JSON-RPC error, never left
@@ -314,8 +315,10 @@ function parseFileChanges(item: Json): FileChange[] | undefined {
     const path = str(raw.path);
     const kind = raw.kind.type;
     if (path === undefined || (kind !== 'add' && kind !== 'update' && kind !== 'delete')) return undefined;
-    const move = raw.kind.move_path;
-    changes.push({ path, kind, movePath: str(move) });
+    const movePath = str(raw.kind.move_path);
+    // Only an update can move a file. A move_path on add or delete is unexpected, so the item is rejected.
+    if (movePath !== undefined && kind !== 'update') return undefined;
+    changes.push({ path, kind, movePath });
   }
   return changes;
 }
