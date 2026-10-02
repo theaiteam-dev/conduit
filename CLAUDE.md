@@ -106,6 +106,8 @@ Some kernel modules are **fully implemented and unit-tested but not yet called b
 
 **Built but NOT yet driven by `runExecutor`:** none of the kernel substrate remains library-only — the remaining unshipped work is the agentic Tool-Bridge (step 9) and kaizen (step 10), which are new surfaces rather than wired-vs-unwired modules.
 
+**Outside `runExecutor` by design:** `src/watch/` (issue #89, `conduit watch`) only reads. It opens the state DB and journal with SQLite's read-only flag rather than through `openConduitDB`, which migrates; folds journal rows through one pure projection (`projection.ts` `foldEvents` then `deriveView`, the same calls for live and replay); and renders the War Room TUI with `@opentui/react`, pinned to exactly 0.5.12. Do not wire it into the executor or give it a write path (PRD §7). A datum the view needs and the journal lacks renders "not recorded" and belongs in `schema-gaps.ts`, not in a write from the watcher.
+
 When you pick up a later build-order step, prefer **wiring the existing library module into `runExecutor`** over re-implementing its logic inline — then point the integration/contract tests at the real executor path so the SPEC guarantee becomes one the shipping binary actually provides.
 
 ## Docs are an input, not a cleanup step
