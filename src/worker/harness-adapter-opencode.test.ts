@@ -46,8 +46,11 @@ writeFileSync(
 );
 
 afterAll(() => {
+  // Registered first, so it runs after every describe block's tests in the file.
+  // The fixtures are removed first so a failed leak check does not leave them behind; isRunScoped excludes them.
   rmSync(ROOT, { recursive: true, force: true });
   rmSync(AUTH_HOME, { recursive: true, force: true });
+  expect(leaked()).toEqual([]);
 });
 
 describeHarnessContainmentConformance('opencode', (opts) =>
@@ -489,10 +492,6 @@ describe('opencode adapter: process, auth and environment', () => {
     const throwing = await run(() => {}, { fake: { throwOnSpawn: true } });
     expect(throwing.error?.message).toContain('spawn boom');
     expect(existsSync(dirname(throwing.fake.state.spec!.env.XDG_CONFIG_HOME!))).toBe(false);
-  });
-
-  it('leaves no run-scoped directory in the temp dir', () => {
-    expect(leaked()).toEqual([]);
   });
 });
 
@@ -1189,6 +1188,37 @@ describe('opencode adapter: failures', () => {
     });
     expect(foreign.error?.code).toBe('harness-nonzero-exit');
     expect(foreign.error?.message).toContain('aborted');
+  });
+
+  it('ignores a child session error when the root session still goes idle', async () => {
+    const o = await run((s) => {
+      s.child('ses_child', 'ses_root');
+      s.assistant('mc', { sessionID: 'ses_child', tokens: USAGE_1, error: { name: 'UnknownError', data: { message: 'subagent failed' } } });
+      s.emit('session.error', { sessionID: 'ses_child', error: { name: 'UnknownError', data: { message: 'subagent failed again' } } });
+      finish(s);
+    });
+    expect(o.error).toBeUndefined();
+    expect(o.result?.usage).toBeDefined();
+  });
+
+  it('still fails when the root session errors after a child error and goes idle', async () => {
+    const o = await run((s) => {
+      s.child('ses_child', 'ses_root');
+      s.assistant('mc', { sessionID: 'ses_child', error: { name: 'UnknownError', data: { message: 'subagent failed' } } });
+      s.assistant('m1', { tokens: USAGE_1, error: { name: 'UnknownError', data: { message: 'root failed' } } });
+      s.idle();
+    });
+    expect(o.error?.code).toBe('harness-nonzero-exit');
+    expect(o.error?.message).toContain('root failed');
+  });
+
+  it('treats a session error with no session id as fatal on idle', async () => {
+    const o = await run((s) => {
+      s.emit('session.error', { error: { name: 'UnknownError', data: { message: 'who failed' } } });
+      finish(s);
+    });
+    expect(o.error?.code).toBe('harness-nonzero-exit');
+    expect(o.error?.message).toContain('who failed');
   });
 
   it('classifies any other session error as a nonzero exit with its message', async () => {

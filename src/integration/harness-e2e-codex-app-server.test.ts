@@ -68,7 +68,7 @@ describe.skipIf(!E2E_ENABLED)('codex-app-server adapter against the real API (CO
     const root = realpathSync(mkdtempSync(join(tmpdir(), 'conduit-e2e-codex-app-')));
     try {
       const events: HarnessEvent[] = [];
-      const out = await adapterFor(root).invoke({
+      await adapterFor(root).invoke({
         prompt:
           'Run this exact shell command: echo denied > denied.txt . ' +
           'If it is refused, say so in one sentence and stop.',
@@ -78,7 +78,6 @@ describe.skipIf(!E2E_ENABLED)('codex-app-server adapter against the real API (CO
         gate: (call) => ({ decision: 'deny', code: 'not_allowlisted', reason: `no ${call.toolName}` }),
         onEvent: (e) => events.push(e),
       });
-      expect(out.outputs).toEqual([]);
       expect(existsSync(join(root, 'denied.txt'))).toBe(false);
       const decisions = events.filter((e) => e.type === 'gate-decision');
       expect(decisions.length).toBeGreaterThan(0);

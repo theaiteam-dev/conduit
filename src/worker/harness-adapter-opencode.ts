@@ -39,7 +39,9 @@
  * Subagents. The `task` tool creates a child session (`session.created` with a
  * `parentID`). The adapter tracks the tree from that event. Asks from a child
  * arrive on the same stream and get the same checks, with the child session id
- * as `agentId`. An ask from a session outside the tree is rejected.
+ * as `agentId`. An ask from a session outside the tree is rejected. On idle,
+ * only errors from the root session (or naming no session) fail the call, since a
+ * subagent's failure returns to the root as a tool result.
  *
  * Hold. Rejecting a call at the ask and aborting at once loses the usage of the
  * step in flight, so the order is: reject the ask, deny every later ask without
@@ -211,6 +213,8 @@ interface SeenError {
   message: string;
   status: number | undefined;
   retryable: boolean;
+  /** Session that raised it; undefined when the event did not say, which is fatal on idle. */
+  sessionID?: string;
 }
 
 type Outcome =
@@ -824,9 +828,10 @@ export function createOpenCodeHarnessAdapter(config: OpenCodeHarnessAdapterConfi
         };
 
         // ---- events -------------------------------------------------------
-        const recordError = (raw: unknown, messageId?: string): void => {
-          const e = parseError(raw);
-          if (e === undefined) return;
+        const recordError = (raw: unknown, sessionID: string | undefined, messageId?: string): void => {
+          const parsed = parseError(raw);
+          if (parsed === undefined) return;
+          const e: SeenError = sessionID !== undefined ? { ...parsed, sessionID } : parsed;
           if (e.name === 'MessageAbortedError' && st.aborting) return;
           if (messageId !== undefined) {
             if (errorMessages.has(messageId)) return;
@@ -864,7 +869,7 @@ export function createOpenCodeHarnessAdapter(config: OpenCodeHarnessAdapterConfi
               if (id === undefined) break;
               const usage = parseUsage(info);
               if (usage !== undefined) usageByMessage.set(id, usage);
-              if (info.error !== undefined) recordError(info.error, id);
+              if (info.error !== undefined) recordError(info.error, sessionID, id);
               checkHoldReady();
               break;
             }
@@ -899,7 +904,7 @@ export function createOpenCodeHarnessAdapter(config: OpenCodeHarnessAdapterConfi
               break;
             case 'session.error': {
               const sessionID = str(props.sessionID);
-              if (sessionID === undefined || sessions.has(sessionID)) recordError(props.error);
+              if (sessionID === undefined || sessions.has(sessionID)) recordError(props.error, sessionID);
               break;
             }
             default:
@@ -1116,7 +1121,11 @@ export function createOpenCodeHarnessAdapter(config: OpenCodeHarnessAdapterConfi
           });
         }
 
-        const finalError = errors.length > 0 ? errors[errors.length - 1] : undefined;
+        // A subagent's failure comes back to the root as a tool result, so on idle only the root's errors
+        // (and errors naming no session, which fail closed) decide the call.
+        const decisive =
+          outcome.kind === 'idle' ? errors.filter((e) => e.sessionID === undefined || e.sessionID === st.rootId) : errors;
+        const finalError = decisive.length > 0 ? decisive[decisive.length - 1] : undefined;
         if (outcome.kind === 'idle' && finalError === undefined) {
           return { outputs: [], usage: usage ?? { unknown: true } };
         }
