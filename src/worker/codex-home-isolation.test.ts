@@ -75,6 +75,19 @@ describe('createRunScopedCodexHome', () => {
     expect(readFileSync(authPath, 'utf8')).toBe('{"token":"A"}');
   });
 
+  it('refuses to delete a dir that is not a run-scoped home, and leaves it in place', () => {
+    const elsewhere = mkdtempSync(join(tmpdir(), 'codex-notahome-'));
+    cleanup.push(elsewhere);
+    writeFileSync(join(elsewhere, 'keep.txt'), 'x');
+    expect(() => removeRunScopedCodexHome(elsewhere)).toThrow(/run-scoped/);
+    expect(existsSync(join(elsewhere, 'keep.txt'))).toBe(true);
+
+    // Right name, wrong parent.
+    const inner = mkdtempSync(join(elsewhere, PREFIX));
+    expect(() => removeRunScopedCodexHome(inner)).toThrow(/run-scoped/);
+    expect(existsSync(inner)).toBe(true);
+  });
+
   it('leaves no dir behind when the link cannot be created', async () => {
     // node:fs is mocked in a child process so the mock cannot leak into other test files.
     const { env } = operator('{}');

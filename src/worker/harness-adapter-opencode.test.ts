@@ -91,6 +91,8 @@ interface Scenario {
   mark(label: string): void;
   /** Run a bash call through its running part and its ask. */
   bash(callID: string, command: string, o?: { sessionID?: string; messageID?: string; patterns?: string[] }): Promise<Json | undefined>;
+  /** Send a request with a wrong password while the server is up. Resolves with the status, rejects if the server is unreachable. */
+  probeWrongPassword(): Promise<number>;
   timeline: string[];
   requests: Recorded[];
 }
@@ -109,6 +111,8 @@ interface FakeOptions {
   noScenario?: boolean;
   /** Answer permission replies with 404, as a server does for an ask it already settled. */
   reply404?: boolean;
+  /** Hold the answer to a question reject for this many ms, keyed by question id. */
+  rejectDelayMs?: Record<string, number>;
 }
 
 const enc = new TextEncoder();
@@ -198,6 +202,13 @@ function fakeOpenCode(scenario: (s: Scenario) => Promise<void> | void, opts: Fak
         tool: { messageID: o.messageID ?? 'msg_1', callID },
       });
     },
+    async probeWrongPassword() {
+      const res = await fetch(`http://127.0.0.1:${state.port}/session`, {
+        method: 'POST',
+        headers: { authorization: `Basic ${btoa('opencode:wrong')}`, 'x-test-probe': '1' },
+      });
+      return res.status;
+    },
     timeline: state.timeline,
     requests: state.requests,
   };
@@ -218,6 +229,8 @@ function fakeOpenCode(scenario: (s: Scenario) => Promise<void> | void, opts: Fak
         } catch {
           body = text;
         }
+        // A probe with the header is a test's own request, not the adapter's, and is kept out of `requests`.
+        if (req.headers.get('x-test-probe') === '1') return new Response('unauthorized', { status: authOk ? 200 : 401 });
         state.requests.push({ directory: req.headers.get('x-opencode-directory'), method: req.method, path: url.pathname, body, authOk });
         state.timeline.push(`${req.method} ${url.pathname}${body !== undefined ? ` ${JSON.stringify(body)}` : ''}`);
         if (!authOk) return new Response('unauthorized', { status: 401 });
@@ -248,7 +261,13 @@ function fakeOpenCode(scenario: (s: Scenario) => Promise<void> | void, opts: Fak
           resolve?.(body);
           return opts.reply404 === true ? new Response('gone', { status: 404 }) : Response.json(true);
         }
-        if (req.method === 'POST' && /^\/question\/[^/]+\/reject$/.test(url.pathname)) return Response.json(true);
+        const questionReject = /^\/question\/([^/]+)\/reject$/.exec(url.pathname);
+        if (req.method === 'POST' && questionReject) {
+          const delay = opts.rejectDelayMs?.[questionReject[1]!];
+          if (delay !== undefined) await Bun.sleep(delay);
+          state.timeline.push(`done ${url.pathname}`);
+          return Response.json(true);
+        }
         if (req.method === 'POST' && /^\/session\/[^/]+\/abort$/.test(url.pathname)) return Response.json(true);
         const message = /^\/session\/([^/]+)\/message\/([^/]+)$/.exec(url.pathname);
         if (req.method === 'GET' && message) {
@@ -400,16 +419,21 @@ describe('opencode adapter: process, auth and environment', () => {
   });
 
   it('gives the fake a way to refuse a wrong password, which the adapter never sends', async () => {
-    const o = await run((s) => finish(s));
-    const spec = o.fake.state.spec!;
-    expect(spec.env[PASSWORD_VAR]!.length).toBeGreaterThanOrEqual(32);
-    const wrong = await fetch(`http://127.0.0.1:${o.fake.state.port}/session`, {
-      method: 'POST',
-      headers: { authorization: `Basic ${btoa('opencode:wrong')}` },
-    }).catch(() => undefined);
-    // The server is stopped after the call, so either the refusal or a closed socket is a pass.
-    expect(wrong === undefined || wrong.status === 401).toBe(true);
-    expect(o.fake.state.requests.some((r) => !r.authOk)).toBe(wrong !== undefined);
+    let probeStatus: number | undefined;
+    let probeError: unknown;
+    const o = await run(async (s) => {
+      try {
+        probeStatus = await s.probeWrongPassword();
+      } catch (err) {
+        probeError = err;
+      }
+      finish(s);
+    });
+    expect(probeError).toBeUndefined();
+    expect(probeStatus).toBe(401);
+    expect(o.fake.state.spec!.env[PASSWORD_VAR]!.length).toBeGreaterThanOrEqual(32);
+    // The probe is not in the adapter's recorded requests.
+    expect(o.fake.state.requests.every((r) => r.authOk)).toBe(true);
   });
 
   it('uses a different password for every invocation', async () => {
@@ -929,14 +953,32 @@ describe('opencode adapter: replies', () => {
 
   it('never replies always on any request in this file', () => {
     const permissionReplies = allRequests.filter((r) => /^\/permission\/[^/]+\/reply$/.test(r.path));
-    expect(permissionReplies.length).toBeGreaterThan(20);
-    for (const r of permissionReplies) expect(['once', 'reject']).toContain(r.body.reply);
+    const kinds = permissionReplies.map((r) => r.body.reply);
+    expect(kinds).toContain('once');
+    expect(kinds).toContain('reject');
+    expect(kinds).not.toContain('always');
+    for (const k of kinds) expect(['once', 'reject']).toContain(k);
     // Every request the adapter made carried the password.
     expect(allRequests.every((r) => r.authOk)).toBe(true);
   });
 });
 
 describe('opencode adapter: question tool and hold', () => {
+  it('does not mark the first hold replied when a later question is rejected first', async () => {
+    const o = await run(async (s) => {
+      s.assistant('msg_1', { cost: 0.001, tokens: USAGE_1 });
+      s.emit('question.asked', { id: 'que_1', sessionID: s.sessionID, questions: [], tool: { messageID: 'msg_1', callID: 'q1' } });
+      await Bun.sleep(20);
+      s.emit('question.asked', { id: 'que_2', sessionID: s.sessionID, questions: [], tool: { messageID: 'msg_1', callID: 'q2' } });
+    }, { fake: { rejectDelayMs: { que_1: 120 } } });
+    expect(o.error?.code).toBe(HARNESS_GATE_HOLD_CODE);
+    const tl = o.fake.state.timeline;
+    const firstDone = tl.indexOf('done /question/que_1/reject');
+    const abort = tl.findIndex((e) => e.includes('/abort'));
+    expect(firstDone).toBeGreaterThan(-1);
+    expect(abort).toBeGreaterThan(firstDone);
+  });
+
   it('rejects a question.asked and holds', async () => {
     const o = await run(async (s) => {
       s.assistant('msg_1', { cost: 0.001, tokens: USAGE_1 });
@@ -1159,7 +1201,7 @@ describe('opencode adapter: failures', () => {
       s.assistant('m1', { tokens: USAGE_1 });
       s.status({ type: 'retry', attempt: 1, message: 'Rate limit reached for requests', next: Date.now() + 60_000 });
       await Bun.sleep(3_000);
-    });
+    }, { invocation: { timeoutMs: 20_000 } });
     expect(o.error?.code).toBe('harness-rate-limited');
     expect(o.error?.resetAtMs).toBeGreaterThan(Date.now());
     expect(o.fake.state.requests.some((r) => r.path.endsWith('/abort'))).toBe(true);

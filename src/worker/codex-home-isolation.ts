@@ -19,7 +19,9 @@
 
 import { existsSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
+
+const HOME_PREFIX = 'conduit-codex-home-';
 
 const AUTH_FILE = 'auth.json';
 
@@ -64,7 +66,7 @@ export function createRunScopedCodexHome(
     );
   }
 
-  const dir = mkdtempSync(join(tmpdir(), 'conduit-codex-home-'));
+  const dir = mkdtempSync(join(tmpdir(), HOME_PREFIX));
   try {
     writeFileSync(join(dir, 'config.toml'), '');
     if (linkAuth) symlinkSync(auth!, join(dir, AUTH_FILE));
@@ -75,7 +77,13 @@ export function createRunScopedCodexHome(
   return dir;
 }
 
-/** Delete a dir made by createRunScopedCodexHome. Removes the link, never its target. */
+/**
+ * Delete a dir made by createRunScopedCodexHome. Removes the link, never its target.
+ * Throws, deleting nothing, for a path that is not a run-scoped home directly under the temp dir.
+ */
 export function removeRunScopedCodexHome(dir: string): void {
+  if (!basename(dir).startsWith(HOME_PREFIX) || dirname(resolve(dir)) !== resolve(tmpdir())) {
+    throw new Error(`refusing to remove '${dir}': not a run-scoped codex home`);
+  }
   rmSync(dir, { recursive: true, force: true });
 }

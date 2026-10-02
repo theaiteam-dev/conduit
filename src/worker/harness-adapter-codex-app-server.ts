@@ -262,7 +262,9 @@ export function unwrapShellCommand(command: string): { command: string } | { err
   const words = splitShellWords(command);
   if (words === null) return { error: 'the command string could not be parsed' };
   if (words.length === 0) return { error: 'the command string is empty' };
-  if (words.length === 3 && SHELLS.has(basename(words[0]!)) && SHELL_COMMAND_FLAG.test(words[1]!)) {
+  if (words.length >= 3 && SHELLS.has(basename(words[0]!)) && SHELL_COMMAND_FLAG.test(words[1]!)) {
+    // Extra words after the script are positional parameters ($0, $1, ...) the script can expand. Gating the raw string would hide the script.
+    if (words.length > 3) return { error: 'the shell wrapper carries extra arguments after the script' };
     return { command: words[2]! };
   }
   return { command };
@@ -410,7 +412,11 @@ type Outcome =
  * for the kernel's signal handlers. Lines are delivered as they complete.
  * `label` prefixes the spawn error. The opencode adapter uses this too.
  */
-export function containedSpawn(containment: Containment, label = 'codex-app-server'): AppServerSpawn {
+export function containedSpawn(
+  containment: Containment,
+  label = 'codex-app-server',
+  seams: { exitWaitMs?: number; kill?: (pid: number, cgroup: string | undefined) => void } = {},
+): AppServerSpawn {
   return (spec, handlers) => {
     const contained = prepareContainedCommand(containment, [spec.command, ...spec.args], { cwd: spec.cwd, env: spec.env });
     let child: ChildProcess;
@@ -433,7 +439,8 @@ export function containedSpawn(containment: Containment, label = 'codex-app-serv
     const pid = child.pid;
     const cgroup = contained.cgroup;
     trackProcessGroup(pid, cgroup);
-    const kill = (): void => killContained(pid, cgroup);
+    const killTree = seams.kill ?? killContained;
+    const kill = (): void => killTree(pid, cgroup);
 
     let exitCode: number | undefined;
     let exitSignal: string | undefined;
@@ -495,14 +502,16 @@ export function containedSpawn(containment: Containment, label = 'codex-app-serv
       async close() {
         kill();
         let wait: ReturnType<typeof setTimeout> | undefined;
-        await Promise.race([
-          exited,
-          new Promise<void>((r) => {
-            wait = setTimeout(r, EXIT_WAIT_MS);
+        const won = await Promise.race([
+          exited.then(() => 'exited' as const),
+          new Promise<'timeout'>((r) => {
+            wait = setTimeout(() => r('timeout'), seams.exitWaitMs ?? EXIT_WAIT_MS);
           }),
         ]);
         // An uncleared timer would hold the process open for EXIT_WAIT_MS after every call.
         clearTimeout(wait);
+        // A process still alive stays tracked so the kernel's signal handlers can reap it. The stale-cgroup sweep handles its cgroup.
+        if (won !== 'exited') return;
         untrackProcessGroup(pid);
         if (cgroup !== undefined) await removeCgroup(cgroup);
       },

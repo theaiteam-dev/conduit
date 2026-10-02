@@ -596,12 +596,19 @@ export function createOpenCodeHarnessAdapter(config: OpenCodeHarnessAdapterConfi
           const now = partFor(callID, sessionID, messageID);
           if (now !== undefined) return now;
           await new Promise<void>((done) => {
-            const timer = setTimeout(done, config.toolPartWaitMs ?? TOOL_PART_WAIT_MS);
-            const list = partWaiters.get(callID) ?? [];
-            list.push(() => {
+            const wake = (): void => {
               clearTimeout(timer);
               done();
-            });
+            };
+            const timer = setTimeout(() => {
+              // Drop this waiter so a timed-out wait does not linger for the call id.
+              const left = (partWaiters.get(callID) ?? []).filter((w) => w !== wake);
+              if (left.length === 0) partWaiters.delete(callID);
+              else partWaiters.set(callID, left);
+              done();
+            }, config.toolPartWaitMs ?? TOOL_PART_WAIT_MS);
+            const list = partWaiters.get(callID) ?? [];
+            list.push(wake);
             partWaiters.set(callID, list);
           });
           const late = partFor(callID, sessionID, messageID);
@@ -815,13 +822,15 @@ export function createOpenCodeHarnessAdapter(config: OpenCodeHarnessAdapterConfi
           if (id === undefined) return;
           const sessionID = str(p.sessionID) ?? st.rootId ?? '';
           const tool = isObject(p.tool) ? p.tool : undefined;
+          // Only the handler that began the hold may mark it replied. A later question gets a deny.
+          const beganHold = st.held === undefined;
           holdDirect('AskUserQuestion', { sessionID, messageID: str(tool?.messageID), toolCallId: str(tool?.callID) });
           try {
             if (!st.finished) await http('POST', `/question/${encodeURIComponent(id)}/reject`);
           } catch {
             /* the hold proceeds either way */
           }
-          if (st.held !== undefined) {
+          if (beganHold && st.held !== undefined) {
             st.held.replied = true;
             checkHoldReady();
           }

@@ -10,9 +10,11 @@ import { describe, it, expect, afterAll } from 'bun:test';
 import { existsSync, lstatSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, mkdirSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { killContained } from './process-group';
 import { describeHarnessContainmentConformance } from './harness-containment.conformance';
 import {
   CODEX_APP_SERVER_ARGS,
+  containedSpawn,
   createCodexAppServerHarnessAdapter,
   splitShellWords,
   unwrapShellCommand,
@@ -39,6 +41,7 @@ describeHarnessContainmentConformance('codex-app-server', (opts) =>
   }),
 );
 
+const PREEXISTING_HOMES = new Set(readdirSync(tmpdir()).filter((n) => n.startsWith('conduit-codex-home-')));
 const ROOT = realpathSync(mkdtempSync(join(tmpdir(), 'conduit-codex-app-')));
 afterAll(() => rmSync(ROOT, { recursive: true, force: true }));
 
@@ -454,9 +457,10 @@ describe('shell command unwrapping', () => {
     expect(unwrapShellCommand('/usr/bin/zsh script.sh')).toEqual({ command: '/usr/bin/zsh script.sh' });
   });
 
-  it('does not unwrap a wrapper that carries extra positional words', () => {
-    const shown = "bash -c 'cat a.txt' extra";
-    expect(unwrapShellCommand(shown)).toEqual({ command: shown });
+  it('refuses a wrapper that carries extra positional words, so the gate never sees the raw string', () => {
+    for (const shown of ["bash -c 'cat a.txt' extra", "sh -c 'cat a.txt' name arg", "/bin/zsh -lc 'cat a.txt' x"]) {
+      expect(unwrapShellCommand(shown)).toEqual({ error: expect.any(String) });
+    }
   });
 
   it('reports a string it cannot parse', () => {
@@ -556,6 +560,14 @@ describe('codex-app-server adapter: command approvals', () => {
     );
     expect(spy.calls).toEqual([]);
     expect(r.answers.map(decisionOf)).toEqual(['decline', 'decline', 'decline', 'decline']);
+  });
+
+  it('declines a shell wrapper with extra words as malformed_input and never asks the gate', async () => {
+    const spy = spyGate();
+    const r = await answers([['item/commandExecution/requestApproval', CMD("sh -c 'cat a.txt' name arg")]], spy.gate);
+    expect(spy.calls).toEqual([]);
+    expect(r.answers.map(decisionOf)).toEqual(['decline']);
+    expect(r.events.filter((e) => e.type === 'gate-decision')).toMatchObject([{ decision: 'deny', code: 'malformed_input' }]);
   });
 
   it('runs the real gate: an allowlisted read is accepted and a redirect is declined', async () => {
@@ -934,7 +946,8 @@ describe('codex-app-server adapter: hold', () => {
     });
     const started = Date.now();
     const err = await rejection(adapterWith(server, { holdStopWaitMs: 60 }).invoke(invocation({ gate: () => hold })));
-    expect(Date.now() - started).toBeLessThan(2_000);
+    // The unconfigured wait is HOLD_STOP_WAIT_MS (5s). 3s separates the two with room for a loaded runner.
+    expect(Date.now() - started).toBeLessThan(3_000);
     expect(err.code).toBe(HARNESS_GATE_HOLD_CODE);
     expect(err.usage).toMatchObject({ tokens: 120 });
     expect(server.state.kills).toBeGreaterThan(0);
@@ -1149,13 +1162,37 @@ describe('codex-app-server adapter: failures', () => {
   });
 });
 
+describe('codex-app-server containedSpawn close()', () => {
+  const trackedHandlers = (): number => process.listeners('SIGTERM').length;
+
+  it('keeps the group tracked when the process outlives the exit wait, and untracks it once it has exited', async () => {
+    const before = trackedHandlers();
+    let real = false;
+    const proc = containedSpawn(containment, 'test', {
+      exitWaitMs: 50,
+      kill: (pid, cgroup) => {
+        if (real) killContained(pid, cgroup);
+      },
+    })({ command: 'sleep', args: ['30'], cwd: ROOT, env: { PATH: '/usr/bin:/bin' } }, { onLine() {}, onStderr() {}, onExit() {} });
+    try {
+      await proc.close();
+      // The kill was a no-op, so the process is still alive: the kernel's signal handlers must still know it.
+      expect(trackedHandlers()).toBeGreaterThan(before);
+    } finally {
+      real = true;
+      await proc.close();
+    }
+    expect(trackedHandlers()).toBe(before);
+  });
+});
+
 describe('codex-app-server adapter: timeouts', () => {
   it('kills the process and throws harness-timeout at the wall-clock bound, even during the handshake', async () => {
     const server = fakeServer(() => {}, { silent: true });
-    const started = Date.now();
     const err = await rejection(adapterWith(server).invoke(invocation({ timeoutMs: 60 })));
+    // No timing bound: a regressed timer leaves the call waiting forever on the silent server, which the
+    // test timeout reports. A wall-clock bound here could only flake.
     expect(err.code).toBe('harness-timeout');
-    expect(Date.now() - started).toBeLessThan(2_000);
     expect(server.state.kills).toBeGreaterThan(0);
   });
 
@@ -1325,7 +1362,8 @@ describe('codex-app-server adapter: registration', () => {
   });
 
   it('leaves no codex home behind in the temp dir after the suite has run its invocations', () => {
-    const leftovers = readdirSync(tmpdir()).filter((n) => n.startsWith('conduit-codex-home-'));
+    // Other files and processes may hold their own live homes; only a new one is a leak from this file.
+    const leftovers = readdirSync(tmpdir()).filter((n) => n.startsWith('conduit-codex-home-') && !PREEXISTING_HOMES.has(n));
     expect(leftovers).toEqual([]);
   });
 });
