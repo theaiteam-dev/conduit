@@ -29,7 +29,6 @@
  */
 
 import { spawn as nodeSpawn, type ChildProcess } from 'node:child_process';
-import { isAbsolute } from 'node:path';
 import type { HookCallback, Options, SDKMessage, SpawnOptions, SpawnedProcess } from '@anthropic-ai/claude-agent-sdk';
 import type {
   HarnessAdapter, HarnessInvocation, HarnessResult, BinaryProbe, RateLimitSnapshot, RateLimitWindow,
@@ -45,6 +44,7 @@ import { createRunScopedClaudeConfigDir, removeRunScopedClaudeConfigDir } from '
 import { killContained, trackProcessGroup, untrackProcessGroup } from './process-group';
 import { prepareContainedCommand, removeCgroup, resolveContainment, type Containment } from './cgroup-containment';
 import { existsSync, statSync } from 'node:fs';
+import { resolveExecutable } from './harness-contained-spawn';
 
 /** The part of the SDK's `Query` this adapter uses. */
 export type AgentSdkQuery = AsyncIterable<SDKMessage> & { close?(): void };
@@ -90,25 +90,6 @@ const STDERR_TAIL_BYTES = 2_000;
 
 function fail(reason: string, code?: string, detail?: Record<string, unknown>): never {
   throw Object.assign(new Error(`agent-sdk: ${reason}`), code !== undefined ? { code } : {}, detail ?? {});
-}
-
-/**
- * The `claude` a bare name resolves to on `sourceEnv`'s PATH, or a given absolute path. Files only,
- * never a shell function. A path containing '/' must be absolute: a relative one would resolve
- * against whatever cwd the kernel happens to have, so it is refused, with its own message.
- */
-export function resolveExecutable(
-  command: string,
-  sourceEnv: Record<string, string | undefined>,
-): { path: string } | { error: string } {
-  if (command.includes('/')) {
-    if (!isAbsolute(command)) return { error: `'${command}' is a relative path, and the command must be an absolute path or a bare name on PATH` };
-    return existsSync(command) && statSync(command).isFile()
-      ? { path: command }
-      : { error: `'${command}' does not exist or is not a file` };
-  }
-  const found = Bun.which(command, { PATH: sourceEnv.PATH ?? '/usr/bin:/bin' });
-  return found !== null ? { path: found } : { error: `'${command}' was not found on PATH` };
 }
 
 interface ActiveChild {

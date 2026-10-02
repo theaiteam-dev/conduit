@@ -60,53 +60,22 @@
  * resume, named agents.
  */
 
-import { spawn as nodeSpawn, type ChildProcess } from 'node:child_process';
-import { StringDecoder } from 'node:string_decoder';
 import { existsSync, statSync } from 'node:fs';
 import { basename, resolve } from 'node:path';
 import type {
   BinaryProbe, HarnessAdapter, HarnessInvocation, HarnessResult, KnownUsage, RateLimitSnapshot, RateLimitWindow,
 } from './harness-adapter';
-import { resolveExecutable } from './harness-adapter-agent-sdk';
+import {
+  containedSpawn, resolveExecutable,
+  type ContainedProcess, type ContainedProcessHandlers, type ContainedSpawn,
+} from './harness-contained-spawn';
 import { bindingResetAtMs } from './harness-adapter-claude';
 import { createRunScopedCodexHome, removeRunScopedCodexHome } from './codex-home-isolation';
 import { createHarnessEventEmitter } from './harness-events';
 import { HARNESS_GATE_HOLD_CODE, callGateFailClosed, type GateDecision, type GateToolCall } from './harness-gate';
 import { buildHarnessChildEnv } from './harness-runner';
 import { isContainedIn, resolveOwnedPath } from './integrity';
-import { killContained, trackProcessGroup, untrackProcessGroup } from './process-group';
-import { prepareContainedCommand, removeCgroup, resolveContainment, type Containment } from './cgroup-containment';
-
-/** What the adapter hands a spawn seam. */
-export interface AppServerSpawnSpec {
-  command: string;
-  args: string[];
-  cwd: string;
-  /** The whole child env. Nothing is inherited. */
-  env: Record<string, string>;
-}
-
-/** The three things a running app-server tells the adapter. */
-export interface AppServerProcessHandlers {
-  /** One complete stdout line, without its newline. */
-  onLine(line: string): void;
-  onStderr(text: string): void;
-  /** Once, after the process is gone and its stdout has been read to the end. */
-  onExit(code: number | undefined, signal: string | undefined): void;
-}
-
-/** A running app-server, as the adapter drives it. */
-export interface AppServerProcess {
-  /** Write one line (the newline is added). Never throws. */
-  write(line: string): void;
-  /** End everything the process started. Idempotent. */
-  kill(): void;
-  /** Resolve once the process has exited and its containment is released, bounded. */
-  close(): Promise<void>;
-}
-
-/** Start an app-server. May throw. Injected by tests. */
-export type AppServerSpawn = (spec: AppServerSpawnSpec, handlers: AppServerProcessHandlers) => AppServerProcess;
+import { resolveContainment, type Containment } from './cgroup-containment';
 
 export interface CodexAppServerHarnessAdapterConfig {
   /** Absolute project root: the app-server's cwd and the confinement root for commands. */
@@ -120,7 +89,7 @@ export interface CodexAppServerHarnessAdapterConfig {
   /** Kernel env used to resolve the allowlist, PATH lookup and credentials. Defaults to process.env. */
   sourceEnv?: Record<string, string | undefined>;
   /** Injected process seam, for tests. Defaults to a contained detached spawn. */
-  spawn?: AppServerSpawn;
+  spawn?: ContainedSpawn;
   /** Injected binary-presence probe, for tests. */
   probe?: () => Promise<BinaryProbe>;
   /** Wait after a gate hold for the turn to end before the process is killed, in ms. For tests; defaults to HOLD_STOP_WAIT_MS. */
@@ -129,10 +98,6 @@ export interface CodexAppServerHarnessAdapterConfig {
   containment?: Containment;
 }
 
-/** Longest wait for the killed process to exit before the adapter gives up on it. */
-const EXIT_WAIT_MS = 5_000;
-/** Grace after `exit` for the stdout stream to close, when a surviving descendant holds the pipe. */
-const CLOSE_GRACE_MS = 1_000;
 /** Longest wait, after a gate hold, for the interrupted turn to end. Then the process is killed. */
 const HOLD_STOP_WAIT_MS = 5_000;
 /** Bytes of the child's stderr kept for error detail. */
@@ -392,7 +357,7 @@ function isAuthError(e: SeenError): boolean {
 }
 
 interface ActiveProcess {
-  proc: AppServerProcess;
+  proc: ContainedProcess;
 }
 
 type Outcome =
@@ -402,122 +367,6 @@ type Outcome =
   | { kind: 'idle' }
   | { kind: 'hold-timeout' }
   | { kind: 'rpc'; message: string };
-
-// ---------------------------------------------------------------------------
-// Default process seam
-// ---------------------------------------------------------------------------
-
-/**
- * Start `spec` detached, in its own cgroup where the host has one, and tracked
- * for the kernel's signal handlers. Lines are delivered as they complete.
- * `label` prefixes the spawn error. The opencode adapter uses this too.
- */
-export function containedSpawn(
-  containment: Containment,
-  label = 'codex-app-server',
-  seams: { exitWaitMs?: number; kill?: (pid: number, cgroup: string | undefined) => void } = {},
-): AppServerSpawn {
-  return (spec, handlers) => {
-    const contained = prepareContainedCommand(containment, [spec.command, ...spec.args], { cwd: spec.cwd, env: spec.env });
-    let child: ChildProcess;
-    try {
-      child = nodeSpawn(contained.argv[0]!, contained.argv.slice(1), {
-        cwd: spec.cwd,
-        env: spec.env,
-        // setsid(): the app-server leads its own session and group, so its pid addresses the whole group.
-        detached: true,
-        stdio: ['pipe', 'pipe', 'pipe'],
-      });
-    } catch (err) {
-      if (contained.cgroup !== undefined) void removeCgroup(contained.cgroup);
-      throw err;
-    }
-    if (child.pid === undefined) {
-      if (contained.cgroup !== undefined) void removeCgroup(contained.cgroup);
-      throw new Error(`${label}: failed to spawn '${spec.command}'`);
-    }
-    const pid = child.pid;
-    const cgroup = contained.cgroup;
-    trackProcessGroup(pid, cgroup);
-    const killTree = seams.kill ?? killContained;
-    const kill = (): void => killTree(pid, cgroup);
-
-    let exitCode: number | undefined;
-    let exitSignal: string | undefined;
-    let exitReported = false;
-    let closeGrace: ReturnType<typeof setTimeout> | undefined;
-    const reportExit = (): void => {
-      if (exitReported) return;
-      exitReported = true;
-      if (closeGrace !== undefined) clearTimeout(closeGrace);
-      handlers.onExit(exitCode, exitSignal);
-    };
-    const exited = new Promise<void>((done) => {
-      child.once('exit', (code, signal) => {
-        exitCode = code ?? undefined;
-        exitSignal = signal ?? undefined;
-        // A descendant it backgrounded may hold the pipes open: end the tree so stdout reaches its end.
-        kill();
-        closeGrace = setTimeout(reportExit, CLOSE_GRACE_MS);
-        done();
-      });
-      child.once('error', () => {
-        done();
-        reportExit();
-      });
-    });
-    child.once('close', reportExit);
-
-    const decoder = new StringDecoder('utf8');
-    let carry = '';
-    child.stdout?.on('data', (chunk: Buffer) => {
-      carry += decoder.write(chunk);
-      let newline = carry.indexOf('\n');
-      while (newline >= 0) {
-        const line = carry.slice(0, newline);
-        carry = carry.slice(newline + 1);
-        if (line.length > 0) handlers.onLine(line);
-        newline = carry.indexOf('\n');
-      }
-    });
-    child.stdout?.on('end', () => {
-      carry += decoder.end();
-      if (carry.length > 0) handlers.onLine(carry);
-      carry = '';
-    });
-    child.stderr?.on('data', (chunk: Buffer) => handlers.onStderr(chunk.toString('utf-8')));
-    child.stdin?.on('error', () => {
-      /* the process is gone: the exit handler reports it */
-    });
-
-    return {
-      write(line) {
-        try {
-          child.stdin?.write(`${line}\n`);
-        } catch {
-          /* the process is gone */
-        }
-      },
-      kill,
-      async close() {
-        kill();
-        let wait: ReturnType<typeof setTimeout> | undefined;
-        const won = await Promise.race([
-          exited.then(() => 'exited' as const),
-          new Promise<'timeout'>((r) => {
-            wait = setTimeout(() => r('timeout'), seams.exitWaitMs ?? EXIT_WAIT_MS);
-          }),
-        ]);
-        // An uncleared timer would hold the process open for EXIT_WAIT_MS after every call.
-        clearTimeout(wait);
-        // A process still alive stays tracked so the kernel's signal handlers can reap it. The stale-cgroup sweep handles its cgroup.
-        if (won !== 'exited') return;
-        untrackProcessGroup(pid);
-        if (cgroup !== undefined) await removeCgroup(cgroup);
-      },
-    };
-  };
-}
 
 // ---------------------------------------------------------------------------
 // The adapter
@@ -560,7 +409,7 @@ export function createCodexAppServerHarnessAdapter(config: CodexAppServerHarness
         fail(`project root '${config.projectRoot}' does not exist, cannot confine the harness cwd`);
       }
       const canonicalRoot = resolveOwnedPath(resolve(config.projectRoot));
-      const spawnFn: AppServerSpawn = config.spawn ?? containedSpawn(config.containment ?? (await resolveContainment()));
+      const spawnFn: ContainedSpawn = config.spawn ?? containedSpawn(config.containment ?? (await resolveContainment()), 'codex-app-server');
       const model = call.model ?? config.model;
 
       // Built before the dir exists: nothing between the dir's creation and the try below can throw.
@@ -951,7 +800,7 @@ export function createCodexAppServerHarnessAdapter(config: CodexAppServerHarness
             }
           }
         };
-        const handlers: AppServerProcessHandlers = {
+        const handlers: ContainedProcessHandlers = {
           onLine,
           onStderr: (text) => {
             st.stderrTail = (st.stderrTail + text).slice(-STDERR_TAIL_BYTES);

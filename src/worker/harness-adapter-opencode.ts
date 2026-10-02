@@ -100,14 +100,14 @@ import { existsSync, statSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 import { resolve } from 'node:path';
 import type { BinaryProbe, HarnessAdapter, HarnessInvocation, HarnessResult, KnownUsage } from './harness-adapter';
-import { resolveExecutable } from './harness-adapter-agent-sdk';
 import {
   containedSpawn,
-  type AppServerProcess,
-  type AppServerProcessHandlers,
-  type AppServerSpawn,
-  type AppServerSpawnSpec,
-} from './harness-adapter-codex-app-server';
+  resolveExecutable,
+  type ContainedProcess,
+  type ContainedProcessHandlers,
+  type ContainedSpawn,
+  type ContainedSpawnSpec,
+} from './harness-contained-spawn';
 import { createHarnessEventEmitter } from './harness-events';
 import { sanitizeGateReason } from './harness-events-journal';
 import { HARNESS_GATE_HOLD_CODE, callGateFailClosed, type GateDecision, type GateToolCall } from './harness-gate';
@@ -121,10 +121,10 @@ import {
   splitOpenCodeModel,
 } from './opencode-isolation';
 
-export type OpenCodeSpawnSpec = AppServerSpawnSpec;
-export type OpenCodeProcessHandlers = AppServerProcessHandlers;
-export type OpenCodeProcess = AppServerProcess;
-export type OpenCodeSpawn = AppServerSpawn;
+export type OpenCodeSpawnSpec = ContainedSpawnSpec;
+export type OpenCodeProcessHandlers = ContainedProcessHandlers;
+export type OpenCodeProcess = ContainedProcess;
+export type OpenCodeSpawn = ContainedSpawn;
 
 export interface OpenCodeHarnessAdapterConfig {
   /** Absolute project root: the server's cwd and the confinement root for tool paths. */

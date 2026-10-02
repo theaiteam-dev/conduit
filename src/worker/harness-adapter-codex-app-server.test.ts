@@ -10,19 +10,15 @@ import { describe, it, expect, afterAll } from 'bun:test';
 import { existsSync, lstatSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, mkdirSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { killContained } from './process-group';
 import { describeHarnessContainmentConformance } from './harness-containment.conformance';
 import {
   CODEX_APP_SERVER_ARGS,
-  containedSpawn,
   createCodexAppServerHarnessAdapter,
   splitShellWords,
   unwrapShellCommand,
-  type AppServerProcessHandlers,
-  type AppServerSpawn,
-  type AppServerSpawnSpec,
   type CodexAppServerHarnessAdapterConfig,
 } from './harness-adapter-codex-app-server';
+import type { ContainedProcessHandlers, ContainedSpawn, ContainedSpawnSpec } from './harness-contained-spawn';
 import {
   bindHarnessDefinitionsForIntrospection, buildHarnessDefinitionRegistry, shippedHarnessAdapterNames,
   type HarnessInvocation, type KnownUsage,
@@ -70,7 +66,7 @@ interface FakeOptions {
 
 function fakeServer(scenario: (peer: Peer) => Promise<void> | void, opts: FakeOptions = {}) {
   const sent: Json[] = [];
-  const state: { spec?: AppServerSpawnSpec; kills: number; closes: number; handlers?: AppServerProcessHandlers } = { kills: 0, closes: 0 };
+  const state: { spec?: ContainedSpawnSpec; kills: number; closes: number; handlers?: ContainedProcessHandlers } = { kills: 0, closes: 0 };
   const serverPending = new Map<number, (m: Json) => void>();
   let nextServerId = 100;
   const deliver = (m: Json): void => queueMicrotask(() => state.handlers?.onLine(JSON.stringify(m)));
@@ -109,7 +105,7 @@ function fakeServer(scenario: (peer: Peer) => Promise<void> | void, opts: FakeOp
         break;
     }
   };
-  const spawn: AppServerSpawn = (spec, handlers) => {
+  const spawn: ContainedSpawn = (spec, handlers) => {
     state.spec = spec;
     if (opts.throwOnSpawn === true) throw new Error('spawn boom');
     state.handlers = handlers;
@@ -136,7 +132,7 @@ function fakeServer(scenario: (peer: Peer) => Promise<void> | void, opts: FakeOp
   return { spawn, sent, state, peer };
 }
 
-function adapterWith(server: { spawn: AppServerSpawn }, extra: Partial<CodexAppServerHarnessAdapterConfig> = {}) {
+function adapterWith(server: { spawn: ContainedSpawn }, extra: Partial<CodexAppServerHarnessAdapterConfig> = {}) {
   return createCodexAppServerHarnessAdapter({
     projectRoot: ROOT,
     envAllowlist: ['OPENAI_API_KEY', 'PATH'],
@@ -277,7 +273,7 @@ describe('codex-app-server adapter: handshake', () => {
 
   it('fails with harness-nonzero-exit when thread/start answers with an error', async () => {
     const server = fakeServer(() => {});
-    const failing: AppServerSpawn = (spec, handlers) => {
+    const failing: ContainedSpawn = (spec, handlers) => {
       const proc = server.spawn(spec, handlers);
       return {
         ...proc,
@@ -1145,7 +1141,7 @@ describe('codex-app-server adapter: failures', () => {
 
   it('fails when the process exits during the handshake instead of waiting for a response', async () => {
     const server = fakeServer(() => {}, { silent: true });
-    const wrapped: AppServerSpawn = (spec, handlers) => {
+    const wrapped: ContainedSpawn = (spec, handlers) => {
       const proc = server.spawn(spec, handlers);
       queueMicrotask(() => handlers.onExit(1, undefined));
       return proc;
@@ -1159,30 +1155,6 @@ describe('codex-app-server adapter: failures', () => {
     const err = await rejection(adapterWith(server).invoke(invocation()));
     expect(err.code).toBe('harness-nonzero-exit');
     expect(err.message).toContain('interrupted');
-  });
-});
-
-describe('codex-app-server containedSpawn close()', () => {
-  const trackedHandlers = (): number => process.listeners('SIGTERM').length;
-
-  it('keeps the group tracked when the process outlives the exit wait, and untracks it once it has exited', async () => {
-    const before = trackedHandlers();
-    let real = false;
-    const proc = containedSpawn(containment, 'test', {
-      exitWaitMs: 50,
-      kill: (pid, cgroup) => {
-        if (real) killContained(pid, cgroup);
-      },
-    })({ command: 'sleep', args: ['30'], cwd: ROOT, env: { PATH: '/usr/bin:/bin' } }, { onLine() {}, onStderr() {}, onExit() {} });
-    try {
-      await proc.close();
-      // The kill was a no-op, so the process is still alive: the kernel's signal handlers must still know it.
-      expect(trackedHandlers()).toBeGreaterThan(before);
-    } finally {
-      real = true;
-      await proc.close();
-    }
-    expect(trackedHandlers()).toBe(before);
   });
 });
 

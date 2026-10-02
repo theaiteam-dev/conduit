@@ -17,7 +17,7 @@ import {
   createOpenCodeHarnessAdapter,
   type OpenCodeHarnessAdapterConfig,
 } from './harness-adapter-opencode';
-import type { AppServerProcessHandlers, AppServerSpawn, AppServerSpawnSpec } from './harness-adapter-codex-app-server';
+import type { ContainedProcessHandlers, ContainedSpawn, ContainedSpawnSpec } from './harness-contained-spawn';
 import {
   bindHarnessDefinitionsForIntrospection, buildHarnessDefinitionRegistry, shippedHarnessAdapterNames,
   type HarnessInvocation, type KnownUsage,
@@ -126,7 +126,7 @@ const allRequests: Recorded[] = [];
 
 function fakeOpenCode(scenario: (s: Scenario) => Promise<void> | void, opts: FakeOptions = {}) {
   const state: {
-    spec?: AppServerSpawnSpec;
+    spec?: ContainedSpawnSpec;
     spawns: number;
     kills: number;
     closes: number;
@@ -138,7 +138,7 @@ function fakeOpenCode(scenario: (s: Scenario) => Promise<void> | void, opts: Fak
   } = { spawns: 0, kills: 0, closes: 0, requests: [], timeline: [] };
   let server: ReturnType<typeof Bun.serve> | undefined;
   let controller: ReadableStreamDefaultController<Uint8Array> | undefined;
-  let handlers: AppServerProcessHandlers | undefined;
+  let handlers: ContainedProcessHandlers | undefined;
   let eventNo = 0;
   let askNo = 0;
   const waiters = new Map<string, (body: Json | undefined) => void>();
@@ -301,7 +301,7 @@ function fakeOpenCode(scenario: (s: Scenario) => Promise<void> | void, opts: Fak
     server = undefined;
   };
 
-  const spawn: AppServerSpawn = (spec, h) => {
+  const spawn: ContainedSpawn = (spec, h) => {
     state.spawns += 1;
     state.spec = spec;
     if (opts.throwOnSpawn === true) throw new Error('spawn boom');
@@ -329,7 +329,7 @@ const allowAll: HarnessToolGate = () => ({ decision: 'allow' });
 const gateFor = (tools: string[], ownedPaths?: string[]): HarnessToolGate =>
   createHarnessToolGate({ projectRoot: ROOT, tools, ...(ownedPaths !== undefined ? { ownedPaths } : {}) });
 
-function adapterWith(server: { spawn: AppServerSpawn }, extra: Partial<OpenCodeHarnessAdapterConfig> = {}) {
+function adapterWith(server: { spawn: ContainedSpawn }, extra: Partial<OpenCodeHarnessAdapterConfig> = {}) {
   return createOpenCodeHarnessAdapter({
     projectRoot: ROOT,
     envAllowlist: [],
