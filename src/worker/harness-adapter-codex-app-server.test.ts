@@ -670,6 +670,41 @@ describe('codex-app-server adapter: file change approvals', () => {
     expect(decisionOf(r.answers[0]!)).toBe('decline');
   });
 
+  it('declines a second request that reuses an item id after the first was decided', async () => {
+    const spy = spyGate();
+    const r = await answers(
+      [
+        ['item/fileChange/requestApproval', FILE_REQ('fc-1')],
+        ['item/fileChange/requestApproval', FILE_REQ('fc-1')],
+      ],
+      spy.gate,
+      { setup: announce([change('/p/out/b.txt', { type: 'add' })]) },
+    );
+    expect(spy.calls.length).toBe(1);
+    expect(r.answers.map(decisionOf)).toEqual(['accept', 'decline']);
+  });
+
+  it('declines a request for an item that completed before the request arrived', async () => {
+    const spy = spyGate();
+    const r = await answers([['item/fileChange/requestApproval', FILE_REQ('fc-1')]], spy.gate, {
+      setup: (p) => {
+        announce([change('/p/out/b.txt', { type: 'add' })])(p);
+        p.completed({ type: 'fileChange', id: 'fc-1', changes: [], status: 'completed' });
+      },
+    });
+    expect(spy.calls).toEqual([]);
+    expect(decisionOf(r.answers[0]!)).toBe('decline');
+  });
+
+  it('does not resolve an item announced on another thread', async () => {
+    const spy = spyGate();
+    const r = await answers([['item/fileChange/requestApproval', FILE_REQ('fc-1', { threadId: 'thr-sub' })]], spy.gate, {
+      setup: announce([change('/p/out/b.txt', { type: 'add' })]),
+    });
+    expect(spy.calls).toEqual([]);
+    expect(decisionOf(r.answers[0]!)).toBe('decline');
+  });
+
   it('declines a request for an item with no changes or a malformed change', async () => {
     const spy = spyGate();
     const r = await answers(
@@ -733,6 +768,18 @@ describe('codex-app-server adapter: MCP elicitations and unknown requests', () =
       setup: (p) => p.started({ type: 'mcpToolCall', id: 'mcp-1', server: 'spike', tool: 'writeMarker', arguments: {} }),
     });
     expect(spy.calls.map((c) => c.toolName)).toEqual(['mcp__spike__writeMarker']);
+  });
+
+  it('ignores an mcpToolCall announced on another thread or already completed', async () => {
+    const spy = spyGate(() => deny());
+    await answers([['mcpServer/elicitation/request', ELICIT({ message: 'Allow?' })]], spy.gate, {
+      setup: (p) => {
+        p.started({ type: 'mcpToolCall', id: 'mcp-1', server: 'spike', tool: 'otherThread', arguments: {} }, 'thr-sub');
+        p.started({ type: 'mcpToolCall', id: 'mcp-2', server: 'spike', tool: 'finished', arguments: {} });
+        p.completed({ type: 'mcpToolCall', id: 'mcp-2', server: 'spike', tool: 'finished', status: 'completed' });
+      },
+    });
+    expect(spy.calls.map((c) => c.toolName)).toEqual(['mcp__spike__elicitation']);
   });
 
   it('is denied by the real gate whatever the station lists', async () => {

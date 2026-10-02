@@ -7,23 +7,26 @@
  *   CONDUIT_E2E_CODEX_APP_SERVER=1 bun test src/integration/harness-e2e-codex-app-server.test.ts
  *
  * It calls the real API through `codex app-server` with the operator's
- * existing login (the run-scoped CODEX_HOME links `auth.json`). Three short
+ * existing login (the run-scoped CODEX_HOME links `auth.json`). Four short
  * calls:
  *
  *   1. an allow-all gate: the result carries real usage and the billed model;
  *   2. a deny gate: the model's shell write is declined, the file is never
  *      created, and a deny gate-decision event is emitted;
- *   3. a hold gate: the call ends with the hold code and no command runs.
+ *   3. a hold gate: the call ends with the hold code and no command runs;
+ *   4. a read-only command (cat) still reaches the gate, i.e. `untrusted` does
+ *      not exempt Codex's known-safe commands from approval.
  *
  * Codex bills through the operator's login and reports no cost, so the figure
  * to watch is the token count.
  */
 import { describe, it, expect } from 'bun:test';
-import { existsSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createCodexAppServerHarnessAdapter } from '../worker/harness-adapter-codex-app-server';
 import type { KnownUsage } from '../worker/harness-adapter';
+import type { GateToolCall } from '../worker/harness-gate';
 import type { HarnessEvent } from '../worker/harness-events';
 import { HARNESS_GATE_HOLD_CODE } from '../worker/harness-gate';
 
@@ -105,6 +108,28 @@ describe.skipIf(!E2E_ENABLED)('codex-app-server adapter against the real API (CO
       expect(error?.code).toBe(HARNESS_GATE_HOLD_CODE);
       expect(existsSync(join(root, 'held.txt'))).toBe(false);
       expect(events.some((e) => e.type === 'gate-decision' && e.decision === 'hold')).toBe(true);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, TIMEOUT_MS + 10_000);
+
+  it('shows the gate a plain read-only command (does `untrusted` ask before ls and cat?)', async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'conduit-e2e-codex-app-')));
+    try {
+      writeFileSync(join(root, 'note.txt'), 'marker-4711\n');
+      const seen: GateToolCall[] = [];
+      await adapterFor(root).invoke({
+        prompt: 'Run this exact shell command: cat note.txt . Then reply with its contents.',
+        inputs: [],
+        tools: ['Bash(cat:*)'],
+        timeoutMs: TIMEOUT_MS,
+        gate: (call) => {
+          seen.push(call);
+          return { decision: 'allow' };
+        },
+      });
+      const commands = seen.filter((c) => c.toolName === 'Bash').map((c) => String((c.input as { command?: unknown }).command));
+      expect(commands.some((c) => c.includes('cat') && c.includes('note.txt'))).toBe(true);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

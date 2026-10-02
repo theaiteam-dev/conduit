@@ -65,11 +65,17 @@
  * included. The adapter refuses a server that reports any other address. The
  * four XDG directories are run-scoped, project config, Claude-compat files,
  * external skills, plugins and default plugins are switched off, and the
- * child env is the allowlist plus PATH and the run-scoped variables. Credentials
+ * child env is the allowlist plus PATH and the run-scoped variables. Allowlisted
+ * OPENCODE_* variables are dropped, since OPENCODE_PERMISSION or OPENCODE_CONFIG could override the ask rules
+ * and OPENCODE_SERVER_USERNAME would break the Basic auth. Credentials
  * for the model's provider only are passed as `OPENCODE_AUTH_CONTENT`
  * (./opencode-isolation.ts). HOME is not injected.
  *
  * Not verified, or not gated:
+ *   - An allowed Bash command runs as the same user as the server and can read its password (the server env
+ *     and /proc/<pid>/environ), find the loopback port and answer later asks with `once`. Allowlisting an
+ *     executable that can make HTTP requests (curl, python, node, ...) allowlists the gate's bypass. The
+ *     container is the boundary for that case.
  *   - The rate-limit shape is inferred from the schema (APIError statusCode
  *     429, `session.status` of type `retry` with rate-limit wording). No live
  *     run hit a provider limit.
@@ -259,7 +265,7 @@ function parseError(raw: unknown): SeenError | undefined {
 }
 
 const isAuthError = (e: SeenError): boolean => e.name === 'ProviderAuthError' || e.status === 401 || AUTH_TEXT.test(e.message);
-const isRateLimitError = (e: SeenError): boolean => e.status === 429 || ((e.retryable || e.status === undefined) && RATE_TEXT.test(e.message));
+const isRateLimitError = (e: SeenError): boolean => e.status === 429 || (e.status === undefined && RATE_TEXT.test(e.message));
 
 /** Every path check compares against the same set of shapes, so a patch entry is parsed once. */
 interface PatchFile {
@@ -320,6 +326,10 @@ export function createOpenCodeHarnessAdapter(config: OpenCodeHarnessAdapterConfi
       if (!existsSync(config.projectRoot) || !statSync(config.projectRoot).isDirectory()) {
         fail(`project root '${config.projectRoot}' does not exist, cannot confine the harness cwd`);
       }
+      // The instance directory is sent as a header and is not encoded, so a root a header cannot carry is refused.
+      if (!/^[\x20-\x7e]+$/.test(config.projectRoot) || config.projectRoot.includes('%')) {
+        fail(`project root '${config.projectRoot}' contains characters that cannot be sent verbatim in the x-opencode-directory header (non-printable or '%')`);
+      }
       const canonicalRoot = resolveOwnedPath(resolve(config.projectRoot));
 
       const modelSpec = splitOpenCodeModel(call.model ?? config.model);
@@ -329,7 +339,12 @@ export function createOpenCodeHarnessAdapter(config: OpenCodeHarnessAdapterConfi
       const spawnFn: OpenCodeSpawn = config.spawn ?? containedSpawn(config.containment ?? (await resolveContainment()), 'opencode');
 
       // Built before the dirs exist: nothing between their creation and the try below can throw.
-      const baseEnv = buildHarnessChildEnv(config.envAllowlist, sourceEnv);
+      // Allowlisted OPENCODE_* names are dropped: OPENCODE_PERMISSION or OPENCODE_CONFIG would override the
+      // ask-everything rules, and OPENCODE_SERVER_USERNAME would break the Basic auth below. The ones the
+      // adapter needs are set explicitly.
+      const baseEnv = Object.fromEntries(
+        Object.entries(buildHarnessChildEnv(config.envAllowlist, sourceEnv)).filter(([k]) => !k.startsWith('OPENCODE_')),
+      );
       const password = randomBytes(24).toString('hex');
       const dirs = createRunScopedOpenCodeDirs();
       const env: Record<string, string> = {
@@ -407,12 +422,9 @@ export function createOpenCodeHarnessAdapter(config: OpenCodeHarnessAdapterConfi
 
         // ---- HTTP ---------------------------------------------------------
         // The spike client sent this header on every request, so it is sent here. Whether the server needs it,
-        // given that its cwd is the project root, was not isolated from the model's own variation. A path with
-        // characters a header cannot carry is percent-encoded, which opencode is believed to decode. That
-        // branch was not run live.
-        const directory = /^[\x20-\x7e]+$/.test(config.projectRoot) && !config.projectRoot.includes('%')
-          ? config.projectRoot
-          : encodeURIComponent(config.projectRoot);
+        // given that its cwd is the project root, was not isolated from the model's own variation. invoke()
+        // has already refused a root that a header cannot carry verbatim.
+        const directory = config.projectRoot;
         const headers = (): Record<string, string> => ({ authorization, 'content-type': 'application/json', 'x-opencode-directory': directory });
         const http = async (method: string, path: string, body?: unknown, timeoutMs = HTTP_TIMEOUT_MS): Promise<{ status: number; text: string }> => {
           const res = await fetch(`${st.base}${path}`, {

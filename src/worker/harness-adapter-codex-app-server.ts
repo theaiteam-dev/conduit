@@ -581,8 +581,11 @@ export function createCodexAppServerHarnessAdapter(config: CodexAppServerHarness
           stderrTail: '', timedOut: false, idledOut: false, finished: false, exit: undefined,
         };
         const usageByThread = new Map<string, TokenTotal>();
+        // Keyed by thread and item id: a request on one thread must not resolve an item announced on another.
+        // Entries are dropped when the item completes, and a fileChange entry also once its request is decided.
+        const itemKey = (threadId: string | undefined, itemId: string): string => `${threadId ?? ''}\u0000${itemId}`;
         const fileChanges = new Map<string, FileChange[]>();
-        const mcpTools = new Map<string, { server: string; tool: string }>();
+        const mcpTools = new Map<string, { server: string; tool: string; threadId: string | undefined }>();
         const errors: SeenError[] = [];
         let rateLimit: RateLimitSnapshot | undefined;
 
@@ -713,7 +716,9 @@ export function createCodexAppServerHarnessAdapter(config: CodexAppServerHarness
         const decideFileChange = (params: Json): GateDecision => {
           const threadId = str(params.threadId);
           const itemId = str(params.itemId);
-          const changes = itemId !== undefined ? fileChanges.get(itemId) : undefined;
+          const key = itemId !== undefined ? itemKey(threadId, itemId) : undefined;
+          const changes = key !== undefined ? fileChanges.get(key) : undefined;
+          if (key !== undefined) fileChanges.delete(key);
           if (changes === undefined) {
             return denyDirect('Write', itemId, threadId, 'malformed_input', 'no file change was announced for this request');
           }
@@ -733,7 +738,7 @@ export function createCodexAppServerHarnessAdapter(config: CodexAppServerHarness
           const threadId = str(params.threadId);
           const server = str(params.serverName) ?? 'unknown';
           const message = str(params.message) ?? '';
-          const announced = [...mcpTools.values()].find((m) => m.server === server);
+          const announced = [...mcpTools.values()].find((m) => m.server === server && m.threadId === threadId);
           const tool = announced?.tool ?? /tool "([^"]{1,64})"/.exec(message)?.[1] ?? 'elicitation';
           return askGate({ toolName: `mcp__${server}__${tool}`, input: {} }, threadId);
         };
@@ -772,6 +777,7 @@ export function createCodexAppServerHarnessAdapter(config: CodexAppServerHarness
           if (!isObject(item)) return;
           const id = str(item.id);
           if (id === undefined) return;
+          const threadId = str(params.threadId);
           if (started) {
             switch (item.type) {
               case 'commandExecution': {
@@ -786,7 +792,7 @@ export function createCodexAppServerHarnessAdapter(config: CodexAppServerHarness
               case 'fileChange': {
                 const changes = parseFileChanges(item);
                 if (changes !== undefined) {
-                  fileChanges.set(id, changes);
+                  fileChanges.set(itemKey(threadId, id), changes);
                   for (const change of changes) {
                     emit?.({
                       type: 'tool-input-available', toolCallId: id, toolName: toolNameForChange(change.kind),
@@ -799,7 +805,7 @@ export function createCodexAppServerHarnessAdapter(config: CodexAppServerHarness
               case 'mcpToolCall': {
                 const server = str(item.server) ?? 'unknown';
                 const tool = str(item.tool) ?? 'unknown';
-                mcpTools.set(id, { server, tool });
+                mcpTools.set(itemKey(threadId, id), { server, tool, threadId });
                 emit?.({ type: 'tool-input-available', toolCallId: id, toolName: `mcp__${server}__${tool}`, input: {} });
                 break;
               }
@@ -808,6 +814,8 @@ export function createCodexAppServerHarnessAdapter(config: CodexAppServerHarness
             }
             return;
           }
+          fileChanges.delete(itemKey(threadId, id));
+          mcpTools.delete(itemKey(threadId, id));
           if (item.type === 'commandExecution' || item.type === 'fileChange' || item.type === 'mcpToolCall') {
             const isError = item.status !== 'completed';
             emit?.({

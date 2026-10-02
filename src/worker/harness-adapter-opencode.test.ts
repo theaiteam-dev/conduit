@@ -28,6 +28,10 @@ import {
   HARNESS_GATE_HOLD_CODE, createHarnessToolGate, type GateToolCall, type HarnessToolGate,
 } from './harness-gate';
 
+const isRunScoped = (n: string): boolean => n.startsWith('conduit-opencode-') && !n.startsWith('conduit-opencode-root-') && !n.startsWith('conduit-opencode-auth-');
+/** Entries left by earlier or concurrent runs. Only entries created after this point count as leaks. */
+const PREEXISTING = new Set(readdirSync(tmpdir()).filter(isRunScoped));
+const leaked = (): string[] => readdirSync(tmpdir()).filter((n) => isRunScoped(n) && !PREEXISTING.has(n));
 const ROOT = realpathSync(mkdtempSync(join(tmpdir(), 'conduit-opencode-root-')));
 mkdirSync(join(ROOT, 'out'));
 writeFileSync(join(ROOT, 'a.txt'), 'one\n');
@@ -230,7 +234,7 @@ function fakeOpenCode(scenario: (s: Scenario) => Promise<void> | void, opts: Fak
         const prompt = /^\/session\/([^/]+)\/prompt_async$/.exec(url.pathname);
         if (req.method === 'POST' && prompt) {
           state.promptBody = body;
-          state.dirsDuring = Object.values(state.spec?.env ?? {}).some(() => true) && existsSync(dirname(state.spec!.env.XDG_CONFIG_HOME!));
+          state.dirsDuring = state.spec?.env.XDG_CONFIG_HOME !== undefined && existsSync(state.spec.env.XDG_CONFIG_HOME);
           if (opts.noScenario !== true && (opts.promptStatus ?? 204) === 204) setTimeout(() => void scenario(s), 0);
           return new Response(opts.promptStatus === undefined || opts.promptStatus === 204 ? null : 'nope', { status: opts.promptStatus ?? 204 });
         }
@@ -449,6 +453,16 @@ describe('opencode adapter: process, auth and environment', () => {
     }
   });
 
+  it('drops every allowlisted OPENCODE_* variable that the adapter does not set itself', async () => {
+    const names = ['OPENCODE_PERMISSION', 'OPENCODE_CONFIG', 'OPENCODE_SERVER_USERNAME'];
+    const o = await run((s) => finish(s), {
+      config: { envAllowlist: names, sourceEnv: { PATH: '/usr/bin', XDG_DATA_HOME: AUTH_HOME, OPENCODE_PERMISSION: '{"*":"allow"}', OPENCODE_CONFIG: '/x/opencode.json', OPENCODE_SERVER_USERNAME: 'root' } },
+    });
+    const env = o.fake.state.spec!.env;
+    for (const name of names) expect(env[name]).toBeUndefined();
+    expect(o.fake.state.requests.every((r) => r.authOk)).toBe(true);
+  });
+
   it('lets the run-scoped variables win over an allowlisted name', async () => {
     const o = await run((s) => finish(s), { config: { envAllowlist: ['XDG_CONFIG_HOME', 'OPENCODE_CONFIG_CONTENT'], sourceEnv: { PATH: '/usr/bin', XDG_CONFIG_HOME: '/home/op/.config', OPENCODE_CONFIG_CONTENT: '{"permission":{"*":"allow"}}', XDG_DATA_HOME: AUTH_HOME } } });
     const env = o.fake.state.spec!.env;
@@ -478,7 +492,7 @@ describe('opencode adapter: process, auth and environment', () => {
   });
 
   it('leaves no run-scoped directory in the temp dir', () => {
-    expect(readdirSync(tmpdir()).filter((n) => n.startsWith('conduit-opencode-') && !n.startsWith('conduit-opencode-root-') && !n.startsWith('conduit-opencode-auth-'))).toEqual([]);
+    expect(leaked()).toEqual([]);
   });
 });
 
@@ -537,7 +551,7 @@ describe('opencode adapter: model and credentials', () => {
     expect((err as Error).message).toContain('groq');
     expect((err as Error).message).not.toContain(OPENAI_SECRET);
     expect(fake.state.spawns).toBe(0);
-    expect(readdirSync(tmpdir()).filter((n) => n.startsWith('conduit-opencode-') && !n.startsWith('conduit-opencode-root-') && !n.startsWith('conduit-opencode-auth-'))).toEqual([]);
+    expect(leaked()).toEqual([]);
   });
 
   it('accepts an allowlisted provider variable in place of an auth.json entry, and passes no auth content', async () => {
@@ -1107,12 +1121,23 @@ describe('opencode adapter: failures', () => {
     expect(o.error?.code).toBe('harness-rate-limited');
   });
 
-  it('classifies rate-limit wording on a retryable error as harness-rate-limited', async () => {
+  it('classifies rate-limit wording on an error with no status as harness-rate-limited', async () => {
     const o = await run((s) => {
-      s.emit('session.error', { sessionID: s.sessionID, error: { name: 'APIError', data: { message: 'You exceeded your current quota', statusCode: 400, isRetryable: true } } });
+      s.emit('session.error', { sessionID: s.sessionID, error: { name: 'APIError', data: { message: 'You exceeded your current quota', isRetryable: true } } });
       s.idle();
     });
     expect(o.error?.code).toBe('harness-rate-limited');
+  });
+
+  it('does not park a non-429 status whose message only mentions a quota or usage limit', async () => {
+    for (const statusCode of [400, 403, 500]) {
+      const o = await run((s) => {
+        s.emit('session.error', { sessionID: s.sessionID, error: { name: 'APIError', data: { message: 'usage limit exceeded', statusCode, isRetryable: true } } });
+        s.idle();
+      });
+      expect(o.error).toBeDefined();
+      expect(o.error?.code).not.toBe('harness-rate-limited');
+    }
   });
 
   it('stops at a retry status that carries rate-limit wording, and aborts the session', async () => {
@@ -1381,6 +1406,20 @@ describe('opencode adapter: registration', () => {
     expect(await present.probeBinary()).toEqual({ present: true, detail: '/x/opencode' });
     const missing = createOpenCodeHarnessAdapter({ projectRoot: ROOT, envAllowlist: [], command: 'definitely-not-installed-opencode', sourceEnv: { PATH: '/usr/bin:/bin' } });
     expect((await missing.probeBinary()).present).toBe(false);
+  });
+
+  it('fails before creating directories or spawning when the project root cannot be sent verbatim as a header', async () => {
+    const odd = mkdtempSync(join(tmpdir(), 'pct%20root-'));
+    try {
+      const fake = fakeOpenCode(() => {});
+      const err = await adapterWith(fake, { projectRoot: odd }).invoke(invocation()).catch((e) => e as Error);
+      expect((err as Error).message).toContain('project root');
+      expect((err as Error).message).toContain('header');
+      expect(fake.state.spawns).toBe(0);
+      expect(leaked()).toEqual([]);
+    } finally {
+      rmSync(odd, { recursive: true, force: true });
+    }
   });
 
   it('fails an invocation naming a missing project root, and a missing binary, before spawning', async () => {

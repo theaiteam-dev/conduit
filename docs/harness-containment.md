@@ -225,6 +225,14 @@ timeout and an idle timeout (no event other than a heartbeat) kill the server an
 
 What it does not cover, beyond the gaps listed above for every gated adapter:
 
+- **An approved Bash command can bypass later asks.** It runs as the same user as the server, so
+  it can read the server's password (from its environment or `/proc/<pid>/environ`), find the
+  loopback port and answer later `permission.asked` events with `once`. Allowlisting an executable
+  that can make HTTP requests (curl, python, node, ...) allowlists that bypass. The container is
+  the boundary for that case.
+- **Allowlisted `OPENCODE_*` variables are dropped** from the child env, since
+  `OPENCODE_PERMISSION` or `OPENCODE_CONFIG` could override the ask rules and
+  `OPENCODE_SERVER_USERNAME` would break the Basic auth.
 - **Tool asks are the only gate.** A builtin that raised no ask would run ungated. None was
   seen with `"*":"ask"`.
 - **A model call opencode makes for itself** (a title, for instance) is not a tool call.
