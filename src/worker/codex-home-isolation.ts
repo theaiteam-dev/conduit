@@ -19,11 +19,14 @@
 
 import { existsSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { basename, dirname, join, resolve } from 'node:path';
+import { join } from 'node:path';
 
 const HOME_PREFIX = 'conduit-codex-home-';
 
 const AUTH_FILE = 'auth.json';
+
+/** Dirs createRunScopedCodexHome returned and removeRunScopedCodexHome has not yet deleted. */
+const createdHomes = new Set<string>();
 
 /**
  * Variables that authenticate the CLI without an `auth.json`. Any one of them
@@ -74,16 +77,20 @@ export function createRunScopedCodexHome(
     rmSync(dir, { recursive: true, force: true });
     throw err;
   }
+  createdHomes.add(dir);
   return dir;
 }
 
 /**
  * Delete a dir made by createRunScopedCodexHome. Removes the link, never its target.
- * Throws, deleting nothing, for a path that is not a run-scoped home directly under the temp dir.
+ * Throws, deleting nothing, for a path this module did not create or has already removed.
+ * Membership in the created set, not the path's name or parent, is the proof of origin,
+ * so a TMPDIR change between creation and removal does not leak the dir.
  */
 export function removeRunScopedCodexHome(dir: string): void {
-  if (!basename(dir).startsWith(HOME_PREFIX) || dirname(resolve(dir)) !== resolve(tmpdir())) {
+  if (!createdHomes.has(dir)) {
     throw new Error(`refusing to remove '${dir}': not a run-scoped codex home`);
   }
+  createdHomes.delete(dir);
   rmSync(dir, { recursive: true, force: true });
 }

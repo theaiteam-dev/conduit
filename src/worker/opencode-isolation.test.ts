@@ -2,7 +2,7 @@
  * Run-scoped opencode state (issue #21): model parsing, credential selection
  * and the per-invocation XDG directories.
  */
-import { describe, it, expect, afterAll } from 'bun:test';
+import { describe, it, expect, afterAll, afterEach } from 'bun:test';
 import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -17,9 +17,20 @@ import {
 const HOME = realpathSync(mkdtempSync(join(tmpdir(), 'conduit-oc-iso-')));
 afterAll(() => rmSync(HOME, { recursive: true, force: true }));
 
-function authAt(dataHome: string, body: string): void {
-  mkdirSync(join(dataHome, 'opencode'), { recursive: true });
-  writeFileSync(join(dataHome, 'opencode', 'auth.json'), body);
+const made: string[] = [];
+afterEach(() => {
+  for (const d of made.splice(0)) rmSync(d, { recursive: true, force: true });
+});
+
+/** A fresh data home per call, with auth.json when a body is given. */
+function dataHomeWith(body?: string): string {
+  const dir = realpathSync(mkdtempSync(join(HOME, 'dh-')));
+  made.push(dir);
+  if (body !== undefined) {
+    mkdirSync(join(dir, 'opencode'), { recursive: true });
+    writeFileSync(join(dir, 'opencode', 'auth.json'), body);
+  }
+  return dir;
 }
 
 describe('splitOpenCodeModel', () => {
@@ -43,30 +54,41 @@ describe('operatorOpenCodeAuthPath', () => {
 
 describe('buildProviderAuthContent', () => {
   it('returns only the entry for the requested provider', () => {
-    authAt(HOME, JSON.stringify({ openai: { type: 'api', key: 'K1' }, anthropic: { type: 'oauth', refresh: 'R2' } }));
-    const got = buildProviderAuthContent({ XDG_DATA_HOME: HOME }, [], 'anthropic');
+    const h = dataHomeWith(JSON.stringify({ openai: { type: 'api', key: 'K1' }, anthropic: { type: 'oauth', refresh: 'R2' } }));
+    const got = buildProviderAuthContent({ XDG_DATA_HOME: h }, [], 'anthropic');
     expect('content' in got && JSON.parse(got.content!)).toEqual({ anthropic: { type: 'oauth', refresh: 'R2' } });
   });
 
   it('falls back to an allowlisted, set provider variable, with no auth content', () => {
-    authAt(HOME, '{}');
-    expect(buildProviderAuthContent({ XDG_DATA_HOME: HOME, OPENAI_API_KEY: 'k' }, ['OPENAI_API_KEY'], 'openai')).toEqual({ content: undefined });
-    expect('error' in buildProviderAuthContent({ XDG_DATA_HOME: HOME, OPENAI_API_KEY: 'k' }, [], 'openai')).toBe(true);
-    expect('error' in buildProviderAuthContent({ XDG_DATA_HOME: HOME, OPENAI_API_KEY: ' ' }, ['OPENAI_API_KEY'], 'openai')).toBe(true);
+    const h = dataHomeWith('{}');
+    expect(buildProviderAuthContent({ XDG_DATA_HOME: h, OPENAI_API_KEY: 'k' }, ['OPENAI_API_KEY'], 'openai')).toEqual({ content: undefined });
+    expect('error' in buildProviderAuthContent({ XDG_DATA_HOME: h, OPENAI_API_KEY: 'k' }, [], 'openai')).toBe(true);
+    expect('error' in buildProviderAuthContent({ XDG_DATA_HOME: h, OPENAI_API_KEY: ' ' }, ['OPENAI_API_KEY'], 'openai')).toBe(true);
   });
 
   it('errors, quoting no credential, for an unreadable file or a missing file', () => {
-    authAt(HOME, '{"openai": {"key": "LEAKME"');
-    const bad = buildProviderAuthContent({ XDG_DATA_HOME: HOME }, [], 'openai');
+    const h = dataHomeWith('{"openai": {"key": "LEAKME"');
+    const bad = buildProviderAuthContent({ XDG_DATA_HOME: h }, [], 'openai');
     expect('error' in bad && bad.error).not.toContain('LEAKME');
-    const missing = buildProviderAuthContent({ XDG_DATA_HOME: join(HOME, 'none') }, [], 'openai');
+    const missing = buildProviderAuthContent({ XDG_DATA_HOME: dataHomeWith() }, [], 'openai');
     expect('error' in missing && missing.error).toContain('openai');
   });
 
   it('does not take an entry that is not an object', () => {
-    authAt(HOME, JSON.stringify({ openai: 'sk-string', groq: [1] }));
-    expect('error' in buildProviderAuthContent({ XDG_DATA_HOME: HOME }, [], 'openai')).toBe(true);
-    expect('error' in buildProviderAuthContent({ XDG_DATA_HOME: HOME }, [], 'groq')).toBe(true);
+    const h = dataHomeWith(JSON.stringify({ openai: 'sk-string', groq: [1] }));
+    expect('error' in buildProviderAuthContent({ XDG_DATA_HOME: h }, [], 'openai')).toBe(true);
+    expect('error' in buildProviderAuthContent({ XDG_DATA_HOME: h }, [], 'groq')).toBe(true);
+  });
+
+  it('prefers a valid file entry over an allowlisted provider variable', () => {
+    const h = dataHomeWith(JSON.stringify({ openai: { type: 'api', key: 'FILEKEY' } }));
+    const got = buildProviderAuthContent({ XDG_DATA_HOME: h, OPENAI_API_KEY: 'envkey' }, ['OPENAI_API_KEY'], 'openai');
+    expect(got).toEqual({ content: JSON.stringify({ openai: { type: 'api', key: 'FILEKEY' } }) });
+  });
+
+  it('falls back to the variable, not an error, when the file entry is not an object', () => {
+    const h = dataHomeWith(JSON.stringify({ openai: 'sk-string' }));
+    expect(buildProviderAuthContent({ XDG_DATA_HOME: h, OPENAI_API_KEY: 'envkey' }, ['OPENAI_API_KEY'], 'openai')).toEqual({ content: undefined });
   });
 });
 

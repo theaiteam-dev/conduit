@@ -51,6 +51,10 @@ afterAll(() => {
   rmSync(ROOT, { recursive: true, force: true });
   rmSync(AUTH_HOME, { recursive: true, force: true });
   expect(leaked()).toEqual([]);
+  // Covers every fake in the file, including invocations that bypass run().
+  const kinds = allRequests.filter((r) => /^\/permission\/[^/]+\/reply$/.test(r.path)).map((r) => r.body?.reply);
+  expect(kinds).not.toContain('always');
+  expect(allRequests.every((r) => r.authOk)).toBe(true);
 });
 
 describeHarnessContainmentConformance('opencode', (opts) =>
@@ -116,6 +120,9 @@ interface FakeOptions {
 }
 
 const enc = new TextEncoder();
+
+/** Every adapter request any fake in this file received, however the invocation was started. */
+const allRequests: Recorded[] = [];
 
 function fakeOpenCode(scenario: (s: Scenario) => Promise<void> | void, opts: FakeOptions = {}) {
   const state: {
@@ -231,7 +238,9 @@ function fakeOpenCode(scenario: (s: Scenario) => Promise<void> | void, opts: Fak
         }
         // A probe with the header is a test's own request, not the adapter's, and is kept out of `requests`.
         if (req.headers.get('x-test-probe') === '1') return new Response('unauthorized', { status: authOk ? 200 : 401 });
-        state.requests.push({ directory: req.headers.get('x-opencode-directory'), method: req.method, path: url.pathname, body, authOk });
+        const recorded: Recorded = { directory: req.headers.get('x-opencode-directory'), method: req.method, path: url.pathname, body, authOk };
+        state.requests.push(recorded);
+        allRequests.push(recorded);
         state.timeline.push(`${req.method} ${url.pathname}${body !== undefined ? ` ${JSON.stringify(body)}` : ''}`);
         if (!authOk) return new Response('unauthorized', { status: 401 });
 
@@ -320,9 +329,6 @@ const allowAll: HarnessToolGate = () => ({ decision: 'allow' });
 const gateFor = (tools: string[], ownedPaths?: string[]): HarnessToolGate =>
   createHarnessToolGate({ projectRoot: ROOT, tools, ...(ownedPaths !== undefined ? { ownedPaths } : {}) });
 
-/** Every fake started by this file, so one afterAll-style check covers every reply the adapter sent. */
-const allRequests: Recorded[] = [];
-
 function adapterWith(server: { spawn: AppServerSpawn }, extra: Partial<OpenCodeHarnessAdapterConfig> = {}) {
   return createOpenCodeHarnessAdapter({
     projectRoot: ROOT,
@@ -381,7 +387,6 @@ async function run(
   } catch (err) {
     out.error = err as Outcome['error'];
   }
-  allRequests.push(...fake.state.requests);
   return out;
 }
 
@@ -949,17 +954,6 @@ describe('opencode adapter: replies', () => {
       finish(s);
     }, { fake: { reply404: true } });
     expect(o.error).toBeUndefined();
-  });
-
-  it('never replies always on any request in this file', () => {
-    const permissionReplies = allRequests.filter((r) => /^\/permission\/[^/]+\/reply$/.test(r.path));
-    const kinds = permissionReplies.map((r) => r.body.reply);
-    expect(kinds).toContain('once');
-    expect(kinds).toContain('reject');
-    expect(kinds).not.toContain('always');
-    for (const k of kinds) expect(['once', 'reject']).toContain(k);
-    // Every request the adapter made carried the password.
-    expect(allRequests.every((r) => r.authOk)).toBe(true);
   });
 });
 

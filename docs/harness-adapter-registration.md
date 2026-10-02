@@ -685,8 +685,10 @@ gate ([containment profile](harness-containment.md#the-codex-app-server-adapter)
 - Its usage has tokens and no cost (`cost` is 0). A call the gate holds reports the usage Codex
   had reported before the hold, so the call in flight is not counted.
 
-`conduit doctor` lists it with `gatesPerCall=yes`. The opt-in live test runs three short calls
-(allow, deny, hold) with the operator's login:
+`conduit doctor` lists it with `gatesPerCall=yes`. The opt-in live test runs four short calls
+with the operator's login: an allow-all gate, a deny gate, a read-only command (`cat`) that must
+reach the gate, and a hold. The shipped gate never holds a Codex call, so the hold case uses a
+test gate that returns `hold`:
 
 ```sh
 CONDUIT_E2E_CODEX_APP_SERVER=1 bun test src/integration/harness-e2e-codex-app-server.test.ts

@@ -88,6 +88,37 @@ describe('createRunScopedCodexHome', () => {
     expect(existsSync(inner)).toBe(true);
   });
 
+  it('refuses a prefix-matching dir under the temp dir that this module did not create', () => {
+    const foreign = mkdtempSync(join(tmpdir(), PREFIX));
+    cleanup.push(foreign);
+    writeFileSync(join(foreign, 'keep.txt'), 'x');
+    expect(() => removeRunScopedCodexHome(foreign)).toThrow(/run-scoped/);
+    expect(existsSync(join(foreign, 'keep.txt'))).toBe(true);
+  });
+
+  it('removes a created dir even when TMPDIR changed after creation', () => {
+    const { env } = operator('{}');
+    const dir = createRunScopedCodexHome(env, []);
+    const other = mkdtempSync(join(tmpdir(), 'codex-tmpdir-'));
+    cleanup.push(dir, other);
+    const saved = process.env.TMPDIR;
+    process.env.TMPDIR = other;
+    try {
+      removeRunScopedCodexHome(dir);
+    } finally {
+      if (saved === undefined) delete process.env.TMPDIR;
+      else process.env.TMPDIR = saved;
+    }
+    expect(existsSync(dir)).toBe(false);
+  });
+
+  it('throws when the same dir is removed a second time', () => {
+    const { env } = operator('{}');
+    const dir = createRunScopedCodexHome(env, []);
+    removeRunScopedCodexHome(dir);
+    expect(() => removeRunScopedCodexHome(dir)).toThrow(/run-scoped/);
+  });
+
   it('leaves no dir behind when the link cannot be created', async () => {
     // node:fs is mocked in a child process so the mock cannot leak into other test files.
     const { env } = operator('{}');
