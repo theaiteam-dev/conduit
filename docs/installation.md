@@ -62,7 +62,7 @@ docker build -t conduit-engine:1.0.0 .
 > | `FROM oven/bun:1.3.11-slim` | Pinned Bun runtime — see [§7](#7-bump-the-bun-version) to change it |
 > | Create `conduit` user/group | Least-privilege execution — the container never runs as root |
 > | `WORKDIR /app` | Relative paths such as `examples/branching/flow.yaml` resolve here |
-> | `COPY package.json bun.lock ./` + `bun install --omit=optional` | Dependency layer cached independently of source changes. Optional dependencies are skipped: they are the Agent SDK's bundled platform binaries, which the `agent-sdk` adapter does not use |
+> | `COPY package.json bun.lock ./` + `bun install --omit=optional` | Dependency layer cached independently of source changes. Optional dependencies are skipped: they are the Agent SDK's bundled platform binaries, which the `agent-sdk` adapter does not use, and OpenTUI's native renderers. The renderer for the image's own platform is then installed on its own, because `conduit watch` needs it |
 > | `COPY . .` | Full source tree — `.dockerignore` strips secrets and state (see [§3](#3-run-a-single-container-engine)) |
 > | `RUN mkdir -p /data && chown conduit:conduit /data` | Mount point for `conduit.sqlite`; must be writable by the non-root user |
 > | `USER conduit` | Drop privileges before the ENTRYPOINT |
@@ -585,6 +585,23 @@ The per-flow image is the operator path because it installs `flow.prerequisites`
 and bakes the flow into `/flow/`. The engine-image pattern is useful while
 iterating, but the mounted project must already have any system prerequisites
 available inside the container.
+
+### Watch a run
+
+`conduit watch` shows a run in the terminal: header meters for wall clock,
+tokens, plan quota and the watchdog, then one row per card with its station and
+state. It opens both databases read-only and writes nothing. It needs a
+terminal of at least 160 by 20 cells, so pass `-it` to `docker run` or
+`docker exec`:
+
+```bash
+docker run --rm -it -v conduit_data:/data conduit-engine watch            # newest run
+docker run --rm -it -v conduit_data:/data conduit-engine watch --run <id> # one run
+```
+
+`j`/`k` move the selection and the status line shows the selected card. `q`
+quits and prints the journal schema gaps the view hit (data the War Room would
+show but the journal does not record); `src/watch/schema-gaps.ts` lists them all.
 
 ---
 

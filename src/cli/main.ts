@@ -9,6 +9,7 @@
  *   conduit doctor                    — run prereq probes; report + exit non-zero on any fail
  *   conduit journal inspect <cardId>  — read-only journal print
  *   conduit journal tail   <cardId>   — read-only journal print
+ *   conduit watch [--run <id>]        — read-only War Room TUI (issue #89)
  *
  * The binary wires the real planTick loop as `runEngine`; tests inject a fake so
  * the lifecycle is unit-testable without a full e2e (WI-307 owns the terminal drive).
@@ -244,6 +245,12 @@ export interface CliDeps {
   adapter: ModelAdapter;
   runEngine: (args: RunEngineArgs) => Promise<void>;
   prereqs: PrereqProbe[];
+  /**
+   * Optional loader for the `conduit watch` module (issue #89), a test seam so
+   * a load failure can be exercised. Defaults to a dynamic import, which keeps
+   * the native renderer out of every other command.
+   */
+  loadWatch?: () => Promise<{ runWatch: (opts: import('../watch/command').RunWatchOptions) => Promise<number> }>;
   /**
    * Registry of engine-config-defined harness adapters (WI-560). Optional so
    * existing CliDeps literals keep compiling; buildProductionDeps populates
@@ -2424,6 +2431,52 @@ async function cmdJournal(argv: string[], deps: CliDeps): Promise<number> {
 }
 
 /**
+ * conduit watch [--run <id>] (issue #89): the War Room as a terminal UI.
+ *
+ * READ-ONLY. It never touches deps.db: the production entry routes `watch`
+ * through buildReadOnlyProductionDeps, whose db throws on any use, and the
+ * watch reader opens both files itself with SQLite's read-only flag. The DB
+ * paths resolve from the same env vars and defaults as every other command.
+ * Without --run it watches the newest run in the state DB.
+ */
+async function cmdWatch(argv: string[], deps: CliDeps): Promise<number> {
+  let runId: string | null = null;
+  for (let i = 1; i < argv.length; i++) {
+    const arg = argv[i]!;
+    if (arg === '--run' || arg === '--run-id') {
+      if (i + 1 >= argv.length) {
+        deps.io.err(`error: ${arg} needs a run id. usage: conduit watch [--run <id>]`);
+        return 1;
+      }
+      const raw = argv[++i]!;
+      try {
+        runId = validateRunId(raw);
+      } catch {
+        deps.io.err(`error: invalid run-id ${JSON.stringify(raw)}: run-id must match [A-Za-z0-9_-]{1..128}`);
+        return 1;
+      }
+    } else {
+      deps.io.err(`unknown watch argument: ${arg}. usage: conduit watch [--run <id>]`);
+      return 1;
+    }
+  }
+  try {
+    // Loaded here, inside the try, so a module that fails to resolve (the
+    // native renderer) is reported like any other watch failure.
+    const { runWatch } = await (deps.loadWatch ?? (() => import('../watch/command')))();
+    return await runWatch({
+      stateDbPath: process.env.CONDUIT_STATE_DB ?? process.env.CONDUIT_DB ?? DEFAULT_STATE_DB,
+      journalDbPath: process.env.CONDUIT_JOURNAL_DB ?? DEFAULT_JOURNAL_DB,
+      runId,
+      err: deps.io.err,
+    });
+  } catch (err) {
+    deps.io.err(`error: ${err instanceof Error ? err.message : String(err)}`);
+    return 1;
+  }
+}
+
+/**
  * conduit listen --flows <name=path>[,...] | --manifest <engine.yaml>
  *
  * Boots the ingress listener assembly (WI-410) over an explicit per-flow
@@ -2785,10 +2838,13 @@ export async function main(argv: string[], deps: CliDeps): Promise<number> {
     case 'explain':
       return cmdExplain(argv, deps);
 
+    case 'watch':
+      return cmdWatch(argv, deps);
+
     default:
       deps.io.err(
         `unknown command: ${cmd ?? '(none)'}. Available: run, run delete, run status, ` +
-          `resume, doctor, journal, reply, listen, build, explain`,
+          `resume, doctor, journal, reply, listen, build, explain, watch`,
       );
       return 1;
   }
@@ -3572,7 +3628,9 @@ if (import.meta.main) {
     // branch writes to stderr directly rather than through deps.io.err.
     let deps: CliDeps;
     try {
-      deps = process.argv[2] === 'explain'
+      // `watch` opens its own read-only DB handles; the read-write open in
+      // buildProductionDeps migrates the schema, which a reader must not do.
+      deps = process.argv[2] === 'explain' || process.argv[2] === 'watch'
         ? buildReadOnlyProductionDeps()
         : buildProductionDeps();
     } catch (err) {

@@ -14,7 +14,17 @@ WORKDIR /app
 COPY package.json bun.lock ./
 # --omit=optional skips the Agent SDK's bundled platform binaries (about 460 MB). The
 # agent-sdk adapter runs the `claude` on PATH, not the bundled one.
-RUN bun install --frozen-lockfile --production --omit=optional
+# It also skips @opentui/core's native renderer, which `conduit watch` needs. That
+# one package is installed for this image's platform in a scratch directory and
+# copied in, because installing it in /app re-resolves the whole tree and brings
+# the skipped packages back. Its version must match the @opentui/core pin in
+# package.json (a packaging test checks this).
+RUN bun install --frozen-lockfile --production --omit=optional && \
+    pkg="@opentui/core-linux-$(uname -m | sed -e s/x86_64/x64/ -e s/aarch64/arm64/)" && \
+    mkdir /tmp/opentui && cd /tmp/opentui && \
+    bun add "${pkg}@0.5.12" && \
+    cp -r "node_modules/${pkg}" /app/node_modules/@opentui/ && \
+    cd /app && rm -rf /tmp/opentui
 
 # Copy the source tree. .dockerignore excludes .env, .git, node_modules, and
 # local sqlite state files so no secret or local state enters any image layer.
