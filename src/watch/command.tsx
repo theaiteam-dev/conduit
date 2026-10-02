@@ -11,7 +11,7 @@ import { createRoot } from '@opentui/react';
 import { WatchApp } from './app';
 import { loadWatchContext } from './context';
 import { createLiveSession } from './live';
-import { newestRunId, openWatchReader } from './reader';
+import { guardedTick, resolveWatchStart } from './startup';
 import { formatGapReport } from './schema-gaps';
 
 /** Poll interval. The PRD's live-lag target is 2 seconds. */
@@ -26,36 +26,35 @@ export interface RunWatchOptions {
 }
 
 export async function runWatch(opts: RunWatchOptions): Promise<number> {
-  const runId = opts.runId ?? newestRunId(opts.stateDbPath);
-  if (runId === null) {
-    opts.err(`error: no runs recorded in ${opts.stateDbPath}`);
+  const start = await resolveWatchStart(opts);
+  if (!start.ok) {
+    opts.err(start.message);
     return 1;
   }
-  const reader = openWatchReader({ stateDbPath: opts.stateDbPath, journalDbPath: opts.journalDbPath }, runId);
-  const run = reader.readState()?.run ?? null;
-  if (run === null) {
-    reader.close();
-    opts.err(`error: run ${JSON.stringify(runId)} not found in ${opts.stateDbPath}`);
-    return 1;
-  }
+  const { runId, reader, run } = start;
 
   const session = createLiveSession(reader, loadWatchContext(run.flow), () => Math.floor(Date.now() / 1000));
   const renderer = await createCliRenderer({ exitOnCtrlC: false });
   const root = createRoot(renderer);
 
   return new Promise<number>((resolve) => {
-    const timer = setInterval(() => session.tick(), POLL_INTERVAL_MS);
     let done = false;
-    const quit = (): void => {
+    let timer: ReturnType<typeof setInterval> | undefined;
+    // Runs once, whether the user quit or a tick failed.
+    const finish = (code: number, failure?: unknown): void => {
       if (done) return;
       done = true;
       clearInterval(timer);
       root.unmount();
       renderer.destroy();
       reader.close();
+      if (failure !== undefined) {
+        opts.err(`error: ${failure instanceof Error ? failure.message : String(failure)}`);
+      }
       for (const line of formatGapReport(runId, session.gapsSeen())) opts.err(line);
-      resolve(0);
+      resolve(code);
     };
-    root.render(<WatchApp store={session.store} onQuit={quit} />);
+    timer = setInterval(() => guardedTick(() => session.tick(), (err) => finish(1, err)), POLL_INTERVAL_MS);
+    root.render(<WatchApp store={session.store} onQuit={() => finish(0)} />);
   });
 }

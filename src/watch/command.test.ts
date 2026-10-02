@@ -10,7 +10,8 @@ import { main, type CliDeps } from '../cli/main';
 import type { ConduitDB } from '../persistence/db';
 import { emptyContext } from './context';
 import { createLiveSession } from './live';
-import { openWatchReader } from './reader';
+import { newestRunId, openWatchReader, WatchBusyError, type WatchReader } from './reader';
+import { guardedTick, resolveWatchStart } from './startup';
 import { card, createWatchFixture, type WatchFixture } from './test-fixture';
 
 let fx: WatchFixture;
@@ -80,6 +81,126 @@ describe('conduit watch exits before rendering', () => {
     const { deps, errors } = readOnlyDeps();
     expect(await main(['watch', '--run', fx.runId], deps)).toBe(1);
     expect(errors[0]).toContain('journal database not found');
+  });
+
+  test('a watch module that fails to load is reported, not thrown', async () => {
+    const { deps, errors } = readOnlyDeps();
+    deps.loadWatch = async () => {
+      throw new Error("Cannot find module '@opentui/react'");
+    };
+    expect(await main(['watch'], deps)).toBe(1);
+    expect(errors).toEqual(["error: Cannot find module '@opentui/react'"]);
+  });
+});
+
+const busy = (): never => {
+  throw new WatchBusyError('state.sqlite');
+};
+
+describe('watch startup', () => {
+  const noSleep = { sleep: async () => {}, attempts: 3 };
+  const base = (): { stateDbPath: string; journalDbPath: string; runId: string | null } => ({
+    stateDbPath: fx.stateDbPath,
+    journalDbPath: fx.journalDbPath,
+    runId: null,
+  });
+
+  test('resolves the newest run and its snapshot', async () => {
+    const start = await resolveWatchStart(base(), noSleep);
+    expect(start.ok).toBe(true);
+    if (start.ok) {
+      expect(start.runId).toBe(fx.runId);
+      expect(start.run.runId).toBe(fx.runId);
+      start.reader.close();
+    }
+  });
+
+  test('a run the state DB does not record is not found', async () => {
+    const start = await resolveWatchStart({ ...base(), runId: 'nope' }, noSleep);
+    expect(start).toEqual({ ok: false, message: expect.stringContaining('run "nope" not found') });
+  });
+
+  test('a state DB with no runs says so', async () => {
+    const start = await resolveWatchStart(base(), { ...noSleep, newestRunId: () => null });
+    expect(start).toEqual({ ok: false, message: expect.stringContaining('no runs recorded') });
+  });
+
+  test('a busy state DB is retried, then the run is found', async () => {
+    let calls = 0;
+    const sleeps: number[] = [];
+    const start = await resolveWatchStart(base(), {
+      attempts: 3,
+      sleep: async (ms) => {
+        sleeps.push(ms);
+      },
+      newestRunId: (path) => {
+        calls += 1;
+        return calls < 3 ? busy() : newestRunId(path);
+      },
+    });
+    expect(start.ok).toBe(true);
+    expect(sleeps).toHaveLength(2);
+    if (start.ok) start.reader.close();
+  });
+
+  test('a state DB busy on every attempt is reported as busy, not as no runs', async () => {
+    let calls = 0;
+    const start = await resolveWatchStart(base(), {
+      ...noSleep,
+      newestRunId: () => {
+        calls += 1;
+        return busy();
+      },
+    });
+    expect(calls).toBe(3);
+    expect(start).toEqual({ ok: false, message: expect.stringContaining('busy') });
+    if (!start.ok) expect(start.message).not.toContain('no runs');
+  });
+
+  test('a busy snapshot read is retried and, if it stays busy, reported as busy not as not found', async () => {
+    let reads = 0;
+    let closed = 0;
+    const reader = {
+      runId: fx.runId,
+      readStateOrBusy: () => {
+        reads += 1;
+        return { busy: true as const };
+      },
+      close: () => {
+        closed += 1;
+      },
+    } as unknown as WatchReader;
+    const start = await resolveWatchStart({ ...base(), runId: fx.runId }, { ...noSleep, openWatchReader: () => reader });
+    expect(reads).toBe(3);
+    expect(closed).toBe(1);
+    expect(start).toEqual({ ok: false, message: expect.stringContaining('busy') });
+    if (!start.ok) expect(start.message).not.toContain('not found');
+  });
+});
+
+describe('guarded tick', () => {
+  test('passes a tick error to the handler instead of throwing', () => {
+    const seen: unknown[] = [];
+    const boom = new Error('journal unopenable');
+    expect(() =>
+      guardedTick(
+        () => {
+          throw boom;
+        },
+        (e) => seen.push(e),
+      ),
+    ).not.toThrow();
+    expect(seen).toEqual([boom]);
+  });
+
+  test('a tick that succeeds does not call the handler', () => {
+    let ticks = 0;
+    guardedTick(() => {
+      ticks += 1;
+    }, () => {
+      throw new Error('unexpected');
+    });
+    expect(ticks).toBe(1);
   });
 });
 

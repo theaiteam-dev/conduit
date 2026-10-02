@@ -54,7 +54,11 @@ export function WatchApp({ store, onQuit }: WatchAppProps) {
 
   const index = Math.max(0, view.rows.findIndex((r) => r.id === selectedId));
   useEffect(() => {
-    if (selectedId === null && view.rows.length > 0) setSelectedId(view.rows[0]!.id);
+    // A null id, or one naming a card that left the view, falls back to the
+    // first row, which is also the row `index` clamps the highlight to.
+    if (view.rows.length > 0 && !view.rows.some((r) => r.id === selectedId)) {
+      setSelectedId(view.rows[0]!.id);
+    }
   }, [selectedId, view.rows]);
 
   useKeyboard((key) => {

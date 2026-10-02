@@ -246,6 +246,12 @@ export interface CliDeps {
   runEngine: (args: RunEngineArgs) => Promise<void>;
   prereqs: PrereqProbe[];
   /**
+   * Optional loader for the `conduit watch` module (issue #89), a test seam so
+   * a load failure can be exercised. Defaults to a dynamic import, which keeps
+   * the native renderer out of every other command.
+   */
+  loadWatch?: () => Promise<{ runWatch: (opts: import('../watch/command').RunWatchOptions) => Promise<number> }>;
+  /**
    * Registry of engine-config-defined harness adapters (WI-560). Optional so
    * existing CliDeps literals keep compiling; buildProductionDeps populates
    * it. Threaded into RunEngineArgs at cmdRun/cmdResume so the harness
@@ -2454,8 +2460,10 @@ async function cmdWatch(argv: string[], deps: CliDeps): Promise<number> {
       return 1;
     }
   }
-  const { runWatch } = await import('../watch/command');
   try {
+    // Loaded here, inside the try, so a module that fails to resolve (the
+    // native renderer) is reported like any other watch failure.
+    const { runWatch } = await (deps.loadWatch ?? (() => import('../watch/command')))();
     return await runWatch({
       stateDbPath: process.env.CONDUIT_STATE_DB ?? process.env.CONDUIT_DB ?? DEFAULT_STATE_DB,
       journalDbPath: process.env.CONDUIT_JOURNAL_DB ?? DEFAULT_JOURNAL_DB,

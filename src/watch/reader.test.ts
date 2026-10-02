@@ -5,13 +5,13 @@
  * and a journal that predates current columns loads.
  */
 
-import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test';
 import { Database } from 'bun:sqlite';
 import { join } from 'node:path';
 import { emptyContext } from './context';
 import type { WatchEvent } from './events';
 import { deriveView, emptyFold, foldEvents, replay, type WatchContext } from './projection';
-import { newestRunId, openReadOnly, openWatchReader, type WatchReader } from './reader';
+import { newestRunId, openReadOnly, openWatchReader, WatchBusyError, type WatchReader } from './reader';
 import { card, createWatchFixture, setSpanTime, type WatchFixture } from './test-fixture';
 
 const NOW = 1_000_600;
@@ -293,6 +293,88 @@ describe('older journals', () => {
     ];
     for (let n = 0; n <= bare.length; n++) {
       expect(() => replay(bare, n, { runId: 'r', context: emptyContext(), snapshot: null, nowSec: NOW })).not.toThrow();
+    }
+  });
+});
+
+describe('a busy state database', () => {
+  /** A rollback-journal DB (WAL readers are never blocked) with an exclusive writer holding it. */
+  function lockedStateDb(): { path: string; release(): void } {
+    const path = join(fx.dir, 'locked.sqlite');
+    const setup = new Database(path);
+    setup.exec(`CREATE TABLE runs (run_id TEXT, created_at INTEGER); INSERT INTO runs VALUES ('r1', 1);`);
+    setup.close();
+    const writer = new Database(path);
+    writer.exec('BEGIN EXCLUSIVE');
+    return {
+      path,
+      release() {
+        writer.exec('ROLLBACK');
+        writer.close();
+      },
+    };
+  }
+
+  test('newestRunId throws WatchBusyError rather than a raw SQLite error', () => {
+    const locked = lockedStateDb();
+    try {
+      expect(() => newestRunId(locked.path, 1)).toThrow(WatchBusyError);
+    } finally {
+      locked.release();
+    }
+  });
+
+  test('newestRunId reads the run once the lock is released', () => {
+    const locked = lockedStateDb();
+    locked.release();
+    expect(newestRunId(locked.path, 1)).toBe('r1');
+  });
+
+  test('readStateOrBusy returns the snapshot when the DB is readable', () => {
+    const r = open();
+    const result = r.readStateOrBusy();
+    expect(result.busy).toBe(false);
+    if (!result.busy) expect(result.snapshot.run?.runId).toBe(fx.runId);
+  });
+});
+
+describe('state snapshot column discovery', () => {
+  test('tables created after the reader opened are picked up', () => {
+    const stateDbPath = join(fx.dir, 'late.sqlite');
+    new Database(stateDbPath).close();
+    const r = openWatchReader({ stateDbPath, journalDbPath: fx.journalDbPath }, 'late');
+    try {
+      expect(r.readState()).toEqual({ cards: [], run: null });
+      const kernel = new Database(stateDbPath);
+      kernel.exec(`
+        CREATE TABLE runs (run_id TEXT, flow TEXT, status TEXT, outcome TEXT, created_at INTEGER);
+        CREATE TABLE cards (run_id TEXT, id TEXT, lane TEXT, status TEXT);
+        INSERT INTO runs VALUES ('late', 'f.yaml', 'running', NULL, 5);
+        INSERT INTO cards VALUES ('late', 'c1', 'draft', 'ready');
+      `);
+      kernel.close();
+      const snap = r.readState()!;
+      expect(snap.run?.flow).toBe('f.yaml');
+      expect(snap.cards.map((c) => c.id)).toEqual(['c1']);
+    } finally {
+      r.close();
+    }
+  });
+
+  test('table_info is not re-run once a table has columns', () => {
+    const r = open();
+    r.readState();
+    const prepare = spyOn(Database.prototype, 'prepare');
+    try {
+      const tableInfo = (): number => prepare.mock.calls.filter(([sql]) => String(sql).includes('table_info')).length;
+      // Control: the spy does see a PRAGMA table_info prepare.
+      fx.db.getStateDb().prepare('PRAGMA table_info(runs)').all();
+      expect(tableInfo()).toBe(1);
+      r.readState();
+      r.readState();
+      expect(tableInfo()).toBe(1);
+    } finally {
+      prepare.mockRestore();
     }
   });
 });

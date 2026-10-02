@@ -171,6 +171,56 @@ describe('conduit watch screen', () => {
     expect(marked[0]).toContain('WI-207');
   });
 
+  test('a selected card that leaves the view moves the selection to the first row', async () => {
+    const full = scenarioView();
+    let current = full;
+    const listeners = new Set<() => void>();
+    const store = {
+      getView: () => current,
+      subscribe: (l: () => void) => {
+        listeners.add(l);
+        return () => listeners.delete(l);
+      },
+    };
+    setup = await testRender(<WatchApp store={store} />, { width: 160, height: 30 });
+    const s = setup;
+    await draw(s);
+    for (let i = 0; i < 4; i += 1) await press(s, 'j');
+    const gone = full.rows[4]!.id;
+    expect(s.captureCharFrame().split('\n').filter((l) => l.startsWith('│>'))[0]).toContain(gone);
+
+    current = { ...full, rows: full.rows.filter((r) => r.id !== gone) };
+    await act(async () => {
+      for (const l of listeners) l();
+    });
+    await draw(s);
+    await draw(s);
+    const marked = () => s.captureCharFrame().split('\n').filter((l) => l.startsWith('│>'));
+    expect(marked()).toHaveLength(1);
+    expect(marked()[0]).toContain(current.rows[0]!.id);
+    expect(s.captureCharFrame().split('\n')[27]).toContain(current.rows[0]!.id);
+
+    // The stale id was replaced, so a card returning to the view does not
+    // pull the highlight back to it.
+    const reduced = current;
+    current = full;
+    await act(async () => {
+      for (const l of listeners) l();
+    });
+    await draw(s);
+    expect(marked()).toHaveLength(1);
+    expect(marked()[0]).toContain(full.rows[0]!.id);
+
+    current = reduced;
+    await act(async () => {
+      for (const l of listeners) l();
+    });
+    await draw(s);
+    await press(s, 'j');
+    expect(marked()).toHaveLength(1);
+    expect(marked()[0]).toContain(reduced.rows[1]!.id);
+  });
+
   test('q calls onQuit', async () => {
     let quit = 0;
     const s = await render(scenarioView(), 160, 30, () => {

@@ -46,13 +46,25 @@ export interface WatchReader {
   poll(): WatchEvent[];
   /** The state DB as it is now; null when the read failed (busy). */
   readState(): StateSnapshot | null;
+  /** Like `readState`, but says so when the state DB was busy instead of returning null. */
+  readStateOrBusy(): { busy: true } | { busy: false; snapshot: StateSnapshot };
   /** The per-table position of the last successful poll. */
   cursor(): WatchCursor;
   close(): void;
 }
 
+/** The state DB stayed busy or locked for the whole wait. */
+export class WatchBusyError extends Error {
+  constructor(path: string) {
+    super(`state database is busy: ${path}`);
+    this.name = 'WatchBusyError';
+  }
+}
+
+const DEFAULT_BUSY_TIMEOUT_MS = 2000;
+
 /** Open one database file read-only, refusing to create it. */
-export function openReadOnly(path: string, label: string): Database {
+export function openReadOnly(path: string, label: string, busyTimeoutMs = DEFAULT_BUSY_TIMEOUT_MS): Database {
   if (!existsSync(path)) {
     throw new Error(`${label} not found: ${path}`);
   }
@@ -60,7 +72,7 @@ export function openReadOnly(path: string, label: string): Database {
   db.exec('PRAGMA query_only = 1');
   // The kernel holds the write lock in short transactions; wait for it rather
   // than fail the read.
-  db.exec('PRAGMA busy_timeout = 2000');
+  db.exec(`PRAGMA busy_timeout = ${Math.trunc(busyTimeoutMs)}`);
   return db;
 }
 
@@ -221,15 +233,22 @@ export function harnessEventFromRow(row: Row): HarnessEventRow {
   };
 }
 
-/** The newest run in the state DB, or null when it records none. */
-export function newestRunId(stateDbPath: string): string | null {
-  const db = openReadOnly(stateDbPath, 'state database');
+/**
+ * The newest run in the state DB, or null when it records none. Throws
+ * `WatchBusyError` when the DB stayed locked, so a busy DB is never reported
+ * as "no runs".
+ */
+export function newestRunId(stateDbPath: string, busyTimeoutMs = DEFAULT_BUSY_TIMEOUT_MS): string | null {
+  const db = openReadOnly(stateDbPath, 'state database', busyTimeoutMs);
   try {
     if (columnsOf(db, 'runs').size === 0) return null;
     const row = db
       .prepare('SELECT run_id FROM runs ORDER BY created_at DESC, rowid DESC LIMIT 1')
       .get() as { run_id: string } | null;
     return row?.run_id ?? null;
+  } catch (err) {
+    if (isBusy(err)) throw new WatchBusyError(stateDbPath);
+    throw err;
   } finally {
     db.close();
   }
@@ -246,6 +265,7 @@ export function openWatchReader(paths: WatchReaderPaths, runId: string): WatchRe
   }
 
   const cursor: WatchCursor = { cardLog: 0, journal: 0, harness: 0 };
+  const readStateSnapshot = createStateSnapshotReader(stateDb, runId);
 
   // Built lazily and rebuilt when a table appears: a journal opened before the
   // kernel created harness_events gains it later.
@@ -301,10 +321,15 @@ export function openWatchReader(paths: WatchReaderPaths, runId: string): WatchRe
     },
 
     readState(): StateSnapshot | null {
+      const result = this.readStateOrBusy();
+      return result.busy ? null : result.snapshot;
+    },
+
+    readStateOrBusy(): { busy: true } | { busy: false; snapshot: StateSnapshot } {
       try {
-        return readStateSnapshot(stateDb, runId);
+        return { busy: false, snapshot: readStateSnapshot() };
       } catch (err) {
-        if (isBusy(err)) return null;
+        if (isBusy(err)) return { busy: true };
         throw err;
       }
     },
@@ -320,59 +345,75 @@ export function openWatchReader(paths: WatchReaderPaths, runId: string): WatchRe
   };
 }
 
-function readStateSnapshot(stateDb: Database, runId: string): StateSnapshot {
-  const runCols = columnsOf(stateDb, 'runs');
-  let run: RunSnapshot | null = null;
-  if (runCols.size > 0) {
-    const row = stateDb
-      .prepare(`SELECT ${selectList(runCols, ['run_id', 'flow', 'status', 'outcome', 'created_at'])} FROM runs WHERE run_id = $run`)
-      .get({ $run: runId }) as Row | null;
-    if (row) {
+type Statement = ReturnType<Database['prepare']>;
+
+/**
+ * Reads the state DB for one run. A table's columns and the statement built
+ * from them are resolved once the table has columns. An empty column set means
+ * the table does not exist yet (the kernel may create it after the watcher
+ * starts), so it is never cached and the next read looks again.
+ */
+function createStateSnapshotReader(stateDb: Database, runId: string): () => StateSnapshot {
+  const resolved = new Map<string, Statement>();
+  const statement = (table: string, build: (have: Set<string>) => string): Statement | null => {
+    const cached = resolved.get(table);
+    if (cached) return cached;
+    const have = columnsOf(stateDb, table);
+    if (have.size === 0) return null;
+    const stmt = stateDb.prepare(build(have));
+    resolved.set(table, stmt);
+    return stmt;
+  };
+
+  return (): StateSnapshot => {
+    let run: RunSnapshot | null = null;
+    const runQuery = statement(
+      'runs',
+      (have) => `SELECT ${selectList(have, ['run_id', 'flow', 'status', 'outcome', 'created_at'])} FROM runs WHERE run_id = $run`,
+    );
+    const runRow = runQuery?.get({ $run: runId }) as Row | null | undefined;
+    if (runRow) {
       run = {
         runId,
-        flow: str(row.flow) ?? '',
-        status: str(row.status) ?? '',
-        outcome: str(row.outcome),
-        createdAt: num(row.created_at) ?? 0,
+        flow: str(runRow.flow) ?? '',
+        status: str(runRow.status) ?? '',
+        outcome: str(runRow.outcome),
+        createdAt: num(runRow.created_at) ?? 0,
       };
     }
-  }
 
-  const cardCols = columnsOf(stateDb, 'cards');
-  if (cardCols.size === 0) return { cards: [], run };
-  const workerCols = columnsOf(stateDb, 'active_workers');
-  const startedAt = new Map<string, number>();
-  if (workerCols.size > 0) {
-    const runFilter = workerCols.has('run_id') ? 'WHERE run_id = $run' : '';
-    for (const w of stateDb
-      .prepare(`SELECT card_id, started_at FROM active_workers ${runFilter}`)
-      .all({ $run: runId }) as Row[]) {
+    const cardQuery = statement(
+      'cards',
+      (have) => `SELECT ${selectList(have, ['id', 'parent_id', 'lane', 'status', 'attempt', 'wave', 'rework_count', 'owned_paths', 'release_at'])}
+       FROM cards ${have.has('run_id') ? 'WHERE run_id = $run' : ''} ORDER BY rowid ASC`,
+    );
+    if (cardQuery === null) return { cards: [], run };
+    const workerQuery = statement(
+      'active_workers',
+      (have) => `SELECT card_id, started_at FROM active_workers ${have.has('run_id') ? 'WHERE run_id = $run' : ''}`,
+    );
+    const startedAt = new Map<string, number>();
+    for (const w of (workerQuery?.all({ $run: runId }) ?? []) as Row[]) {
       const id = str(w.card_id);
       const at = num(w.started_at);
       if (id !== null && at !== null) startedAt.set(id, at);
     }
-  }
-  const runFilter = cardCols.has('run_id') ? 'WHERE run_id = $run' : '';
-  const rows = stateDb
-    .prepare(
-      `SELECT ${selectList(cardCols, ['id', 'parent_id', 'lane', 'status', 'attempt', 'wave', 'rework_count', 'owned_paths', 'release_at'])}
-       FROM cards ${runFilter} ORDER BY rowid ASC`,
-    )
-    .all({ $run: runId }) as Row[];
-  const cards: CardSnapshot[] = rows.map((r) => {
-    const id = str(r.id) ?? '';
-    return {
-      id,
-      parentId: str(r.parent_id),
-      lane: str(r.lane) ?? '',
-      status: str(r.status) ?? '',
-      attempt: num(r.attempt) ?? 0,
-      wave: num(r.wave) ?? 0,
-      reworkCount: num(r.rework_count),
-      ownedPaths: parseStringArray(r.owned_paths) ?? [],
-      releaseAt: num(r.release_at),
-      workerStartedAt: startedAt.get(id) ?? null,
-    };
-  });
-  return { cards, run };
+    const rows = cardQuery.all({ $run: runId }) as Row[];
+    const cards: CardSnapshot[] = rows.map((r) => {
+      const id = str(r.id) ?? '';
+      return {
+        id,
+        parentId: str(r.parent_id),
+        lane: str(r.lane) ?? '',
+        status: str(r.status) ?? '',
+        attempt: num(r.attempt) ?? 0,
+        wave: num(r.wave) ?? 0,
+        reworkCount: num(r.rework_count),
+        ownedPaths: parseStringArray(r.owned_paths) ?? [],
+        releaseAt: num(r.release_at),
+        workerStartedAt: startedAt.get(id) ?? null,
+      };
+    });
+    return { cards, run };
+  };
 }
