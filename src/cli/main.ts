@@ -2437,7 +2437,11 @@ async function cmdWatch(argv: string[], deps: CliDeps): Promise<number> {
   let runId: string | null = null;
   for (let i = 1; i < argv.length; i++) {
     const arg = argv[i]!;
-    if ((arg === '--run' || arg === '--run-id') && i + 1 < argv.length) {
+    if (arg === '--run' || arg === '--run-id') {
+      if (i + 1 >= argv.length) {
+        deps.io.err(`error: ${arg} needs a run id. usage: conduit watch [--run <id>]`);
+        return 1;
+      }
       const raw = argv[++i]!;
       try {
         runId = validateRunId(raw);

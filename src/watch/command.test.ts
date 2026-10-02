@@ -57,6 +57,12 @@ describe('conduit watch exits before rendering', () => {
     expect(errors[0]).toContain('invalid run-id');
   });
 
+  test('--run with no value', async () => {
+    const { deps, errors } = readOnlyDeps();
+    expect(await main(['watch', '--run'], deps)).toBe(1);
+    expect(errors).toEqual(['error: --run needs a run id. usage: conduit watch [--run <id>]']);
+  });
+
   test('an unknown argument', async () => {
     const { deps, errors } = readOnlyDeps();
     expect(await main(['watch', '--follow'], deps)).toBe(1);
