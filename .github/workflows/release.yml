@@ -40,11 +40,38 @@ jobs:
       - name: Install (frozen lockfile)
         run: bun install --frozen-lockfile
 
+      # The same gates as the required PR checks (test.yml, blackbox.yml).
+      # A squash merge produces a tree no PR check ran on, so the release
+      # job runs them again before it publishes. blackbox/scaffold.test.ts
+      # pins this list.
       - name: Typecheck
         run: bun run typecheck
 
+      - name: Black-box typecheck
+        run: bun run typecheck:blackbox
+
       - name: Test
-        run: bun run test
+        env:
+          CONDUIT_REQUIRE_CGROUP_CONTAINMENT: '1'
+        run: |
+          cg=/sys/fs/cgroup/conduit-ci
+          sudo mkdir -p "$cg"
+          sudo chown -R "$(id -u):$(id -g)" "$cg"
+          echo $$ | sudo tee "$cg/cgroup.procs" > /dev/null
+          bun run test
+
+      - name: Mutation check (harness usage fold sites)
+        run: bun run test:mutation
+
+      - name: Black-box test
+        env:
+          CONDUIT_REQUIRE_CGROUP_CONTAINMENT: '1'
+        run: |
+          cg=/sys/fs/cgroup/conduit-ci
+          sudo mkdir -p "$cg"
+          sudo chown -R "$(id -u):$(id -g)" "$cg"
+          echo $$ | sudo tee "$cg/cgroup.procs" > /dev/null
+          bun run test:blackbox
 
       # @semantic-release/npm updates package.json but does not publish this
       # private, Docker-first package to npm. The git plugin commits the version.

@@ -83,8 +83,8 @@ export interface HarnessGateConfig {
   /**
    * The card's owned paths. Write, Edit and NotebookEdit inputs must resolve
    * inside them. Absent: owned paths are not enforced for this flow
-   * (`defaults.enforce_owned_paths` is off), and write paths are not checked.
-   * Present and empty: every write is denied.
+   * (`defaults.enforce_owned_paths` is off), and write paths must resolve
+   * inside the project root instead. Present and empty: every write is denied.
    */
   ownedPaths?: readonly string[];
 }
@@ -188,24 +188,25 @@ function hasDanglingSymlink(abs: string): boolean {
   }
 }
 
-function checkWritePath(
-  toolName: string,
-  input: unknown,
-  projectRoot: string,
-  canonicalOwned: readonly string[] | undefined,
-): GateDecision {
+/** Where a write may land: the card's owned paths, or the whole project root when they are not enforced. */
+interface WriteBoundary {
+  roots: readonly string[];
+  /** Ends the deny reason: "the owned paths" or "the project root". */
+  label: string;
+}
+
+function checkWritePath(toolName: string, input: unknown, projectRoot: string, boundary: WriteBoundary): GateDecision {
   const fields = input as { file_path?: unknown; notebook_path?: unknown } | null | undefined;
   const path = toolName === 'NotebookEdit' ? fields?.notebook_path : fields?.file_path;
   if (typeof path !== 'string' || path === '' || path.includes('\0')) {
     return deny('malformed_input', `${toolName} input has no usable path`);
   }
-  if (canonicalOwned === undefined) return { decision: 'allow' };
 
   const abs = resolve(projectRoot, path);
-  const escape = deny('path_escape', `${toolName} path ${JSON.stringify(path.slice(0, 120))} is outside the owned paths`);
+  const escape = deny('path_escape', `${toolName} path ${JSON.stringify(path.slice(0, 120))} is outside ${boundary.label}`);
   if (hasDanglingSymlink(abs)) return escape;
   const target = resolveOwnedPath(abs);
-  const inside = canonicalOwned.some((owned) => isContainedIn(target, owned));
+  const inside = boundary.roots.some((root) => isContainedIn(target, root));
   return inside ? { decision: 'allow' } : escape;
 }
 
@@ -218,8 +219,10 @@ function checkWritePath(
  *
  * Owned paths are canonicalized once here, at build time, so a call resolves
  * only its own candidate path. A symlink re-pointed after the gate is built
- * does not move the owned boundary. Absent `ownedPaths` stays absent (not
- * enforced) and an empty array stays empty (every write denied).
+ * does not move the owned boundary. Absent `ownedPaths` (ownership not
+ * enforced) confines writes to the canonical project root, since a flow that
+ * does not enforce ownership has still not granted the host, and an empty
+ * array stays empty (every write denied).
  *
  * Reads are not confined to the project root here. Write ownership, the Bash
  * allowlist and the tool allowlist are enforced; read confinement is a later
@@ -227,7 +230,13 @@ function checkWritePath(
  */
 export function createHarnessToolGate(config: HarnessGateConfig): HarnessToolGate {
   const { names, bashExecutables } = parseTools(config.tools);
-  const canonicalOwned = config.ownedPaths?.map((owned) => resolveOwnedPath(resolve(config.projectRoot, owned)));
+  const writeBoundary: WriteBoundary =
+    config.ownedPaths === undefined
+      ? { roots: [resolveOwnedPath(resolve(config.projectRoot))], label: 'the project root' }
+      : {
+          roots: config.ownedPaths.map((owned) => resolveOwnedPath(resolve(config.projectRoot, owned))),
+          label: 'the owned paths',
+        };
   return (call) => {
     try {
       const toolName: unknown = call.toolName;
@@ -243,7 +252,7 @@ export function createHarnessToolGate(config: HarnessGateConfig): HarnessToolGat
       }
       if (toolName === 'Bash') return checkBash(call.input, bashExecutables);
       if (WRITE_TOOLS.has(toolName)) {
-        return checkWritePath(toolName, call.input, config.projectRoot, canonicalOwned);
+        return checkWritePath(toolName, call.input, config.projectRoot, writeBoundary);
       }
       return { decision: 'allow' };
     } catch {

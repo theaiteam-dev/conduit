@@ -54,8 +54,10 @@ still owns the loop, and the kernel sees one call at a time. The gate
   containing a shell metacharacter is denied before the allowlist is consulted.
 - **Write ownership.** Write, Edit, MultiEdit and NotebookEdit targets must resolve inside
   the card's owned paths, with symlinks resolved on both sides, including a write through
-  a dangling symlink. This applies only where the flow sets `defaults.enforce_owned_paths`
-  and the card declares owned paths, the same condition as the other integrity checks.
+  a dangling symlink, where the flow sets `defaults.enforce_owned_paths` and the card
+  declares owned paths, the same condition as the other integrity checks. Otherwise the
+  targets must resolve inside the project root, by the same rules: not enforcing ownership
+  opens the project root to the file tools, not the host.
 - **No network tools.** `WebFetch` and `WebSearch` are always denied.
 - **Human questions hold.** `AskUserQuestion` moves the card to `hold`: the adapter ends
   the harness process and the executor holds the card without spending an execution
