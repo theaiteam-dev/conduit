@@ -272,7 +272,8 @@ function parseError(raw: unknown): SeenError | undefined {
 }
 
 const isAuthError = (e: SeenError): boolean => e.name === 'ProviderAuthError' || e.status === 401 || AUTH_TEXT.test(e.message);
-const isRateLimitError = (e: SeenError): boolean => e.status === 429 || (e.status === undefined && RATE_TEXT.test(e.message));
+// Wording alone is not a rate-limit signal: a status-less error must also be marked retryable.
+const isRateLimitError = (e: SeenError): boolean => e.status === 429 || (e.status === undefined && e.retryable && RATE_TEXT.test(e.message));
 
 /** Every path check compares against the same set of shapes, so a patch entry is parsed once. */
 interface PatchFile {

@@ -117,6 +117,8 @@ export function containedSpawn(
     let exitReported = false;
     let closeGrace: ReturnType<typeof setTimeout> | undefined;
     const decoder = new StringDecoder('utf8');
+    // Separate from stdout: each stream needs its own partial multi-byte state.
+    const errDecoder = new StringDecoder('utf8');
     let carry = '';
     // Set once exit is reported: nothing is delivered after onExit.
     let ended = false;
@@ -133,6 +135,10 @@ export function containedSpawn(
       if (closeGrace !== undefined) clearTimeout(closeGrace);
       // The grace timer can fire with the stream still open: deliver the buffered tail first.
       flushTail();
+      if (!ended) {
+        const errTail = errDecoder.end();
+        if (errTail.length > 0) handlers.onStderr(errTail);
+      }
       ended = true;
       handlers.onExit(exitCode, exitSignal);
     };
@@ -173,7 +179,9 @@ export function containedSpawn(
     });
     child.stdout?.on('end', flushTail);
     child.stderr?.on('data', (chunk: Buffer) => {
-      if (!ended) handlers.onStderr(chunk.toString('utf-8'));
+      if (ended) return;
+      const text = errDecoder.write(chunk);
+      if (text.length > 0) handlers.onStderr(text);
     });
     child.stdin?.on('error', () => {
       /* the process is gone: the exit handler reports it */

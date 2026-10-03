@@ -138,6 +138,8 @@ function fakeOpenCode(scenario: (s: Scenario) => Promise<void> | void, opts: Fak
     dirsDuring?: boolean;
     homeEmptyDuring?: boolean;
     promptBody?: Json;
+    /** Set when the scenario rejected, so the test fails with its own error rather than a timeout. */
+    scenarioError?: unknown;
   } = { spawns: 0, kills: 0, closes: 0, requests: [], timeline: [] };
   let server: ReturnType<typeof Bun.serve> | undefined;
   let controller: ReadableStreamDefaultController<Uint8Array> | undefined;
@@ -265,7 +267,14 @@ function fakeOpenCode(scenario: (s: Scenario) => Promise<void> | void, opts: Fak
           state.dirsDuring = state.spec?.env.XDG_CONFIG_HOME !== undefined && existsSync(state.spec.env.XDG_CONFIG_HOME);
           const home = state.spec?.env.HOME;
           state.homeEmptyDuring = home !== undefined && existsSync(home) && readdirSync(home).length === 0;
-          if (opts.noScenario !== true && (opts.promptStatus ?? 204) === 204) setTimeout(() => void scenario(s), 0);
+          if (opts.noScenario !== true && (opts.promptStatus ?? 204) === 204) setTimeout(() => {
+            Promise.resolve()
+              .then(() => scenario(s))
+              .catch((e) => {
+                state.scenarioError = e;
+                stop();
+              });
+          }, 0);
           return new Response(opts.promptStatus === undefined || opts.promptStatus === 204 ? null : 'nope', { status: opts.promptStatus ?? 204 });
         }
         const reply = /^\/permission\/([^/]+)\/reply$/.exec(url.pathname);
@@ -398,6 +407,7 @@ async function run(
   } catch (err) {
     out.error = err as Outcome['error'];
   }
+  if (fake.state.scenarioError !== undefined) throw fake.state.scenarioError;
   return out;
 }
 
@@ -1250,6 +1260,16 @@ describe('opencode adapter: failures', () => {
       s.idle();
     });
     expect(o.error?.code).toBe('harness-rate-limited');
+  });
+
+  it('does not park rate-limit wording on a status-less error that is not retryable', async () => {
+    for (const data of [{ message: 'You exceeded your current quota' }, { message: 'usage limit exceeded', isRetryable: false }]) {
+      const o = await run((s) => {
+        s.emit('session.error', { sessionID: s.sessionID, error: { name: 'UnknownError', data } });
+        s.idle();
+      });
+      expect(o.error?.code).toBe('harness-nonzero-exit');
+    }
   });
 
   it('does not park a non-429 status whose message only mentions a quota or usage limit', async () => {

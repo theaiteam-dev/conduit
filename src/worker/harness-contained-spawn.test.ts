@@ -180,4 +180,25 @@ describe('containedSpawn real children', () => {
     await exited;
     expect(lines).toEqual(['h\u00e9\u20ac', 'second', 'last']);
   });
+
+  it('reassembles a multi-byte character split across stderr chunks', async () => {
+    const chunks: string[] = [];
+    let done!: () => void;
+    const exited = new Promise<void>((r) => (done = r));
+    const script = `
+      const w = (b) => new Promise((r) => process.stderr.write(b, () => setTimeout(r, 60)));
+      const e = Buffer.from('h\\u00e9\\u20ac!', 'utf8');
+      await w(e.subarray(0, 2));
+      await w(e.subarray(2, 4));
+      await w(e.subarray(4));
+    `;
+    containedSpawn(containment, 'test')(
+      { command: process.execPath, args: ['-e', script], cwd: ROOT, env: ENV },
+      { onLine() {}, onStderr: (s) => chunks.push(s), onExit: () => done() },
+    );
+    await exited;
+    const text = chunks.join('');
+    expect(text).toBe('h\u00e9\u20ac!');
+    expect(text).not.toContain('\ufffd');
+  });
 });
