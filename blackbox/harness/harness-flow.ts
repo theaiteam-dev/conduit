@@ -52,7 +52,36 @@ export interface JournalSpanRow {
   usage_unknown: number;
 }
 
-export interface HarnessFlowOptions {
+/**
+ * The agent-CLI stand-in a journey runs behind a shipped harness adapter.
+ * Default: fake-claude behind `claude-headless`.
+ */
+export interface HarnessStub {
+  /** Shipped adapter name, e.g. `codex-app-server`. Sets CONDUIT_HARNESS_ADAPTERS and its `_COMMAND`/`_ENV`. */
+  adapter: string;
+  /** Absolute path of the bun script the generated wrapper execs. */
+  script: string;
+  /** Wrapper file name, as the adapter would find the real binary (`claude`, `codex`, `opencode`). */
+  binName: string;
+  /** Env var the stub reads its scenario path from. It is added to the adapter's env allowlist. */
+  scenarioVar: string;
+  /** Further names for the adapter's env allowlist, besides PATH and `scenarioVar`. */
+  allowlist?: string[];
+}
+
+export const FAKE_CLAUDE_STUB: HarnessStub = {
+  adapter: "claude-headless",
+  script: FAKE_CLAUDE,
+  binName: "claude",
+  scenarioVar: "FAKE_CLAUDE_SCENARIO",
+};
+
+/** `CONDUIT_HARNESS_<NAME>_`, the engine-config prefix for an adapter name. */
+export function harnessEnvPrefix(adapter: string): string {
+  return `CONDUIT_HARNESS_${adapter.toUpperCase().replace(/-/g, "_")}_`;
+}
+
+export interface HarnessFlowOptions<R = FakeClaudeRole> {
   /** Full flow.yaml text. `project_root: .` resolves to the scaffolded project dir. */
   flowYaml: string;
   /** Files written under the project root before the run (prompts, inputs). */
@@ -64,7 +93,9 @@ export interface HarnessFlowOptions {
    * receives the scratch dir, for scenarios that name files outside the
    * project root (pid files).
    */
-  roles: FakeClaudeRole[] | ((ctx: { scratchDir: string }) => FakeClaudeRole[]);
+  roles: R[] | ((ctx: { scratchDir: string }) => R[]);
+  /** The agent CLI stand-in. Default: FAKE_CLAUDE_STUB. */
+  stub?: HarnessStub;
   /** Extra kernel env, e.g. `CONDUIT_HARNESS_CLAUDE_HEADLESS_MODEL`. */
   env?: Record<string, string>;
 }
@@ -81,14 +112,16 @@ export interface HarnessFlow {
   env: Readonly<Record<string, string>>;
   /** A directory OUTSIDE the project root, for files a test wants the stub to drop (pid files). */
   scratchDir: string;
+  /** The generated wrapper the adapter runs as its binary. */
+  stubCommand: string;
   /** `conduit run <flow> --input <entry> --run-id <runId> [extra]`, awaited to exit. */
   run(extraArgs?: string[], opts?: { timeoutMs?: number }): Promise<CliResult>;
   /** `conduit <args>` against this workspace's DBs and env. */
   conduit(args: string[], opts?: { timeoutMs?: number }): Promise<CliResult>;
   runStatus(): Promise<CliResult>;
   journalInspect(cardId?: string): Promise<CliResult>;
-  /** Every fake-claude invocation so far, in order. */
-  stubLog(): FakeClaudeLogEntry[];
+  /** Every stub invocation so far, in order. `L` is the stub's log entry type (fake-claude's by default). */
+  stubLog<L = FakeClaudeLogEntry>(): L[];
   /**
    * Journal rows for this run, read straight from the journal DB (read-only).
    * No CLI prints a span's token usage or attributes: `journal inspect`
@@ -132,15 +165,16 @@ export function pidAlive(pid: number): boolean {
  * Should cleanup() reap `pid`? Only a live process whose cmdline names
  * fake-claude, so a pid the OS recycled for something else is left alone.
  */
-export function isOrphanedStub(pid: number): boolean {
+export function isOrphanedStub(pid: number, script: string = FAKE_CLAUDE): boolean {
   try {
-    return pidAlive(pid) && readFileSync(`/proc/${pid}/cmdline`, "utf8").includes(FAKE_CLAUDE);
+    return pidAlive(pid) && readFileSync(`/proc/${pid}/cmdline`, "utf8").includes(script);
   } catch {
     return false;
   }
 }
 
-export function startHarnessFlow(opts: HarnessFlowOptions): HarnessFlow {
+export function startHarnessFlow<R = FakeClaudeRole>(opts: HarnessFlowOptions<R>): HarnessFlow {
+  const stub = opts.stub ?? FAKE_CLAUDE_STUB;
   if (process.platform !== "linux") {
     throw new Error(`blackbox harness-flow journeys require Linux (got '${process.platform}'; see blackbox/README.md)`);
   }
@@ -168,8 +202,8 @@ export function startHarnessFlow(opts: HarnessFlowOptions): HarnessFlow {
 
   // The adapter scrubs the child env to its allowlist, so `bun` may not be on
   // the child's PATH. The wrapper names the running bun binary absolutely.
-  const wrapper = join(stubDir, "claude");
-  writeFileSync(wrapper, `#!/bin/sh\nexec '${process.execPath}' '${FAKE_CLAUDE}' "$@"\n`);
+  const wrapper = join(stubDir, stub.binName);
+  writeFileSync(wrapper, `#!/bin/sh\nexec '${process.execPath}' '${stub.script}' "$@"\n`);
   chmodSync(wrapper, 0o755);
 
   runCounter += 1;
@@ -181,6 +215,7 @@ export function startHarnessFlow(opts: HarnessFlowOptions): HarnessFlow {
   const ambient = Object.entries(process.env).filter(
     (e): e is [string, string] => !e[0].startsWith("CONDUIT_") && e[1] !== undefined,
   );
+  const prefix = harnessEnvPrefix(stub.adapter);
   const env: Record<string, string> = {
     ...Object.fromEntries(ambient),
     CONDUIT_STATE_DB: join(root, "state.db"),
@@ -190,11 +225,11 @@ export function startHarnessFlow(opts: HarnessFlowOptions): HarnessFlow {
     // harness-only flow; nothing ever calls it.
     CONDUIT_API_KEY: "blackbox-harness-unused",
     CONDUIT_BASE_URL: "http://127.0.0.1:9",
-    CONDUIT_HARNESS_ADAPTERS: "claude-headless",
-    CONDUIT_HARNESS_CLAUDE_HEADLESS_COMMAND: wrapper,
-    // PATH so the stub can find `setsid`/`sh`; FAKE_CLAUDE_SCENARIO carries the scenario.
-    CONDUIT_HARNESS_CLAUDE_HEADLESS_ENV: "PATH,FAKE_CLAUDE_SCENARIO",
-    FAKE_CLAUDE_SCENARIO: scenarioPath,
+    CONDUIT_HARNESS_ADAPTERS: stub.adapter,
+    [`${prefix}COMMAND`]: wrapper,
+    // PATH so the stub can find `setsid`/`sh`; the scenario var carries the scenario.
+    [`${prefix}ENV`]: ["PATH", stub.scenarioVar, ...(stub.allowlist ?? [])].join(","),
+    [stub.scenarioVar]: scenarioPath,
     ...opts.env,
   };
 
@@ -223,24 +258,24 @@ export function startHarnessFlow(opts: HarnessFlowOptions): HarnessFlow {
     }
   }
 
-  function stubLog(): FakeClaudeLogEntry[] {
+  function stubLog<L = FakeClaudeLogEntry>(): L[] {
     if (!existsSync(logPath)) return [];
     // fake-claude appends from its own process, so a read can race a write
     // and see a truncated final line; only that line may fail to parse. A
     // malformed line before it is a real logging failure and throws.
     const lines = readFileSync(logPath, "utf8").split("\n");
     const last = lines.pop()!;
-    const entries: FakeClaudeLogEntry[] = [];
+    const entries: L[] = [];
     lines.forEach((l, i) => {
       if (l.length === 0) return;
       try {
-        entries.push(JSON.parse(l) as FakeClaudeLogEntry);
+        entries.push(JSON.parse(l) as L);
       } catch (err) {
-        throw new Error(`fake-claude invocations.ndjson line ${i + 1} is malformed: ${(err as Error).message}`);
+        throw new Error(`stub invocations.ndjson line ${i + 1} is malformed: ${(err as Error).message}`);
       }
     });
     try {
-      if (last.length > 0) entries.push(JSON.parse(last) as FakeClaudeLogEntry);
+      if (last.length > 0) entries.push(JSON.parse(last) as L);
     } catch {
       /* partial write */
     }
@@ -255,6 +290,7 @@ export function startHarnessFlow(opts: HarnessFlowOptions): HarnessFlow {
     cardId,
     env,
     scratchDir,
+    stubCommand: wrapper,
     run: (extraArgs = [], o) =>
       conduit(["run", flowPath, "--input", join(projectRoot, opts.entryInput), "--run-id", runId, ...extraArgs], o),
     conduit,
@@ -301,7 +337,7 @@ export function startHarnessFlow(opts: HarnessFlowOptions): HarnessFlow {
         }
         for (const { pid } of logged) {
           try {
-            if (isOrphanedStub(pid)) process.kill(-pid, "SIGKILL");
+            if (isOrphanedStub(pid, stub.script)) process.kill(-pid, "SIGKILL");
           } catch {
             /* already gone */
           }

@@ -281,11 +281,36 @@ describe('createHarnessToolGate write ownership', () => {
     expect(write(gate, join(f.owned, 'x'))).toMatchObject({ decision: 'deny', code: 'path_escape' });
   });
 
-  it('does not enforce ownership when ownedPaths is undefined, but still enforces the tool allowlist', () => {
+  it('confines writes to the project root when ownedPaths is undefined, and still enforces the tool allowlist', () => {
     const f = fixture();
     const gate = createHarnessToolGate({ projectRoot: f.root, tools: ['Write'] });
+    // Not enforcing ownership opens the whole project root, not the host.
     expect(write(gate, join(f.outside, 'x')).decision).toBe('allow');
+    expect(write(gate, 'relative/new.txt').decision).toBe('allow');
     expect(write(gate, join(f.outside, 'x'), 'Edit')).toMatchObject({ code: 'tool_not_allowed' });
+  });
+
+  it('denies a write outside the project root when ownedPaths is undefined', () => {
+    const f = fixture();
+    const host = realpathSync(mkdtempSync(join(tmpdir(), 'harness-gate-host-')));
+    dirs.push(host);
+    const gate = createHarnessToolGate({ projectRoot: f.root, tools: ['Write'] });
+    for (const path of [join(host, 'x'), '../escape.txt', `${f.root}-sibling/x`, '/etc/passwd']) {
+      expect(write(gate, path)).toMatchObject({ decision: 'deny', code: 'path_escape' });
+    }
+  });
+
+  it('follows symlinks, dangling ones included, when confining to the project root', () => {
+    const f = fixture();
+    const host = realpathSync(mkdtempSync(join(tmpdir(), 'harness-gate-host-')));
+    dirs.push(host);
+    symlinkSync(host, join(f.root, 'hostlink'));
+    symlinkSync(join(host, 'not-yet'), join(f.root, 'hostdangling'));
+    const gate = createHarnessToolGate({ projectRoot: f.root, tools: ['Write'] });
+    expect(write(gate, join(f.root, 'hostlink', 'x'))).toMatchObject({ decision: 'deny', code: 'path_escape' });
+    expect(write(gate, join(f.root, 'hostdangling'))).toMatchObject({ decision: 'deny', code: 'path_escape' });
+    // A link that stays inside the root is fine.
+    expect(write(gate, join(f.owned, 'linkdir', 'x')).decision).toBe('allow');
   });
 
   it.each([[undefined], [null], [5], [''], [{}], [['a']], ['a\0b']])('a non-usable path %j is malformed_input', (path) => {

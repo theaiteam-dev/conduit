@@ -63,6 +63,57 @@ user or CI consumer actually sees, not internal implementation details.
   card with no attempt consumed, and `run status` reports the run parked with
   its resume command, including when the park outlasts the wall-clock budget
   (#84).
+- `harness/fake-codex-app-server.ts`: a scenario-driven stand-in for
+  `codex app-server`, run behind the shipped `codex-app-server` adapter
+  through `stub:` on `startHarnessFlow()`. `--version` prints the codex
+  version the adapter checks against; `app-server` speaks the line-delimited
+  JSON-RPC on stdio (initialize, thread/start, turn/start, turn/interrupt) and
+  then, inside the turn, sends one approval request per scenario step: a
+  shell command (`item/commandExecution/requestApproval`) or a file add
+  (`item/started` fileChange, then `item/fileChange/requestApproval`). It runs
+  the command or writes the file only when the kernel answers `accept`, then
+  sends `thread/tokenUsage/updated` and `turn/completed`. Each turn logs its
+  role, call number, argv, cwd, pid, the thread/start params and every
+  decision received, in fields `stubLog()` reads. The message shapes are
+  copied from the adapter's unit-test peer, not imported.
+  `harness/fake-codex-app-server.smoke.test.ts` drives it directly as a
+  JSON-RPC client.
+- `codex-app-server-gate.test.ts`: the per-call tool gate (issue #21) on a
+  real `conduit run` with `enforce_owned_paths`. In one turn the fake asks
+  for an allowlisted `cat`, a `curl`, a redirect, a write of the declared
+  output and a write outside the project root; the kernel accepts exactly the
+  first and fourth, only those effects happen, the card reaches `done`, and
+  `journal inspect` prints one `gate-decision` row per request under the
+  `research.harness` span, whose usage is the fake's token total. A second
+  case drops `enforce_owned_paths`: the gate then confines writes to the
+  project root, so the output write is accepted and the out-of-root write is
+  still declined. A third case declines every call, so the output is never
+  written and the card is scrapped as `harness-output-missing` after
+  `max_execution_attempts`.
+- `harness/fake-opencode.ts`: a scenario-driven stand-in for
+  `opencode serve`, run behind the shipped `opencode` adapter through `stub:`
+  on `startHarnessFlow()`. It binds 127.0.0.1 on a free port, prints the
+  listening line the adapter reads, and checks HTTP Basic auth against
+  `OPENCODE_SERVER_PASSWORD` on every request, the event stream included (a
+  wrong password gets 401 and an `auth-rejected` log line). When the prompt
+  arrives it plays the role's steps over the SSE stream: a running tool part
+  plus a `permission.asked` per bash, write or `external_directory` step, or a
+  `question.asked`. It runs the command or writes the file only when the
+  adapter answers `once`, then reports the assistant message's tokens and
+  goes idle. Every log line carries the fields `stubLog()` reads plus a
+  `kind` (`serve`, `prompt`, `answer`, `question-reject`, `abort`,
+  `auth-rejected`). The shapes are copied from the adapter and its unit-test
+  fake, not imported. `harness/fake-opencode.smoke.test.ts` drives it
+  directly to prove the auth check rejects a wrong or missing password.
+- `opencode-gate.test.ts`: the per-call tool gate (issue #21) on the
+  `opencode` adapter in a real `conduit run`. In one invocation the fake asks
+  for an allowlisted `cat`, an `ls`, a pipeline, an `external_directory` read
+  and a write of the declared output; the fake records `once` for the first
+  and last and `reject` for the rest, only those effects happen, the card
+  reaches `done`, and `journal inspect` prints one `gate-decision` row per ask
+  under the `research.harness` span, whose usage is the fake's tokens. A
+  second case sends a question: the adapter holds, aborts the session, and
+  the card lands in `hold` at attempt 0 with the call's usage billed.
 - `no-internal-imports.test.ts` + `harness/import-scan.ts` — the zero-imports
   gate (AC-1): a TypeScript-compiler-API scan that fails if any file under
   `blackbox/` imports anything resolving into `src/`.
@@ -89,7 +140,10 @@ Both are **intentionally separate** from `bun run test`/`bun run typecheck`
 (scoped to `src/` only). CI runs them in their own required job, `blackbox`,
 alongside the `tests` job in `.github/workflows/test.yml`; a PR cannot merge
 until both pass. See `.github/workflows/blackbox.yml` for the CI wiring and the
-burn-in record that preceded promotion.
+burn-in record that preceded promotion. `.github/workflows/release.yml` runs
+the suite again, with the unit suite and the mutation check, before it
+publishes, because a squash merge produces a tree no PR check ran on.
+`scaffold.test.ts` pins both.
 
 `blackbox/tsconfig.json` extends the root `tsconfig.json` and scopes
 `include` to this directory — it is what makes `typecheck:blackbox` a real

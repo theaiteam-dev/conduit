@@ -2281,8 +2281,11 @@ async function cmdDoctor(argv: string[], deps: CliDeps): Promise<number> {
       // reading `canRestrictTools=false` would conclude the adapter can never
       // host a critic — false for lattice adapters like codex-exec.
       const perList = def.canExpressTools !== undefined ? ' perListTools=yes' : '';
+      // Issue #21: an adapter that asks the kernel about every tool call reads its `tools` list as the
+      // gate's allowlist, which is a different contract from a harness-side restriction.
+      const gated = def.canGatePerCall === true ? ' gatesPerCall=yes' : '';
       deps.io.out(
-        `  harness '${def.name}' canRestrictTools=${def.canRestrictTools}${perList} ` +
+        `  harness '${def.name}' canRestrictTools=${def.canRestrictTools}${perList}${gated} ` +
           `reportsUsage=${def.reportsUsage}${pathDetail}: ${status}`,
       );
       if (!probe.present) anyFail = true;

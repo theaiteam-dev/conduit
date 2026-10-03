@@ -55,6 +55,42 @@ describe("blackbox/ directory layout", () => {
   });
 });
 
+describe("release workflow runs every PR gate before it publishes", () => {
+  // A release is cut from main after a squash merge, so the merged tree is a
+  // tree no PR check ran on. The release job must run the same gates the
+  // required PR checks run, in a step before semantic-release, or a merge that
+  // breaks the black-box suite or a budget fold site ships anyway.
+  const wf = parse(readFileSync(join(repoRoot, ".github/workflows/release.yml"), "utf8"));
+  const steps: Array<{ name?: string; run?: string; uses?: string; env?: Record<string, string> }> =
+    wf.jobs?.release?.steps ?? [];
+  const publishAt = steps.findIndex((s) => s.uses?.startsWith("cycjimmy/semantic-release-action"));
+  // Exact script name: `bun run test` must not be satisfied by `bun run test:blackbox`.
+  const runIndex = (script: string) =>
+    steps.findIndex((s) => new RegExp(`bun run ${script.replace(":", "\\:")}(\\s|$)`, "m").test(s.run ?? ""));
+
+  test("the release job has a semantic-release step", () => {
+    expect(publishAt).toBeGreaterThan(-1);
+  });
+
+  for (const script of ["typecheck", "typecheck:blackbox", "test", "test:blackbox", "test:mutation"]) {
+    test(`runs \`bun run ${script}\` before semantic-release`, () => {
+      const at = runIndex(script);
+      expect(at).toBeGreaterThan(-1);
+      expect(at).toBeLessThan(publishAt);
+    });
+  }
+
+  for (const script of ["test", "test:blackbox"]) {
+    test(`\`bun run ${script}\` requires cgroup containment, as the PR job does`, () => {
+      // Without it, a runner where cgroup containment fails falls back to the
+      // process-group kill, and the containment assertions skip instead of failing.
+      const step = steps[runIndex(script)]!;
+      expect(step.env?.CONDUIT_REQUIRE_CGROUP_CONTAINMENT).toBe("1");
+      expect(step.run).toContain("/sys/fs/cgroup/conduit-ci");
+    });
+  }
+});
+
 describe("required blackbox CI workflow (DQ-3)", () => {
   const workflowPath = join(repoRoot, ".github/workflows/blackbox.yml");
 
