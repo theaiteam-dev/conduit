@@ -214,7 +214,7 @@ session outside the tree is rejected.
 Hold. Aborting at the ask loses the usage of the step in flight, so the order is: reject the
 ask, deny every later ask without asking the gate, wait until the message that owns the call
 reports tokens or the session goes idle (at most 5 seconds), then `POST /session/:id/abort`
-and end. The server is killed on every exit path. The thrown
+for every session in the tree and end. The server is killed on every exit path. The thrown
 error carries the usage summed so far, and a live hold returned non-zero usage. The question
 tool exists only with `OPENCODE_ENABLE_QUESTION_TOOL`, which is never set. A `question.asked`
 that arrives anyway is rejected (`POST /question/:id/reject`) and held.
@@ -226,7 +226,8 @@ A model or provider opencode has no price for reports 0.
 Errors. A 401 or a `ProviderAuthError` is a `harness-nonzero-exit` classified as an
 authentication failure. An `APIError` with status 429, or rate-limit wording on a retryable
 error, or a `session.status` of type `retry` with rate-limit wording, is `harness-rate-limited`;
-the adapter aborts the session on the retry status instead of waiting out opencode's backoff.
+the adapter aborts every session in the tree on the retry status instead of waiting out
+opencode's backoff.
 That rate-limit shape is inferred from the schema: no live run hit a provider limit. HTTP 426
 (free `opencode/*` models need opencode 1.18 or newer) and a server that dies before the session
 is idle are `harness-nonzero-exit`. An abort the adapter sent is not an error. The wall-clock

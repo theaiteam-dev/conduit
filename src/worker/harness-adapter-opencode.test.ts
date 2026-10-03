@@ -1186,6 +1186,23 @@ describe('opencode adapter: sessions and usage', () => {
     expect(o.result!.outputs).toEqual([]);
   });
 
+  it('does not complete on a stale root idle when the root resumes before its ask is answered', async () => {
+    const o = await run(async (s) => {
+      const pending = s.ask({ permission: 'bash', patterns: ['cat a.txt'], tool: { messageID: 'msg_1', callID: 'c1' } });
+      s.part({ callID: 'c1', tool: 'bash', status: 'pending', input: {} });
+      s.idle();
+      s.status({ type: 'busy' });
+      await Bun.sleep(100);
+      s.part({ callID: 'c1', tool: 'bash', status: 'running', input: { command: 'cat a.txt' } });
+      expect((await pending)?.reply).toBe('once');
+      await Bun.sleep(100);
+      s.assistant('m2', { tokens: USAGE_1 });
+      s.idle();
+    }, { gate: allowAll, config: { toolPartWaitMs: 5_000 } });
+    expect(o.error).toBeUndefined();
+    expect((o.result!.usage as KnownUsage).tokens).toBe(1000);
+  });
+
   it('waits for pending asks before completing on idle', async () => {
     const o = await run(async (s) => {
       const pending = s.bash('c1', 'cat a.txt');
@@ -1282,6 +1299,32 @@ describe('opencode adapter: failures', () => {
       await Bun.sleep(1_000);
     }, { gate: () => ({ decision: 'hold', code: 'needs_human', reason: 'r' }), fake: { idleOnAbort: true } });
     expect(o.error?.code).toBe(HARNESS_GATE_HOLD_CODE);
+  });
+
+  it('aborts every session in the tree, children included, on a rate limit', async () => {
+    const o = await run(async (s) => {
+      s.child('ses_c1', s.sessionID);
+      s.child('ses_c2', s.sessionID);
+      s.assistant('m1', { tokens: USAGE_1 });
+      s.status({ type: 'retry', attempt: 1, message: 'Rate limit reached for requests', next: Date.now() + 60_000 });
+      await Bun.sleep(3_000);
+    }, { invocation: { timeoutMs: 20_000 } });
+    expect(o.error?.code).toBe('harness-rate-limited');
+    const aborted = o.fake.state.requests.filter((r) => r.path.endsWith('/abort')).map((r) => r.path).sort();
+    expect(aborted).toEqual(['/session/ses_c1/abort', '/session/ses_c2/abort', '/session/ses_root/abort']);
+  });
+
+  it('aborts every session in the tree on a hold', async () => {
+    const o = await run(async (s) => {
+      s.child('ses_c1', s.sessionID);
+      s.child('ses_c2', s.sessionID);
+      await s.bash('c1', 'rm x');
+      s.assistant('msg_1', { tokens: USAGE_1 });
+      await Bun.sleep(1_000);
+    }, { gate: () => ({ decision: 'hold', code: 'needs_human', reason: 'r' }) });
+    expect(o.error?.code).toBe(HARNESS_GATE_HOLD_CODE);
+    const aborted = o.fake.state.requests.filter((r) => r.path.endsWith('/abort')).map((r) => r.path).sort();
+    expect(aborted).toEqual(['/session/ses_c1/abort', '/session/ses_c2/abort', '/session/ses_root/abort']);
   });
 
   it('keeps waiting through a retry status that is not a rate limit', async () => {

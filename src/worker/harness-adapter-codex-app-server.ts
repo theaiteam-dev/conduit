@@ -110,7 +110,11 @@ const VERSION_PROBE_TIMEOUT_MS = 5_000;
 /** The codex version the ungated built-in list below was checked against. */
 export const UNGATED_FEATURES_CHECKED_VERSION = '0.159.1';
 
-/** Run `<binary> --version` with a bounded wait. Undefined when it fails, times out or prints nothing. */
+/**
+ * Run `<binary> --version` with a bounded wait. Undefined when it fails, times out or prints nothing.
+ * Spawned without containment on purpose: it runs no model and no tools, starts no child, and is
+ * SIGKILLed at VERSION_PROBE_TIMEOUT_MS.
+ */
 async function runVersionCommand(binaryPath: string, sourceEnv: Record<string, string | undefined>): Promise<string | undefined> {
   try {
     const proc = Bun.spawn([binaryPath, '--version'], {

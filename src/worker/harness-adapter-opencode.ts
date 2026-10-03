@@ -470,12 +470,14 @@ export function createOpenCodeHarnessAdapter(config: OpenCodeHarnessAdapterConfi
             /* the process is killed next either way */
           }
         };
-        /** Abort the sessions involved, then end the call with `outcome`. The abort is ours, not an error. */
+        /** Abort every session in the tree, then end the call with `outcome`. The abort is ours, not an error. */
         const abortThenFinish = async (outcome: Outcome, also?: string): Promise<void> => {
           if (st.finished || st.aborting) return;
           st.aborting = true;
-          if (also !== undefined && also !== st.rootId) await abortSession(also);
-          if (st.rootId !== undefined) await abortSession(st.rootId);
+          // In parallel, so the wait stays one ABORT_TIMEOUT_MS however many children there are.
+          const targets = new Set(sessions);
+          if (also !== undefined) targets.add(also);
+          await Promise.all([...targets].map((id) => abortSession(id)));
           finish(outcome);
         };
 
@@ -916,8 +918,10 @@ export function createOpenCodeHarnessAdapter(config: OpenCodeHarnessAdapterConfi
               if (status.type === 'idle' && sessionID === st.rootId) {
                 st.rootIdle = true;
                 maybeComplete();
-              } else if (status.type === 'retry') {
-                handleRetry(status, sessionID);
+              } else {
+                // A root that resumes work is no longer idle, or a stale idle would end the call under a live turn.
+                if (sessionID === st.rootId) st.rootIdle = false;
+                if (status.type === 'retry') handleRetry(status, sessionID);
               }
               break;
             }
