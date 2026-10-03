@@ -1129,6 +1129,26 @@ describe('codex-app-server adapter: usage', () => {
     expect(usage.tokens).toBe(130);
   });
 
+  it('ignores an update missing input or output tokens, keeping the thread\'s last complete total', async () => {
+    const server = fakeServer((p) => {
+      p.usage('thr-root', USAGE_A);
+      p.usage('thr-root', { totalTokens: 7, inputTokens: 7, cachedInputTokens: 0 });
+      p.usage('thr-root', { ...USAGE_A, outputTokens: Number.NaN });
+      p.completeTurn();
+    });
+    const usage = (await adapterWith(server).invoke(invocation())).usage as KnownUsage;
+    expect(usage.tokens).toBe(120);
+    expect(usage.breakdown).toEqual({ inputTokens: 40, outputTokens: 20, cacheReadInputTokens: 60, cacheCreationInputTokens: 0 });
+  });
+
+  it('reports usage unknown when every update was incomplete', async () => {
+    const server = fakeServer((p) => {
+      p.usage('thr-root', { totalTokens: 7, outputTokens: 7 });
+      p.completeTurn();
+    });
+    expect((await adapterWith(server).invoke(invocation())).usage).toEqual({ unknown: true });
+  });
+
   it('reports usage explicitly unknown when a successful call reported none', async () => {
     const server = fakeServer((p) => p.completeTurn());
     const out = await adapterWith(server).invoke(invocation());

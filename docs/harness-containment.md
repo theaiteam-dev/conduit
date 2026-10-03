@@ -213,8 +213,8 @@ session outside the tree is rejected.
 
 Hold. Aborting at the ask loses the usage of the step in flight, so the order is: reject the
 ask, deny every later ask without asking the gate, wait until the message that owns the call
-reports tokens or the session goes idle, then `POST /session/:id/abort` and end. The wait is
-bounded at 5 seconds. Then the session is aborted and the server killed anyway. The thrown
+reports tokens or the session goes idle (at most 5 seconds), then `POST /session/:id/abort`
+and end. The server is killed on every exit path. The thrown
 error carries the usage summed so far, and a live hold returned non-zero usage. The question
 tool exists only with `OPENCODE_ENABLE_QUESTION_TOOL`, which is never set. A `question.asked`
 that arrives anyway is rejected (`POST /question/:id/reject`) and held.
@@ -261,8 +261,9 @@ random per-invocation password on every request, the event stream included. The 
 a server that reports any other address.
 
 The child gets a run-scoped, empty `HOME` and four run-scoped XDG directories (config, data,
-state, cache), all removed on every exit path, and `OPENCODE_DISABLE_PROJECT_CONFIG`, `_CLAUDE_CODE`, `_EXTERNAL_SKILLS`,
-`_DEFAULT_PLUGINS` and `OPENCODE_PURE` set to 1. With these, `AGENTS.md` in the project, project
+state, cache), all removed on every exit path, and `OPENCODE_DISABLE_PROJECT_CONFIG`,
+`OPENCODE_DISABLE_CLAUDE_CODE`, `OPENCODE_DISABLE_EXTERNAL_SKILLS`,
+`OPENCODE_DISABLE_DEFAULT_PLUGINS` and `OPENCODE_PURE` set to 1. With these, `AGENTS.md` in the project, project
 MCP servers and project plugins did not load. Its env is the allowlist plus `PATH` and those
 variables. An allowlisted `HOME` is replaced by the run-scoped one: opencode loads
 `~/.opencode/` (config, agents, commands, MCP servers) from `os.homedir()` whatever the XDG

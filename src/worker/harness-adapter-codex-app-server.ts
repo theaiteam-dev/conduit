@@ -349,10 +349,13 @@ interface TokenTotal {
 
 function parseTokenTotal(value: unknown): TokenTotal | undefined {
   if (!isObject(value)) return undefined;
-  const input = num(value.inputTokens);
-  const output = num(value.outputTokens);
+  // A total without both counts is not used: it would replace the thread's last complete total with a smaller one.
+  const finite = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
+  if (!finite(value.inputTokens) || !finite(value.outputTokens)) return undefined;
+  const input = value.inputTokens;
+  const output = value.outputTokens;
   return {
-    totalTokens: typeof value.totalTokens === 'number' ? value.totalTokens : input + output,
+    totalTokens: finite(value.totalTokens) ? value.totalTokens : input + output,
     inputTokens: input,
     cachedInputTokens: num(value.cachedInputTokens),
     cacheWriteInputTokens: num(value.cacheWriteInputTokens),
