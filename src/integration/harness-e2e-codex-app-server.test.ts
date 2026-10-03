@@ -125,7 +125,9 @@ describe.skipIf(!E2E_ENABLED)('codex-app-server adapter against the real API (CO
       expect(existsSync(join(root, 'denied.txt'))).toBe(false);
       expect(events.some((e) => e.type === 'gate-decision' && e.decision === 'hold')).toBe(true);
       // The hold ends the call, so the held call is the last one the gate saw and must be the Bash write.
-      expect(isDeniedTxtBash(seen[seen.length - 1]!)).toBe(true);
+      const last = seen[seen.length - 1];
+      expect(last).toBeDefined();
+      expect(isDeniedTxtBash(last!)).toBe(true);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

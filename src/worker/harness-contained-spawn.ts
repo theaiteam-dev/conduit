@@ -199,8 +199,13 @@ export function containedSpawn(
         ]);
         // An uncleared timer would hold the process open for EXIT_WAIT_MS after every call.
         clearTimeout(wait);
-        // A process still alive stays tracked so the kernel's signal handlers can reap it. The stale-cgroup sweep handles its cgroup.
-        if (won !== 'exited') return;
+        if (won !== 'exited') {
+          // A process still alive stays tracked so the kernel's signal handlers can reap it. The stale-cgroup sweep
+          // handles its cgroup if the kernel dies first. Nothing else calls release() for this child, so it is
+          // released whenever the process does exit, instead of staying tracked for the life of the kernel.
+          void exited.then(release).catch(() => {});
+          return;
+        }
         await release();
       },
     };

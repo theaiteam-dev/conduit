@@ -143,7 +143,8 @@ What it does not cover, beyond the gaps listed above for every gated adapter:
   approval request would not be gated. The list was checked against codex-cli 0.159.1, and
   `conduit doctor` shows the installed version and notes when it differs. The adapter also
   reads the version on the first invoke for each binary path and writes one stderr line when it
-  differs from 0.159.1 or cannot be read. It still runs.
+  differs from 0.159.1. A version it cannot read is reported once per path and probed again on
+  the next invoke. It still runs.
 - **Subagent creation** is not asked. The commands a subagent runs are, and carry the
   subagent's thread id as `agentId`.
 - **Usage carries no cost.** Codex reports tokens only, so `cost` is 0, as for `codex-exec`.

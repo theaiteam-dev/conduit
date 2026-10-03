@@ -1078,8 +1078,9 @@ describe('opencode adapter: question tool and hold', () => {
     const o = await run(async (s) => {
       s.assistant('msg_0', { cost: 0.001, tokens: { total: 50, input: 20, output: 30, reasoning: 0, cache: { read: 0, write: 0 } } });
       await s.bash('c1', 'rm x', { messageID: 'msg_2' });
-    }, { gate: () => ({ decision: 'hold', code: 'needs_human', reason: 'r' }), config: { holdStopWaitMs: 200 } });
-    expect(Date.now() - started).toBeLessThan(3_000);
+    }, { gate: () => ({ decision: 'hold', code: 'needs_human', reason: 'r' }), config: { holdStopWaitMs: 200 }, invocation: { timeoutMs: 30_000 } });
+    // Expected near 200 ms; a bound far below the 30 s wall clock separates the bounded wait from it.
+    expect(Date.now() - started).toBeLessThan(10_000);
     expect(o.error?.code).toBe(HARNESS_GATE_HOLD_CODE);
     expect(o.fake.state.requests.some((r) => r.path.endsWith('/abort'))).toBe(true);
     expect(o.error?.usage).toMatchObject({ tokens: 50 });
@@ -1406,16 +1407,17 @@ describe('opencode adapter: timeouts and containment', () => {
   it('does not idle out while real events keep arriving, and reports progress', async () => {
     let progress = 0;
     const o = await run(async (s) => {
-      // The run outlasts the idle timeout, so only a reset on each event lets it finish.
-      for (let i = 0; i < 40; i++) {
+      // 50 gaps of at least 50 ms put the run past the 2 s idle timeout, so only a reset on
+      // each event lets it finish, while each gap stays far below the timeout under load.
+      for (let i = 0; i < 50; i++) {
         s.assistant('m1', { tokens: USAGE_1 });
-        await Bun.sleep(20);
+        await Bun.sleep(50);
       }
       s.idle();
-    }, { invocation: { timeoutMs: 5_000, idleTimeoutMs: 500, onProgress: () => { progress += 1; } } });
+    }, { invocation: { timeoutMs: 30_000, idleTimeoutMs: 2_000, onProgress: () => { progress += 1; } } });
     expect(o.error).toBeUndefined();
     expect(progress).toBeGreaterThan(20);
-  });
+  }, 20_000);
 
   it('kills the contained process exactly through kill and close on every exit path', async () => {
     const paths = await Promise.all([
@@ -1435,8 +1437,9 @@ describe('opencode adapter: timeouts and containment', () => {
     const started = Date.now();
     const o = await run(() => {}, { fake: { noScenario: true }, invocation: { timeoutMs: 300 } });
     expect(o.error?.code).toBe('harness-timeout');
-    expect(Date.now() - started).toBeLessThan(3_000);
-  });
+    // Expected near 300 ms; the bound only has to be far below a hang.
+    expect(Date.now() - started).toBeLessThan(10_000);
+  }, 20_000);
 });
 
 describe('opencode adapter: events', () => {

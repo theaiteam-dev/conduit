@@ -67,6 +67,22 @@ describe('createRunScopedCodexHome', () => {
     expect(readFileSync(join(dir, 'config.toml'), 'utf8')).toBe('');
   });
 
+  it('links <HOME>/.codex/auth.json when only HOME is set', () => {
+    const home = mkdtempSync(join(tmpdir(), 'codex-op-home-'));
+    cleanup.push(home);
+    mkdirSync(join(home, '.codex'));
+    const authPath = join(home, '.codex', 'auth.json');
+    writeFileSync(authPath, '{"token":"H"}');
+    const dir = createRunScopedCodexHome({ HOME: home }, []);
+    try {
+      const link = join(dir, 'auth.json');
+      expect(lstatSync(link).isSymbolicLink()).toBe(true);
+      expect(readlinkSync(link)).toBe(authPath);
+    } finally {
+      removeRunScopedCodexHome(dir);
+    }
+  });
+
   it('removal deletes the dir and leaves the operator auth.json intact', () => {
     const { env, authPath } = operator('{"token":"A"}');
     const dir = createRunScopedCodexHome(env, []);

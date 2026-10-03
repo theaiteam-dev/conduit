@@ -141,25 +141,40 @@ export function describeCodexProbe(path: string, version: string | undefined): s
   return `${path} (${version}${note})`;
 }
 
-/** Binary paths whose version check has started in this process. The promise is cached so concurrent invokes share one check. */
+/**
+ * Binary paths whose version check is in flight or finished with a readable version. The promise is
+ * cached so concurrent invokes share one check. A check that could not read the version removes its
+ * entry, so the next invoke probes again.
+ */
 const versionChecks = new Map<string, Promise<void>>();
+/** Binary paths already reported as having an unreadable version, so the line is written once per path. */
+const unknownVersionWarned = new Set<string>();
 
 /** Forget which binaries were checked. For tests. */
 export function resetCodexVersionWarnings(): void {
   versionChecks.clear();
+  unknownVersionWarned.clear();
 }
 
 /**
  * Write one stderr line, once per binary path per process, when the running codex is not the
- * version the ungated built-in list was checked against, or its version cannot be read. Never throws.
+ * version the ungated built-in list was checked against. A version that cannot be read is reported
+ * at most once per path and is probed again on the next invoke. Never throws.
  */
 function warnOnUncheckedVersion(path: string, readVersion: () => Promise<string | undefined>): Promise<void> {
   let check = versionChecks.get(path);
   if (check === undefined) {
-    check = (async () => {
+    let started: Promise<void> | undefined;
+    started = (async () => {
       try {
         const number = versionNumber(await readVersion().catch(() => undefined));
-        if (number === UNGATED_FEATURES_CHECKED_VERSION) return;
+        if (number === undefined) {
+          if (versionChecks.get(path) === started) versionChecks.delete(path);
+          if (unknownVersionWarned.has(path)) return;
+          unknownVersionWarned.add(path);
+        } else if (number === UNGATED_FEATURES_CHECKED_VERSION) {
+          return;
+        }
         process.stderr.write(
           `conduit: codex-app-server: the ungated built-in list was checked against codex ${UNGATED_FEATURES_CHECKED_VERSION}, ` +
           `the running codex (${path}) is ${number ?? 'unknown'}, so built-ins that do not ask for approval may be ungated\n`,
@@ -168,6 +183,7 @@ function warnOnUncheckedVersion(path: string, readVersion: () => Promise<string 
         // A warning must never fail a billed call.
       }
     })();
+    check = started;
     versionChecks.set(path, check);
   }
   return check;

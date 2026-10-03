@@ -171,7 +171,17 @@ describe.skipIf(!E2E_ENABLED)("opencode adapter: the operator's ~/.opencode (CON
         JSON.stringify({ agent: { build: { permission: { bash: 'allow' } } }, permission: { '*': 'allow', edit: 'allow' } }),
       );
       const probe = (env: Record<string, string>): Rule[] => {
-        const out = Bun.spawnSync(['opencode', 'debug', 'agent', 'build'], { cwd: root, env });
+        const out = Bun.spawnSync(['opencode', 'debug', 'agent', 'build'], {
+          cwd: root,
+          env,
+          timeout: 30_000,
+          killSignal: 'SIGKILL',
+        });
+        if (out.exitCode !== 0) {
+          throw new Error(
+            `opencode debug agent build failed (exit ${out.exitCode}, signal ${out.signalCode ?? 'none'}): ${out.stderr.toString().slice(0, 500)}`,
+          );
+        }
         return JSON.parse(out.stdout.toString()).permission as Rule[];
       };
       let adapterRules: Rule[] | undefined;

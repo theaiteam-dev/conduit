@@ -31,6 +31,19 @@ describe('containedSpawn close()', () => {
     }
     expect(trackedHandlers()).toBe(before);
   });
+
+  it('untracks a group that outlived the exit wait once it exits on its own, with no second close()', async () => {
+    const before = trackedHandlers();
+    // The no-op kill lets the short sleep outlive the 20ms wait, then exit by itself.
+    const proc = containedSpawn(containment, 'test', { exitWaitMs: 20, kill: () => {} })(
+      { command: 'sleep', args: ['0.4'], cwd: ROOT, env: { PATH: '/usr/bin:/bin' } },
+      { onLine() {}, onStderr() {}, onExit() {} },
+    );
+    await proc.close();
+    expect(trackedHandlers()).toBeGreaterThan(before);
+    for (let i = 0; i < 60 && trackedHandlers() > before; i++) await new Promise((r) => setTimeout(r, 50));
+    expect(trackedHandlers()).toBe(before);
+  });
 });
 
 const ENV = { PATH: '/usr/bin:/bin' };

@@ -307,6 +307,31 @@ describe('codex-app-server adapter: version warning', () => {
       expect(out).toContain('is unknown');
     }
   });
+
+  it('re-probes after an unreadable version and warns on the mismatch the second probe reads', async () => {
+    resetCodexVersionWarnings();
+    let calls = 0;
+    const readVersion = async (): Promise<string | undefined> => (++calls === 1 ? undefined : 'codex-cli 9.9.9');
+    const out = await stderrOf(async () => {
+      await runOnce(readVersion)();
+      await runOnce(readVersion)();
+      await runOnce(readVersion)();
+    });
+    expect(calls).toBe(2);
+    expect(out).toContain('is unknown');
+    expect(out).toContain('is 9.9.9');
+    expect(out.match(/ungated built-in list/g)?.length).toBe(2);
+  });
+
+  it('writes the unknown line once across a run of unreadable probes', async () => {
+    resetCodexVersionWarnings();
+    let calls = 0;
+    const out = await stderrOf(async () => {
+      for (let i = 0; i < 3; i++) await runOnce(async () => { calls++; return undefined; })();
+    });
+    expect(calls).toBe(3);
+    expect(out.match(/is unknown/g)?.length).toBe(1);
+  });
 });
 
 describe('codex-app-server adapter: handshake', () => {
