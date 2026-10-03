@@ -73,7 +73,8 @@ describe('buildProviderAuthContent', () => {
   it('errors, quoting no credential, for an unreadable file or a missing file', () => {
     const h = dataHomeWith('{"openai": {"key": "LEAKME"');
     const bad = buildProviderAuthContent({ XDG_DATA_HOME: h }, [], 'openai');
-    expect('error' in bad && bad.error).not.toContain('LEAKME');
+    expect(bad).toEqual({ error: expect.any(String) });
+    expect((bad as { error: string }).error).not.toContain('LEAKME');
     const missing = buildProviderAuthContent({ XDG_DATA_HOME: dataHomeWith() }, [], 'openai');
     expect('error' in missing && missing.error).toContain('openai');
   });
