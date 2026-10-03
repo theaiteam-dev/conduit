@@ -87,11 +87,14 @@ describe.skipIf(!E2E_ENABLED)('codex-app-server adapter against the real API (CO
         onEvent: (e) => events.push(e),
       });
       // The model must have actually attempted the write, else absence of the file proves nothing.
-      expect(seen.some(isDeniedTxtBash)).toBe(true);
+      const deniedCall = seen.find(isDeniedTxtBash);
+      expect(deniedCall).toBeDefined();
       expect(existsSync(join(root, 'denied.txt'))).toBe(false);
-      const decisions = events.filter((e) => e.type === 'gate-decision');
-      expect(decisions.length).toBeGreaterThan(0);
-      expect(decisions.every((e) => (e as { decision: string }).decision === 'deny')).toBe(true);
+      // The deny decision must be journaled for the denied.txt call itself, not just for some call.
+      expect(deniedCall!.toolCallId).toBeDefined();
+      expect(
+        events.some((e) => e.type === 'gate-decision' && e.toolCallId === deniedCall!.toolCallId && e.decision === 'deny'),
+      ).toBe(true);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

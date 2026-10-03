@@ -141,7 +141,9 @@ What it does not cover, beyond the gaps listed above for every gated adapter:
   named neither `list_mcp_resources` nor `read_mcp_resource`, which ran ungated without them.
   That is the model's own report from one codex version. A tool that a newer Codex adds without an
   approval request would not be gated. The list was checked against codex-cli 0.159.1, and
-  `conduit doctor` shows the installed version and notes when it differs.
+  `conduit doctor` shows the installed version and notes when it differs. The adapter also
+  reads the version on the first invoke for each binary path and writes one stderr line when it
+  differs from 0.159.1 or cannot be read. It still runs.
 - **Subagent creation** is not asked. The commands a subagent runs are, and carry the
   subagent's thread id as `agentId`.
 - **Usage carries no cost.** Codex reports tokens only, so `cost` is 0, as for `codex-exec`.
@@ -323,7 +325,10 @@ hold it together:
   stuck on a hung tool call runs until that bound. `idle_timeout_seconds` adds a second
   bound, reset by every stdout line: if no line arrives for that long, the runner kills the
   process group as it does on the wall-clock timeout
-  ([#31](https://github.com/theaiteam-dev/conduit/issues/31)). It applies only to
+  ([#31](https://github.com/theaiteam-dev/conduit/issues/31)). `codex-app-server` and
+  `opencode` run a server rather than a one-shot process and keep their own idle timer:
+  codex resets it on every stdout JSON-RPC line, opencode on every SSE event except
+  `server.heartbeat`. It applies only to
   `kind: harness` stations and must be a positive integer below the wall-clock timeout
   that applies (`timeout_seconds`, or the 300-second default). An idle kill fails as
   `harness-idle-timeout` rather than `harness-timeout`, and is retried the same way: it

@@ -808,6 +808,27 @@ describe('opencode adapter: mapping asks to the gate', () => {
     expect(gateFor(['Read'])(o.gateCalls[0]!)).toMatchObject({ decision: 'deny', code: 'tool_not_allowed' });
   });
 
+  it('journals the same input the gate received for path, network, task and skill categories', async () => {
+    const o = await run(async (s) => {
+      s.part({ callID: 'g1', tool: 'grep', status: 'running', input: { pattern: 'needle', path: 'out' } });
+      await s.ask({ permission: 'grep', patterns: ['p'], tool: { messageID: 'msg_1', callID: 'g1' } });
+      await s.ask({ permission: 'webfetch', patterns: ['https://example.com'], tool: { messageID: 'msg_1', callID: 'w1' } });
+      await s.ask({ permission: 'websearch', patterns: ['a query'], tool: { messageID: 'msg_1', callID: 'w2' } });
+      await s.ask({ permission: 'task', patterns: ['general'], tool: { messageID: 'msg_1', callID: 't1' } });
+      await s.ask({ permission: 'skill', patterns: ['review'], tool: { messageID: 'msg_1', callID: 'k1' } });
+      finish(s);
+    }, { gate: gateFor([...tools, 'WebFetch', 'WebSearch', 'Agent', 'Skill']) });
+    const journaled = o.events.filter((e) => e.type === 'tool-input-available') as Array<{ toolCallId: string; toolName: string; input: unknown }>;
+    expect(journaled.length).toBe(5);
+    expect(o.gateCalls.length).toBe(5);
+    for (const call of o.gateCalls) {
+      const row = journaled.find((e) => e.toolCallId === call.toolCallId);
+      expect(row).toMatchObject({ toolName: call.toolName, input: call.input });
+    }
+    expect(o.gateCalls[0]!.input).toHaveProperty('pattern', 'needle');
+    expect(o.gateCalls[1]!.input).toEqual({ url: 'https://example.com' });
+  });
+
   it('always rejects external_directory and never asks the gate, even for an allow-all gate', async () => {
     const o = await run(async (s) => {
       expect((await s.ask({ permission: 'external_directory', patterns: ['/etc/*'], tool: { messageID: 'msg_1', callID: 'x1' } }))?.reply).toBe('reject');

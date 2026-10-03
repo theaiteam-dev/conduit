@@ -17,6 +17,7 @@ import {
   splitShellWords,
   unwrapShellCommand,
   UNGATED_FEATURES_CHECKED_VERSION,
+  resetCodexVersionWarnings,
   type CodexAppServerHarnessAdapterConfig,
 } from './harness-adapter-codex-app-server';
 import type { ContainedProcessHandlers, ContainedSpawn, ContainedSpawnSpec } from './harness-contained-spawn';
@@ -266,6 +267,45 @@ describe('codex-app-server adapter: capabilities', () => {
     const err = await rejection(adapterWith(server, { projectRoot: join(ROOT, 'missing') }).invoke(invocation()));
     expect(err.message).toContain('does not exist');
     expect(server.state.spec).toBeUndefined();
+  });
+});
+
+describe('codex-app-server adapter: version warning', () => {
+  async function stderrOf(run: () => Promise<void>): Promise<string> {
+    const original = process.stderr.write;
+    let out = '';
+    process.stderr.write = ((chunk: string | Uint8Array) => { out += String(chunk); return true; }) as typeof process.stderr.write;
+    try { await run(); } finally { process.stderr.write = original; }
+    return out;
+  }
+  const runOnce = (readVersion: () => Promise<string | undefined>) => async () => {
+    const server = fakeServer((p) => p.completeTurn());
+    await adapterWith(server, { readVersion }).invoke(invocation());
+  };
+
+  it('warns once per binary across two invokes when the version differs', async () => {
+    resetCodexVersionWarnings();
+    const out = await stderrOf(async () => {
+      await runOnce(async () => 'codex-cli 9.9.9')();
+      await runOnce(async () => 'codex-cli 9.9.9')();
+    });
+    expect(out.match(/ungated built-in list/g)?.length).toBe(1);
+    expect(out).toContain(UNGATED_FEATURES_CHECKED_VERSION);
+    expect(out).toContain('9.9.9');
+  });
+
+  it('does not warn when the version matches', async () => {
+    resetCodexVersionWarnings();
+    const out = await stderrOf(runOnce(async () => `codex-cli ${UNGATED_FEATURES_CHECKED_VERSION}`));
+    expect(out).toBe('');
+  });
+
+  it('warns that the version is unknown when it cannot be read, and still runs', async () => {
+    for (const readVersion of [async () => undefined, async (): Promise<string | undefined> => { throw new Error('boom'); }]) {
+      resetCodexVersionWarnings();
+      const out = await stderrOf(runOnce(readVersion));
+      expect(out).toContain('is unknown');
+    }
   });
 });
 

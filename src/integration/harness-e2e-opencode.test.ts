@@ -32,6 +32,7 @@ import { join } from 'node:path';
 import { createOpenCodeHarnessAdapter } from '../worker/harness-adapter-opencode';
 import type { KnownUsage } from '../worker/harness-adapter';
 import type { HarnessEvent } from '../worker/harness-events';
+import type { GateToolCall } from '../worker/harness-gate';
 import { HARNESS_GATE_HOLD_CODE, createHarnessToolGate } from '../worker/harness-gate';
 
 const E2E_ENABLED = !!process.env.CONDUIT_E2E_OPENCODE && Bun.which('opencode') !== null;
@@ -39,6 +40,10 @@ const MODEL = process.env.CONDUIT_E2E_OPENCODE_MODEL ?? 'openai/gpt-4.1-mini';
 const TIMEOUT_MS = 120_000;
 // The model may look around before it writes, and a denied look can end the call without a write.
 const WRITE_TOOLS = ['Write', 'Edit', 'Read', 'Glob', 'Grep'];
+
+function isDeniedTxtBash(call: GateToolCall): boolean {
+  return call.toolName === 'Bash' && String((call.input as { command?: unknown }).command).includes('denied.txt');
+}
 
 function adapterFor(projectRoot: string) {
   return createOpenCodeHarnessAdapter({ projectRoot, envAllowlist: ['PATH'], model: MODEL });
@@ -94,21 +99,28 @@ describe.skipIf(!E2E_ENABLED)('opencode adapter against the real API (CONDUIT_E2
     const root = realpathSync(mkdtempSync(join(tmpdir(), 'conduit-e2e-opencode-')));
     try {
       const events: HarnessEvent[] = [];
-      const out = await adapterFor(root).invoke({
+      const seen: GateToolCall[] = [];
+      await adapterFor(root).invoke({
         prompt:
           'Run this exact bash command: echo denied > denied.txt . ' +
           'If it is refused, say so in one sentence and stop.',
         inputs: [],
         tools: ['Bash'],
         timeoutMs: TIMEOUT_MS,
-        gate: (call) => ({ decision: 'deny', code: 'not_allowlisted', reason: `no ${call.toolName}` }),
+        gate: (call) => {
+          seen.push(call);
+          return { decision: 'deny', code: 'not_allowlisted', reason: `no ${call.toolName}` };
+        },
         onEvent: (e) => events.push(e),
       });
-      expect(out.outputs).toEqual([]);
+      // The model must have actually attempted the write, else absence of the file proves nothing.
+      const attempt = seen.find(isDeniedTxtBash);
+      expect(attempt).toBeDefined();
       expect(existsSync(join(root, 'denied.txt'))).toBe(false);
       const decisions = events.filter((e) => e.type === 'gate-decision');
-      expect(decisions.length).toBeGreaterThan(0);
-      expect(decisions.every((e) => (e as { decision: string }).decision === 'deny')).toBe(true);
+      expect(
+        decisions.some((e) => e.type === 'gate-decision' && e.decision === 'deny' && e.toolName === 'Bash' && e.toolCallId === attempt!.toolCallId),
+      ).toBe(true);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

@@ -1,9 +1,9 @@
 import { describe, it, expect } from 'bun:test';
 import { spawn as nodeSpawn, type ChildProcess } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { containedSpawn } from './harness-contained-spawn';
+import { CLOSE_GRACE_MS, containedSpawn } from './harness-contained-spawn';
 import { killContained } from './process-group';
 
 const ROOT = process.cwd();
@@ -92,7 +92,8 @@ describe('containedSpawn real children', () => {
     // Poll rather than sleep a fixed time: a slow spawn only makes onExit later.
     for (let i = 0; i < 100 && exits.length === 0; i++) await new Promise((r) => setTimeout(r, 50));
     expect(exits.length).toBe(1);
-    expect(exits[0]!).toBeGreaterThanOrEqual(950);
+    // The grace timer is what ends the wait; 50ms of tolerance covers timer and Date.now() jitter.
+    expect(exits[0]!).toBeGreaterThanOrEqual(CLOSE_GRACE_MS - 50);
     await proc.close();
     expect(exits.length).toBe(1);
     // Reap the real descendant: the kill seam above was a no-op.
@@ -100,12 +101,16 @@ describe('containedSpawn real children', () => {
   });
 
   // The no-op kill leaves the backgrounded descendant alive holding the pipe past the close grace.
-  const heldPipe = async (script: string) => {
+  // `script` receives a sentinel path that the descendant must touch after its late write, so the test
+  // waits on that observable instead of a fixed sleep.
+  const heldPipe = async (script: (sentinel: string) => string) => {
+    const dir = mkdtempSync(join(tmpdir(), 'conduit-held-'));
+    const sentinel = join(dir, 'late-written');
     const events: string[] = [];
     let descendant: number | undefined;
     let exits = 0;
     const proc = containedSpawn(containment, 'test', { kill: () => {} })(
-      { command: 'sh', args: ['-c', script], cwd: ROOT, env: ENV },
+      { command: 'sh', args: ['-c', script(sentinel)], cwd: ROOT, env: ENV },
       {
         onLine(line) {
           if (descendant === undefined) descendant = Number(line);
@@ -116,23 +121,29 @@ describe('containedSpawn real children', () => {
       },
     );
     for (let i = 0; i < 100 && exits === 0; i++) await new Promise((r) => setTimeout(r, 50));
-    // The descendant writes ~0.5s after the grace-timer exit.
-    await new Promise((r) => setTimeout(r, 1000));
-    await proc.close();
-    if (descendant !== undefined && descendant > 0) {
-      try { process.kill(descendant, 'SIGKILL'); } catch { /* already gone */ }
+    try {
+      // Wait until the descendant has written its late output, then let the event loop read the pipe.
+      for (let i = 0; i < 200 && !existsSync(sentinel); i++) await new Promise((r) => setTimeout(r, 50));
+      expect(existsSync(sentinel)).toBe(true);
+      await new Promise((r) => setTimeout(r, 100));
+      await proc.close();
+    } finally {
+      if (descendant !== undefined && descendant > 0) {
+        try { process.kill(descendant, 'SIGKILL'); } catch { /* already gone */ }
+      }
+      rmSync(dir, { recursive: true, force: true });
     }
     return { events, exits };
   };
 
   it('delivers no line after onExit when a descendant writes after the close grace', async () => {
-    const { events, exits } = await heldPipe('(sleep 1.5; echo late) & echo $!; echo first');
+    const { events, exits } = await heldPipe((s) => `(sleep 1.5; echo late; touch ${s}) & echo $!; echo first`);
     expect(exits).toBe(1);
     expect(events).toEqual(['line:first', 'exit']);
   });
 
   it('flushes a final unterminated line before onExit when a descendant holds the pipe', async () => {
-    const { events, exits } = await heldPipe('(sleep 1.5; echo late) & echo $!; printf partial');
+    const { events, exits } = await heldPipe((s) => `(sleep 1.5; echo late; touch ${s}) & echo $!; printf partial`);
     expect(exits).toBe(1);
     expect(events).toEqual(['line:partial', 'exit']);
   });

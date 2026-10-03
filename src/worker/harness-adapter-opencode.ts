@@ -751,7 +751,7 @@ export function createOpenCodeHarnessAdapter(config: OpenCodeHarnessAdapterConfi
               if (abs === undefined) return denyDirect(spec.toolName, ctx, 'path_escape', 'the path is outside the project root');
               const input: Json = { [spec.pathField]: abs };
               if (typeof part.input.pattern === 'string') input.pattern = part.input.pattern;
-              emitInputs(toolCallId, [{ toolName: spec.toolName, input: { [spec.pathField]: abs } }]);
+              emitInputs(toolCallId, [{ toolName: spec.toolName, input }]);
               return askGate({ toolName: spec.toolName, input, ...(toolCallId !== undefined ? { toolCallId } : {}) }, ctx);
             }
             case 'webfetch':
@@ -759,18 +759,23 @@ export function createOpenCodeHarnessAdapter(config: OpenCodeHarnessAdapterConfi
             case 'codesearch': {
               // Network tools are denied by the gate whatever they carry, so no tool part is awaited.
               const toolName = category === 'webfetch' ? 'WebFetch' : 'WebSearch';
-              emitInputs(toolCallId, [{ toolName, input: {} }]);
-              return askGate({ toolName, input: category === 'webfetch' ? { url: patterns[0] ?? '' } : { query: patterns[0] ?? '' }, ...(toolCallId !== undefined ? { toolCallId } : {}) }, ctx);
+              const input: Json = category === 'webfetch' ? { url: patterns[0] ?? '' } : { query: patterns[0] ?? '' };
+              emitInputs(toolCallId, [{ toolName, input }]);
+              return askGate({ toolName, input, ...(toolCallId !== undefined ? { toolCallId } : {}) }, ctx);
             }
-            case 'task':
-              emitInputs(toolCallId, [{ toolName: 'Agent', input: {} }]);
-              return askGate({ toolName: 'Agent', input: { subagent_type: patterns[0] ?? '' }, ...(toolCallId !== undefined ? { toolCallId } : {}) }, ctx);
+            case 'task': {
+              const input: Json = { subagent_type: patterns[0] ?? '' };
+              emitInputs(toolCallId, [{ toolName: 'Agent', input }]);
+              return askGate({ toolName: 'Agent', input, ...(toolCallId !== undefined ? { toolCallId } : {}) }, ctx);
+            }
             case 'todowrite':
               emitInputs(toolCallId, [{ toolName: 'TodoWrite', input: {} }]);
               return askGate({ toolName: 'TodoWrite', input: {}, ...(toolCallId !== undefined ? { toolCallId } : {}) }, ctx);
-            case 'skill':
-              emitInputs(toolCallId, [{ toolName: 'Skill', input: {} }]);
-              return askGate({ toolName: 'Skill', input: { name: patterns[0] ?? '' }, ...(toolCallId !== undefined ? { toolCallId } : {}) }, ctx);
+            case 'skill': {
+              const input: Json = { name: patterns[0] ?? '' };
+              emitInputs(toolCallId, [{ toolName: 'Skill', input }]);
+              return askGate({ toolName: 'Skill', input, ...(toolCallId !== undefined ? { toolCallId } : {}) }, ctx);
+            }
             case 'external_directory':
               // Never allowed: it is the route to files outside the project root.
               return bad('access outside the project root is not allowed', 'path_escape');

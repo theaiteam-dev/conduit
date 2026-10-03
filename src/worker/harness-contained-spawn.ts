@@ -14,7 +14,7 @@ import { prepareContainedCommand, removeCgroup, type Containment } from './cgrou
 /** Longest wait for the killed process to exit before `close()` gives up on it. */
 const EXIT_WAIT_MS = 5_000;
 /** Grace after `exit` for the stdout stream to close, when a surviving descendant holds the pipe. */
-const CLOSE_GRACE_MS = 1_000;
+export const CLOSE_GRACE_MS = 1_000;
 
 /**
  * The executable a bare name (`claude`, `codex`, `opencode`) resolves to on `sourceEnv`'s PATH, or a given absolute path. Files only,

@@ -139,3 +139,32 @@ describe('run-scoped directories', () => {
     expect(existsSync(dirs.root)).toBe(false);
   });
 });
+
+describe('createRunScopedOpenCodeDirs failure', () => {
+  it('leaves no dir behind when a subdirectory cannot be created', () => {
+    // node:fs is mocked in a child process so the mock cannot leak into other test files.
+    const tmp = realpathSync(mkdtempSync(join(HOME, 'oc-fail-tmp-')));
+    const script = `
+      import { mock } from 'bun:test';
+      import { readdirSync } from 'node:fs';
+      const real = await import('node:fs');
+      let calls = 0;
+      mock.module('node:fs', () => ({
+        ...real,
+        mkdirSync: (...a) => { if (++calls === 2) throw new Error('EACCES: simulated'); return real.mkdirSync(...a); },
+      }));
+      const { createRunScopedOpenCodeDirs } = await import(${JSON.stringify(join(import.meta.dir, 'opencode-isolation.ts'))});
+      let msg = '';
+      try { createRunScopedOpenCodeDirs(); } catch (e) { msg = String(e); }
+      console.log(JSON.stringify({ msg, calls, left: readdirSync(process.env.TMPDIR) }));
+    `;
+    const proc = Bun.spawnSync([process.execPath, '-e', script], { env: { ...process.env, TMPDIR: tmp } });
+    if (proc.exitCode !== 0) throw new Error(`child exited ${proc.exitCode}: ${proc.stderr.toString()}`);
+    const lines = proc.stdout.toString().trim();
+    if (lines === '') throw new Error(`child printed nothing: ${proc.stderr.toString()}`);
+    const out = JSON.parse(lines.split('\n').pop()!) as { msg: string; calls: number; left: string[] };
+    expect(out.msg).toContain('simulated');
+    expect(out.calls).toBe(2);
+    expect(out.left).toEqual([]);
+  });
+});

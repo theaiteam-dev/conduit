@@ -126,14 +126,51 @@ async function runVersionCommand(binaryPath: string, sourceEnv: Record<string, s
   }
 }
 
+/** The version number inside `--version` output, or undefined when there is none. */
+function versionNumber(version: string | undefined): string | undefined {
+  return version === undefined ? undefined : /\d+\.\d+\.\d+\S*/.exec(version)?.[0];
+}
+
 /** The probe detail: the path, the version when known, and a note when it differs from the checked one. */
 export function describeCodexProbe(path: string, version: string | undefined): string {
   if (version === undefined) return path;
-  const number = /\d+\.\d+\.\d+\S*/.exec(version)?.[0];
+  const number = versionNumber(version);
   const note = number !== undefined && number === UNGATED_FEATURES_CHECKED_VERSION
     ? ''
     : `, ungated built-ins checked against ${UNGATED_FEATURES_CHECKED_VERSION}`;
   return `${path} (${version}${note})`;
+}
+
+/** Binary paths whose version check has started in this process. The promise is cached so concurrent invokes share one check. */
+const versionChecks = new Map<string, Promise<void>>();
+
+/** Forget which binaries were checked. For tests. */
+export function resetCodexVersionWarnings(): void {
+  versionChecks.clear();
+}
+
+/**
+ * Write one stderr line, once per binary path per process, when the running codex is not the
+ * version the ungated built-in list was checked against, or its version cannot be read. Never throws.
+ */
+function warnOnUncheckedVersion(path: string, readVersion: () => Promise<string | undefined>): Promise<void> {
+  let check = versionChecks.get(path);
+  if (check === undefined) {
+    check = (async () => {
+      try {
+        const number = versionNumber(await readVersion().catch(() => undefined));
+        if (number === UNGATED_FEATURES_CHECKED_VERSION) return;
+        process.stderr.write(
+          `conduit: codex-app-server: the ungated built-in list was checked against codex ${UNGATED_FEATURES_CHECKED_VERSION}, ` +
+          `the running codex (${path}) is ${number ?? 'unknown'}, so built-ins that do not ask for approval may be ungated\n`,
+        );
+      } catch {
+        // A warning must never fail a billed call.
+      }
+    })();
+    versionChecks.set(path, check);
+  }
+  return check;
 }
 
 /**
@@ -438,6 +475,7 @@ export function createCodexAppServerHarnessAdapter(config: CodexAppServerHarness
       const resolved = resolveExecutable(command, sourceEnv);
       if ('error' in resolved) fail(resolved.error);
       const executable = resolved.path;
+      await warnOnUncheckedVersion(executable, () => (config.readVersion ?? ((p) => runVersionCommand(p, sourceEnv)))(executable));
       if (!existsSync(config.projectRoot) || !statSync(config.projectRoot).isDirectory()) {
         fail(`project root '${config.projectRoot}' does not exist, cannot confine the harness cwd`);
       }
