@@ -17,7 +17,7 @@ const EXIT_WAIT_MS = 5_000;
 const CLOSE_GRACE_MS = 1_000;
 
 /**
- * The `claude` a bare name resolves to on `sourceEnv`'s PATH, or a given absolute path. Files only,
+ * The executable a bare name (`claude`, `codex`, `opencode`) resolves to on `sourceEnv`'s PATH, or a given absolute path. Files only,
  * never a shell function. A path containing '/' must be absolute: a relative one would resolve
  * against whatever cwd the kernel happens to have, so it is refused, with its own message.
  */
@@ -92,6 +92,9 @@ export function containedSpawn(
       throw err;
     }
     if (child.pid === undefined) {
+      // The exec failure (EACCES, ENOENT) arrives as an 'error' event on a later tick. With no listener it is
+      // an uncaught exception that ends the kernel, so it is absorbed here: the throw below reports it.
+      child.once('error', () => {});
       if (contained.cgroup !== undefined) void removeCgroup(contained.cgroup);
       throw new Error(`${label}: failed to spawn '${spec.command}'`);
     }

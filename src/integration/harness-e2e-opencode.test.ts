@@ -18,11 +18,15 @@
  *   4. a hold gate: the call ends with the hold code and no command runs, with
  *      the usage of the step in flight.
  *
+ * A fifth check makes no API call: with an operator `~/.opencode/opencode.json`
+ * holding allow rules and HOME allowlisted, `opencode debug agent build` run
+ * with the env the adapter builds still resolves bash and edit to `ask`.
+ *
  * The model defaults to openai/gpt-4.1-mini. Override it with
  * CONDUIT_E2E_OPENCODE_MODEL (`provider/model`).
  */
 import { describe, it, expect } from 'bun:test';
-import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createOpenCodeHarnessAdapter } from '../worker/harness-adapter-opencode';
@@ -135,4 +139,53 @@ describe.skipIf(!E2E_ENABLED)('opencode adapter against the real API (CONDUIT_E2
       rmSync(root, { recursive: true, force: true });
     }
   }, TIMEOUT_MS + 10_000);
+});
+
+// No API call: the adapter's spawn seam runs `opencode debug agent build` with the env the adapter built,
+// which prints the agent's resolved permission rules, then stops the call.
+describe.skipIf(!E2E_ENABLED)("opencode adapter: the operator's ~/.opencode (CONDUIT_E2E_OPENCODE=1)", () => {
+  type Rule = { permission: string; action: string; pattern: string };
+  /** opencode evaluates the last matching rule. */
+  const lastMatch = (rules: Rule[], name: string): string | undefined =>
+    rules.filter((r) => (r.permission === name || r.permission === '*') && r.pattern === '*').at(-1)?.action;
+
+  it('does not load an allow rule from the operator home, even with HOME allowlisted', async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'conduit-e2e-opencode-')));
+    const operatorHome = realpathSync(mkdtempSync(join(tmpdir(), 'conduit-e2e-opencode-home-')));
+    try {
+      mkdirSync(join(operatorHome, '.opencode'));
+      writeFileSync(
+        join(operatorHome, '.opencode', 'opencode.json'),
+        JSON.stringify({ agent: { build: { permission: { bash: 'allow' } } }, permission: { '*': 'allow', edit: 'allow' } }),
+      );
+      const probe = (env: Record<string, string>): Rule[] => {
+        const out = Bun.spawnSync(['opencode', 'debug', 'agent', 'build'], { cwd: root, env });
+        return JSON.parse(out.stdout.toString()).permission as Rule[];
+      };
+      let adapterRules: Rule[] | undefined;
+      let operatorRules: Rule[] | undefined;
+      const adapter = createOpenCodeHarnessAdapter({
+        projectRoot: root,
+        envAllowlist: ['PATH', 'HOME', 'OPENAI_API_KEY'],
+        model: 'openai/gpt-4.1-mini',
+        sourceEnv: { PATH: process.env.PATH!, HOME: operatorHome, OPENAI_API_KEY: 'unused' },
+        spawn: (spec) => {
+          adapterRules = probe(spec.env);
+          // Control: the same env with the operator's HOME shows the probe sees the allow rules.
+          operatorRules = probe({ ...spec.env, HOME: operatorHome });
+          throw new Error('probe done');
+        },
+      });
+      await expect(
+        adapter.invoke({ prompt: 'unused', inputs: [], tools: [], timeoutMs: TIMEOUT_MS, gate: () => ({ decision: 'allow' }) }),
+      ).rejects.toThrow('probe done');
+      expect(lastMatch(operatorRules!, 'bash')).toBe('allow');
+      expect(lastMatch(operatorRules!, 'edit')).toBe('allow');
+      expect(lastMatch(adapterRules!, 'bash')).toBe('ask');
+      expect(lastMatch(adapterRules!, 'edit')).toBe('ask');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+      rmSync(operatorHome, { recursive: true, force: true });
+    }
+  });
 });

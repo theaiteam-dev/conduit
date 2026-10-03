@@ -1219,6 +1219,13 @@ describe('codex-app-server adapter: timeouts', () => {
     expect(server.state.kills).toBeGreaterThan(0);
   });
 
+  it('recovers the usage reported before an idle timeout', async () => {
+    const server = fakeServer((p) => p.usage('thr-root', USAGE_A));
+    const err = await rejection(adapterWith(server).invoke(invocation({ timeoutMs: 5_000, idleTimeoutMs: 200 })));
+    expect(err.code).toBe('harness-idle-timeout');
+    expect(err.usage).toMatchObject({ tokens: 120 });
+  });
+
   it('resets the idle timer on every line', async () => {
     const server = fakeServer(async (p) => {
       // 40 lines x 20 ms gaps = 800 ms in all, well past one 500 ms idle window, so a timer that did not

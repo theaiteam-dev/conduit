@@ -3,7 +3,7 @@
  * and the per-invocation XDG directories.
  */
 import { describe, it, expect, afterAll, afterEach } from 'bun:test';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -97,13 +97,14 @@ describe('buildProviderAuthContent', () => {
 });
 
 describe('run-scoped directories', () => {
-  it('creates four empty XDG directories and removes them all', () => {
+  it('creates an empty HOME and four empty XDG directories and removes them all', () => {
     const dirs = createRunScopedOpenCodeDirs();
     for (const path of Object.values(dirs.env)) {
       expect(existsSync(path)).toBe(true);
       expect(path.startsWith(dirs.root)).toBe(true);
+      expect(readdirSync(path)).toEqual([]);
     }
-    expect(Object.keys(dirs.env).sort()).toEqual(['XDG_CACHE_HOME', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_STATE_HOME']);
+    expect(Object.keys(dirs.env).sort()).toEqual(['HOME', 'XDG_CACHE_HOME', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_STATE_HOME']);
     removeRunScopedOpenCodeDirs(dirs);
     expect(existsSync(dirs.root)).toBe(false);
   });

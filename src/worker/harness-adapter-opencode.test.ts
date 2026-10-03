@@ -117,6 +117,8 @@ interface FakeOptions {
   reply404?: boolean;
   /** Hold the answer to a question reject for this many ms, keyed by question id. */
   rejectDelayMs?: Record<string, number>;
+  /** On an abort, publish the root going idle before answering, as a real cancel does. */
+  idleOnAbort?: boolean;
 }
 
 const enc = new TextEncoder();
@@ -134,6 +136,7 @@ function fakeOpenCode(scenario: (s: Scenario) => Promise<void> | void, opts: Fak
     timeline: string[];
     port?: number;
     dirsDuring?: boolean;
+    homeEmptyDuring?: boolean;
     promptBody?: Json;
   } = { spawns: 0, kills: 0, closes: 0, requests: [], timeline: [] };
   let server: ReturnType<typeof Bun.serve> | undefined;
@@ -260,6 +263,8 @@ function fakeOpenCode(scenario: (s: Scenario) => Promise<void> | void, opts: Fak
         if (req.method === 'POST' && prompt) {
           state.promptBody = body;
           state.dirsDuring = state.spec?.env.XDG_CONFIG_HOME !== undefined && existsSync(state.spec.env.XDG_CONFIG_HOME);
+          const home = state.spec?.env.HOME;
+          state.homeEmptyDuring = home !== undefined && existsSync(home) && readdirSync(home).length === 0;
           if (opts.noScenario !== true && (opts.promptStatus ?? 204) === 204) setTimeout(() => void scenario(s), 0);
           return new Response(opts.promptStatus === undefined || opts.promptStatus === 204 ? null : 'nope', { status: opts.promptStatus ?? 204 });
         }
@@ -277,7 +282,13 @@ function fakeOpenCode(scenario: (s: Scenario) => Promise<void> | void, opts: Fak
           state.timeline.push(`done ${url.pathname}`);
           return Response.json(true);
         }
-        if (req.method === 'POST' && /^\/session\/[^/]+\/abort$/.test(url.pathname)) return Response.json(true);
+        if (req.method === 'POST' && /^\/session\/[^/]+\/abort$/.test(url.pathname)) {
+          if (opts.idleOnAbort === true) {
+            s.idle();
+            await Bun.sleep(50);
+          }
+          return Response.json(true);
+        }
         const message = /^\/session\/([^/]+)\/message\/([^/]+)$/.exec(url.pathname);
         if (req.method === 'GET' && message) {
           const found = opts.messageBody?.(message[1]!, message[2]!);
@@ -476,13 +487,22 @@ describe('opencode adapter: process, auth and environment', () => {
     const env = o.fake.state.spec!.env;
     expect(env.PATH).toBe('/usr/bin');
     expect(env.LANG).toBe('C');
-    expect(env.HOME).toBeUndefined();
     expect(env.SECRET).toBeUndefined();
-    expect(Object.keys(env).filter((k) => !k.startsWith('OPENCODE_') && !k.startsWith('XDG_')).sort()).toEqual(['LANG', 'PATH']);
+    expect(Object.keys(env).filter((k) => !k.startsWith('OPENCODE_') && !k.startsWith('XDG_')).sort()).toEqual(['HOME', 'LANG', 'PATH']);
     for (const name of ['XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_STATE_HOME', 'XDG_CACHE_HOME']) {
       expect(env[name]).toContain('conduit-opencode-');
       expect(env[name]).not.toBe(AUTH_HOME);
     }
+  });
+
+  it("points HOME at an empty run-scoped directory, even when HOME is allowlisted, so the operator's ~/.opencode never loads", async () => {
+    // opencode reads ~/.opencode/opencode.json from os.homedir() whatever the XDG roots say, and an
+    // `allow` rule there outranks the "*":"ask" the adapter passes, so no ask reaches the gate.
+    const o = await run((s) => finish(s), { config: { envAllowlist: ['HOME'], sourceEnv: { PATH: '/usr/bin', HOME: '/home/op', XDG_DATA_HOME: AUTH_HOME } } });
+    const env = o.fake.state.spec!.env;
+    expect(env.HOME).not.toBe('/home/op');
+    expect(dirname(env.HOME!)).toBe(dirname(env.XDG_CONFIG_HOME!));
+    expect(o.fake.state.homeEmptyDuring).toBe(true);
   });
 
   it('drops every allowlisted OPENCODE_* variable that the adapter does not set itself', async () => {
@@ -1175,12 +1195,14 @@ describe('opencode adapter: failures', () => {
     expect(o.error?.message).toContain('authentication failed');
   });
 
-  it('classifies a 429 as harness-rate-limited', async () => {
+  it('classifies a 429 as harness-rate-limited, with the usage seen so far', async () => {
     const o = await run((s) => {
+      s.assistant('m0', { tokens: USAGE_1 });
       s.emit('session.error', { sessionID: s.sessionID, error: { name: 'APIError', data: { message: 'Too many requests', statusCode: 429, isRetryable: true } } });
       s.idle();
     });
     expect(o.error?.code).toBe('harness-rate-limited');
+    expect((o.error?.usage as KnownUsage).tokens).toBe(1000);
   });
 
   it('classifies rate-limit wording on an error with no status as harness-rate-limited', async () => {
@@ -1213,6 +1235,31 @@ describe('opencode adapter: failures', () => {
     expect(o.fake.state.requests.some((r) => r.path.endsWith('/abort'))).toBe(true);
     expect((o.error?.usage as KnownUsage).tokens).toBe(1000);
     expect(o.events.some((e) => e.type === 'rate-limit')).toBe(true);
+  });
+
+  it('still parks when the root goes idle while its own abort is in flight', async () => {
+    // A real cancel publishes the root idle before the abort request returns. That idle must not end
+    // the call as a success with empty outputs.
+    for (const sessionID of [undefined, 'ses_child']) {
+      const o = await run(async (s) => {
+        if (sessionID !== undefined) s.child(sessionID, s.sessionID);
+        s.assistant('m1', { tokens: USAGE_1 });
+        s.status({ type: 'retry', attempt: 1, message: 'Rate limit reached for requests', next: Date.now() + 60_000 }, sessionID);
+        await Bun.sleep(3_000);
+      }, { fake: { idleOnAbort: true }, invocation: { timeoutMs: 20_000 } });
+      expect(o.result).toBeUndefined();
+      expect(o.error?.code).toBe('harness-rate-limited');
+      expect((o.error?.usage as KnownUsage).tokens).toBe(1000);
+    }
+  });
+
+  it('still holds when the root goes idle while the hold abort is in flight', async () => {
+    const o = await run(async (s) => {
+      await s.bash('c1', 'rm x');
+      s.assistant('msg_1', { tokens: USAGE_1 });
+      await Bun.sleep(1_000);
+    }, { gate: () => ({ decision: 'hold', code: 'needs_human', reason: 'r' }), fake: { idleOnAbort: true } });
+    expect(o.error?.code).toBe(HARNESS_GATE_HOLD_CODE);
   });
 
   it('keeps waiting through a retry status that is not a rate limit', async () => {
@@ -1322,14 +1369,16 @@ describe('opencode adapter: timeouts and containment', () => {
     expect(o.events[o.events.length - 1]).toMatchObject({ type: 'lifecycle', phase: 'timeout' });
   });
 
-  it('kills the server and throws harness-idle-timeout when only heartbeats arrive', async () => {
+  it('kills the server and throws harness-idle-timeout when only heartbeats arrive, with the usage seen so far', async () => {
     const o = await run(async (s) => {
+      s.assistant('m1', { tokens: USAGE_1 });
       for (let i = 0; i < 50; i++) {
         s.heartbeat();
         await Bun.sleep(20);
       }
     }, { invocation: { timeoutMs: 5_000, idleTimeoutMs: 500 } });
     expect(o.error?.code).toBe('harness-idle-timeout');
+    expect((o.error?.usage as KnownUsage).tokens).toBe(1000);
     expect(o.events[o.events.length - 1]).toMatchObject({ type: 'lifecycle', phase: 'idle-timeout' });
   });
 

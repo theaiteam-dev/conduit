@@ -257,11 +257,18 @@ reaches them. The server binds `127.0.0.1` on a random port and requires HTTP Ba
 random per-invocation password on every request, the event stream included. The adapter refuses
 a server that reports any other address.
 
-The child gets four run-scoped XDG directories (config, data, state, cache), removed on every
-exit path, and `OPENCODE_DISABLE_PROJECT_CONFIG`, `_CLAUDE_CODE`, `_EXTERNAL_SKILLS`,
+The child gets a run-scoped, empty `HOME` and four run-scoped XDG directories (config, data,
+state, cache), all removed on every exit path, and `OPENCODE_DISABLE_PROJECT_CONFIG`, `_CLAUDE_CODE`, `_EXTERNAL_SKILLS`,
 `_DEFAULT_PLUGINS` and `OPENCODE_PURE` set to 1. With these, `AGENTS.md` in the project, project
 MCP servers and project plugins did not load. Its env is the allowlist plus `PATH` and those
-variables. `HOME` is not injected: live calls ran without it. Credentials are the `auth.json`
+variables. An allowlisted `HOME` is replaced by the run-scoped one: opencode loads
+`~/.opencode/` (config, agents, commands, MCP servers) from `os.homedir()` whatever the XDG
+roots say, falling back to the passwd entry when `HOME` is unset, and an `allow` rule there is
+merged after the adapter's `"*":"ask"` and wins, so no ask reaches the gate. With the operator's
+`HOME`, a `~/.opencode/opencode.json` holding `bash: allow` left `bash → allow` as the last
+matching rule; with the run-scoped one it did not (opencode 1.15.10). Bash commands the agent
+runs see the same empty `HOME`, so they do not read the operator's git or shell config either.
+Credentials are the `auth.json`
 entry for the model's provider only, passed as `OPENCODE_AUTH_CONTENT`, and never logged or
 journaled. A call fails before spawning if that provider has no entry and no allowlisted
 provider variable. An OAuth entry is copied, so a token the child refreshes is discarded with

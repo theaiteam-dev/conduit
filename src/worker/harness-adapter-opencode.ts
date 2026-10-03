@@ -64,14 +64,15 @@
  *
  * The child. It binds 127.0.0.1 on a random port and requires HTTP Basic auth
  * with a random per-invocation password on every request, the event stream
- * included. The adapter refuses a server that reports any other address. The
- * four XDG directories are run-scoped, project config, Claude-compat files,
+ * included. The adapter refuses a server that reports any other address. HOME
+ * and the four XDG directories are run-scoped and empty, project config, Claude-compat files,
  * external skills, plugins and default plugins are switched off, and the
  * child env is the allowlist plus PATH and the run-scoped variables. Allowlisted
  * OPENCODE_* variables are dropped, since OPENCODE_PERMISSION or OPENCODE_CONFIG could override the ask rules
  * and OPENCODE_SERVER_USERNAME would break the Basic auth. Credentials
  * for the model's provider only are passed as `OPENCODE_AUTH_CONTENT`
- * (./opencode-isolation.ts). HOME is not injected.
+ * (./opencode-isolation.ts). An allowlisted HOME is replaced: opencode loads
+ * `~/.opencode/` from it, and an `allow` rule there outranks the ask rules.
  *
  * Not verified, or not gated:
  *   - An allowed Bash command runs as the same user as the server and can read its password (the server env
@@ -389,12 +390,11 @@ export function createOpenCodeHarnessAdapter(config: OpenCodeHarnessAdapterConfi
           aborting: boolean;
           rootIdle: boolean;
           pendingAsks: number;
-          rateLimited: { message: string; resetAtMs: number | undefined } | undefined;
           exit: { code: number | undefined; signal: string | undefined } | undefined;
         } = {
           base: undefined, rootId: undefined, held: undefined, holdTimer: undefined, outputTail: '',
           timedOut: false, stalled: false, finished: false, aborting: false, rootIdle: false, pendingAsks: 0,
-          rateLimited: undefined, exit: undefined,
+          exit: undefined,
         };
         const sessions = new Set<string>();
         const toolParts = new Map<string, ToolPart>();
@@ -566,12 +566,15 @@ export function createOpenCodeHarnessAdapter(config: OpenCodeHarnessAdapterConfi
             output: exit !== undefined && exit !== 0 ? `Exit code ${exit}` : '',
             isError,
           });
+          // The call is settled and journaled. Its input and metadata can hold a whole file body or diff, and
+          // nothing reads them again, so they are not kept for the rest of a long call.
+          toolParts.set(callID, { ...stored, input: {}, metadata: {} });
         };
 
         const recordToolPart = (part: Json): void => {
           const callID = str(part.callID);
           const state = isObject(part.state) ? part.state : undefined;
-          if (callID === undefined || state === undefined) return;
+          if (callID === undefined || state === undefined || emittedOutputs.has(callID)) return;
           const status = str(state.status) ?? 'pending';
           toolParts.set(callID, {
             tool: str(part.tool) ?? '',
@@ -788,7 +791,8 @@ export function createOpenCodeHarnessAdapter(config: OpenCodeHarnessAdapterConfi
         };
 
         const maybeComplete = (): void => {
-          if (st.finished || !st.rootIdle) return;
+          // Our own abort publishes the root idle before the abort request returns; abortThenFinish decides the outcome.
+          if (st.finished || st.aborting || !st.rootIdle) return;
           if (st.held !== undefined) {
             checkHoldReady();
             return;
@@ -862,8 +866,7 @@ export function createOpenCodeHarnessAdapter(config: OpenCodeHarnessAdapterConfi
           if (!RATE_TEXT.test(message) || st.finished || st.aborting) return;
           const next = num(status.next);
           const resetAtMs = next !== undefined && next > Date.now() ? next : undefined;
-          st.rateLimited = { message: message.slice(0, 200), resetAtMs };
-          void abortThenFinish({ kind: 'rate-limit', message: st.rateLimited.message, resetAtMs }, sessionID);
+          void abortThenFinish({ kind: 'rate-limit', message: message.slice(0, 200), resetAtMs }, sessionID);
         };
 
         const handleEvent = (type: string, props: Json): void => {

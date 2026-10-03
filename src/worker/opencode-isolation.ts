@@ -8,6 +8,12 @@
  * XDG roots at a directory it builds per invocation and hands the credentials
  * over in the environment instead of through the operator's `auth.json`.
  *
+ * HOME. opencode also loads `~/.opencode/` (config, agents, commands, MCP
+ * servers) from `os.homedir()`, whatever the XDG roots say, and falls back to
+ * the passwd entry when HOME is unset. An `allow` rule there is merged after
+ * the adapter's `"*":"ask"` and wins, so the call never asks the gate. HOME is
+ * therefore an empty directory under the same root, never the operator's.
+ *
  * Credentials. Only the entry for the provider of the chosen model is passed,
  * as `OPENCODE_AUTH_CONTENT`. The value is never logged, journaled or put in an
  * error message. An OAuth entry is copied, not linked: a token the child
@@ -22,10 +28,11 @@ import { join } from 'node:path';
 /** Roots createRunScopedOpenCodeDirs returned and removeRunScopedOpenCodeDirs has not yet removed. */
 const createdRoots = new Set<string>();
 
-/** The XDG variables the child is pointed at, all under one run-scoped directory. */
+/** The HOME and XDG variables the child is pointed at, all under one run-scoped directory. */
 export interface RunScopedOpenCodeDirs {
   root: string;
   env: {
+    HOME: string;
     XDG_CONFIG_HOME: string;
     XDG_DATA_HOME: string;
     XDG_STATE_HOME: string;
@@ -33,7 +40,7 @@ export interface RunScopedOpenCodeDirs {
   };
 }
 
-/** Create the four empty XDG directories under a fresh temp directory. */
+/** Create an empty HOME and the four empty XDG directories under a fresh temp directory. */
 export function createRunScopedOpenCodeDirs(): RunScopedOpenCodeDirs {
   const root = mkdtempSync(join(tmpdir(), 'conduit-opencode-'));
   try {
@@ -45,6 +52,7 @@ export function createRunScopedOpenCodeDirs(): RunScopedOpenCodeDirs {
     const dirs = {
       root,
       env: {
+        HOME: dir('home'),
         XDG_CONFIG_HOME: dir('config'),
         XDG_DATA_HOME: dir('data'),
         XDG_STATE_HOME: dir('state'),

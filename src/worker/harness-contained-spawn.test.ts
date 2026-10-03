@@ -1,5 +1,8 @@
 import { describe, it, expect } from 'bun:test';
 import { spawn as nodeSpawn, type ChildProcess } from 'node:child_process';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { containedSpawn } from './harness-contained-spawn';
 import { killContained } from './process-group';
 
@@ -34,6 +37,30 @@ const ENV = { PATH: '/usr/bin:/bin' };
 const trackedCount = (): number => process.listeners('SIGTERM').length;
 
 describe('containedSpawn error path', () => {
+  it('throws on an exec failure and leaves no error event to crash the kernel', async () => {
+    // spawn() reports EACCES or ENOENT as an 'error' event on a later tick, after the pid check has thrown.
+    const dir = mkdtempSync(join(tmpdir(), 'conduit-spawn-'));
+    const noExec = join(dir, 'noexec.sh');
+    writeFileSync(noExec, '#!/bin/sh\n', { mode: 0o644 });
+    const uncaught: unknown[] = [];
+    const onUncaught = (err: unknown): void => {
+      uncaught.push(err);
+    };
+    process.on('uncaughtException', onUncaught);
+    try {
+      for (const command of [noExec, join(dir, 'missing')]) {
+        expect(() =>
+          containedSpawn(containment, 'test')({ command, args: [], cwd: ROOT, env: ENV }, { onLine() {}, onStderr() {}, onExit() {} }),
+        ).toThrow(/failed to spawn/);
+      }
+      await Bun.sleep(50);
+      expect(uncaught).toEqual([]);
+    } finally {
+      process.off('uncaughtException', onUncaught);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('cleans up on a child error without close(): onExit once, group untracked, later close() is safe', async () => {
     const before = trackedCount();
     let child: ChildProcess | undefined;
