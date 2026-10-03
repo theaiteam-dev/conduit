@@ -132,14 +132,15 @@ export function buildProviderAuthContent(
   providerID: string,
 ): { content: string | undefined } | { error: string } {
   const authPath = operatorOpenCodeAuthPath(sourceEnv);
+  let unreadable = false;
   if (authPath !== undefined && existsSync(authPath)) {
     let entry: unknown;
     try {
       const parsed: unknown = JSON.parse(readFileSync(authPath, 'utf-8'));
       entry = typeof parsed === 'object' && parsed !== null ? (parsed as Record<string, unknown>)[providerID] : undefined;
     } catch {
-      // The parse error can quote the file, so it is not reported.
-      return { error: `${authPath} could not be read as JSON` };
+      // The parse error can quote the file, so it is not reported. A provider variable can still authenticate.
+      unreadable = true;
     }
     if (typeof entry === 'object' && entry !== null && !Array.isArray(entry)) {
       return { content: JSON.stringify({ [providerID]: entry }) };
@@ -149,6 +150,7 @@ export function buildProviderAuthContent(
   if (vars.some((name) => envAllowlist.includes(name) && (sourceEnv[name] ?? '').trim().length > 0)) {
     return { content: undefined };
   }
+  if (unreadable) return { error: `${authPath} could not be read as JSON` };
   return {
     error:
       `no credentials for provider ${JSON.stringify(providerID.slice(0, 40))}: no entry in ` +

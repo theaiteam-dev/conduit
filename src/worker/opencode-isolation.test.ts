@@ -78,6 +78,13 @@ describe('buildProviderAuthContent', () => {
     expect('error' in missing && missing.error).toContain('openai');
   });
 
+  it('falls back to an allowlisted, set provider variable when the file is not valid JSON', () => {
+    const h = dataHomeWith('{"openai": {"key": "LEAKME"');
+    expect(buildProviderAuthContent({ XDG_DATA_HOME: h, OPENAI_API_KEY: 'envkey' }, ['OPENAI_API_KEY'], 'openai')).toEqual({ content: undefined });
+    const none = buildProviderAuthContent({ XDG_DATA_HOME: h }, [], 'openai');
+    expect('error' in none && none.error).toContain('could not be read as JSON');
+  });
+
   it('does not take an entry that is not an object', () => {
     const h = dataHomeWith(JSON.stringify({ openai: 'sk-string', groq: [1] }));
     expect('error' in buildProviderAuthContent({ XDG_DATA_HOME: h }, [], 'openai')).toBe(true);

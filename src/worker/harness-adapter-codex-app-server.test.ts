@@ -1197,6 +1197,16 @@ describe('codex-app-server adapter: failures', () => {
     expect(err.resetAtMs).toBe(2_000_000_000_000);
   });
 
+  it('names the last retried error when a failed turn carries no error of its own', async () => {
+    const server = fakeServer((p) => {
+      p.notify('error', { error: { message: 'stream dropped', codexErrorInfo: 'other' }, willRetry: true });
+      p.completeTurn('failed', null);
+    });
+    const err = await rejection(adapterWith(server).invoke(invocation()));
+    expect(err.code).toBe('harness-nonzero-exit');
+    expect(err.message).toContain('turn failed: stream dropped');
+  });
+
   it('does not park on a warning-level snapshot when the failure has another cause', async () => {
     const server = fakeServer((p) => {
       p.notify('account/rateLimits/updated', {

@@ -1043,9 +1043,11 @@ export function createCodexAppServerHarnessAdapter(config: CodexAppServerHarness
         // Failure. The final error is the turn's own, else the last one that was not going to be retried.
         const finalError =
           (outcome.kind === 'turn' ? outcome.error : undefined) ?? [...errors].reverse().find((e) => !e.willRetry);
+        // Detail only: a turn that failed with nothing but retried errors is still described by the last of them.
+        const detailError = finalError ?? errors.at(-1);
         const detailText =
           outcome.kind === 'turn'
-            ? `turn ${outcome.status}${finalError !== undefined ? `: ${finalError.message}` : ''}`
+            ? `turn ${outcome.status}${detailError !== undefined ? `: ${detailError.message}` : ''}`
             : outcome.kind === 'rpc'
               ? outcome.message
               : st.exit?.signal !== undefined
