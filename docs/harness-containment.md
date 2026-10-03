@@ -100,8 +100,9 @@ How each request reaches the gate:
 
 - **Shell commands** go to the gate as a `Bash` call. Codex shows the command as a string such
   as `/usr/bin/zsh -lc 'cat a.txt'`. The adapter removes the shell wrapper and gates the
-  script, so the station lists `Bash(cat:*)` for `cat a.txt`. Codex has no Read, Glob or Grep
-  tool: it reads files through shell commands, and those entries in `tools` have no effect
+  script, but only when the shell is a bare name or lives in `/bin`, `/usr/bin` or
+  `/usr/local/bin`; a wrapper at any other path is gated as the raw string. A station
+  lists `Bash(cat:*)` for `cat a.txt`. Codex has no Read, Glob or Grep tool: it reads files through shell commands, and those entries in `tools` have no effect
   here. A string the adapter cannot read as a word list is declined. A working directory
   outside the project root is declined before the gate is asked, because the gate does not
   see it.

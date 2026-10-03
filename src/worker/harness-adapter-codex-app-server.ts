@@ -61,7 +61,7 @@
  */
 
 import { existsSync, statSync } from 'node:fs';
-import { basename, resolve } from 'node:path';
+import { resolve } from 'node:path';
 import type {
   BinaryProbe, HarnessAdapter, HarnessInvocation, HarnessResult, KnownUsage, RateLimitSnapshot, RateLimitWindow,
 } from './harness-adapter';
@@ -306,18 +306,33 @@ export function splitShellWords(input: string): string[] | null {
 
 const SHELLS: ReadonlySet<string> = new Set(['sh', 'bash', 'zsh', 'dash', 'ash', 'ksh']);
 const SHELL_COMMAND_FLAG = /^-[a-z]*c$/;
+const SHELL_DIRS: ReadonlySet<string> = new Set(['/bin', '/usr/bin', '/usr/local/bin']);
+
+/**
+ * True when `word` names a shell the gate can safely look past: a bare shell
+ * name, which resolves through PATH like any other bare executable the gate
+ * allowlists, or an absolute path in /bin, /usr/bin or /usr/local/bin.
+ */
+function isTrustedShell(word: string): boolean {
+  if (!word.includes('/')) return SHELLS.has(word);
+  const slash = word.lastIndexOf('/');
+  return SHELL_DIRS.has(word.slice(0, slash)) && SHELLS.has(word.slice(slash + 1));
+}
 
 /**
  * The command an approval request will run, as the string the gate should see.
  * A `<shell> -c '<script>'` wrapper (`-lc` and `-ic` included) yields the
- * script. Any other command is returned as shown. Returns an error when the
+ * script, but only when the shell is a bare name or sits in /bin, /usr/bin or
+ * /usr/local/bin. A wrapper at any other path (`./bash`, `/tmp/x/bash`) is
+ * returned as shown, so the gate evaluates the executable that will run. Any
+ * other command is returned as shown. Returns an error when the
  * string cannot be read as a word list, which the caller treats as a deny.
  */
 export function unwrapShellCommand(command: string): { command: string } | { error: string } {
   const words = splitShellWords(command);
   if (words === null) return { error: 'the command string could not be parsed' };
   if (words.length === 0) return { error: 'the command string is empty' };
-  if (words.length >= 3 && SHELLS.has(basename(words[0]!)) && SHELL_COMMAND_FLAG.test(words[1]!)) {
+  if (words.length >= 3 && isTrustedShell(words[0]!) && SHELL_COMMAND_FLAG.test(words[1]!)) {
     // Extra words after the script are positional parameters ($0, $1, ...) the script can expand. Gating the raw string would hide the script.
     if (words.length > 3) return { error: 'the shell wrapper carries extra arguments after the script' };
     return { command: words[2]! };
@@ -847,8 +862,8 @@ export function createCodexAppServerHarnessAdapter(config: CodexAppServerHarness
           killAll();
           finish({ kind: 'timeout' });
         }, call.timeoutMs);
-        // One-shot counterpart: runHarnessProcess (worker/harness-runner.ts) has the same idle guard. It cannot drive a
-        // long-lived session, so both exist: a change to idle-timeout semantics must be made in both.
+        // runHarnessProcess (worker/harness-runner.ts) and harness-adapter-opencode.ts have the same idle guard. The runner cannot drive a
+        // long-lived session, so each server adapter keeps its own: a change to idle-timeout semantics must be made in all three.
         let idleTimer: ReturnType<typeof setTimeout> | undefined;
         const resetIdleTimer = (): void => {
           if (call.idleTimeoutMs === undefined || st.finished) return;

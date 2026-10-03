@@ -548,6 +548,19 @@ describe('shell command unwrapping', () => {
     expect(unwrapShellCommand("/usr/bin/zsh -lc 'echo hi > c.txt'")).toEqual({ command: 'echo hi > c.txt' });
   });
 
+  it('unwraps a shell named by a bare name or a canonical system path', () => {
+    expect(unwrapShellCommand("/bin/bash -lc 'cat x'")).toEqual({ command: 'cat x' });
+    expect(unwrapShellCommand("/usr/bin/zsh -lc 'cat x'")).toEqual({ command: 'cat x' });
+    expect(unwrapShellCommand("/usr/local/bin/bash -c 'cat x'")).toEqual({ command: 'cat x' });
+    expect(unwrapShellCommand("bash -c 'cat x'")).toEqual({ command: 'cat x' });
+  });
+
+  it('returns a wrapper whose shell is at a non-canonical path unchanged, so the gate sees the real executable', () => {
+    for (const shown of ["/tmp/evil/bash -c 'cat note.txt'", "./bash -c 'cat x'", "/usr/bin/../../tmp/bash -c 'cat x'", "/bin/sub/bash -c 'cat x'", "/usr/bin/notashell -c 'cat x'"]) {
+      expect(unwrapShellCommand(shown)).toEqual({ command: shown });
+    }
+  });
+
   it('returns a command that is not a shell wrapper as shown', () => {
     expect(unwrapShellCommand('git status')).toEqual({ command: 'git status' });
     expect(unwrapShellCommand('/usr/bin/zsh script.sh')).toEqual({ command: '/usr/bin/zsh script.sh' });
@@ -572,6 +585,12 @@ describe('codex-app-server adapter: command approvals', () => {
     expect(spy.calls).toEqual([{ toolName: 'Bash', input: { command: 'cat a.txt' }, toolCallId: 'item-1' }]);
     expect(decisionOf(r.answers[0]!)).toBe('accept');
     expect(r.answers[0]!.id).toBeGreaterThanOrEqual(100);
+  });
+
+  it('gates a wrapper at a non-canonical shell path as the raw string, never the inner script', async () => {
+    const spy = spyGate();
+    await answers([['item/commandExecution/requestApproval', CMD("/tmp/evil/bash -c 'cat a.txt'")]], spy.gate);
+    expect(spy.calls.map((c) => c.input)).toEqual([{ command: "/tmp/evil/bash -c 'cat a.txt'" }]);
   });
 
   it('declines on deny', async () => {
