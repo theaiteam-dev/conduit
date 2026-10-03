@@ -92,6 +92,8 @@ interface Scenario {
   status(status: Json, sessionID?: string): void;
   heartbeat(): void;
   exit(code?: number): void;
+  /** Close the event stream while the server process keeps running. */
+  closeStream(): void;
   mark(label: string): void;
   /** Run a bash call through its running part and its ask. */
   bash(callID: string, command: string, o?: { sessionID?: string; messageID?: string; patterns?: string[] }): Promise<Json | undefined>;
@@ -206,6 +208,13 @@ function fakeOpenCode(scenario: (s: Scenario) => Promise<void> | void, opts: Fak
     status: (status, id) => send('session.status', { sessionID: id ?? sessionID, status }),
     heartbeat: () => send('server.heartbeat', {}),
     exit: (code = 1) => queueMicrotask(() => handlers?.onExit(code, undefined)),
+    closeStream: () => {
+      try {
+        controller?.close();
+      } catch {
+        /* already closed */
+      }
+    },
     mark: (label) => state.timeline.push(`MARK ${label}`),
     bash: async (callID, command, o = {}) => {
       s.part({ callID, tool: 'bash', status: 'running', input: { command, workdir: '' }, sessionID: o.sessionID, messageID: o.messageID });
@@ -1434,6 +1443,18 @@ describe('opencode adapter: failures', () => {
       s.exit(0);
     });
     expect(o.error?.code).toBe('harness-nonzero-exit');
+    expect(o.error?.message).toContain('exited');
+  });
+
+  it('reports an event stream that closes while the server keeps running as a nonzero exit, without claiming the server exited', async () => {
+    const o = await run((s) => {
+      s.assistant('m1', { tokens: USAGE_1 });
+      s.closeStream();
+    });
+    expect(o.error?.code).toBe('harness-nonzero-exit');
+    expect(o.error?.message).toContain('event stream closed');
+    expect(o.error?.message).toContain('server still running');
+    expect(o.error?.message).not.toContain('exited');
   });
 
   it('fails when the server never reports its address before the timeout', async () => {

@@ -1002,6 +1002,10 @@ export function createOpenCodeHarnessAdapter(config: OpenCodeHarnessAdapterConfi
           } catch {
             /* an abort or a dropped connection ends the stream */
           }
+          // Deliberate: a dropped stream is fatal and there is no reconnect. Events published while
+          // disconnected (permission.asked, the root's session.idle) are never replayed, so a reconnected
+          // turn would wait out the call's whole wall clock, which costs more than one retried attempt.
+          // Holding the finish while asks are pending does not help either: nothing reports idle now.
           if (!st.finished) setTimeout(() => finish({ kind: 'exit' }), STREAM_END_GRACE_MS);
         };
 
@@ -1177,7 +1181,9 @@ export function createOpenCodeHarnessAdapter(config: OpenCodeHarnessAdapterConfi
               ? `${finalError.name}${finalError.message !== '' ? `: ${finalError.message}` : ''}`
               : st.exit?.signal !== undefined
                 ? `the opencode server exited with signal ${st.exit.signal} before the session went idle`
-                : `the opencode server exited${exitCode !== undefined ? ` with code ${exitCode}` : ''} before the session went idle`;
+                : st.exit === undefined
+                  ? 'the opencode event stream closed before the session went idle, with the server still running'
+                  : `the opencode server exited${exitCode !== undefined ? ` with code ${exitCode}` : ''} before the session went idle`;
         fail(
           finalError !== undefined && isAuthError(finalError)
             ? `authentication failed: ${finalError.message || finalError.name}`

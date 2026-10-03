@@ -1,9 +1,9 @@
 import { describe, it, expect } from 'bun:test';
 import { spawn as nodeSpawn, type ChildProcess } from 'node:child_process';
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { CLOSE_GRACE_MS, containedSpawn } from './harness-contained-spawn';
+import { CLOSE_GRACE_MS, containedSpawn, resolveExecutable } from './harness-contained-spawn';
 import { killContained } from './process-group';
 
 const ROOT = process.cwd();
@@ -200,5 +200,37 @@ describe('containedSpawn real children', () => {
     const text = chunks.join('');
     expect(text).toBe('h\u00e9\u20ac!');
     expect(text).not.toContain('\ufffd');
+  });
+});
+
+describe('resolveExecutable absolute path', () => {
+  const withFile = (mode: number, body: (file: string) => void): void => {
+    const dir = mkdtempSync(join(tmpdir(), 'conduit-resolve-exec-'));
+    try {
+      const file = join(dir, 'tool');
+      writeFileSync(file, '#!/bin/sh\n');
+      chmodSync(file, mode);
+      body(file);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  };
+
+  it('refuses an existing file that is not executable, with a specific message', () => {
+    withFile(0o644, (file) => {
+      expect(resolveExecutable(file, {})).toEqual({ error: `'${file}' is not executable` });
+    });
+  });
+
+  it('resolves an executable file', () => {
+    withFile(0o755, (file) => {
+      expect(resolveExecutable(file, {})).toEqual({ path: file });
+    });
+  });
+
+  it('keeps the existence error for a missing path', () => {
+    expect(resolveExecutable('/nonexistent/conduit-tool', {})).toEqual({
+      error: "'/nonexistent/conduit-tool' does not exist or is not a file",
+    });
   });
 });

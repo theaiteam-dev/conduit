@@ -6,7 +6,7 @@
 
 import { spawn as nodeSpawn, type ChildProcess } from 'node:child_process';
 import { StringDecoder } from 'node:string_decoder';
-import { existsSync, statSync } from 'node:fs';
+import { accessSync, constants, existsSync, statSync } from 'node:fs';
 import { isAbsolute } from 'node:path';
 import { killContained, trackProcessGroup, untrackProcessGroup } from './process-group';
 import { prepareContainedCommand, removeCgroup, type Containment } from './cgroup-containment';
@@ -17,7 +17,7 @@ const EXIT_WAIT_MS = 5_000;
 export const CLOSE_GRACE_MS = 1_000;
 
 /**
- * The executable a bare name (`claude`, `codex`, `opencode`) resolves to on `sourceEnv`'s PATH, or a given absolute path. Files only,
+ * The executable a bare name (`claude`, `codex`, `opencode`) resolves to on `sourceEnv`'s PATH, or a given absolute path, which must be an executable file. Files only,
  * never a shell function. A path containing '/' must be absolute: a relative one would resolve
  * against whatever cwd the kernel happens to have, so it is refused, with its own message.
  */
@@ -27,9 +27,13 @@ export function resolveExecutable(
 ): { path: string } | { error: string } {
   if (command.includes('/')) {
     if (!isAbsolute(command)) return { error: `'${command}' is a relative path, and the command must be an absolute path or a bare name on PATH` };
-    return existsSync(command) && statSync(command).isFile()
-      ? { path: command }
-      : { error: `'${command}' does not exist or is not a file` };
+    if (!existsSync(command) || !statSync(command).isFile()) return { error: `'${command}' does not exist or is not a file` };
+    try {
+      accessSync(command, constants.X_OK);
+    } catch {
+      return { error: `'${command}' is not executable` };
+    }
+    return { path: command };
   }
   const found = Bun.which(command, { PATH: sourceEnv.PATH ?? '/usr/bin:/bin' });
   return found !== null ? { path: found } : { error: `'${command}' was not found on PATH` };
