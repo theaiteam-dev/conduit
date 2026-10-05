@@ -378,3 +378,89 @@ describe('state snapshot column discovery', () => {
     }
   });
 });
+
+describe('state snapshot consistency', () => {
+  /**
+   * Runs `fn` while `onWorkerRead` fires right after each `active_workers` read.
+   * bun:sqlite defines `all` on each statement instance, so the hook wraps the
+   * statement `prepare` returns. Use it on a reader that has not read state yet,
+   * so the statement is prepared (and wrapped) inside `fn`.
+   */
+  function withWorkerReadHook<T>(onWorkerRead: () => void, fn: () => T): T {
+    const realPrepare = Database.prototype.prepare;
+    const spy = spyOn(Database.prototype, 'prepare').mockImplementation(function (this: Database, ...args: Parameters<Database['prepare']>) {
+      const stmt = realPrepare.apply(this, args);
+      if (String(args[0]).includes('FROM active_workers')) {
+        const realAll = stmt.all.bind(stmt);
+        stmt.all = ((...a: unknown[]) => {
+          const out = (realAll as (...x: unknown[]) => unknown)(...a);
+          onWorkerRead();
+          return out;
+        }) as typeof stmt.all;
+      }
+      return stmt;
+    } as Database['prepare']);
+    try {
+      return fn();
+    } finally {
+      spy.mockRestore();
+    }
+  }
+
+  test('cards and active_workers come from one snapshot even if a writer commits between the reads', () => {
+    fx.db.insertCard(card(fx.runId, 'k', { lane: 'review', status: 'working' }));
+    fx.db.getStateDb()
+      .prepare('INSERT INTO active_workers (run_id, card_id, station, worker_id, started_at, lease_until) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(fx.runId, 'k', 'review', 'w1', 1_000_100, 1_000_900);
+    const r = open();
+    const writer = new Database(fx.stateDbPath);
+    let injected = false;
+    try {
+      const snap = withWorkerReadHook(
+        () => {
+          if (injected) return;
+          injected = true;
+          // The worker finishes between the active_workers read and the cards read.
+          writer.exec(`UPDATE cards SET status = 'done', lane = 'done' WHERE id = 'k'; DELETE FROM active_workers WHERE card_id = 'k';`);
+        },
+        () => r.readState()!,
+      );
+      expect(injected).toBe(true);
+      expect(snap.cards[0]).toMatchObject({ id: 'k', status: 'working', workerStartedAt: 1_000_100 });
+    } finally {
+      writer.close();
+    }
+    // The next snapshot sees the committed change.
+    expect(r.readState()!.cards[0]).toMatchObject({ status: 'done', workerStartedAt: null });
+  });
+
+  test('a busy error mid-snapshot leaves no open transaction and the next read succeeds', () => {
+    const r = open();
+    let armed = true;
+    const result = withWorkerReadHook(
+      () => {
+        if (!armed) return;
+        armed = false;
+        throw new Error('SQLITE_BUSY: database is locked');
+      },
+      () => r.readStateOrBusy(),
+    );
+    expect(result).toEqual({ busy: true });
+    // A leaked transaction would make the next BEGIN fail with "within a transaction".
+    expect(r.readStateOrBusy().busy).toBe(false);
+  });
+
+  test('a non-busy error mid-snapshot propagates and still closes the transaction', () => {
+    const r = open();
+    let armed = true;
+    withWorkerReadHook(
+      () => {
+        if (!armed) return;
+        armed = false;
+        throw new Error('boom');
+      },
+      () => expect(() => r.readStateOrBusy()).toThrow('boom'),
+    );
+    expect(r.readStateOrBusy().busy).toBe(false);
+  });
+});

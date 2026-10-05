@@ -177,27 +177,31 @@ function laneSegment(row: RowView): Segment {
 }
 
 /** One cell per station visit, oldest first; « marks a visit that was a rework bounce. */
-function trailSegments(row: RowView, width: number): Segment[] {
-  const cells: Segment[] = [];
-  row.visits.forEach((v, i) => {
-    if (v.rework) cells.push({ text: '«', fg: COLORS.rework, bold: true });
+export function trailSegments(row: RowView, width: number): Segment[] {
+  // One group per visit, so a « marker is trimmed together with its block, never apart.
+  const groups: Segment[][] = row.visits.map((v, i) => {
+    const group: Segment[] = [];
+    if (v.rework) group.push({ text: '«', fg: COLORS.rework, bold: true });
     const hue = v.stationIndex !== null ? stationHue(v.stationIndex) : null;
     const last = i === row.visits.length - 1;
     let fg = hue === null ? COLORS.textDim : last && row.state !== 'done' ? hue.live : hue.past;
     if (row.state === 'done' && hue !== null) fg = hue.done;
-    cells.push({ text: '█', fg });
+    group.push({ text: '█', fg });
+    return group;
   });
   if (row.state === 'scrap') {
-    cells.push({ text: ` SCRAP · ${row.terminalReason ?? NOT_RECORDED}`, fg: COLORS.scrap, bold: true });
+    groups.push([{ text: ` SCRAP · ${row.terminalReason ?? NOT_RECORDED}`, fg: COLORS.scrap, bold: true }]);
   }
-  // Keep the newest visits when the trail is wider than the column.
-  let used = cells.reduce((n, s) => n + cellWidth(s.text), 0);
-  while (used > width - 1 && cells.length > 0) {
-    used -= cellWidth(cells.shift()!.text);
+  const groupWidth = (g: Segment[]): number => g.reduce((n, s) => n + cellWidth(s.text), 0);
+  // Keep the newest groups when the trail is wider than the column, reserving one column for '…'.
+  let used = groups.reduce((n, g) => n + groupWidth(g), 0);
+  let dropped = 0;
+  while (used > width - 1 && dropped < groups.length) {
+    used -= groupWidth(groups[dropped]!);
+    dropped++;
   }
-  if (cells.length < row.visits.length + (row.state === 'scrap' ? 1 : 0) && used < width) {
-    cells.unshift(dim('…'));
-  }
+  const cells = groups.slice(dropped).flat();
+  if (dropped > 0 && used < width) cells.unshift(dim('…'));
   return cells;
 }
 

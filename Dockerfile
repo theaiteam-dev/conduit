@@ -18,11 +18,16 @@ COPY package.json bun.lock ./
 # one package is installed for this image's platform in a scratch directory and
 # copied in, because installing it in /app re-resolves the whole tree and brings
 # the skipped packages back. Its version must match the @opentui/core pin in
-# package.json (a packaging test checks this).
+# package.json (a packaging test checks this). The scratch install sits outside the
+# frozen-lockfile check, so the integrity bun records for the package is compared with
+# the one in /app/bun.lock, and the build fails on a mismatch or an empty value.
 RUN bun install --frozen-lockfile --production --omit=optional && \
     pkg="@opentui/core-linux-$(uname -m | sed -e s/x86_64/x64/ -e s/aarch64/arm64/)" && \
     mkdir /tmp/opentui && cd /tmp/opentui && \
     bun add "${pkg}@0.5.12" && \
+    want="$(grep -F "\"${pkg}\": [" /app/bun.lock | grep -o 'sha512-[A-Za-z0-9+/=]*' | head -n 1)" && \
+    got="$(grep -F "\"${pkg}\": [" bun.lock | grep -o 'sha512-[A-Za-z0-9+/=]*' | head -n 1)" && \
+    test -n "$want" && test -n "$got" && test "$want" = "$got" && \
     cp -r "node_modules/${pkg}" /app/node_modules/@opentui/ && \
     cd /app && rm -rf /tmp/opentui
 

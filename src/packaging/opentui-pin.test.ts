@@ -28,4 +28,25 @@ describe('@opentui pin', () => {
     expect(match).not.toBeNull();
     expect(match![1]).toBe(pkg.dependencies['@opentui/core']);
   });
+
+  it('checks the scratch install integrity against /app/bun.lock and fails the build on mismatch', () => {
+    // Read both integrities, require them non-empty, and require equality, all
+    // before the package is copied into /app/node_modules.
+    expect(dockerfile).toMatch(/want="\$\(grep[^\n]*\/app\/bun\.lock[^\n]*sha512-/);
+    expect(dockerfile).toMatch(/got="\$\(grep[^\n]*\bbun\.lock[^\n]*sha512-/);
+    expect(dockerfile).toMatch(/test -n "\$want" && test -n "\$got" && test "\$want" = "\$got"/);
+    const check = dockerfile.indexOf('test "$want" = "$got"');
+    const copy = dockerfile.indexOf('cp -r "node_modules/${pkg}"');
+    expect(check).toBeGreaterThan(-1);
+    expect(copy).toBeGreaterThan(check);
+  });
+
+  it('records an integrity for the linux native packages in bun.lock', () => {
+    const lock = readFileSync(join(REPO_ROOT, 'bun.lock'), 'utf-8');
+    for (const arch of ['x64', 'arm64']) {
+      expect(lock).toMatch(
+        new RegExp(`"@opentui/core-linux-${arch}": \\["@opentui/core-linux-${arch}@[^"]+", "", \\{[^}]*\\}, "sha512-[A-Za-z0-9+/=]+"\\]`),
+      );
+    }
+  });
 });

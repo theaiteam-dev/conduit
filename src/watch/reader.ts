@@ -92,6 +92,36 @@ function isBusy(err: unknown): boolean {
   return /SQLITE_BUSY|SQLITE_LOCKED|database is locked|database table is locked/i.test(msg);
 }
 
+/**
+ * Runs `fn` inside one read transaction so every query in it sees one snapshot.
+ * The transaction is always closed. A failure from `fn` or from COMMIT is
+ * rethrown as is; a ROLLBACK that itself fails never replaces it.
+ */
+function inReadTransaction<T>(db: Database, fn: () => T): T {
+  db.exec('BEGIN');
+  const rollback = (): void => {
+    try {
+      db.exec('ROLLBACK');
+    } catch {
+      // Nothing is open to roll back, or the handle is unusable: the original error is the one to report.
+    }
+  };
+  let result: T;
+  try {
+    result = fn();
+  } catch (err) {
+    rollback();
+    throw err;
+  }
+  try {
+    db.exec('COMMIT');
+  } catch (err) {
+    rollback();
+    throw err;
+  }
+  return result;
+}
+
 function parseJsonObject(raw: unknown): Record<string, unknown> {
   if (typeof raw !== 'string') return {};
   try {
@@ -297,14 +327,11 @@ export function openWatchReader(paths: WatchReaderPaths, runId: string): WatchRe
       let harnessRows: Row[];
       try {
         // One read transaction, so the three tables come from one snapshot.
-        journalDb.exec('BEGIN');
-        try {
-          cardLogRows = readTable('card_log', CARD_LOG_COLS, cursor.cardLog);
-          journalRows = readTable('journal', JOURNAL_COLS, cursor.journal);
-          harnessRows = readTable('harness_events', HARNESS_COLS, cursor.harness);
-        } finally {
-          journalDb.exec('COMMIT');
-        }
+        [cardLogRows, journalRows, harnessRows] = inReadTransaction(journalDb, () => [
+          readTable('card_log', CARD_LOG_COLS, cursor.cardLog),
+          readTable('journal', JOURNAL_COLS, cursor.journal),
+          readTable('harness_events', HARNESS_COLS, cursor.harness),
+        ]);
       } catch (err) {
         if (isBusy(err)) return [];
         throw err;
@@ -365,7 +392,11 @@ function createStateSnapshotReader(stateDb: Database, runId: string): () => Stat
     return stmt;
   };
 
-  return (): StateSnapshot => {
+  // runs, active_workers and cards are read in one transaction: a card that
+  // finishes between the reads would otherwise show as working with no worker.
+  return (): StateSnapshot => inReadTransaction(stateDb, readSnapshot);
+
+  function readSnapshot(): StateSnapshot {
     let run: RunSnapshot | null = null;
     const runQuery = statement(
       'runs',
@@ -415,5 +446,5 @@ function createStateSnapshotReader(stateDb: Database, runId: string): () => Stat
       };
     });
     return { cards, run };
-  };
+  }
 }
