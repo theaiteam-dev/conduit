@@ -595,9 +595,14 @@ terminal of at least 160 by 20 cells, so pass `-it` to `docker run` or
 `docker exec`:
 
 ```bash
-docker run --rm -it -v conduit_data:/data conduit-engine watch            # newest run
-docker run --rm -it -v conduit_data:/data conduit-engine watch --run <id> # one run
+docker run --rm -it -v conduit_data:/data branching-flow watch            # newest run
+docker run --rm -it -v conduit_data:/data branching-flow watch --run <id> # one run
 ```
+
+Use the image that ran the flow. `watch` reads the budgets, rework caps and
+station order from the flow path recorded for the run (`/flow/flow.yaml` for a
+per-flow image), and that path must exist in the watching container. From
+`conduit-engine` the budgets render "not recorded".
 
 `j`/`k` move the selection and the status line shows the selected card. `q`
 quits and prints the journal schema gaps the view hit (data the War Room would
