@@ -427,10 +427,10 @@ describe("agent-sdk journey: a setsid descendant of the CLI dies with the call",
   let f: HarnessFlow;
   let run: CliResult;
   let doctorContainment: string;
-  let sleeperPidFile: string;
+  let sleeperPidFile: string | undefined;
 
   const sleeperPid = (): number | undefined => {
-    if (!existsSync(sleeperPidFile)) return undefined;
+    if (sleeperPidFile === undefined || !existsSync(sleeperPidFile)) return undefined;
     const n = Number(readFileSync(sleeperPidFile, "utf8").trim());
     return Number.isInteger(n) && n > 0 ? n : undefined;
   };
