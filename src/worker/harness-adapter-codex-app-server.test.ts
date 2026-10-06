@@ -21,7 +21,7 @@ import {
   runVersionCommand,
   type CodexAppServerHarnessAdapterConfig,
 } from './harness-adapter-codex-app-server';
-import { resolveContainment } from './cgroup-containment';
+import { resolveContainment, type Containment } from './cgroup-containment';
 import { setsidContainmentRequired } from './containment-fixture-files';
 import type { ContainedProcessHandlers, ContainedSpawn, ContainedSpawnSpec } from './harness-contained-spawn';
 import {
@@ -258,7 +258,9 @@ describe('codex-app-server adapter: capabilities', () => {
     expect((await a.probeBinary()).detail).toMatch(/^\S+ \(\d+\.\d+\.\d+/);
   });
 
-  describe('the version command', () => {
+  // Liveness is read from /proc/<pid>/stat (zombie aware). Without /proc every pid would read as
+  // dead and the cleanup assertions would pass with descendants still running, so skip instead.
+  describe.skipIf(!existsSync('/proc/self/stat'))('the version command', () => {
     // A stand-in codex that prints a version, starts a backgrounded child and, where the host has
     // `setsid`, one in its own session, records their pids and its cwd under $HOME, then exits or hangs.
     const STUB = `#!/bin/sh
@@ -292,10 +294,22 @@ exit 0
       writeFileSync(bin, mode === 'hang' ? STUB.replace('#!/bin/sh\n', '#!/bin/sh\nMODE=hang\n') : STUB, { mode: 0o755 });
       return { home, bin };
     };
+    const readPid = (home: string, file: string): number | undefined =>
+      existsSync(join(home, file)) ? Number(readFileSync(join(home, file), 'utf8').trim()) : undefined;
     const pids = (home: string): number[] =>
-      ['bg.pid', 'setsid.pid']
-        .filter((f) => existsSync(join(home, f)))
-        .map((f) => Number(readFileSync(join(home, f), 'utf8').trim()));
+      [readPid(home, 'bg.pid'), readPid(home, 'setsid.pid')].filter((p): p is number => p !== undefined);
+    // The stub writes setsid.pid exactly when `setsid` resolves on the PATH it runs with.
+    const hostHasSetsid = Bun.which('setsid', { PATH: '/usr/bin:/bin' }) !== null;
+    // Fail on a pid the stub never recorded: a missing pid file would otherwise make the death
+    // checks below pass without having watched anything.
+    const expectDead = async (home: string, hostContainment: Containment) => {
+      const bg = readPid(home, 'bg.pid');
+      expect(bg).toBeDefined();
+      expect(await eventuallyDead(bg!)).toBe(true);
+      const setsid = readPid(home, 'setsid.pid');
+      if (hostHasSetsid) expect(setsid).toBeDefined();
+      if (setsid !== undefined && setsidContainmentRequired(hostContainment)) expect(await eventuallyDead(setsid)).toBe(true);
+    };
 
     it('runs outside the kernel cwd, in a directory it removes, and reaps what the binary left running', async () => {
       const hostContainment = await resolveContainment();
@@ -306,9 +320,7 @@ exit 0
         const cwd = readFileSync(join(home, 'cwd'), 'utf8').trim();
         expect(cwd).not.toBe(process.cwd());
         expect(existsSync(cwd)).toBe(false);
-        const [bg, setsid] = pids(home);
-        expect(await eventuallyDead(bg!)).toBe(true);
-        if (setsid !== undefined && setsidContainmentRequired(hostContainment)) expect(await eventuallyDead(setsid)).toBe(true);
+        await expectDead(home, hostContainment);
       } finally {
         for (const pid of pids(home)) try { process.kill(pid, 'SIGKILL'); } catch { /* gone */ }
         rmSync(home, { recursive: true, force: true });
@@ -321,9 +333,7 @@ exit 0
       try {
         const version = await runVersionCommand(bin, { PATH: '/usr/bin:/bin', HOME: home }, hostContainment, 500);
         expect(version).toBeUndefined();
-        const [bg, setsid] = pids(home);
-        expect(await eventuallyDead(bg!)).toBe(true);
-        if (setsid !== undefined && setsidContainmentRequired(hostContainment)) expect(await eventuallyDead(setsid)).toBe(true);
+        await expectDead(home, hostContainment);
       } finally {
         for (const pid of pids(home)) try { process.kill(pid, 'SIGKILL'); } catch { /* gone */ }
         rmSync(home, { recursive: true, force: true });
