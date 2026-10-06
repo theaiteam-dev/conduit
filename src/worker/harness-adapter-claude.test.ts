@@ -23,8 +23,10 @@
  *   - --allowed-tools is added IFF call.tools is non-empty; an empty tools list
  *     (the executor's encoding of a waived `unrestricted_tools: true` station)
  *     passes through with NO narrowing flag.
- *   - usage.tokens = sum of the four disjoint usage counters (input/output/
- *     cache_creation/cache_read, absent → 0); usage.cost = total_cost_usd.
+ *   - usage.tokens = sum of the four disjoint token classes (input/output/
+ *     cache_creation/cache_read, absent → 0) across every `modelUsage` entry,
+ *     or from `usage` when `modelUsage` is missing (issue #108);
+ *     usage.cost = total_cost_usd.
  *   - a malformed/unexpected/errored/timed-out payload REJECTS with a named
  *     ('claude-headless') error — never a silent zero-usage success.
  *   - outputs is []: the executor collects declared outputs from DISK
@@ -32,7 +34,10 @@
  *     file manifest, so the adapter never fabricates output references.
  */
 import { describe, it, expect } from 'bun:test';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import {
+  buildKnownUsage,
   createClaudeHarnessAdapter,
   parseClaudeStream,
   bindingResetAtMs,
@@ -772,6 +777,130 @@ describe('dominantModel', () => {
   it('is undefined when nothing was reported', () => {
     expect(dominantModel(undefined)).toBeUndefined();
     expect(dominantModel({})).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Issue #108: `usage` on a result message covers only the turns since the
+// previous result and leaves out the side-task model. `modelUsage` and
+// `total_cost_usd` are cumulative for the session, so the token figure the
+// budgets fold comes from `modelUsage`.
+// ---------------------------------------------------------------------------
+
+/**
+ * Two result messages, as a background subagent produces them. Reconstructed
+ * from the claude 2.1.290 spike in issue #108: the usage and modelUsage figures
+ * are the recorded ones, the surrounding fields are trimmed.
+ */
+const BACKGROUND_SUBAGENT_STREAM = readFileSync(
+  join(import.meta.dir, '..', '..', 'fixtures', 'harness', 'claude-background-subagent.ndjson'),
+  'utf-8',
+);
+
+describe('buildKnownUsage: tokens come from modelUsage (issue #108)', () => {
+  it('sums the four classes across every modelUsage entry when it exceeds usage', () => {
+    const usage = buildKnownUsage(
+      {
+        type: 'result',
+        total_cost_usd: 0.0267,
+        usage: { input_tokens: 10, output_tokens: 363, cache_read_input_tokens: 16826, cache_creation_input_tokens: 826 },
+        modelUsage: {
+          'claude-haiku-4-5-20251001': {
+            inputTokens: 989, outputTokens: 20, cacheReadInputTokens: 0, cacheCreationInputTokens: 0,
+            canonicalModel: 'claude-haiku-4-5',
+          },
+          'claude-haiku-4-5': {
+            inputTokens: 54, outputTokens: 2312, cacheReadInputTokens: 63946, cacheCreationInputTokens: 4535,
+            canonicalModel: 'claude-haiku-4-5',
+          },
+        },
+      },
+      undefined,
+    );
+    expect(usage).toEqual({
+      tokens: 71_856,
+      cost: 0.0267,
+      breakdown: { inputTokens: 1043, outputTokens: 2332, cacheReadInputTokens: 63_946, cacheCreationInputTokens: 4535 },
+      model: 'claude-haiku-4-5',
+    });
+  });
+
+  it('falls back to usage when modelUsage is absent', () => {
+    const usage = buildKnownUsage(
+      {
+        type: 'result',
+        total_cost_usd: 0.01,
+        usage: { input_tokens: 1, output_tokens: 2, cache_read_input_tokens: 3, cache_creation_input_tokens: 4 },
+      },
+      undefined,
+    );
+    expect(usage).toEqual({
+      tokens: 10,
+      cost: 0.01,
+      breakdown: { inputTokens: 1, outputTokens: 2, cacheReadInputTokens: 3, cacheCreationInputTokens: 4 },
+    });
+  });
+
+  it('falls back to usage when modelUsage has no entry carrying a token count', () => {
+    const payload = { type: 'result', total_cost_usd: 0.01, usage: { input_tokens: 5, output_tokens: 5 } };
+    expect(buildKnownUsage({ ...payload, modelUsage: {} }, undefined)?.tokens).toBe(10);
+    expect(buildKnownUsage({ ...payload, modelUsage: { m: { canonicalModel: 'm' } } }, undefined)?.tokens).toBe(10);
+    expect(buildKnownUsage({ ...payload, modelUsage: [] } as never, undefined)?.tokens).toBe(10);
+    expect(buildKnownUsage({ ...payload, modelUsage: { m: null } } as never, undefined)?.tokens).toBe(10);
+  });
+
+  it('counts a non-numeric class as zero rather than concatenating it', () => {
+    const usage = buildKnownUsage(
+      {
+        type: 'result',
+        total_cost_usd: 0.01,
+        usage: { input_tokens: 1 },
+        modelUsage: { m: { inputTokens: 7, outputTokens: '3' } } as never,
+      },
+      undefined,
+    );
+    expect(usage?.tokens).toBe(7);
+    expect(usage?.breakdown).toEqual({ inputTokens: 7, outputTokens: 0, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 });
+  });
+
+  it('still requires a usage object and a numeric total_cost_usd', () => {
+    const modelUsage = { m: { inputTokens: 7 } };
+    expect(buildKnownUsage({ type: 'result', total_cost_usd: 0.01, modelUsage }, undefined)).toBeUndefined();
+    expect(buildKnownUsage({ type: 'result', usage: {}, modelUsage }, undefined)).toBeUndefined();
+  });
+});
+
+describe('claude-headless adapter: a stream with two result messages (issue #108)', () => {
+  it('parseClaudeStream keeps the last result, whose modelUsage is cumulative', () => {
+    const parsed = parseClaudeStream(BACKGROUND_SUBAGENT_STREAM);
+    expect(parsed.result?.total_cost_usd).toBe(0.0267);
+    // The last result's own usage is 18,025 tokens; the session spent 71,856.
+    expect(buildKnownUsage(parsed.result, undefined)?.tokens).toBe(71_856);
+  });
+
+  it("reports the cumulative figure from invoke(), not the last result's usage", async () => {
+    const adapter = makeAdapter({ run: makeRun({ stdout: BACKGROUND_SUBAGENT_STREAM }).run });
+    const result = await adapter.invoke(invocation());
+    expect(result.usage).toEqual({
+      tokens: 71_856,
+      cost: 0.0267,
+      breakdown: { inputTokens: 1043, outputTokens: 2332, cacheReadInputTokens: 63_946, cacheCreationInputTokens: 4535 },
+      model: 'claude-haiku-4-5',
+    });
+  });
+
+  it('carries the cumulative figure on a billed nonzero exit', async () => {
+    const lines = BACKGROUND_SUBAGENT_STREAM.trim().split('\n');
+    const last = JSON.parse(lines[lines.length - 1]!) as Record<string, unknown>;
+    lines[lines.length - 1] = JSON.stringify({
+      ...last, subtype: 'error_during_execution', is_error: true, terminal_reason: 'refusal',
+    });
+    const adapter = makeAdapter({ run: makeRun({ stdout: lines.join('\n'), exitCode: 1 }).run });
+    const err = await adapter.invoke(invocation()).then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+    expect(usageFromThrow(err)).toMatchObject({ tokens: 71_856, cost: 0.0267 });
   });
 });
 

@@ -27,7 +27,7 @@ import type {
 } from './harness-adapter';
 import { runHarnessProcess } from './harness-runner';
 import { createHarnessEventEmitter } from './harness-events';
-import { mapClaudeStreamLine, rateLimitWindowsFromInfo } from './harness-events-claude';
+import { claudeResultBreakdown, mapClaudeStreamLine, rateLimitWindowsFromInfo } from './harness-events-claude';
 import { resolveClaudePluginAgent } from './claude-plugin-agents';
 import { createRunScopedClaudeConfigDir, removeRunScopedClaudeConfigDir } from './claude-config-isolation';
 import type { HarnessCommand, HarnessRunnerConfig, HarnessSpawnResult } from './harness-runner';
@@ -156,7 +156,9 @@ interface ParsedClaudeStream {
  * whole invocation, because this parse now runs on the FAILURE path too, where
  * a partially-written stream is likely. The LAST event of each kind wins — the
  * result event is terminal, and only the most recent capacity reading is
- * meaningful.
+ * meaningful. A call that runs a background subagent emits two result events;
+ * the last one is still right because buildKnownUsage reads its cumulative
+ * `modelUsage` and `total_cost_usd`, not its `usage` (issue #108).
  */
 export function parseClaudeStream(stdout: string): ParsedClaudeStream {
   let result: ClaudeResultPayload | null = null;
@@ -214,12 +216,8 @@ export function parseClaudeStream(stdout: string): ParsedClaudeStream {
 
 /** Total tokens a modelUsage entry accounts for, across every class. */
 function entryTokens(entry: ClaudeModelUsageEntry): number {
-  return (
-    (entry.inputTokens ?? 0) +
-    (entry.outputTokens ?? 0) +
-    (entry.cacheReadInputTokens ?? 0) +
-    (entry.cacheCreationInputTokens ?? 0)
-  );
+  const n = (v: unknown): number => (typeof v === 'number' ? v : 0);
+  return n(entry.inputTokens) + n(entry.outputTokens) + n(entry.cacheReadInputTokens) + n(entry.cacheCreationInputTokens);
 }
 
 /**
@@ -233,6 +231,8 @@ export function dominantModel(
 ): string | undefined {
   let best: { model: string; tokens: number } | undefined;
   for (const [key, entry] of Object.entries(modelUsage ?? {})) {
+    // The payload is untrusted JSON: skip an entry that is not an object.
+    if (typeof entry !== 'object' || entry === null) continue;
     const model = entry.canonicalModel ?? key;
     const tokens = entryTokens(entry);
     if (best === undefined || tokens > best.tokens) best = { model, tokens };
@@ -262,17 +262,18 @@ export function buildKnownUsage(
   }
   if (typeof payload.total_cost_usd !== 'number') return undefined;
 
-  const usage = payload.usage;
+  // The session's cumulative figure, summed across modelUsage entries, with
+  // `usage` as the fallback (issue #108, see claudeResultBreakdown). The last
+  // result's `usage` alone undercounts a call that ran a background subagent.
+  // `usage` is still required above: a result without it is malformed.
+  const breakdown = claudeResultBreakdown(payload)!;
   // Still the TRUE TOTAL across all four classes: run and wave budgets fold
   // this number, so it must not shrink to input+output when the breakdown
-  // below splits it out. (These four are disjoint in claude's schema —
-  // input_tokens is uncached input, not an inclusive total — so summing
-  // them double-counts nothing.)
+  // splits it out. (These four are disjoint in claude's schema: input tokens
+  // are uncached input, not an inclusive total, so summing them
+  // double-counts nothing.)
   const tokens =
-    (usage.input_tokens ?? 0) +
-    (usage.output_tokens ?? 0) +
-    (usage.cache_creation_input_tokens ?? 0) +
-    (usage.cache_read_input_tokens ?? 0);
+    breakdown.inputTokens + breakdown.outputTokens + breakdown.cacheReadInputTokens + breakdown.cacheCreationInputTokens;
 
   // modelUsage names the models the provider actually billed, filling the
   // journal's `model` column (empty on harness rows until now).
@@ -289,12 +290,7 @@ export function buildKnownUsage(
   return {
     tokens,
     cost: payload.total_cost_usd,
-    breakdown: {
-      inputTokens: usage.input_tokens ?? 0,
-      outputTokens: usage.output_tokens ?? 0,
-      cacheReadInputTokens: usage.cache_read_input_tokens ?? 0,
-      cacheCreationInputTokens: usage.cache_creation_input_tokens ?? 0,
-    },
+    breakdown,
     ...(billedModel !== undefined ? { model: billedModel } : {}),
     ...(rateLimit !== undefined ? { rateLimit } : {}),
   };
