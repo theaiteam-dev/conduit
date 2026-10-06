@@ -101,8 +101,10 @@ input that ran, compare the two as JSON values. On a mismatch it journals a `gat
 hold with code `input_rewritten` and ends the call as a gate hold does: the executor holds
 the card without spending an execution attempt, and the call's usage is billed. This
 applies to subagent calls too. The rewritten call has already run, so this is a backstop
-like the MARK_DONE integrity check, not a pre-execution control. A call that reaches
-`PreToolUse` and never reports a post event is not treated as a rewrite.
+like the MARK_DONE integrity check, not a pre-execution control. Other calls the model
+issued in the same turn also run before the hold stops the CLI (observed live with two Bash
+calls in one turn, both rewritten). A call that reaches `PreToolUse` and never reports a
+post event is not treated as a rewrite.
 
 Every invocation is a fresh session: `agent-sdk` does not resume one, and it does not run
 named agents (`agent`, `pluginDirs`).
