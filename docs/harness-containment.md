@@ -75,6 +75,9 @@ What it does not cover:
   stays mandatory as the backstop.
 - Reads outside the project root, and a symlink swapped between the check and the write.
 - The input of `Agent` and of any other listed tool that is not a file tool.
+- On `agent-sdk`, an input rewritten by another `PreToolUse` hook after the gate approved
+  it. The adapter detects the rewrite after the call runs and holds the card (below). It
+  does not prevent it.
 
 The SDK reports a hook denial nowhere (`result.permission_denials` stays empty), so the
 adapter emits a `gate-decision` event for every call the gate sees. It is journaled in
@@ -84,6 +87,22 @@ reason cut to 200 characters. No tool input body is stored. `conduit journal ins
 result message (about 15 ms in a live run), and the thrown error carries that call's usage
 and cost. Every later call is denied without asking the gate. If no result arrives within 5
 seconds the process is killed, and the error then carries no usage.
+
+On `agent-sdk`, hooks other than the gate's run beside it: plugin hooks load with their
+plugin (`settingSources: []` does not stop them), and an agent file can declare hooks in
+its frontmatter. A deny from either the gate or another hook wins. Hooks that block or
+observe are allowed. A `PreToolUse` hook that returns `updatedInput` is different: it
+replaces the tool input after the gate approved the original, and the gate cannot pin the
+approved input, because the hook that answers last wins
+([#109](https://github.com/theaiteam-dev/conduit/issues/109)). The adapter detects the
+rewrite instead. It records the input the gate approved for each `tool_use_id`, and its own
+`PostToolUse` and `PostToolUseFailure` hooks, which receive the same `tool_use_id` and the
+input that ran, compare the two as JSON values. On a mismatch it journals a `gate-decision`
+hold with code `input_rewritten` and ends the call as a gate hold does: the executor holds
+the card without spending an execution attempt, and the call's usage is billed. This
+applies to subagent calls too. The rewritten call has already run, so this is a backstop
+like the MARK_DONE integrity check, not a pre-execution control. A call that reaches
+`PreToolUse` and never reports a post event is not treated as a rewrite.
 
 Every invocation is a fresh session: `agent-sdk` does not resume one, and it does not run
 named agents (`agent`, `pluginDirs`).

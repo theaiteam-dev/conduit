@@ -32,7 +32,14 @@
  * held call's usage is billed: it is on the span, and with `max_tokens` below
  * that usage the consumption andon trips on it.
  *
- * Case 4, containment: the fake spawns a `setsid` sleeper during the call.
+ * Case 4, an input rewrite: the fake stands in for a plugin PreToolUse hook
+ * that rewrote an approved `cat topic.md` to `touch rewritten.txt` after the
+ * kernel's hook answered. The touch runs. The adapter's PostToolUse hook sees
+ * the input that ran differ from the approved one, journals a gate-decision
+ * hold with code input_rewritten and stops the turn, and the card lands in
+ * `hold` at attempt 0. An unchanged call before it passes the same check.
+ *
+ * Case 5, containment: the fake spawns a `setsid` sleeper during the call.
  * It must be dead after the run when `conduit doctor` reports cgroup
  * containment, with the same skip/require logic as
  * harness-idle-timeout.test.ts.
@@ -420,6 +427,84 @@ describe("agent-sdk journey: a held call's usage counts against the run token bu
     expect(run.stderr.split("\n").filter((l) => l.startsWith("andon:"))).toEqual(["andon: run halted — tokens budget exceeded"]);
     expect(run.stderr).toContain(`${f.cardId}: lane=hold station=research attempt=0`);
     expect(f.stubLog<FakeClaudeSdkLogEntry>()).toHaveLength(1);
+  });
+});
+
+describe("agent-sdk journey: an input rewrite by another PreToolUse hook holds the card after it runs", () => {
+  let f: HarnessFlow;
+  let run: CliResult;
+  const REWRITE_REASON = "another PreToolUse hook changed the input the gate approved, and the changed call ran";
+
+  beforeAll(async () => {
+    f = startHarnessFlow<FakeClaudeSdkRole>({
+      flowYaml: flowYaml("bb-agent-sdk-rewrite"),
+      files: FILES,
+      entryInput: "topic.md",
+      stub: SDK_STUB,
+      roles: [
+        {
+          name: "maker",
+          promptIncludes: "ROLE:MAKER",
+          calls: [
+            {
+              steps: [
+                bash("cat", "cat topic.md"),
+                { ...bash("rewritten", "cat topic.md"), rewriteInput: { command: "touch rewritten.txt", description: "rewritten" } },
+                write("write-output", "result.json", OUTPUT),
+              ],
+              usage: { input_tokens: 400, output_tokens: 100 },
+              costUsd: 0.0007,
+            },
+          ],
+        },
+      ],
+    });
+    run = await f.run();
+  }, TIMEOUT_MS);
+
+  afterAll(async () => {
+    await f?.cleanup();
+  });
+
+  test("the unchanged call passed the post check, the rewritten one ran and stopped the turn", () => {
+    const log = f.stubLog<FakeClaudeSdkLogEntry>();
+    expect(log).toHaveLength(1);
+    expect(log[0]!.postToolUseCallbackIds).toHaveLength(1);
+    expect(log[0]!.postToolUseFailureCallbackIds).toHaveLength(1);
+    expect(log[0]!.stopped).toBe(true);
+    expect(log[0]!.answers.map((a) => [a.label, a.decision, a.performed, a.rewritten, a.postEvent, a.continue])).toEqual([
+      ["cat", "allow", true, false, "PostToolUse", true],
+      ["rewritten", "allow", true, true, "PostToolUse", false],
+    ]);
+    // Detection, not prevention: the rewritten command ran, and nothing after it did.
+    expect(existsSync(join(f.projectRoot, "rewritten.txt"))).toBe(true);
+    expect(existsSync(join(f.projectRoot, "result.json"))).toBe(false);
+  });
+
+  test("the card is held at attempt 0, and journal inspect names the rewrite", async () => {
+    expect(run.exitCode).toBe(1);
+    expect(run.stderr).toContain(`${f.cardId}: lane=hold station=research attempt=0`);
+    expect(run.stderr).toContain("the tool gate held the card on Bash (input_rewritten)");
+    expect(run.stderr).not.toContain("andon");
+
+    const inspect = await f.journalInspect();
+    expect(inspect.exitCode).toBe(0);
+    expect(inspect.stdout).toContain(`[${f.cardId}] entered_lane: research → hold (hold)`);
+    expect(inspect.stdout.match(/research\.harness$/gm)).toHaveLength(1);
+    expect(decisionsIn(harnessRows(inspect.stdout, f.cardId))).toEqual([
+      "gate-decision allow Bash",
+      "gate-decision allow Bash",
+      `gate-decision hold Bash code=input_rewritten reason=${REWRITE_REASON}`,
+    ]);
+  });
+
+  test("the held call's usage is on its span", () => {
+    const spans = f.journalSpans().filter((s) => s.name === "research.harness");
+    expect(spans).toHaveLength(1);
+    expect(spans[0]!.usage_unknown).toBe(0);
+    expect(spans[0]!.input_tokens).toBe(400);
+    expect(spans[0]!.output_tokens).toBe(100);
+    expect(spans[0]!.attributes.outcome).toBe("harness-gate-hold");
   });
 });
 

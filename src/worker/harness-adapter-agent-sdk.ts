@@ -12,6 +12,16 @@
  * The loop stays the CLI's own. This is a pre-execution decision on each call,
  * not the Law-grade Tool-Bridge (SPEC §7, step 9b).
  *
+ * Other PreToolUse hooks (plugin hooks, agent frontmatter hooks) run beside the
+ * gate's, and one that returns `updatedInput` replaces the input after the gate
+ * approved it. The gate cannot prevent that: the hook that answers last wins.
+ * The adapter detects it instead. It records the input the gate approved per
+ * `tool_use_id`, and its `PostToolUse` and `PostToolUseFailure` hooks compare
+ * the input that ran with it. A mismatch is journaled as a `gate-decision`
+ * hold with code `input_rewritten` and ends the call as a gate hold does. The
+ * rewritten call has already run, so this is a backstop like the MARK_DONE
+ * integrity check (issue #109).
+ *
  * Process ownership. The SDK would spawn the CLI itself and kill only the
  * immediate child. `spawnClaudeCodeProcess` hands the spawn back to this
  * adapter, which starts the CLI detached (its own session and process group),
@@ -44,6 +54,7 @@ import { createRunScopedClaudeConfigDir, removeRunScopedClaudeConfigDir } from '
 import { killContained, trackProcessGroup, untrackProcessGroup } from './process-group';
 import { prepareContainedCommand, removeCgroup, resolveContainment, type Containment } from './cgroup-containment';
 import { existsSync, statSync } from 'node:fs';
+import { isDeepStrictEqual } from 'node:util';
 import { resolveExecutable } from './harness-contained-spawn';
 
 /** The part of the SDK's `Query` this adapter uses. */
@@ -216,6 +227,18 @@ export function createAgentSdkHarnessAdapter(config: AgentSdkHarnessAdapterConfi
             permissionDecisionReason: reason,
           },
         });
+        // The input the gate allowed, per tool_use_id, until the call's post event compares it.
+        const approvedInputs = new Map<string, unknown>();
+        // The first hold wins. Stop the CLI gracefully so it still emits its result message, which carries
+        // the call's usage and cost. If it has not ended by itself after HOLD_STOP_WAIT_MS, kill it.
+        const startHold = (held: { code: string; reason: string; toolName: string }): void => {
+          if (st.held !== undefined) return;
+          st.held = held;
+          st.holdTimer = setTimeout(() => {
+            abortController.abort();
+            killAll();
+          }, config.holdStopWaitMs ?? HOLD_STOP_WAIT_MS);
+        };
         const preToolUse: HookCallback = async (input, toolUseId) => {
           if (input.hook_event_name !== 'PreToolUse') return { continue: true };
           const toolCallId = toolUseId ?? input.tool_use_id;
@@ -259,18 +282,40 @@ export function createAgentSdkHarnessAdapter(config: AgentSdkHarnessAdapterConfi
           }
           // Allow returns no permissionDecision, so the SDK's normal permission flow continues and
           // `allowedTools` decides. Returning 'allow' here would grant what no rule granted.
-          if (decision.decision === 'allow') return { continue: true };
+          if (decision.decision === 'allow') {
+            if (toolCallId !== undefined) approvedInputs.set(toolCallId, input.tool_input);
+            return { continue: true };
+          }
           if (decision.decision === 'hold') {
-            st.held = { code: decision.code, reason: decision.reason, toolName: input.tool_name };
-            // Stop the CLI gracefully so it still emits its result message, which carries the call's
-            // usage and cost. If it has not ended by itself after HOLD_STOP_WAIT_MS, kill it.
-            st.holdTimer = setTimeout(() => {
-              abortController.abort();
-              killAll();
-            }, config.holdStopWaitMs ?? HOLD_STOP_WAIT_MS);
+            startHold({ code: decision.code, reason: decision.reason, toolName: input.tool_name });
             return { continue: false, stopReason: decision.reason, ...deny(decision.reason) };
           }
           return deny(decision.reason);
+        };
+
+        // The rewrite check. A call the gate did not allow, or one that never reports a post event,
+        // is not compared.
+        const postToolUse: HookCallback = async (input, toolUseId) => {
+          if (input.hook_event_name !== 'PostToolUse' && input.hook_event_name !== 'PostToolUseFailure') {
+            return { continue: true };
+          }
+          const toolCallId = toolUseId ?? input.tool_use_id;
+          if (toolCallId === undefined || !approvedInputs.has(toolCallId)) return { continue: true };
+          const approved = approvedInputs.get(toolCallId);
+          approvedInputs.delete(toolCallId);
+          if (isDeepStrictEqual(approved, input.tool_input)) return { continue: true };
+          const reason = 'another PreToolUse hook changed the input the gate approved, and the changed call ran';
+          emit?.({
+            type: 'gate-decision',
+            toolCallId,
+            toolName: input.tool_name,
+            decision: 'hold',
+            code: 'input_rewritten',
+            reason,
+            ...(input.agent_id !== undefined ? { agentId: input.agent_id } : {}),
+          });
+          startHold({ code: 'input_rewritten', reason, toolName: input.tool_name });
+          return { continue: false, stopReason: reason };
         };
 
         const options: Options = {
@@ -281,7 +326,11 @@ export function createAgentSdkHarnessAdapter(config: AgentSdkHarnessAdapterConfi
           permissionMode: 'default',
           abortController,
           spawnClaudeCodeProcess,
-          hooks: { PreToolUse: [{ hooks: [preToolUse] }] },
+          hooks: {
+            PreToolUse: [{ hooks: [preToolUse] }],
+            PostToolUse: [{ hooks: [postToolUse] }],
+            PostToolUseFailure: [{ hooks: [postToolUse] }],
+          },
           // Defence in depth: the gate is the enforcement. Empty tools is the executor's encoding of a
           // waived `unrestricted_tools` station and passes no narrowing.
           ...(call.tools.length > 0 ? { allowedTools: call.tools } : {}),
