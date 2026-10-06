@@ -356,11 +356,17 @@ describe('buildHarnessDefinitionRegistry — two-phase config + binding', () => 
       expect(adapter.bind('/tmp').name).toBe('agent-sdk');
     });
 
-    it.each<[string, Partial<HarnessAdapterConfigDef>]>([
-      ['pluginDirs', { pluginDirs: ['/opt/plugins'] }],
-      ['agent', { agent: 'team:coder' }],
-    ])('rejects %s rather than dropping it', (_name, over) => {
-      expect(() => buildHarnessDefinitionRegistry([sdkDef(over)])).toThrow('does not support');
+    // Issue #109: agent-sdk runs named agents, so it takes both options.
+    it('accepts agent and binds an adapter that carries it as its default', () => {
+      const registry = buildHarnessDefinitionRegistry([sdkDef({ agent: 'team:coder' })]);
+      const adapter = expectOk(registry.resolve('agent-sdk'));
+      expect(adapter.bind('/tmp').agent).toBe('team:coder');
+    });
+
+    it('checks pluginDirs at construction rather than accepting a missing dir', () => {
+      expect(() => buildHarnessDefinitionRegistry([sdkDef({ pluginDirs: ['/no/such/conduit/plugins'] })])).toThrow(
+        'does not exist',
+      );
     });
   });
 });

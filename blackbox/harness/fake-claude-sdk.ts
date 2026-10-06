@@ -33,6 +33,17 @@
  *     - after each step, a `user` message with the `tool_result`.
  *     - a `result` message with `usage`, `modelUsage` and `total_cost_usd`.
  *
+ * Named agents. With `--agent <plugin>:<agent>` and `--plugin-dir <dir>` in
+ * argv (the SDK's `agent` and `plugins` options), the fake reads each plugin
+ * dir's `.claude-plugin/plugin.json` name and the frontmatter `name:` of each
+ * `agents/*.md`, lists every `<plugin>:<agent>` it found in the init message's
+ * `agents`, and, when the requested agent is among them, sends it as
+ * `agent_type` on every hook input, as Claude Code 2.1.290 does for the main
+ * thread of an `--agent` session. A requested agent it did not find is not an
+ * error: like the real CLI on the SDK path, it runs the default agent, lists
+ * only what it loaded, and sends no `agent_type`. `dropAgent` on a call makes
+ * the fake ignore the requested agent even when a plugin dir defines it.
+ *
  * A step's effect (running a Bash command, writing a file) happens only when
  * no hook answered `permissionDecision: "deny"`. A hook output with
  * `continue: false` stops the turn after that step, as the real CLI does: no
@@ -54,7 +65,7 @@
  * extension, so the SDK runs it directly, as it runs a native `claude`.
  */
 
-import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, writeFileSync, writeSync } from "node:fs";
+import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, writeFileSync, writeSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 
 export interface FakeClaudeSdkUsage {
@@ -93,6 +104,13 @@ export interface FakeClaudeSdkCall {
    * absolute path outside the project root.
    */
   setsidSleeperPidFile?: string;
+  /**
+   * Do not load the `--agent` the SDK asked for, even when a plugin dir
+   * defines it: run the default agent, leave it out of init's `agents`, and
+   * send no `agent_type`. Stands for a CLI that resolves plugin agents
+   * differently from the kernel.
+   */
+  dropAgent?: boolean;
 }
 
 export interface FakeClaudeSdkRole {
@@ -143,6 +161,10 @@ export interface FakeClaudeSdkLogEntry {
   stopped: boolean;
   /** Subtypes of the SDK control requests received, in order. */
   sdkRequests: string[];
+  /** `--agent` from argv, or null. */
+  agent: string | null;
+  /** True when the requested agent was loaded and sent as `agent_type`. */
+  agentLoaded: boolean;
 }
 
 type Json = Record<string, any>;
@@ -172,6 +194,36 @@ function nextCallNumber(stateDir: string, role: string): number {
   }
 }
 
+function argValues(argv: string[], flag: string): string[] {
+  const values: string[] = [];
+  for (let i = 0; i < argv.length - 1; i++) if (argv[i] === flag) values.push(argv[i + 1]!);
+  return values;
+}
+
+/** `<plugin>:<agent>` for every agent file in the given plugin dirs. */
+function pluginAgents(pluginDirs: string[]): string[] {
+  const found: string[] = [];
+  for (const dir of pluginDirs) {
+    let plugin: string;
+    try {
+      plugin = String(JSON.parse(readFileSync(join(dir, ".claude-plugin", "plugin.json"), "utf8")).name);
+    } catch {
+      continue;
+    }
+    let files: string[] = [];
+    try {
+      files = readdirSync(join(dir, "agents")).filter((f) => f.endsWith(".md"));
+    } catch {
+      continue;
+    }
+    for (const file of files) {
+      const m = /^name:\s*(\S+)\s*$/m.exec(readFileSync(join(dir, "agents", file), "utf8"));
+      if (m) found.push(`${plugin}:${m[1]}`);
+    }
+  }
+  return found;
+}
+
 function spawnSetsidSleeper(pidFile: string): void {
   mkdirSync(dirname(pidFile), { recursive: true });
   Bun.spawn(["setsid", "sh", "-c", `echo $$ > '${pidFile}.tmp' && mv '${pidFile}.tmp' '${pidFile}' && exec sleep 300`], {
@@ -192,6 +244,8 @@ async function main(): Promise<number> {
   }
   const scenario = JSON.parse(readFileSync(scenarioPath, "utf8")) as FakeClaudeSdkScenario;
   const model = argValue(argv, "--model");
+  const requestedAgent = argValue(argv, "--agent");
+  const loadedPluginAgents = pluginAgents(argValues(argv, "--plugin-dir"));
 
   let preToolUseCallbackIds: string[] = [];
   const sdkRequests: string[] = [];
@@ -218,6 +272,8 @@ async function main(): Promise<number> {
     const call = role.calls[Math.min(callNumber, role.calls.length) - 1] ?? {};
     const startedAt = Date.now();
     const cwd = process.cwd();
+    const agents = call.dropAgent === true ? loadedPluginAgents.filter((a) => a !== requestedAgent) : loadedPluginAgents;
+    const agentLoaded = requestedAgent !== null && agents.includes(requestedAgent);
 
     emit({
       type: "system",
@@ -227,6 +283,7 @@ async function main(): Promise<number> {
       tools: ["Bash", "Read", "Write", "AskUserQuestion"],
       model: model ?? "claude-fake",
       permissionMode: argValue(argv, "--permission-mode") ?? "default",
+      agents: ["general-purpose", ...agents],
       uuid: "00000000-0000-4000-8000-000000000001",
     });
 
@@ -279,6 +336,7 @@ async function main(): Promise<number> {
             tool_name: step.tool,
             tool_input: step.input,
             tool_use_id: toolUseId,
+            ...(agentLoaded ? { agent_type: requestedAgent } : {}),
           },
         });
         if (response.subtype !== "success") {
@@ -349,6 +407,8 @@ async function main(): Promise<number> {
       answers,
       stopped,
       sdkRequests,
+      agent: requestedAgent,
+      agentLoaded,
     };
     appendFileSync(scenario.logPath, JSON.stringify(entry) + "\n");
 

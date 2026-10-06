@@ -134,7 +134,8 @@ describe('agent-sdk adapter: capabilities', () => {
     expect(adapter.reportsUsage).toBe(true);
     expect(adapter.canRestrictTools).toBe(true);
     expect(adapter.canGatePerCall).toBe(true);
-    expect(adapter.resolveAgentDefinition).toBeUndefined();
+    // Named agents (issue #109): see harness-adapter-agent-sdk-agent.test.ts.
+    expect(typeof adapter.resolveAgentDefinition).toBe('function');
   });
 
   it('probes the resolved binary, and reports a missing one', async () => {
@@ -881,12 +882,5 @@ describe('agent-sdk adapter: registration', () => {
     expect(() =>
       buildHarnessDefinitionRegistry([{ name: 'agent-sdk', envAllowlist: ['HOME'], isolateConfig: true }]),
     ).not.toThrow();
-  });
-
-  it.each([
-    ['agent', { agent: 'team:coder' }, 'AGENT'],
-    ['pluginDirs', { pluginDirs: ['/opt/plugins'] }, 'PLUGIN_DIRS'],
-  ])('rejects %s, since named agents are not implemented for this adapter', (_option, extra, suffix) => {
-    expect(() => buildHarnessDefinitionRegistry([{ name: 'agent-sdk', envAllowlist: ['HOME'], ...extra }])).toThrow(suffix);
   });
 });

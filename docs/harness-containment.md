@@ -85,8 +85,38 @@ result message (about 15 ms in a live run), and the thrown error carries that ca
 and cost. Every later call is denied without asking the gate. If no result arrives within 5
 seconds the process is killed, and the error then carries no usage.
 
-Every invocation is a fresh session: `agent-sdk` does not resume one, and it does not run
-named agents (`agent`, `pluginDirs`).
+Every invocation is a fresh session: `agent-sdk` does not resume one.
+
+#### Named agents and plugin dirs on `agent-sdk`
+
+`agent-sdk` runs named agents and loads plugin dirs from the same engine config as
+`claude-headless`: `CONDUIT_HARNESS_AGENT_SDK_AGENT` and
+`CONDUIT_HARNESS_AGENT_SDK_PLUGIN_DIRS`, a station's `agent:` and a critic's
+`check.critic.agent` ([#109](https://github.com/theaiteam-dev/conduit/issues/109)). The
+adapter passes the agent to the SDK as `agent` and each plugin dir as a local plugin, and the
+SDK hands the CLI `--agent` and `--plugin-dir`. The kernel hashes the same definition file
+into the binding stamp that it hashes for `claude-headless`, and holds a card whose agent it
+cannot locate, at load and at dispatch.
+
+On this path the CLI does not fail on an agent it cannot find. It runs its default agent and
+reports success (observed with `claude` 2.1.290; `claude -p` exits 1 instead). So the
+adapter checks that the CLI loaded the agent the kernel hashed:
+
+- every `system`/`init` message must list the agent in `agents`, and
+- every main-thread tool call (no `agent_id`) must carry the agent as `agent_type`.
+
+A miss on either ends the call and holds the card without spending an execution attempt, as
+a gate hold does. A miss at init ends the call before any model request. A miss on a tool call
+denies that call with `continue: false`, journals a `gate-decision` hold with code
+`agent_not_loaded`, and bills the result the CLI emits. A subagent's call carries its own
+`agent_type` and an `agent_id`, so the check does not apply to it; the gate still does.
+
+Plugin hooks load with the plugin (`settingSources: []` does not stop them) and run
+alongside the gate's `PreToolUse` callback, on the main thread and in subagents. A deny from
+either side wins: a gate deny holds when a plugin hook answers allow, and a plugin hook can
+deny a call the gate allowed. A plugin hook that answers with `updatedInput` replaces the
+tool input after the gate approved the original, and the gate does not see the replacement.
+Hooks that only block or observe are unaffected.
 
 ### The `codex-app-server` adapter
 
