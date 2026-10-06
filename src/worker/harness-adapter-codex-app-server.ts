@@ -60,8 +60,9 @@
  * resume, named agents.
  */
 
-import { existsSync, statSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { existsSync, mkdtempSync, rmSync, statSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
 import type {
   BinaryProbe, HarnessAdapter, HarnessInvocation, HarnessResult, KnownUsage, RateLimitSnapshot, RateLimitWindow,
 } from './harness-adapter';
@@ -112,21 +113,41 @@ export const UNGATED_FEATURES_CHECKED_VERSION = '0.159.1';
 
 /**
  * Run `<binary> --version` with a bounded wait. Undefined when it fails, times out or prints nothing.
- * Spawned without containment on purpose: it runs no model and no tools, starts no child, and is
- * SIGKILLed at VERSION_PROBE_TIMEOUT_MS.
+ * Contained like a real invocation, in a temporary cwd it removes: the configured binary may be a
+ * wrapper script that starts children, and those must neither outlive the check nor write into the
+ * kernel's cwd. The tree is ended when the binary exits or at `timeoutMs`, whichever comes first.
  */
-async function runVersionCommand(binaryPath: string, sourceEnv: Record<string, string | undefined>): Promise<string | undefined> {
+export async function runVersionCommand(
+  binaryPath: string,
+  sourceEnv: Record<string, string | undefined>,
+  containment: Containment,
+  timeoutMs = VERSION_PROBE_TIMEOUT_MS,
+): Promise<string | undefined> {
+  let cwd: string | undefined;
+  let proc: ContainedProcess | undefined;
+  let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    const proc = Bun.spawn([binaryPath, '--version'], {
-      stdout: 'pipe', stderr: 'ignore', stdin: 'ignore',
-      env: { PATH: sourceEnv.PATH ?? '/usr/bin:/bin', HOME: sourceEnv.HOME ?? '/' },
-      timeout: VERSION_PROBE_TIMEOUT_MS, killSignal: 'SIGKILL',
+    cwd = mkdtempSync(join(tmpdir(), 'conduit-codex-version-'));
+    const lines: string[] = [];
+    const code = await new Promise<number | undefined>((done) => {
+      timer = setTimeout(() => done(undefined), timeoutMs);
+      proc = containedSpawn(containment, 'codex-version')(
+        { command: binaryPath, args: ['--version'], cwd: cwd!, env: { PATH: sourceEnv.PATH ?? '/usr/bin:/bin', HOME: sourceEnv.HOME ?? '/' } },
+        { onLine: (line) => lines.push(line), onStderr: () => {}, onExit: (exitCode) => done(exitCode) },
+      );
     });
-    const out = await new Response(proc.stdout).text();
-    if ((await proc.exited) !== 0) return undefined;
-    return out.trim() === '' ? undefined : out.trim();
+    const out = lines.join('\n').trim();
+    return code === 0 && out !== '' ? out : undefined;
   } catch {
     return undefined;
+  } finally {
+    clearTimeout(timer);
+    try {
+      await proc?.close();
+    } catch {
+      /* already gone */
+    }
+    if (cwd !== undefined) rmSync(cwd, { recursive: true, force: true });
   }
 }
 
@@ -487,12 +508,14 @@ type Outcome =
 export function createCodexAppServerHarnessAdapter(config: CodexAppServerHarnessAdapterConfig): HarnessAdapter {
   const command = config.command ?? 'codex';
   const sourceEnv = config.sourceEnv ?? process.env;
+  const readVersion =
+    config.readVersion ?? (async (path: string) => runVersionCommand(path, sourceEnv, config.containment ?? (await resolveContainment())));
   const probe =
     config.probe ??
     (async (): Promise<BinaryProbe> => {
       const resolved = resolveExecutable(command, sourceEnv);
       if (!('path' in resolved)) return { present: false, detail: resolved.error };
-      const version = await (config.readVersion ?? ((p) => runVersionCommand(p, sourceEnv)))(resolved.path).catch(() => undefined);
+      const version = await readVersion(resolved.path).catch(() => undefined);
       return { present: true, detail: describeCodexProbe(resolved.path, version) };
     });
 
@@ -513,7 +536,7 @@ export function createCodexAppServerHarnessAdapter(config: CodexAppServerHarness
       const resolved = resolveExecutable(command, sourceEnv);
       if ('error' in resolved) fail(resolved.error);
       const executable = resolved.path;
-      await warnOnUncheckedVersion(executable, () => (config.readVersion ?? ((p) => runVersionCommand(p, sourceEnv)))(executable));
+      await warnOnUncheckedVersion(executable, () => readVersion(executable));
       if (!existsSync(config.projectRoot) || !statSync(config.projectRoot).isDirectory()) {
         fail(`project root '${config.projectRoot}' does not exist, cannot confine the harness cwd`);
       }

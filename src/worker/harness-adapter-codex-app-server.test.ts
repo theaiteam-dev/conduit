@@ -18,8 +18,11 @@ import {
   unwrapShellCommand,
   UNGATED_FEATURES_CHECKED_VERSION,
   resetCodexVersionWarnings,
+  runVersionCommand,
   type CodexAppServerHarnessAdapterConfig,
 } from './harness-adapter-codex-app-server';
+import { resolveContainment, type Containment } from './cgroup-containment';
+import { setsidContainmentRequired } from './containment-fixture-files';
 import type { ContainedProcessHandlers, ContainedSpawn, ContainedSpawnSpec } from './harness-contained-spawn';
 import {
   bindHarnessDefinitionsForIntrospection, buildHarnessDefinitionRegistry, shippedHarnessAdapterNames,
@@ -253,6 +256,89 @@ describe('codex-app-server adapter: capabilities', () => {
   it('reads a real version from the default runner', async () => {
     const a = createCodexAppServerHarnessAdapter({ projectRoot: ROOT, envAllowlist: [], command: process.execPath });
     expect((await a.probeBinary()).detail).toMatch(/^\S+ \(\d+\.\d+\.\d+/);
+  });
+
+  // Liveness is read from /proc/<pid>/stat (zombie aware). Without /proc every pid would read as
+  // dead and the cleanup assertions would pass with descendants still running, so skip instead.
+  describe.skipIf(!existsSync('/proc/self/stat'))('the version command', () => {
+    // A stand-in codex that prints a version, starts a backgrounded child and, where the host has
+    // `setsid`, one in its own session, records their pids and its cwd under $HOME, then exits or hangs.
+    const STUB = `#!/bin/sh
+( while :; do sleep 0.1; done ) </dev/null >/dev/null 2>&1 &
+echo "$!" > "$HOME/bg.pid"
+if command -v setsid >/dev/null 2>&1; then
+  setsid -f sh -c 'echo "$$" > "$HOME/setsid.pid"; while :; do sleep 0.1; done' </dev/null >/dev/null 2>&1
+  while [ ! -s "$HOME/setsid.pid" ]; do sleep 0.01; done
+fi
+pwd > "$HOME/cwd"
+echo "codex-cli 1.2.3"
+[ "$MODE" = hang ] && exec sleep 60
+exit 0
+`;
+    const alive = (pid: number): boolean => {
+      try {
+        // Field 3 of /proc/<pid>/stat is the state: a zombie is dead, only not yet reaped.
+        return readFileSync(`/proc/${pid}/stat`, 'utf8').split(') ')[1]?.[0] !== 'Z';
+      } catch {
+        return false;
+      }
+    };
+    const eventuallyDead = async (pid: number): Promise<boolean> => {
+      for (let i = 0; i < 40 && alive(pid); i++) await Bun.sleep(50);
+      return !alive(pid);
+    };
+
+    const setup = (mode: 'exit' | 'hang') => {
+      const home = mkdtempSync(join(tmpdir(), 'conduit-codex-version-test-'));
+      const bin = join(home, 'codex');
+      writeFileSync(bin, mode === 'hang' ? STUB.replace('#!/bin/sh\n', '#!/bin/sh\nMODE=hang\n') : STUB, { mode: 0o755 });
+      return { home, bin };
+    };
+    const readPid = (home: string, file: string): number | undefined =>
+      existsSync(join(home, file)) ? Number(readFileSync(join(home, file), 'utf8').trim()) : undefined;
+    const pids = (home: string): number[] =>
+      [readPid(home, 'bg.pid'), readPid(home, 'setsid.pid')].filter((p): p is number => p !== undefined);
+    // The stub writes setsid.pid exactly when `setsid` resolves on the PATH it runs with.
+    const hostHasSetsid = Bun.which('setsid', { PATH: '/usr/bin:/bin' }) !== null;
+    // Fail on a pid the stub never recorded: a missing pid file would otherwise make the death
+    // checks below pass without having watched anything.
+    const expectDead = async (home: string, hostContainment: Containment) => {
+      const bg = readPid(home, 'bg.pid');
+      expect(bg).toBeDefined();
+      expect(await eventuallyDead(bg!)).toBe(true);
+      const setsid = readPid(home, 'setsid.pid');
+      if (hostHasSetsid) expect(setsid).toBeDefined();
+      if (setsid !== undefined && setsidContainmentRequired(hostContainment)) expect(await eventuallyDead(setsid)).toBe(true);
+    };
+
+    it('runs outside the kernel cwd, in a directory it removes, and reaps what the binary left running', async () => {
+      const hostContainment = await resolveContainment();
+      const { home, bin } = setup('exit');
+      try {
+        const version = await runVersionCommand(bin, { PATH: '/usr/bin:/bin', HOME: home }, hostContainment);
+        expect(version).toBe('codex-cli 1.2.3');
+        const cwd = readFileSync(join(home, 'cwd'), 'utf8').trim();
+        expect(cwd).not.toBe(process.cwd());
+        expect(existsSync(cwd)).toBe(false);
+        await expectDead(home, hostContainment);
+      } finally {
+        for (const pid of pids(home)) try { process.kill(pid, 'SIGKILL'); } catch { /* gone */ }
+        rmSync(home, { recursive: true, force: true });
+      }
+    });
+
+    it('reports no version and kills the whole tree when the binary hangs past the timeout', async () => {
+      const hostContainment = await resolveContainment();
+      const { home, bin } = setup('hang');
+      try {
+        const version = await runVersionCommand(bin, { PATH: '/usr/bin:/bin', HOME: home }, hostContainment, 500);
+        expect(version).toBeUndefined();
+        await expectDead(home, hostContainment);
+      } finally {
+        for (const pid of pids(home)) try { process.kill(pid, 'SIGKILL'); } catch { /* gone */ }
+        rmSync(home, { recursive: true, force: true });
+      }
+    });
   });
 
   it('rejects an invocation before spawning when the binary is not found', async () => {
