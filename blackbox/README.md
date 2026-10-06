@@ -114,6 +114,43 @@ user or CI consumer actually sees, not internal implementation details.
   under the `research.harness` span, whose usage is the fake's tokens. A
   second case sends a question: the adapter holds, aborts the session, and
   the card lands in `hold` at attempt 0 with the call's usage billed.
+- `harness/fake-claude-sdk.ts`: a scenario-driven stand-in for the Claude
+  Code CLI as the Agent SDK drives it, run behind the shipped `agent-sdk`
+  adapter through `stub:` on `startHarnessFlow()`. The adapter hands it to the
+  real `@anthropic-ai/claude-agent-sdk` as `pathToClaudeCodeExecutable`, and
+  the fake speaks the CLI side of the SDK's stream-json control protocol: it
+  answers the SDK's `initialize` control request and records the PreToolUse
+  `hookCallbackIds` it registers, takes the prompt from the `user` message on
+  stdin, and per scenario step sends an `assistant` `tool_use` message and a
+  `hook_callback` control request carrying the PreToolUse hook input. It
+  performs the step (runs the Bash command, writes the file) only when no hook
+  answered `permissionDecision: "deny"`, stops the turn on `continue: false`,
+  then sends a `result` message with usage and cost and exits when the SDK
+  closes stdin. A relative `file_path` is resolved against the cwd before it
+  is reported, as Claude Code's file tools take absolute paths. When no hook
+  was registered nothing runs and the log says `ungated`. Each invocation logs
+  its role, call number, argv, cwd, pid, the callback ids, every hook answer
+  and what it did, in fields `stubLog()` reads; it can also spawn a `setsid`
+  sleeper. The protocol shapes are read from the installed SDK (`sdk.mjs`,
+  `sdk.d.ts`), not imported. `harness/fake-claude-sdk.smoke.test.ts` drives it
+  with the SDK's `query()` and a test hook, without conduit.
+- `agent-sdk-gate.test.ts`: the per-call tool gate (issue #21) on the
+  `agent-sdk` adapter in a real `conduit run`. With `enforce_owned_paths`, one
+  call makes an allowlisted `cat`, a `curl`, a redirect, a Write of the
+  declared output and a Write outside the project root; the hook allows the
+  first and fourth, only those effects happen, the card reaches `done`, the
+  argv shows stream-json mode, `--setting-sources=` and the station's
+  `--allowedTools`, and `journal inspect` prints one `gate-decision` row per
+  call under the `research.harness` span, whose usage is the fake's result
+  message. A second case drops `enforce_owned_paths`, and the out-of-root
+  Write is still denied. A third case calls `AskUserQuestion`: the hook
+  answers `continue: false`, the fake runs nothing after it, and the card
+  lands in `hold` at attempt 0 with the result message's usage on the span. A
+  fourth case runs the same hold under `max_tokens` below that usage, and the
+  run halts on the tokens andon, so the held call's spend reaches the run
+  budget. A fifth case checks that a `setsid` sleeper spawned by the CLI is
+  dead after the run, with the same cgroup skip and require logic as
+  `harness-idle-timeout.test.ts`.
 - `no-internal-imports.test.ts` + `harness/import-scan.ts` — the zero-imports
   gate (AC-1): a TypeScript-compiler-API scan that fails if any file under
   `blackbox/` imports anything resolving into `src/`.
