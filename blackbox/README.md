@@ -26,7 +26,8 @@ user or CI consumer actually sees, not internal implementation details.
   role by a substring of the prompt, and uses a per-role counter file so call 1
   and call 2 can behave differently. Per call it can write files, emit
   stream-json lines (system/init, assistant tool_use, user tool_result,
-  `rate_limit_event`, `result` with usage and `total_cost_usd`), delay, exit
+  `rate_limit_event`, `result` with usage and `total_cost_usd`, optionally
+  preceded by earlier `result` events with a cumulative `modelUsage`), delay, exit
   with a given code, go silent for the idle timeout, and spawn a `setsid`
   sleeper that writes its pid. Every invocation appends its argv, cwd and pid
   to a log. The stream shapes are copied from the recorded CLI fixture
@@ -51,6 +52,13 @@ user or CI consumer actually sees, not internal implementation details.
   and the run halts on the tokens andon; a control run with more budget
   completes. The halt prints one andon line, and `run status` reports the run
   halted with its resume command (#83).
+- `harness-claude-session-usage.test.ts`: a Claude call's tokens are the
+  session total from `modelUsage`, not the last `result` event's `usage`
+  (issue #108). The maker's call emits two results, as a session with a
+  background subagent does; a run budget above the last turn's usage but
+  below the session total halts on the tokens andon before the second station
+  runs, and a control run with more budget completes. Runs once behind
+  `claude-headless` and once behind `agent-sdk`.
 - `harness-idle-timeout.test.ts`: `worker.idle_timeout_seconds` kills a
   silent call, which is retried up to `max_execution_attempts` and then
   scrapped as `harness-idle-timeout`. A `setsid` sleeper spawned by the stub

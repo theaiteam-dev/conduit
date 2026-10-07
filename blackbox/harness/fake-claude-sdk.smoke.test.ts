@@ -121,4 +121,33 @@ describe("fake-claude-sdk", () => {
     const result = messages.find((m) => m.type === "result") as Record<string, any> | undefined;
     expect(result?.usage).toMatchObject({ input_tokens: 7, output_tokens: 3 });
   }, 30_000);
+
+  test("every result's modelUsage entries carry costUSD and canonicalModel, as the real CLI's do", async () => {
+    const { messages } = await drive(
+      {
+        earlierResults: [
+          { usage: { input_tokens: 10, output_tokens: 5 }, modelUsage: { "claude-a": { inputTokens: 10, outputTokens: 5, costUSD: 0.01 } } },
+        ],
+        modelUsage: {
+          "claude-a": { inputTokens: 20, outputTokens: 10, costUSD: 0.02 },
+          "claude-b": { inputTokens: 3, outputTokens: 1, canonicalModel: "claude-b-canonical" },
+        },
+      },
+      () => "allow",
+    );
+    const results = messages.filter((m) => m.type === "result") as Record<string, any>[];
+    expect(results.map((r) => r.modelUsage)).toEqual([
+      { "claude-a": expect.objectContaining({ costUSD: 0.01, canonicalModel: "claude-a" }) },
+      {
+        "claude-a": expect.objectContaining({ costUSD: 0.02, canonicalModel: "claude-a" }),
+        "claude-b": expect.objectContaining({ costUSD: 0, canonicalModel: "claude-b-canonical" }),
+      },
+    ]);
+  }, 30_000);
+
+  test("the default modelUsage entry carries canonicalModel", async () => {
+    const { messages } = await drive({ usage: { input_tokens: 4, output_tokens: 2 } }, () => "allow");
+    const result = messages.find((m) => m.type === "result") as Record<string, any> | undefined;
+    expect(result?.modelUsage).toEqual({ "claude-fake": expect.objectContaining({ inputTokens: 4, costUSD: 0.001, canonicalModel: "claude-fake" }) });
+  }, 30_000);
 });
