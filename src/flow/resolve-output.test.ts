@@ -156,6 +156,14 @@ describe('resolveDeliverFile', () => {
     ).toBe(join(dir, 'r.json'));
   });
 
+  it('throws for a card-scoped output whose card dir cannot be resolved, never returning the bare name', () => {
+    const station = { outputs: ['report.md'], output_scope: 'owned_dir' as const };
+    expect(() => resolveDeliverFile('report.md', station, root, [])).toThrow(/has no owned_paths/);
+    expect(() => resolveDeliverFile('report.md', station, root, ['missing'])).toThrow(/existing directory/);
+    writeFileSync(join(root, 'report.md'), 'shared');
+    expect(() => resolveDeliverFile('report.md', station, root, undefined)).toThrow(/has no owned_paths/);
+  });
+
   it('leaves entries that are not card-scoped outputs unchanged', () => {
     mkdirSync(join(root, 'c1'));
     expect(resolveDeliverFile('other.md', { outputs: ['report.md'], output_scope: 'owned_dir' }, root, ['c1'])).toBe(
