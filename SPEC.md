@@ -834,6 +834,46 @@ risk and gets the most poka-yoke.
 > unchanged. See [`docs/harness-containment.md`](docs/harness-containment.md) for the
 > full profile.
 
+### Overlapping harness calls (ADR-0012, Proposed)
+
+> **Not built.** This subsection specifies the rule [ADR-0012](adr/0012-overlapping-ungated-harness-calls.md)
+> proposes. Until it ships, every `kind: harness` station runs one card at a time under any
+> `--concurrency K`, and the harness integrity check is the serial rule: every path touched
+> under the project root between the call's baseline snapshot and its post-invoke snapshot
+> must lie inside the card's `owned_paths`, or the card holds.
+
+A harness station may declare `overlap: true` (station level, beside `wip`; rejected on any
+other `kind`). Its cards then run as overlapping calls, up to `min(K, wip)` at a time, when
+every admission condition holds:
+
+- **Static, validated at load:** the station has no `check:` block, is not `effectful`, is
+  not a fan-out station, and has no `deliver` block; its adapter has `canGatePerCall` (checked
+  again at dispatch); and the flow sets `defaults.enforce_owned_paths: true`, so the per-call
+  gate confines file-tool writes to the card's `owned_paths`.
+- **Dynamic, at dispatch:** the card declares non-empty `owned_paths`, and they are disjoint
+  (canonicalized) from those of every member already in flight. A card that fails either
+  runs on the serial path under the serial rule.
+
+Harness members and transform members never overlap each other: a dispatch pass runs them as
+separate batches.
+
+**The overlap integrity rule.** A member's window runs from its baseline snapshot to its
+post-invoke snapshot, and the kernel records which other members' windows intersected it.
+Each path in a member's diff is classified as: inside its own `owned_paths` → allowed; inside
+the `owned_paths` of a member whose window intersected its own → attributed to that member
+(journaled on the span), not a breach; anywhere else → a breach, and the card holds. The
+disjoint ownership invariant (§9) makes the attribution unambiguous. Because a path that no
+member owns cannot be attributed, a breach by one member holds every member whose diff
+contains it.
+
+**The gap.** The overlap rule cannot detect a write by one member into another overlapping
+member's `owned_paths`: both diffs attribute it to the owner. The per-call gate denies such a
+write through the file-write tools before it runs. It does not deny one made by an
+allowlisted Bash executable that writes to a path given as an argument (`cp`, `tee`,
+`sed -i`, a script the agent wrote); shell redirects are already denied as metacharacters.
+`overlap: true` is the flow author's acceptance of that gap for the station. A write outside
+every member's `owned_paths` is still detected.
+
 ### The atomic claim (rev-1 C6)
 deps + WIP + worker-slot must become true at a **single linearization point**. They live
 in different substrates (deps/WIP in SQLite; worker slot is physical), so the claim is a
@@ -937,7 +977,9 @@ Conduit unfurls the plan at runtime rather than following a static script.
   **validates that owned-path sets across concurrently-eligible cards are disjoint** —
   or forces a `depends_on` serialization edge for a shared path. The Architect (an LLM)
   proposes; the Kernel (deterministic) enforces. This closes the "two cards both own
-  `config.ts`" race that path-ownership alone misses.
+  `config.ts`" race that path-ownership alone misses. The overlap integrity rule for
+  harness calls (§7) depends on this invariant: it attributes a touched path to the one
+  in-flight card that owns it.
 - **Two axes of motion, deliberately different:**
   - **Forward-only across waves.** An implementation failure → **hard pause for a human**
     (`hold`), never an automatic "nuclear reversal" to Wave 1 (state rot).
