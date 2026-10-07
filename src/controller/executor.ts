@@ -27,7 +27,7 @@
  *   - halt/escalation reasons — io.out / io.err
  */
 
-import { readFileSync, writeFileSync, existsSync, realpathSync, readdirSync, statSync, readlinkSync, mkdirSync, unlinkSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, realpathSync, readdirSync, statSync, readlinkSync, mkdirSync, unlinkSync, rmSync } from 'node:fs';
 import { join, resolve, sep, dirname } from 'node:path';
 import { createHash } from 'node:crypto';
 import { AsyncLocalStorage } from 'node:async_hooks';
@@ -57,6 +57,14 @@ import { loadImageInput, hashImageInputs, assertImagePayloadWithinLimits } from 
 import type { ImageInput } from '../worker/image-input';
 import { renderPrompt } from '../flow/render';
 import { resolveInputPath, SEED_INPUT } from '../flow/resolve-input';
+import {
+  cardScopedArtifactNames,
+  describeOutputDestinations,
+  isOutputCardScoped,
+  resolveDeclaredOutputs,
+  resolveDeliverFile,
+  type ResolvedOutput,
+} from '../flow/resolve-output';
 import { buildOutputSchema } from '../flow/schema';
 import { runGateRework } from './gate-rework';
 import {
@@ -2011,6 +2019,23 @@ function persistStdoutToSingleDeclaredOutput(
  * silently produced nothing. Returns the missing output paths (empty = all
  * declared outputs are present).
  */
+/**
+ * Remove each declared output that exists, before a harness attempt (issue #98
+ * freshness rule). A missing file is the normal case. Returns null on success,
+ * or a description of the first output that could not be removed (a directory
+ * at the output path, a permission error), which the caller turns into a hold.
+ */
+function removeStaleOutputs(outputs: readonly ResolvedOutput[]): string | null {
+  for (const output of outputs) {
+    try {
+      rmSync(output.path, { force: true });
+    } catch (rmErr) {
+      return `'${output.name}' at '${output.path}': ${(rmErr as Error).message}`;
+    }
+  }
+  return null;
+}
+
 function findMissingDeclaredOutputs(projectRoot: string, stationConfig: StationConfig): string[] {
   const outputs = stationConfig.outputs ?? [];
   return outputs.filter((output) => !existsSync(join(projectRoot, output)));
@@ -2632,7 +2657,23 @@ async function performStationDelivery(args: {
       ? resolveThreadAddress(db, { run_id: runId }, deliver.thread_from)
       : undefined;
 
-  for (const file of deliver.files) {
+  for (const declaredFile of deliver.files) {
+    // Issue #98: an entry naming one of this station's card-scoped declared
+    // outputs is delivered from the card's own directory, resolved by the same
+    // resolver that wrote or collected it. Every other entry is a
+    // project-root-relative path, unchanged. A card whose directory cannot be
+    // resolved holds rather than delivering a project-root file of that name.
+    let file: string;
+    try {
+      file = resolveDeliverFile(declaredFile, stationConfig, projectRoot, card.owned_paths);
+    } catch (resolveErr) {
+      escalateToHold(
+        stateDb, db, cardId, stationId, card,
+        `station '${stationId}' deliver.files declares '${declaredFile}', a card-scoped output that could not be resolved: ${(resolveErr as Error).message}`,
+        err, runId,
+      );
+      return { ok: false };
+    }
     // UNCONDITIONAL project-root containment (symlink-resolved) — delivery is
     // an EGRESS surface that reads and ships bytes to an external service, so
     // it must be contained regardless of the enforce_owned_paths write-gate
@@ -2857,9 +2898,12 @@ async function runGateCheckOrAdvance(args: GateCheckOrAdvanceArgs): Promise<bool
         harnessOnEvent: criticEvents.onEvent,
         projectRoot,
         // The critic judges THIS child's work, so it resolves the same
-        // card-scoped inputs the maker did (issue #51).
+        // card-scoped inputs the maker did (issue #51), and its scope's
+        // declared OUTPUTS from where the maker wrote them: the card's own dir
+        // under output_scope: owned_dir (issue #98), which resolve-output.ts
+        // and resolve-input.ts both put at resolve(projectRoot, owned_paths[0]).
         ownedPaths: card.owned_paths,
-        ownedDirInputs: stationConfig.input_scope?.owned_dir ?? [],
+        ownedDirInputs: cardScopedArtifactNames(stationConfig),
         validBackEdges: flow.back_edges ?? [],
         // Pass the flow-level cap policy so gate-rework can signal 'rework' for
         // proceed_with_findings (rather than 'scrap') when the rework cap trips.
@@ -3459,97 +3503,26 @@ async function executeTransformStation(args: TransformArgs): Promise<boolean> {
 
   // ── Write output artifacts to disk ────────────────────────────────────────
   // Gate critics read these artifacts — they must exist before renderPrompt runs.
-  // Issue C: guard each output path against traversal outside the project root.
   //
-  // Two roots are needed for the two branches of the guard:
-  //   resolvedProjectRoot — realpath'd (symlink-resolved). Used on the normal
-  //     branch where the parent dir exists and realpathSync succeeds. This is
-  //     the symlink-escape defense — a malicious ancestor symlink cannot launder
-  //     an escape.
-  //   lexicalProjectRoot — lexically normalised (resolve(), no realpathSync). Used
-  //     on the fallback branch when the parent dir does not exist yet (ENOENT).
-  //     A not-yet-created subdir cannot be symlink-resolved; comparing the lexical
-  //     target against the lexical root is the correct and sufficient check here.
-  // v10 output_scope: 'owned_dir' writes declared outputs into the card's
-  // owned_paths[0] directory (the same card-scoped location seed.json lives in)
-  // instead of project root, so N homogeneous fan-out children each produce
-  // their OWN artifacts rather than clobbering one shared name (SPEC §9:
-  // outputs are disjoint across concurrent cards). Fail-closed: a scoped card
-  // whose owned_paths[0] is not an existing directory is a config violation —
-  // thrown, matching the escape-guard convention below.
-  const outputBase = (() => {
-    if (stationConfig.output_scope !== 'owned_dir') return projectRoot;
-    const owned = card.owned_paths?.[0];
-    if (owned === undefined) {
-      throw new Error(
-        `Station '${stationId}' declares output_scope: owned_dir but card '${cardId}' has no ` +
-          `owned_paths — cannot resolve an owned output directory`,
-      );
-    }
-    const ownedDir = resolve(projectRoot, owned);
-    let isDir = false;
+  // Where each one goes is decided by flow/resolve-output.ts, the resolver the
+  // harness collector, the gate critic and deliver.files also use (issue #98).
+  // `output_scope: owned_dir` puts them in the card's owned_paths[0] instead of
+  // project root, so N fan-out children each write their own files (SPEC §9).
+  // Both failure modes are thrown config violations, as they were before the
+  // resolver existed: a scoped card whose owned_paths[0] is not an existing
+  // directory, and an output name that escapes its base (Issue C: lexically,
+  // or through a symlinked ancestor).
+  const declaredOutputs = (() => {
     try {
-      isDir = statSync(ownedDir).isDirectory();
-    } catch {
-      isDir = false;
-    }
-    if (!isDir) {
-      throw new Error(
-        `Station '${stationId}' declares output_scope: owned_dir but card '${cardId}' ` +
-          `owned_paths[0] '${owned}' is not an existing directory — create it before fan-out ` +
-          `(same rule as the per-child seed)`,
-      );
-    }
-    return ownedDir;
-  })();
-
-  const resolvedProjectRoot = (() => {
-    try {
-      return realpathSync(outputBase);
-    } catch {
-      return resolve(outputBase);
+      return resolveDeclaredOutputs(stationConfig, projectRoot, card.owned_paths);
+    } catch (resolveErr) {
+      throw new Error(`Station '${stationId}' card '${cardId}': ${(resolveErr as Error).message}`);
     }
   })();
-  const lexicalProjectRoot = resolve(outputBase);
 
   const payload = stationOutput.payload;
-  for (const outputName of stationConfig.outputs) {
-    // Guard: lexically normalize (catches `../` traversal).
-    const lexicalTarget = resolve(join(outputBase, outputName));
-
-    // Guard: symlink-aware check on the parent directory so a malicious
-    // ancestor symlink cannot launder an escape into a false allow.
-    // If the parent doesn't exist yet (first write into a new subdir), fall back
-    // to the LEXICAL root check — comparing the lexical target against the lexical
-    // project root avoids the false-reject that occurs when the project root is
-    // reached through a symlink and the output dir has not been created yet.
-    const parentDir = join(lexicalTarget, '..');
-    let resolvedTarget: string;
-    let parentExists = false;
-    try {
-      const resolvedParent = realpathSync(parentDir);
-      // join(resolvedParent, basename(lexicalTarget)) reassembles the canonical path.
-      const fileName = lexicalTarget.slice(parentDir.length).replace(/^[\\/]+/, '');
-      resolvedTarget = join(resolvedParent, fileName);
-      parentExists = true;
-    } catch {
-      resolvedTarget = lexicalTarget;
-    }
-
-    // Choose the appropriate root for the confinement check:
-    //   - Parent exists → use realpath-based root (full symlink-escape defense).
-    //   - Parent ENOENT  → use lexical root (safe for new subdirs under a symlinked root).
-    const rootForCheck = parentExists ? resolvedProjectRoot : lexicalProjectRoot;
-
-    if (!resolvedTarget.startsWith(rootForCheck + sep) && resolvedTarget !== rootForCheck) {
-      // Output would escape the project root — throw to surface as a fatal config violation.
-      throw new Error(
-        `Output path '${outputName}' resolves outside the project root '${rootForCheck}'. ` +
-          `Station '${stationId}' output paths must not traverse above the project root.`,
-      );
-    }
-
-    writeFileSync(join(outputBase, outputName), JSON.stringify(payload, null, 2), 'utf-8');
+  for (const output of declaredOutputs) {
+    writeFileSync(output.path, JSON.stringify(payload, null, 2), 'utf-8');
   }
 
   // ── MARK_DONE integrity gate (SPEC §5/§6) ─────────────────────────────────
@@ -3559,14 +3532,11 @@ async function executeTransformStation(args: TransformArgs): Promise<boolean> {
   // (so a resume never skip-replays the out-of-bounds output) and hard-pause to
   // hold for a human.
   if (flow.defaults?.enforceOwnedPaths === true) {
-    // Under output_scope: owned_dir the outputs were written into owned_paths[0],
-    // so the touched set must be the owned-dir-joined paths — checking the bare
-    // names would test project-root locations nothing wrote to (a false violation
-    // for scoped stations, a false pass for the actual writes).
-    const touchedOutputs =
-      stationConfig.output_scope === 'owned_dir' && card.owned_paths?.[0] !== undefined
-        ? stationConfig.outputs.map((name) => join(card.owned_paths![0]!, name))
-        : stationConfig.outputs;
+    // The touched set is the paths the writer above actually wrote, from the
+    // same resolver. Under output_scope: owned_dir the bare names would test
+    // project-root locations nothing wrote to (a false violation for scoped
+    // stations, a false pass for the actual writes).
+    const touchedOutputs = declaredOutputs.map((output) => output.path);
     const violation = runOwnedPathsIntegrity(projectRoot, card.owned_paths ?? [], touchedOutputs);
     if (violation && !violation.ok) {
       invalidateCheckpoint(stateDb, { run: runId, flow: String(flow.version), card: cardId, station: stationId, attempt: card.attempt });
@@ -3873,6 +3843,7 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
     // unknown outcome, since nothing was actually invoked yet.
     let prompt: string;
     let mountedInputs: MountedInput[];
+    let declaredOutputs: ResolvedOutput[];
     try {
       const promptTemplate = stationConfig.prompt_content ?? readFileSync(stationConfig.prompt_file!, 'utf-8');
       prompt = renderPrompt(
@@ -3908,6 +3879,39 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
       return false;
     }
 
+    // ── Resolve declared outputs BEFORE the invoke (issue #98) ───────────────
+    // flow/resolve-output.ts is the one resolver for every use of these paths
+    // below: the destinations the agent is told, the stale-file removal, the
+    // presence check, the JSON/schema read and the artifact hashes. Resolving
+    // here, before anything is invoked, is the fail-closed check the issue #51
+    // input side already has: a card-scoped station whose card has no owned
+    // dir, a dir that does not exist or lies outside the project root (the
+    // integrity snapshot below sees only the project root), or an output name
+    // that escapes its dir, holds the card instead of running an agent whose
+    // result could not be collected or checked.
+    try {
+      declaredOutputs = resolveDeclaredOutputs(stationConfig, projectRoot, card.owned_paths, {
+        requireWithinProjectRoot: true,
+      });
+    } catch (resolveErr) {
+      if (pendingIntentKey !== null) {
+        discardIntent(stateDb, pendingIntentKey);
+      }
+      escalateToHold(
+        stateDb, db, cardId, stationId, card,
+        `harness station '${stationId}' could not resolve its declared outputs: ${(resolveErr as Error).message}`,
+        err, runId, true,
+      );
+      return false;
+    }
+    const outputsCardScoped = isOutputCardScoped(stationConfig);
+    // A card-scoped station's prompt names each destination, so the flow's
+    // template need not know the card's directory. The default scope adds
+    // nothing, which keeps every existing prompt byte-identical.
+    if (outputsCardScoped) {
+      prompt += describeOutputDestinations(declaredOutputs);
+    }
+
     const timeoutMs =
       stationConfig.timeout_seconds !== undefined
         ? stationConfig.timeout_seconds * 1000
@@ -3924,7 +3928,7 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
     // card SCRAPS (never holds) with a reason that NAMES which class exhausted
     // it — distinct from a transform's 'model-incompatible' scrap.
     const schema = buildOutputSchema(stationConfig.output_schema?.fields ?? []);
-    const outputFile = stationConfig.outputs[0];
+    const outputFile = declaredOutputs[0];
     let callsMade = 0;
     let scrapReason = 'harness-invocation-failed';
     // Issue #71: the journal sink for this station's harness events. Each
@@ -3952,6 +3956,32 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
       // by owned_paths, so declared-outputs alone is not a complete touched-set
       // for this station kind (unlike transform, where the executor itself
       // performs the only write, from the model's structured response).
+      //
+      // Issue #98 freshness rule: a card-scoped declared output is REMOVED before
+      // every attempt, ahead of the baseline, so a file found after the invoke
+      // was written by this invoke. A file from a prior failed attempt, or from
+      // an earlier run of this card, cannot be collected as this attempt's
+      // result. A sibling's file is never at this path at all (disjoint owned
+      // dirs), and the shared project-root name is never read. The removal is
+      // limited to card-scoped outputs because those paths belong to this card
+      // alone; a project-root output may be shared state the flow relies on, so
+      // the default scope keeps its pre-#98 behaviour (presence only).
+      if (outputsCardScoped) {
+        const removeErr = removeStaleOutputs(declaredOutputs);
+        if (removeErr !== null) {
+          // Only the first attempt has invoked nothing yet; after a failed
+          // attempt the pending intent's outcome is unknown and stays for a human.
+          if (pendingIntentKey !== null && callsMade === 0) {
+            discardIntent(stateDb, pendingIntentKey);
+          }
+          escalateToHold(
+            stateDb, db, cardId, stationId, card,
+            `harness station '${stationId}' could not remove a stale declared output before invoking: ${removeErr}`,
+            err, runId, true,
+          );
+          return false;
+        }
+      }
       const integrityBaseline = snapshotTree(projectRoot);
 
       // Issue #30: read the clock fresh, since a retry runs after this loop's
@@ -3973,6 +4003,7 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
         invokeResult = await harnessAdapter.invoke({
           prompt,
           inputs: mountedInputs,
+          declaredOutputs: declaredOutputs.map((o) => ({ name: o.name, path: o.path })),
           tools: stationConfig.tools ?? [],
           timeoutMs,
           model: effectiveModel,
@@ -4244,9 +4275,9 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
       }
 
       // ── Collect declared outputs FROM DISK (hybrid: like deterministic) ────
-      // "validated present" == the declared output file exists on disk — the
-      // harness wrote it itself during invoke.
-      const missingOutputs = findMissingDeclaredOutputs(projectRoot, stationConfig);
+      // "validated present" == the declared output file exists on disk at its
+      // resolved path — the harness wrote it itself during invoke.
+      const missingOutputs = declaredOutputs.filter((o) => !existsSync(o.path)).map((o) => o.name);
       if (missingOutputs.length > 0) {
         callsMade++;
         scrapReason = `harness-output-missing: ${missingOutputs.join(', ')}`;
@@ -4264,14 +4295,14 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
       let payload: unknown = null;
       if (outputFile !== undefined) {
         try {
-          payload = coerciveParse(readFileSync(join(projectRoot, outputFile), 'utf-8'));
+          payload = coerciveParse(readFileSync(outputFile.path, 'utf-8'));
         } catch {
           payload = null;
         }
       }
       if (payload === null) {
         callsMade++;
-        scrapReason = `harness-output-unparseable: station '${stationId}' output '${outputFile ?? '(none declared)'}' is not valid JSON`;
+        scrapReason = `harness-output-unparseable: station '${stationId}' output '${outputFile?.name ?? '(none declared)'}' is not valid JSON`;
         db.appendJournalSpan({
           runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.harness`, ...provenance, invocationId,
           adapter: harnessAdapter.name, durationMs, usageUnknown: !usageKnown, usage: journalUsage,
@@ -4313,9 +4344,9 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
       // name + sha256, never raw bytes, mirroring the containment profile's
       // "hashes, never transcripts" posture.
       const artifactHashes: Record<string, string> = {};
-      for (const name of stationConfig.outputs) {
+      for (const { name, path } of declaredOutputs) {
         try {
-          artifactHashes[name] = createHash('sha256').update(readFileSync(join(projectRoot, name))).digest('hex');
+          artifactHashes[name] = createHash('sha256').update(readFileSync(path)).digest('hex');
         } catch {
           /* best-effort — presence of this exact file was already confirmed above */
         }
