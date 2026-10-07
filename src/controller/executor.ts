@@ -2013,13 +2013,6 @@ function persistStdoutToSingleDeclaredOutput(
 }
 
 /**
- * the deterministic-output work fix 2 — the post-run safety net. After the command runs (and after
- * fix 1's stdout capture has had its chance to fill the single-output case),
- * any declared `outputs:` artifact still missing on disk means the station
- * silently produced nothing. Returns the missing output paths (empty = all
- * declared outputs are present).
- */
-/**
  * Remove each declared output that exists, before a harness attempt (issue #98
  * freshness rule). A missing file is the normal case. Returns null on success,
  * or a description of the first output that could not be removed (a directory
@@ -2036,6 +2029,13 @@ function removeStaleOutputs(outputs: readonly ResolvedOutput[]): string | null {
   return null;
 }
 
+/**
+ * the deterministic-output work fix 2 — the post-run safety net. After the command runs (and after
+ * fix 1's stdout capture has had its chance to fill the single-output case),
+ * any declared `outputs:` artifact still missing on disk means the station
+ * silently produced nothing. Returns the missing output paths (empty = all
+ * declared outputs are present).
+ */
 function findMissingDeclaredOutputs(projectRoot: string, stationConfig: StationConfig): string[] {
   const outputs = stationConfig.outputs ?? [];
   return outputs.filter((output) => !existsSync(join(projectRoot, output)));
@@ -3611,7 +3611,8 @@ interface HarnessArgs {
  *     one bounded `adapter.invoke` call.
  *   - COLLECTS OUTPUTS FROM DISK like a deterministic station — the harness
  *     writes its declared output files itself during invoke; this reads them
- *     back (findMissingDeclaredOutputs, then coerciveParse + buildOutputSchema,
+ *     back from the paths `flow/resolve-output.ts` resolves (presence, then
+ *     coerciveParse + buildOutputSchema,
  *     mirroring the transform coercive-parse contract) rather than serializing
  *     a returned payload as the transform path does.
  *

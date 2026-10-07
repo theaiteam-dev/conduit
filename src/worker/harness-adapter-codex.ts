@@ -33,7 +33,7 @@
  *      counts, with cost approximated as 0 rather than discarding the tokens.
  *
  * `outputs` is always `[]` — the executor collects declared outputs from disk
- * (findMissingDeclaredOutputs in executor.ts); the codex stream carries no
+ * (at the paths flow/resolve-output.ts resolves); the codex stream carries no
  * file manifest, so this adapter never fabricates output references.
  *
  * Do NOT touch ./harness.ts (unrelated worker-pool subprocess harness).
