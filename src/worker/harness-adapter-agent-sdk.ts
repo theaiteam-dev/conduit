@@ -59,7 +59,7 @@ import {
 } from './harness-adapter-claude';
 import { createHarnessEventEmitter } from './harness-events';
 import { mapClaudeStreamMessage, rateLimitWindowsFromInfo, type ClaudeRateLimitInfo } from './harness-events-claude';
-import { HARNESS_GATE_HOLD_CODE, callGateFailClosed, type GateDecision } from './harness-gate';
+import { HARNESS_GATE_HOLD_CODE, callGateFailClosed, type GateDecision, type GateDenyCode } from './harness-gate';
 import { buildHarnessChildEnv } from './harness-runner';
 import { resolveClaudePluginAgent } from './claude-plugin-agents';
 import { createRunScopedClaudeConfigDir, removeRunScopedClaudeConfigDir } from './claude-config-isolation';
@@ -116,7 +116,7 @@ const EXIT_WAIT_MS = 5_000;
  */
 const HOLD_STOP_WAIT_MS = 5_000;
 /** `gate-decision` code journaled when a main-thread call shows the CLI did not load the requested agent. */
-const AGENT_NOT_LOADED = 'agent_not_loaded';
+const AGENT_NOT_LOADED: GateDenyCode = 'agent_not_loaded';
 /** Bytes of the child's stderr kept for rate-limit detection and error detail. */
 const STDERR_TAIL_BYTES = 2_000;
 
@@ -279,7 +279,7 @@ export function createAgentSdkHarnessAdapter(config: AgentSdkHarnessAdapterConfi
         const preToolUse: HookCallback = async (input, toolUseId) => {
           if (input.hook_event_name !== 'PreToolUse') return { continue: true };
           const toolCallId = toolUseId ?? input.tool_use_id;
-          const emitDecision = (decision: GateDecision | { decision: 'deny'; code: string; reason: string }): void =>
+          const emitDecision = (decision: GateDecision): void =>
             emit?.({
               type: 'gate-decision',
               toolCallId,
@@ -289,8 +289,7 @@ export function createAgentSdkHarnessAdapter(config: AgentSdkHarnessAdapterConfi
               ...(input.agent_id !== undefined ? { agentId: input.agent_id } : {}),
             });
           if (st.held !== undefined || st.agentNotLoaded !== undefined) {
-            // AGENT_NOT_LOADED is the adapter's own code, outside the gate's GateDenyCode set.
-            const later: { decision: 'deny'; code: string; reason: string } =
+            const later: GateDecision =
               st.held !== undefined
                 ? { decision: 'deny', code: 'needs_human', reason: 'an earlier call was held for a human' }
                 : { decision: 'deny', code: AGENT_NOT_LOADED, reason: 'an earlier call showed the CLI did not load the requested agent' };

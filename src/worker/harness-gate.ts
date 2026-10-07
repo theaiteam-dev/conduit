@@ -42,7 +42,13 @@ export type GateDenyCode =
    * PreToolUse hook rewrote it. Never returned by the gate. The agent-sdk
    * adapter detects it after the call ran and holds (issue #109).
    */
-  | 'input_rewritten';
+  | 'input_rewritten'
+  /**
+   * The CLI ran a different agent than the one the kernel resolved and hashed.
+   * Never returned by the gate. The agent-sdk adapter detects it from the init
+   * message or a main-thread call's `agent_type` and holds (issue #109).
+   */
+  | 'agent_not_loaded';
 
 /** One tool call, as the harness is about to run it. */
 export interface GateToolCall {
