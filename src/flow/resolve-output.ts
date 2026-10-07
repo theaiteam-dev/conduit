@@ -251,6 +251,16 @@ function confineOutput(base: string, name: string, label: string): string {
     // Parent does not exist yet: the lexical comparison below applies.
   }
 
+  // A name that normalizes to the base itself (`.`, `sub/..`) names a
+  // directory, not an output file: the writer would target the directory and
+  // the harness freshness rule would try to remove it.
+  if (lexicalTarget === lexicalBase) {
+    throw new Error(
+      `Output path '${name}' resolves to the ${label} itself. ` +
+        `A declared output must name a file inside the directory it is scoped to.`,
+    );
+  }
+
   const rootForCheck = parentExists ? canonical(base) : lexicalBase;
   if (resolvedTarget !== rootForCheck && !resolvedTarget.startsWith(rootForCheck + sep)) {
     throw new Error(

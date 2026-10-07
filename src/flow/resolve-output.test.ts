@@ -115,6 +115,15 @@ describe('resolveDeclaredOutputs', () => {
     ]);
   });
 
+  it('rejects a name that resolves to the base directory itself', () => {
+    mkdirSync(join(root, 'c1'));
+    const scoped = { output_scope: 'owned_dir' as const };
+    expect(() => resolveDeclaredOutputs({ outputs: ['.'], ...scoped }, root, ['c1'])).toThrow(/resolves to the owned directory itself/);
+    expect(() => resolveDeclaredOutputs({ outputs: ['sub/..'], ...scoped }, root, ['c1'])).toThrow(/resolves to the owned directory itself/);
+    expect(() => resolveDeclaredOutputs({ outputs: ['.'] }, root, [])).toThrow(/resolves to the project root itself/);
+    expect(() => resolveDeclaredOutputs({ outputs: ['new/..'] }, root, [])).toThrow(/resolves to the project root itself/);
+  });
+
   it('keeps the project-root escape message for the default scope', () => {
     expect(() => resolveDeclaredOutputs({ outputs: ['../x.json'] }, root, [])).toThrow(
       /resolves outside the project root/,
