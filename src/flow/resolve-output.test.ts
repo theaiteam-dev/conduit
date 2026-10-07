@@ -102,6 +102,19 @@ describe('resolveDeclaredOutputs', () => {
     ).toThrow(/resolves outside the owned directory/);
   });
 
+  it('rejects a default-scope name that escapes the root through a symlinked ancestor', () => {
+    symlinkSync(outside, join(root, 'linked'));
+    expect(() => resolveDeclaredOutputs({ outputs: ['linked/result.json'] }, root, [])).toThrow(
+      /resolves outside the project root/,
+    );
+  });
+
+  it('allows a default-scope name under a not-yet-created subdirectory of the root', () => {
+    expect(resolveDeclaredOutputs({ outputs: ['newdir/result.json'] }, root, [])).toEqual([
+      { name: 'newdir/result.json', path: join(root, 'newdir/result.json') },
+    ]);
+  });
+
   it('keeps the project-root escape message for the default scope', () => {
     expect(() => resolveDeclaredOutputs({ outputs: ['../x.json'] }, root, [])).toThrow(
       /resolves outside the project root/,
@@ -133,6 +146,14 @@ describe('resolveDeliverFile', () => {
     expect(
       resolveDeliverFile('report.md', { outputs: ['report.md'], output_scope: 'owned_dir' }, root, ['evidence/c1']),
     ).toBe(join('evidence', 'c1', 'report.md'));
+  });
+
+  it('returns the absolute path when the owned dir is outside the project root', () => {
+    const dir = join(outside, 'card');
+    mkdirSync(dir);
+    expect(
+      resolveDeliverFile('r.json', { outputs: ['r.json'], output_scope: 'owned_dir' }, root, [dir]),
+    ).toBe(join(dir, 'r.json'));
   });
 
   it('leaves entries that are not card-scoped outputs unchanged', () => {

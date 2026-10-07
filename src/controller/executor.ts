@@ -4277,8 +4277,16 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
 
       // ── Collect declared outputs FROM DISK (hybrid: like deterministic) ────
       // "validated present" == the declared output file exists on disk at its
-      // resolved path — the harness wrote it itself during invoke.
-      const missingOutputs = declaredOutputs.filter((o) => !existsSync(o.path)).map((o) => o.name);
+      // resolved path — the harness wrote it itself during invoke. A directory
+      // at the path is not an output: it could not be hashed below.
+      const isFile = (p: string): boolean => {
+        try {
+          return statSync(p).isFile();
+        } catch {
+          return false;
+        }
+      };
+      const missingOutputs = declaredOutputs.filter((o) => !isFile(o.path)).map((o) => o.name);
       if (missingOutputs.length > 0) {
         callsMade++;
         scrapReason = `harness-output-missing: ${missingOutputs.join(', ')}`;

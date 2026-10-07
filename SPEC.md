@@ -458,11 +458,12 @@ A `harness` station writes its outputs itself, so a card-scoped one has three mo
   `HarnessInvocation.declaredOutputs`. The flow's template does not have to know the
   card's directory.
 - **Checked before execution.** The card's dir must exist, must be inside the project
-  root after symlinks are resolved (the mandatory integrity check snapshots only the
+  root after symlinks are resolved (the harness integrity check snapshots only the
   project root, so it could not check writes anywhere else), and no output name may
   escape it. A card that fails any of these goes to `hold` before the harness runs, as a
-  card-scoped input that cannot be resolved does. The mandatory owned-paths integrity
-  check still runs on every attempt.
+  card-scoped input that cannot be resolved does. The harness owned-paths integrity
+  check still runs on every attempt: for `kind: harness` it is unconditional, unlike the
+  `defaults.enforce_owned_paths` opt-in that governs the transform and deterministic paths.
 - **Freshness.** Before every attempt, including a retry within one dispatch, the kernel
   removes each card-scoped declared output that exists. A file present after the call
   was therefore written by that call: a file from a failed attempt or an earlier run

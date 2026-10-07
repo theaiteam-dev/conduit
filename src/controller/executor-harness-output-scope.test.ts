@@ -438,6 +438,38 @@ describe('harness output_scope: owned_dir — freshness and retry (issue #98)', 
     expect(outcomes[1]).toMatch(/harness-output-missing/);
   });
 
+  it('reports a directory at a non-first declared output path as missing, and accepts no checkpoint', async () => {
+    const calls: HarnessInvocation[] = [];
+    const adapter: HarnessAdapter = {
+      name: 'fake-walker',
+      reportsUsage: true,
+      canRestrictTools: true,
+      async probeBinary() {
+        return { present: true };
+      },
+      async invoke(call: HarnessInvocation) {
+        calls.push(call);
+        const result = outputPathFromPrompt(call.prompt, 'result.json')!;
+        const extra = outputPathFromPrompt(call.prompt, 'extra.json')!;
+        writeFileSync(result, JSON.stringify({ verdict: 'pass' }), 'utf-8');
+        mkdirSync(extra, { recursive: true });
+        return { outputs: [{ name: 'result.json', path: result }], usage: { tokens: 10, cost: 0.01 } };
+      },
+    };
+    const registry = createHarnessRegistry([adapter]);
+    const flow = writeFlow(dir, registry, { outputs: '[result.json, extra.json]', maxAttempts: 1 });
+    seedChild(db, dir, 'c1');
+
+    await run(db, flow, registry, makeModel().adapter);
+
+    expect(db.getCard(DEFAULT_RUN_ID, 'c1')?.lane).toBe('scrap');
+    expect(terminalReasons(db, 'c1')).toMatch(/harness-output-missing: extra\.json/);
+    const outcomes = harnessSpans(db, 'c1').map((s) => String(s.attributes?.outcome));
+    expect(outcomes.length).toBeGreaterThan(0);
+    for (const outcome of outcomes) expect(outcome).toMatch(/harness-output-missing: extra\.json/);
+    expect(checkpointPayload(db, 'c1')).toBeUndefined();
+  });
+
   it('a retry that writes a valid result succeeds with that attempt’s bytes', async () => {
     const walker = makeWalker((_c, n) => (n === 1 ? 'invalid' : 'valid'));
     const registry = createHarnessRegistry([walker.adapter]);
