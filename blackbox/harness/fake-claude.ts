@@ -335,22 +335,22 @@ async function main(): Promise<number> {
     });
   }
 
+  for (const [i, earlier] of (call.earlierResults ?? []).entries()) {
+    emit(resultEvent(earlier.usage, modelUsageEntries(earlier.modelUsage), earlier.costUsd ?? 0.001));
+    emit({
+      type: "assistant",
+      message: {
+        model: model ?? "claude-fake",
+        id: `msg_fake_${callNumber}_after_result_${i + 1}`,
+        type: "message",
+        role: "assistant",
+        content: [{ type: "text", text: "The background agent reported back." }],
+      },
+      parent_tool_use_id: null,
+      session_id: SESSION_ID,
+    });
+  }
   if (!call.noResult) {
-    for (const [i, earlier] of (call.earlierResults ?? []).entries()) {
-      emit(resultEvent(earlier.usage, modelUsageEntries(earlier.modelUsage), earlier.costUsd ?? 0.001));
-      emit({
-        type: "assistant",
-        message: {
-          model: model ?? "claude-fake",
-          id: `msg_fake_${callNumber}_after_result_${i + 1}`,
-          type: "message",
-          role: "assistant",
-          content: [{ type: "text", text: "The background agent reported back." }],
-        },
-        parent_tool_use_id: null,
-        session_id: SESSION_ID,
-      });
-    }
     const usage = call.usage ?? { input_tokens: 100, output_tokens: 50 };
     const canonicalModel = call.canonicalModel ?? model ?? "claude-fake";
     const costUsd = call.costUsd ?? 0.001;

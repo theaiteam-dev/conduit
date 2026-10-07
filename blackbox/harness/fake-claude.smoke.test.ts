@@ -125,4 +125,41 @@ describe("fake-claude — result shape", () => {
       },
     ]);
   });
+
+  test("noResult omits only the terminal result: earlier results are still emitted", async () => {
+    const scenarioPath = join(root, "no-result.json");
+    writeFileSync(
+      scenarioPath,
+      JSON.stringify({
+        stateDir: join(root, "no-result-counters"),
+        logPath: join(root, "no-result.ndjson"),
+        roles: [
+          {
+            name: "maker",
+            promptIncludes: "ROLE:MAKER",
+            calls: [
+              {
+                noResult: true,
+                earlierResults: [
+                  { usage: { input_tokens: 10, output_tokens: 5 }, modelUsage: { "claude-a": { inputTokens: 10, outputTokens: 5 } } },
+                ],
+              },
+            ],
+          },
+        ],
+      }),
+    );
+    const proc = Bun.spawn([process.execPath, FAKE_CLAUDE, "-p", "--", "ROLE:MAKER"], {
+      env: { ...process.env, FAKE_CLAUDE_SCENARIO: scenarioPath },
+      stdout: "pipe",
+      stderr: "ignore",
+    });
+    const [stdout] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+    const results = stdout
+      .split("\n")
+      .filter((l) => l.length > 0)
+      .map((l) => JSON.parse(l) as Record<string, any>)
+      .filter((e) => e.type === "result");
+    expect(results.map((r) => r.modelUsage)).toEqual([{ "claude-a": expect.objectContaining({ inputTokens: 10, outputTokens: 5 }) }]);
+  });
 });
