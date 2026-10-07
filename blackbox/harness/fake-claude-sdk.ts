@@ -16,7 +16,8 @@
  * implements the CLI side of the part the adapter uses:
  *
  *   SDK -> CLI (stdin):
- *     - `control_request` `initialize`, carrying `hooks.PreToolUse` as
+ *     - `control_request` `initialize`, carrying `hooks.PreToolUse` (and
+ *       `PostToolUse`, `PostToolUseFailure`) as
  *       `[{ matcher, hookCallbackIds, timeout }]`. The fake records the ids
  *       and answers `control_response` `success`. Any other SDK control
  *       request is answered `success` with an empty response.
@@ -34,9 +35,15 @@
  *     - a `result` message with `usage`, `modelUsage` and `total_cost_usd`.
  *
  * A step's effect (running a Bash command, writing a file) happens only when
- * no hook answered `permissionDecision: "deny"`. A hook output with
- * `continue: false` stops the turn after that step, as the real CLI does: no
- * further step runs and the result message follows. When no PreToolUse
+ * no hook answered `permissionDecision: "deny"`. A step with `rewriteInput`
+ * stands in for a plugin PreToolUse hook that answered after the SDK's with
+ * `updatedInput`: the effect runs with the rewritten input. After an effect
+ * runs, the fake sends a `hook_callback` for each registered `PostToolUse`
+ * callback id (or `PostToolUseFailure` when the call failed), carrying the
+ * same `tool_use_id` and the input that ran, as the real CLI does. A hook
+ * output with `continue: false`, from a pre or a post hook, stops the turn
+ * after that step, as the real CLI does: no further step runs and the result
+ * message follows. When no PreToolUse
  * callback was registered at initialize, no step's effect runs and the log
  * records `ungated`, so a journey can tell a missing gate from an allowed one.
  * After the result, the fake exits once the SDK closes stdin.
@@ -78,6 +85,13 @@ export interface FakeClaudeSdkStep {
    * no effect.
    */
   input: Record<string, unknown>;
+  /**
+   * The input that runs instead of `input` when no hook denied the call, as
+   * when a plugin PreToolUse hook rewrote it after the SDK's hook approved
+   * `input`. The post hooks receive this input. A relative `file_path` is
+   * resolved as for `input`.
+   */
+  rewriteInput?: Record<string, unknown>;
 }
 
 /** One invocation's behaviour. */
@@ -117,10 +131,14 @@ export interface FakeClaudeSdkAnswer {
   decision: "allow" | "deny" | "error";
   /** `permissionDecisionReason` of a deny, or the error text. */
   reason: string | null;
-  /** False when a hook answered `continue: false`. */
+  /** False when a pre or post hook answered `continue: false`. */
   continue: boolean;
   /** True when the step's effect ran. */
   performed: boolean;
+  /** True when the effect ran with the step's `rewriteInput`. */
+  rewritten: boolean;
+  /** The post hook event sent after the effect ran, if any. */
+  postEvent: "PostToolUse" | "PostToolUseFailure" | null;
   /** Exit code of a Bash command that ran. */
   exitCode?: number;
 }
@@ -136,6 +154,9 @@ export interface FakeClaudeSdkLogEntry {
   startedAt: number;
   /** The `hookCallbackIds` the SDK registered for PreToolUse at initialize. */
   preToolUseCallbackIds: string[];
+  /** The `hookCallbackIds` the SDK registered for PostToolUse and PostToolUseFailure at initialize. */
+  postToolUseCallbackIds: string[];
+  postToolUseFailureCallbackIds: string[];
   /** True when no PreToolUse callback was registered, so nothing ran. */
   ungated: boolean;
   answers: FakeClaudeSdkAnswer[];
@@ -194,6 +215,8 @@ async function main(): Promise<number> {
   const model = argValue(argv, "--model");
 
   let preToolUseCallbackIds: string[] = [];
+  let postToolUseCallbackIds: string[] = [];
+  let postToolUseFailureCallbackIds: string[] = [];
   const sdkRequests: string[] = [];
   let nextRequestId = 1;
   const pending = new Map<string, (response: Json) => void>();
@@ -239,10 +262,13 @@ async function main(): Promise<number> {
       const toolUseId = `toolu_fake_${callNumber}_${i + 1}`;
       // Claude Code's file tools take an absolute file_path, so a relative one in the scenario is resolved
       // against the cwd before the model reports it.
-      const step: FakeClaudeSdkStep =
-        typeof scripted.input.file_path === "string"
-          ? { ...scripted, input: { ...scripted.input, file_path: resolve(cwd, scripted.input.file_path) } }
-          : scripted;
+      const absolutePath = (input: Record<string, unknown>): Record<string, unknown> =>
+        typeof input.file_path === "string" ? { ...input, file_path: resolve(cwd, input.file_path) } : input;
+      const step: FakeClaudeSdkStep = {
+        ...scripted,
+        input: absolutePath(scripted.input),
+        ...(scripted.rewriteInput !== undefined ? { rewriteInput: absolutePath(scripted.rewriteInput) } : {}),
+      };
       emit({
         type: "assistant",
         message: {
@@ -264,6 +290,8 @@ async function main(): Promise<number> {
         reason: ungated ? "no PreToolUse hook was registered" : null,
         continue: true,
         performed: false,
+        rewritten: false,
+        postEvent: null,
       };
       for (const callbackId of preToolUseCallbackIds) {
         const response = await request({
@@ -296,10 +324,13 @@ async function main(): Promise<number> {
 
       let resultText = "ok";
       let isError = false;
+      // What a later plugin hook's `updatedInput` would make run instead of what the hooks above saw.
+      const executed = answer.decision === "allow" && step.rewriteInput !== undefined ? step.rewriteInput : step.input;
       if (answer.decision === "allow") {
         answer.performed = true;
+        answer.rewritten = executed !== step.input;
         if (step.tool === "Bash") {
-          const proc = Bun.spawnSync(["/bin/sh", "-c", String(step.input.command ?? "")], {
+          const proc = Bun.spawnSync(["/bin/sh", "-c", String(executed.command ?? "")], {
             cwd,
             stdout: "pipe",
             stderr: "ignore",
@@ -309,10 +340,33 @@ async function main(): Promise<number> {
           isError = proc.exitCode !== 0;
           if (isError) resultText = `Exit code ${proc.exitCode}`;
         } else if (step.tool === "Write") {
-          const abs = String(step.input.file_path ?? "");
+          const abs = String(executed.file_path ?? "");
           mkdirSync(dirname(abs), { recursive: true });
-          writeFileSync(abs, String(step.input.content ?? ""));
+          writeFileSync(abs, String(executed.content ?? ""));
           resultText = `File created successfully at: ${abs}`;
+        }
+        // The CLI reports a call that ran to the post hooks, with the same tool_use_id and the input that ran.
+        const postEvent = isError ? "PostToolUseFailure" : "PostToolUse";
+        const postIds = isError ? postToolUseFailureCallbackIds : postToolUseCallbackIds;
+        if (postIds.length > 0) answer.postEvent = postEvent;
+        for (const callbackId of postIds) {
+          const response = await request({
+            subtype: "hook_callback",
+            callback_id: callbackId,
+            tool_use_id: toolUseId,
+            input: {
+              session_id: SESSION_ID,
+              transcript_path: join(cwd, ".fake-transcript.jsonl"),
+              cwd,
+              permission_mode: "default",
+              hook_event_name: postEvent,
+              tool_name: step.tool,
+              tool_input: executed,
+              tool_use_id: toolUseId,
+              ...(isError ? { error: resultText } : { tool_response: resultText }),
+            },
+          });
+          if (response.subtype === "success" && (response.response ?? {}).continue === false) answer.continue = false;
         }
       } else {
         isError = true;
@@ -345,6 +399,8 @@ async function main(): Promise<number> {
       model,
       startedAt,
       preToolUseCallbackIds,
+      postToolUseCallbackIds,
+      postToolUseFailureCallbackIds,
       ungated,
       answers,
       stopped,
@@ -401,8 +457,13 @@ async function main(): Promise<number> {
       sdkRequests.push(subtype);
       let response: Json = {};
       if (subtype === "initialize") {
-        const entries = (m.request?.hooks?.PreToolUse ?? []) as Json[];
-        preToolUseCallbackIds = entries.flatMap((e) => (Array.isArray(e.hookCallbackIds) ? e.hookCallbackIds.map(String) : []));
+        const ids = (event: string): string[] =>
+          ((m.request?.hooks?.[event] ?? []) as Json[]).flatMap((e) =>
+            Array.isArray(e.hookCallbackIds) ? e.hookCallbackIds.map(String) : [],
+          );
+        preToolUseCallbackIds = ids("PreToolUse");
+        postToolUseCallbackIds = ids("PostToolUse");
+        postToolUseFailureCallbackIds = ids("PostToolUseFailure");
         response = { commands: [], agents: [], output_style: "default", available_output_styles: ["default"], models: [], account: {} };
       }
       emit({ type: "control_response", response: { subtype: "success", request_id: m.request_id, response } });

@@ -36,7 +36,13 @@ export type GateDenyCode =
   /** The gate itself threw or returned garbage. Always a deny. */
   | 'gate_error'
   /** The tool asks a human (AskUserQuestion). Held, never auto-answered. */
-  | 'needs_human';
+  | 'needs_human'
+  /**
+   * The input that ran differs from the input the gate approved: another
+   * PreToolUse hook rewrote it. Never returned by the gate. The agent-sdk
+   * adapter detects it after the call ran and holds (issue #109).
+   */
+  | 'input_rewritten';
 
 /** One tool call, as the harness is about to run it. */
 export interface GateToolCall {
