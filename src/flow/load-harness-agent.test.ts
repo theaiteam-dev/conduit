@@ -25,6 +25,8 @@ import { tmpdir } from 'node:os';
 import { loadFlow, type LoadFlowResult } from './load';
 import type { FlowConfig } from '../types/kernel';
 import {
+  bindHarnessDefinitionsForIntrospection,
+  buildHarnessDefinitionRegistry,
   createHarnessRegistry,
   makeFakeHarnessAdapter,
   type HarnessAdapter,
@@ -180,5 +182,54 @@ describe('check.critic.agent on a harness critic (issue #28 AC2)', () => {
     const registry = createHarnessRegistry([agentCapableAdapter('claude-headless', ['team:coder'])]);
     const errors = errorsOf(load(flow({ criticAgentLine: 'agent: team:reviewer' }), registry));
     expect(errors.map((e) => e.code)).toContain('UNRESOLVED_HARNESS_AGENT');
+  });
+});
+
+describe('agent: on an agent-sdk station, through the engine-config registry (issue #109)', () => {
+  /** A plugin dir holding `team:coder` and `team:reviewer`. */
+  function withPluginDir<T>(fn: (dir: string) => T): T {
+    const dir = mkdtempSync(join(tmpdir(), 'conduit-sdk-plugin-'));
+    try {
+      mkdirSync(join(dir, '.claude-plugin'), { recursive: true });
+      writeFileSync(join(dir, '.claude-plugin', 'plugin.json'), JSON.stringify({ name: 'team' }));
+      mkdirSync(join(dir, 'agents'), { recursive: true });
+      for (const name of ['coder', 'reviewer']) {
+        writeFileSync(join(dir, 'agents', `${name}.md`), `---\nname: ${name}\ndescription: d\n---\nBody.\n`);
+      }
+      return fn(dir);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+  const sdkRegistry = (pluginDirs?: string[]): HarnessRegistry =>
+    bindHarnessDefinitionsForIntrospection(
+      buildHarnessDefinitionRegistry([
+        { name: 'agent-sdk', envAllowlist: ['HOME'], ...(pluginDirs !== undefined ? { pluginDirs } : {}) },
+      ]),
+    );
+  const sdkFlow = (parts: Parameters<typeof flow>[0]): string => flow(parts).replace(/claude-headless/g, 'agent-sdk');
+
+  it('accepts a maker agent and a critic agent when _PLUGIN_DIRS defines them', () => {
+    withPluginDir((dir) => {
+      const loaded = expectOk(
+        load(sdkFlow({ agentLine: 'agent: team:coder', criticAgentLine: 'agent: team:reviewer' }), sdkRegistry([dir])),
+      );
+      expect(loaded.stations.coder!.agent).toBe('team:coder');
+      expect(loaded.stations.coder!.gateCheck!.criticAgent).toBe('team:reviewer');
+    });
+  });
+
+  it('rejects a maker agent when no plugin dirs are configured', () => {
+    const errors = errorsOf(load(sdkFlow({ agentLine: 'agent: team:coder' }), sdkRegistry()));
+    const unresolved = errors.filter((e) => e.code === 'UNRESOLVED_HARNESS_AGENT');
+    expect(unresolved).toHaveLength(1);
+    expect(unresolved[0]!.message).toContain('no plugin dirs');
+  });
+
+  it('rejects a critic agent the plugin dirs do not define', () => {
+    withPluginDir((dir) => {
+      const errors = errorsOf(load(sdkFlow({ criticAgentLine: 'agent: team:nobody' }), sdkRegistry([dir])));
+      expect(errors.map((e) => e.code)).toContain('UNRESOLVED_HARNESS_AGENT');
+    });
   });
 });

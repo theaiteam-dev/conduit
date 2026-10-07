@@ -430,21 +430,23 @@ function fail(reason: string, code?: string, detail?: Record<string, unknown>): 
  * Reject a plugin dir the kernel cannot use, at construction (engine boot).
  * `claude --plugin-dir` also accepts a .zip, but a zip cannot be scanned for
  * agent definitions without unpacking it, so only directories are accepted.
+ * Shared by every adapter that passes plugin dirs to the Claude Code CLI;
+ * `adapterName` prefixes the error.
  */
-function assertUsablePluginDirs(pluginDirs: readonly string[]): void {
+export function assertUsablePluginDirs(pluginDirs: readonly string[], adapterName = 'claude-headless'): void {
   for (const dir of pluginDirs) {
     if (!isAbsolute(dir)) {
-      throw new Error(`claude-headless: plugin dir '${dir}' is not an absolute path`);
+      throw new Error(`${adapterName}: plugin dir '${dir}' is not an absolute path`);
     }
     let isDir = false;
     try {
       isDir = statSync(dir).isDirectory();
     } catch {
-      throw new Error(`claude-headless: plugin dir '${dir}' does not exist`);
+      throw new Error(`${adapterName}: plugin dir '${dir}' does not exist`);
     }
     if (!isDir) {
       throw new Error(
-        `claude-headless: plugin dir '${dir}' is not a directory (a .zip plugin must be unpacked so its ` +
+        `${adapterName}: plugin dir '${dir}' is not a directory (a .zip plugin must be unpacked so its ` +
           `agent definitions can be hashed)`,
       );
     }
@@ -500,7 +502,9 @@ export function createClaudeHarnessAdapter(config: ClaudeHarnessAdapterConfig): 
       }
       // Station wins over the adapter's configured default, as for --model.
       // An agent the CLI does not know exits 1 naming it (verified against
-      // claude 2.1.282), which the nonzero-exit path below reports.
+      // claude 2.1.282 and again on 2.1.291, with and without stream-json),
+      // which the nonzero-exit path below reports. The Agent SDK path does
+      // not fail this way: see harness-adapter-agent-sdk.ts.
       const agent = call.agent ?? config.agent;
       if (agent !== undefined) {
         args.push('--agent', agent);

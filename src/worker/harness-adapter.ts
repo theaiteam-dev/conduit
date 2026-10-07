@@ -425,8 +425,8 @@ const ADAPTER_SPECIFIC_OPTIONS: ReadonlyArray<{
   suffix: string;
   adapters: readonly string[];
 }> = [
-  { field: 'agent', suffix: 'AGENT', adapters: ['claude-headless'] },
-  { field: 'pluginDirs', suffix: 'PLUGIN_DIRS', adapters: ['claude-headless'] },
+  { field: 'agent', suffix: 'AGENT', adapters: ['claude-headless', 'agent-sdk'] },
+  { field: 'pluginDirs', suffix: 'PLUGIN_DIRS', adapters: ['claude-headless', 'agent-sdk'] },
   { field: 'isolateConfig', suffix: 'ISOLATE_CONFIG', adapters: ['claude-headless', 'agent-sdk'] },
 ];
 

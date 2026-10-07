@@ -41,8 +41,8 @@ warnings `doctor` gives you when something's off.
 | `CONDUIT_HARNESS_<NAME>_ENV` | Yes, per registered adapter | Comma-separated env var **names** the harness child process may see. Explicit-only — the engine never injects a baseline; `HOME`/`PATH` are not assumed. An empty string is legal (an intentionally empty allowlist); an *absent* var for a registered adapter is a hard config error at engine boot. |
 | `CONDUIT_HARNESS_<NAME>_COMMAND` | No | Overrides the binary invoked (default: the adapter's own name, e.g. `claude`, `codex`). See [Use absolute paths](#_command-use-absolute-paths) below. |
 | `CONDUIT_HARNESS_<NAME>_MODEL` | No | The adapter's deployment-default model. A station's own `model:` in `flow.yaml` **wins** when both are set — see [Model precedence](#model-precedence-station-wins-over-_model). |
-| `CONDUIT_HARNESS_<NAME>_AGENT` | No, `claude-headless` only | The adapter's default named agent (`<plugin>:<agent>`), passed as `--agent`. A station's own `agent:` wins. The value is trimmed; setting it to an empty or whitespace-only string is a boot error naming the variable, not a silently empty default. See [Named agents and plugin dirs](#named-agents-and-plugin-dirs). |
-| `CONDUIT_HARNESS_<NAME>_PLUGIN_DIRS` | No, `claude-headless` only | Comma-separated **absolute** plugin directories, one `--plugin-dir` each. Absent or empty: no flag. A relative entry is a boot error; a missing or non-directory entry fails when the adapter is built. |
+| `CONDUIT_HARNESS_<NAME>_AGENT` | No, `claude-headless` and `agent-sdk` only | The adapter's default named agent (`<plugin>:<agent>`), passed as `--agent`. A station's own `agent:` wins. The value is trimmed; setting it to an empty or whitespace-only string is a boot error naming the variable, not a silently empty default. See [Named agents and plugin dirs](#named-agents-and-plugin-dirs). |
+| `CONDUIT_HARNESS_<NAME>_PLUGIN_DIRS` | No, `claude-headless` and `agent-sdk` only | Comma-separated **absolute** plugin directories, one `--plugin-dir` each. Absent or empty: no flag. A relative entry is a boot error; a missing or non-directory entry fails when the adapter is built. |
 | `CONDUIT_HARNESS_<NAME>_ISOLATE_CONFIG` | No, `claude-headless` and `agent-sdk` only | `1`/`true` gives the child a run-scoped config dir instead of the operator's `~/.claude`; `0`/`false` or absent keeps today's behaviour. Any other value is a boot error. See [Isolating the child's Claude config](#isolating-the-childs-claude-config-_isolate_config). |
 
 Setting `_AGENT`, `_PLUGIN_DIRS` or `_ISOLATE_CONFIG` for an adapter that does
@@ -382,11 +382,12 @@ default changed correctly re-invokes rather than silently skipping.
 
 ## Named agents and plugin dirs
 
-Only `claude-headless` runs named agents. An `agent:` (or `check.critic.agent`) on an
-`agent-sdk`, `codex-exec`, `codex-app-server` or `opencode` station is refused at load, and holds the card if it
-reaches dispatch, rather than being ignored.
+`claude-headless` and `agent-sdk` run named agents. An `agent:` (or `check.critic.agent`) on a
+`codex-exec`, `codex-app-server` or `opencode` station is refused at load, and holds the card if it
+reaches dispatch, rather than being ignored. The rules below apply to both adapters, with
+`CONDUIT_HARNESS_AGENT_SDK_` in place of `CONDUIT_HARNESS_CLAUDE_HEADLESS_` for `agent-sdk`.
 
-A `claude-headless` station can run a named Claude Code agent out of a plugin
+A `claude-headless` or `agent-sdk` station can run a named Claude Code agent out of a plugin
 directory the deployment supplies, without that plugin being installed in
 anyone's user config:
 
@@ -439,8 +440,12 @@ A gate critic takes the same field as `check.critic.agent`, next to
   again at dispatch, where the card hard-pauses to `hold` without invoking the
   harness. `agent:` on a station that is not `kind: harness`, or on a critic
   with no `harness`, is `INVALID_HARNESS_AGENT`. A name the CLI itself does
-  not know makes `claude` exit 1 naming it, which the adapter reports as a
-  `harness-nonzero-exit` attempt failure.
+  not know makes `claude -p` exit 1 naming it, which `claude-headless` reports
+  as a `harness-nonzero-exit` attempt failure. Through the Agent SDK the CLI
+  runs its default agent instead and reports success, so `agent-sdk` checks
+  the agents the CLI lists at init and the `agent_type` on each main-thread
+  tool call, and holds the card on a miss without spending an attempt (see
+  [the containment profile](harness-containment.md#named-agents-and-plugin-dirs-on-agent-sdk)).
 
 ## Isolating the child's Claude config: `_ISOLATE_CONFIG`
 
@@ -662,8 +667,12 @@ can gate every tool call ([containment profile](harness-containment.md#a-middle-
 - It runs the `claude` on `PATH`, resolved to a file, not the binary bundled with the SDK.
   Set `CONDUIT_HARNESS_AGENT_SDK_COMMAND` to an absolute path to use another. The env
   allowlist needs `PATH`, and `HOME` for subscription auth unless `_ISOLATE_CONFIG` is on.
-- It supports `_ENV`, `_COMMAND`, `_MODEL` and `_ISOLATE_CONFIG`. `_AGENT` and
-  `_PLUGIN_DIRS` fail registry construction at boot, as they do for `codex-exec`.
+- It supports `_ENV`, `_COMMAND`, `_MODEL`, `_ISOLATE_CONFIG`, `_AGENT` and `_PLUGIN_DIRS`.
+  Named agents work as on `claude-headless` ([Named agents and plugin dirs](#named-agents-and-plugin-dirs)).
+  Plugin hooks run alongside the gate, and a deny from either wins. The gate cannot stop a
+  plugin hook's `updatedInput` from replacing an input it approved: the adapter detects the
+  rewritten input after the call runs and holds the card with code `input_rewritten`
+  ([containment profile](harness-containment.md#a-middle-claim-supervised-adapters)).
 - A station's `tools` list is the gate's allowlist: `Bash` alone allows no executable, so
   list `Bash(git:*)` style entries for the commands it may run.
 - Its usage, like `claude-headless`'s, comes from the last `result` message: the cost is
