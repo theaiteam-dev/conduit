@@ -32,7 +32,10 @@
  *       The SDK runs the adapter's hook and returns its output as the
  *       `control_response` `response`.
  *     - after each step, a `user` message with the `tool_result`.
- *     - a `result` message with `usage`, `modelUsage` and `total_cost_usd`.
+ *     - a `result` message with `usage`, `modelUsage` and `total_cost_usd`,
+ *       optionally preceded by earlier `result` messages, as a session with a
+ *       background subagent sends. The SDK closes stdin after the first, and
+ *       still delivers every one the fake wrote before it exits.
  *
  * Named agents. With `--agent <plugin>:<agent>` and `--plugin-dir <dir>` in
  * argv (the SDK's `agent` and `plugins` options), the fake reads each plugin
@@ -82,6 +85,25 @@ export interface FakeClaudeSdkUsage {
   cache_read_input_tokens?: number;
 }
 
+/** One `modelUsage` entry, cumulative over the session. */
+export interface FakeClaudeSdkModelUsage {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadInputTokens?: number;
+  cacheCreationInputTokens?: number;
+}
+
+/**
+ * A `result` message sent before the terminal one, as a session with a
+ * background subagent sends (issue #108). `usage` covers the last API turn
+ * only; `modelUsage` is the session total so far.
+ */
+export interface FakeClaudeSdkEarlierResult {
+  usage: FakeClaudeSdkUsage;
+  modelUsage: Record<string, FakeClaudeSdkModelUsage>;
+  costUsd?: number;
+}
+
 /** One tool call the model makes. */
 export interface FakeClaudeSdkStep {
   /** Names the step in the log. */
@@ -112,6 +134,17 @@ export interface FakeClaudeSdkCall {
   usage?: FakeClaudeSdkUsage;
   /** `total_cost_usd` on the result message. Default 0.001. */
   costUsd?: number;
+  /**
+   * `modelUsage` on the terminal result message, the session total. Default:
+   * one entry under the model equal to `usage`, as a single-turn call reports.
+   */
+  modelUsage?: Record<string, FakeClaudeSdkModelUsage>;
+  /**
+   * `result` messages sent, each followed by an assistant text message, after
+   * the steps and before the terminal one. All of them are written before the
+   * fake reads the stdin close the SDK sends after the first.
+   */
+  earlierResults?: FakeClaudeSdkEarlierResult[];
   /**
    * Spawn a `setsid` descendant (a new session, so it leaves the fake's
    * process group) that writes its own pid to this path and sleeps. Use an
@@ -195,6 +228,20 @@ const SESSION_ID = "00000000-0000-4000-8000-00000000fa5d";
 /** Synchronous, so nothing is lost when the kernel kills the process right after. */
 function emit(obj: unknown): void {
   writeSync(1, JSON.stringify(obj) + "\n");
+}
+
+/** `modelUsage` entries with every token class present, as the CLI sends them. */
+function modelUsageEntries(entries: Record<string, FakeClaudeSdkModelUsage>): Record<string, Record<string, unknown>> {
+  const out: Record<string, Record<string, unknown>> = {};
+  for (const [model, e] of Object.entries(entries)) {
+    out[model] = {
+      inputTokens: e.inputTokens,
+      outputTokens: e.outputTokens,
+      cacheReadInputTokens: e.cacheReadInputTokens ?? 0,
+      cacheCreationInputTokens: e.cacheCreationInputTokens ?? 0,
+    };
+  }
+  return out;
 }
 
 function argValue(argv: string[], flag: string): string | null {
@@ -477,35 +524,61 @@ async function main(): Promise<number> {
     const usage = call.usage ?? { input_tokens: 100, output_tokens: 50 };
     const costUsd = call.costUsd ?? 0.001;
     const canonicalModel = model ?? "claude-fake";
-    emit({
+    const resultMessage = (
+      u: FakeClaudeSdkUsage,
+      modelUsage: Record<string, Record<string, unknown>>,
+      cost: number,
+      uuid: string,
+      final: boolean,
+    ): Json => ({
       type: "result",
       subtype: "success",
       is_error: false,
       duration_ms: 10,
       num_turns: 1,
-      result: stopped ? "stopped by a hook" : "done",
-      stop_reason: stopped ? null : "end_turn",
+      result: final && stopped ? "stopped by a hook" : "done",
+      stop_reason: final && stopped ? null : "end_turn",
       session_id: SESSION_ID,
-      total_cost_usd: costUsd,
+      total_cost_usd: cost,
       usage: {
-        input_tokens: usage.input_tokens,
-        output_tokens: usage.output_tokens,
-        cache_creation_input_tokens: usage.cache_creation_input_tokens ?? 0,
-        cache_read_input_tokens: usage.cache_read_input_tokens ?? 0,
+        input_tokens: u.input_tokens,
+        output_tokens: u.output_tokens,
+        cache_creation_input_tokens: u.cache_creation_input_tokens ?? 0,
+        cache_read_input_tokens: u.cache_read_input_tokens ?? 0,
       },
-      modelUsage: {
-        [canonicalModel]: {
-          inputTokens: usage.input_tokens,
-          outputTokens: usage.output_tokens,
-          cacheReadInputTokens: usage.cache_read_input_tokens ?? 0,
-          cacheCreationInputTokens: usage.cache_creation_input_tokens ?? 0,
-          costUSD: costUsd,
-        },
-      },
+      modelUsage,
       permission_denials: [],
       terminal_reason: "completed",
-      uuid: "00000000-0000-4000-8000-000000000099",
+      uuid,
     });
+    for (const [i, earlier] of (call.earlierResults ?? []).entries()) {
+      const n = String(i + 1).padStart(2, "0");
+      emit(resultMessage(earlier.usage, modelUsageEntries(earlier.modelUsage), earlier.costUsd ?? 0.001, `00000000-0000-4000-8000-0000000001${n}`, false));
+      emit({
+        type: "assistant",
+        message: {
+          model: canonicalModel,
+          id: `msg_fake_sdk_after_result_${i + 1}`,
+          type: "message",
+          role: "assistant",
+          content: [{ type: "text", text: "The background agent reported back." }],
+        },
+        parent_tool_use_id: null,
+        session_id: SESSION_ID,
+      });
+    }
+    const modelUsage = call.modelUsage
+      ? modelUsageEntries(call.modelUsage)
+      : {
+          [canonicalModel]: {
+            inputTokens: usage.input_tokens,
+            outputTokens: usage.output_tokens,
+            cacheReadInputTokens: usage.cache_read_input_tokens ?? 0,
+            cacheCreationInputTokens: usage.cache_creation_input_tokens ?? 0,
+            costUSD: costUsd,
+          },
+        };
+    emit(resultMessage(usage, modelUsage, costUsd, "00000000-0000-4000-8000-000000000099", true));
   };
 
   const handle = (m: Json): void => {

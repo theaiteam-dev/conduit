@@ -34,6 +34,26 @@ export interface FakeClaudeUsage {
   cache_read_input_tokens?: number;
 }
 
+/** One `modelUsage` entry, cumulative over the session. */
+export interface FakeClaudeModelUsage {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadInputTokens?: number;
+  cacheCreationInputTokens?: number;
+}
+
+/**
+ * A `result` event emitted before the terminal one. The real CLI emits one per
+ * turn that ends while a background subagent is still running, so a session
+ * with a background subagent has two or more (issue #108). `usage` covers the
+ * last API turn only; `modelUsage` is the session total so far.
+ */
+export interface FakeClaudeEarlierResult {
+  usage: FakeClaudeUsage;
+  modelUsage: Record<string, FakeClaudeModelUsage>;
+  costUsd?: number;
+}
+
 export interface FakeClaudeRateLimit {
   /** e.g. "allowed", "allowed_warning", "rejected". */
   status: string;
@@ -53,6 +73,13 @@ export interface FakeClaudeCall {
   costUsd?: number;
   /** Model named in `modelUsage`. Default: the `--model` argv value, else "claude-fake". */
   canonicalModel?: string;
+  /**
+   * `modelUsage` on the terminal result event, the session total. Default: one
+   * entry under `canonicalModel` equal to `usage`, as a single-turn call reports.
+   */
+  modelUsage?: Record<string, FakeClaudeModelUsage>;
+  /** `result` events emitted, each followed by an assistant text message, before the terminal one. */
+  earlierResults?: FakeClaudeEarlierResult[];
   /** A `rate_limit_event` emitted before the result. */
   rateLimit?: FakeClaudeRateLimit;
   /** Result event overrides for a failed call (e.g. is_error, api_error_status, result text). */
@@ -115,6 +142,43 @@ const SESSION_ID = "00000000-0000-4000-8000-00000000fa4e";
 /** Synchronous, so nothing is lost when the stub exits right after. */
 function emit(obj: unknown): void {
   writeSync(1, JSON.stringify(obj) + "\n");
+}
+
+/** `modelUsage` entries with every token class present, as the CLI sends them. */
+function modelUsageEntries(entries: Record<string, FakeClaudeModelUsage>): Record<string, Record<string, unknown>> {
+  const out: Record<string, Record<string, unknown>> = {};
+  for (const [model, e] of Object.entries(entries)) {
+    out[model] = {
+      inputTokens: e.inputTokens,
+      outputTokens: e.outputTokens,
+      cacheReadInputTokens: e.cacheReadInputTokens ?? 0,
+      cacheCreationInputTokens: e.cacheCreationInputTokens ?? 0,
+    };
+  }
+  return out;
+}
+
+/** A successful `result` event. */
+function resultEvent(usage: FakeClaudeUsage, modelUsage: Record<string, unknown>, costUsd: number): Record<string, unknown> {
+  return {
+    type: "result",
+    subtype: "success",
+    is_error: false,
+    duration_ms: 10,
+    num_turns: 1,
+    result: "done",
+    stop_reason: "end_turn",
+    session_id: SESSION_ID,
+    total_cost_usd: costUsd,
+    usage: {
+      input_tokens: usage.input_tokens,
+      output_tokens: usage.output_tokens,
+      cache_creation_input_tokens: usage.cache_creation_input_tokens ?? 0,
+      cache_read_input_tokens: usage.cache_read_input_tokens ?? 0,
+    },
+    modelUsage,
+    terminal_reason: "completed",
+  };
 }
 
 function argValue(argv: string[], flag: string): string | null {
@@ -266,37 +330,37 @@ async function main(): Promise<number> {
   }
 
   if (!call.noResult) {
+    for (const [i, earlier] of (call.earlierResults ?? []).entries()) {
+      emit(resultEvent(earlier.usage, modelUsageEntries(earlier.modelUsage), earlier.costUsd ?? 0.001));
+      emit({
+        type: "assistant",
+        message: {
+          model: model ?? "claude-fake",
+          id: `msg_fake_${callNumber}_after_result_${i + 1}`,
+          type: "message",
+          role: "assistant",
+          content: [{ type: "text", text: "The background agent reported back." }],
+        },
+        parent_tool_use_id: null,
+        session_id: SESSION_ID,
+      });
+    }
     const usage = call.usage ?? { input_tokens: 100, output_tokens: 50 };
     const canonicalModel = call.canonicalModel ?? model ?? "claude-fake";
-    emit({
-      type: "result",
-      subtype: "success",
-      is_error: false,
-      duration_ms: 10,
-      num_turns: 1,
-      result: "done",
-      stop_reason: "end_turn",
-      session_id: SESSION_ID,
-      total_cost_usd: call.costUsd ?? 0.001,
-      usage: {
-        input_tokens: usage.input_tokens,
-        output_tokens: usage.output_tokens,
-        cache_creation_input_tokens: usage.cache_creation_input_tokens ?? 0,
-        cache_read_input_tokens: usage.cache_read_input_tokens ?? 0,
-      },
-      modelUsage: {
-        [canonicalModel]: {
-          inputTokens: usage.input_tokens,
-          outputTokens: usage.output_tokens,
-          cacheReadInputTokens: usage.cache_read_input_tokens ?? 0,
-          cacheCreationInputTokens: usage.cache_creation_input_tokens ?? 0,
-          costUSD: call.costUsd ?? 0.001,
-          canonicalModel,
-        },
-      },
-      terminal_reason: "completed",
-      ...call.resultOverrides,
-    });
+    const costUsd = call.costUsd ?? 0.001;
+    const modelUsage = call.modelUsage
+      ? modelUsageEntries(call.modelUsage)
+      : {
+          [canonicalModel]: {
+            inputTokens: usage.input_tokens,
+            outputTokens: usage.output_tokens,
+            cacheReadInputTokens: usage.cache_read_input_tokens ?? 0,
+            cacheCreationInputTokens: usage.cache_creation_input_tokens ?? 0,
+            costUSD: costUsd,
+            canonicalModel,
+          },
+        };
+    emit({ ...resultEvent(usage, modelUsage, costUsd), ...call.resultOverrides });
   }
 
   if (call.stderr) writeSync(2, call.stderr);
