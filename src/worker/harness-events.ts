@@ -43,9 +43,18 @@ export type HarnessEventBody =
        */
       toolUseResult?: unknown;
     }
+  /**
+   * Cumulative usage for the invocation so far, not a delta since the last
+   * `usage` event. One invocation can emit several (a Claude stream emits one
+   * per `result`, issue #108), and each supersedes the one before: the latest
+   * `seq` per `invocationId` is the invocation's figure. Never sum them.
+   */
   | {
       type: 'usage';
-      /** Total across every class, the same figure KnownUsage.tokens carries. */
+      /**
+       * Total across every class. The last event of an invocation carries the
+       * same figure as KnownUsage.tokens.
+       */
       tokens: number;
       breakdown: UsageBreakdown;
       costUsd?: number;

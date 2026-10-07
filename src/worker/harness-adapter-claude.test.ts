@@ -778,6 +778,16 @@ describe('dominantModel', () => {
     expect(dominantModel(undefined)).toBeUndefined();
     expect(dominantModel({})).toBeUndefined();
   });
+
+  it('skips an entry that is not an object (untrusted JSON)', () => {
+    const malformed = {
+      bad: null,
+      prim: 'x',
+      good: { canonicalModel: 'good-model', inputTokens: 5 },
+    } as unknown as Parameters<typeof dominantModel>[0];
+    expect(dominantModel(malformed)).toBe('good-model');
+    expect(dominantModel({ bad: null, prim: 7 } as unknown as Parameters<typeof dominantModel>[0])).toBeUndefined();
+  });
 });
 
 // ---------------------------------------------------------------------------
