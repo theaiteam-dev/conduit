@@ -105,6 +105,7 @@ export interface FakeClaudeSdkModelUsage {
 export interface FakeClaudeSdkEarlierResult {
   usage: FakeClaudeSdkUsage;
   modelUsage: Record<string, FakeClaudeSdkModelUsage>;
+  /** `total_cost_usd` on this result: the session total so far, as the CLI reports it. Default 0.001. */
   costUsd?: number;
 }
 
@@ -136,7 +137,11 @@ export interface FakeClaudeSdkCall {
   steps?: FakeClaudeSdkStep[];
   /** Usage on the result message. Default: 100 in / 50 out. */
   usage?: FakeClaudeSdkUsage;
-  /** `total_cost_usd` on the result message. Default 0.001. */
+  /**
+   * `total_cost_usd` on the terminal result message, the session total as the
+   * CLI reports it. Like `modelUsage`, it is sent as given: the fake does not
+   * add `earlierResults`' costs to it. Default 0.001.
+   */
   costUsd?: number;
   /**
    * `modelUsage` on the terminal result message, the session total. Default:

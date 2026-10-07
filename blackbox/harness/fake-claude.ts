@@ -55,6 +55,7 @@ export interface FakeClaudeModelUsage {
 export interface FakeClaudeEarlierResult {
   usage: FakeClaudeUsage;
   modelUsage: Record<string, FakeClaudeModelUsage>;
+  /** `total_cost_usd` on this result: the session total so far, as the CLI reports it. Default 0.001. */
   costUsd?: number;
 }
 
@@ -73,7 +74,11 @@ export interface FakeClaudeCall {
   writeFiles?: Record<string, string>;
   /** Usage on the terminal `result` event. Default: 100 in / 50 out. */
   usage?: FakeClaudeUsage;
-  /** `total_cost_usd` on the result event. Default 0.001. */
+  /**
+   * `total_cost_usd` on the terminal result event, the session total as the CLI
+   * reports it. Like `modelUsage`, it is emitted as given: the fake does not add
+   * `earlierResults`' costs to it. Default 0.001.
+   */
   costUsd?: number;
   /** Model named in `modelUsage`. Default: the `--model` argv value, else "claude-fake". */
   canonicalModel?: string;
