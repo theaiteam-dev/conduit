@@ -238,7 +238,13 @@ function pluginAgents(pluginDirs: string[]): string[] {
       continue;
     }
     for (const file of files) {
-      const m = /^name:\s*(\S+)\s*$/m.exec(readFileSync(join(dir, "agents", file), "utf8"));
+      let body: string;
+      try {
+        body = readFileSync(join(dir, "agents", file), "utf8");
+      } catch {
+        continue;
+      }
+      const m = /^name:\s*(\S+)\s*$/m.exec(body);
       if (m) found.push(`${plugin}:${m[1]}`);
     }
   }

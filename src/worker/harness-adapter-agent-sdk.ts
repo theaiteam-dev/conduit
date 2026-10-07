@@ -279,7 +279,7 @@ export function createAgentSdkHarnessAdapter(config: AgentSdkHarnessAdapterConfi
         const preToolUse: HookCallback = async (input, toolUseId) => {
           if (input.hook_event_name !== 'PreToolUse') return { continue: true };
           const toolCallId = toolUseId ?? input.tool_use_id;
-          const emitDecision = (decision: GateDecision): void =>
+          const emitDecision = (decision: GateDecision | { decision: 'deny'; code: string; reason: string }): void =>
             emit?.({
               type: 'gate-decision',
               toolCallId,
@@ -289,7 +289,11 @@ export function createAgentSdkHarnessAdapter(config: AgentSdkHarnessAdapterConfi
               ...(input.agent_id !== undefined ? { agentId: input.agent_id } : {}),
             });
           if (st.held !== undefined || st.agentNotLoaded !== undefined) {
-            const later: GateDecision = { decision: 'deny', code: 'needs_human', reason: 'an earlier call was held for a human' };
+            // AGENT_NOT_LOADED is the adapter's own code, outside the gate's GateDenyCode set.
+            const later: { decision: 'deny'; code: string; reason: string } =
+              st.held !== undefined
+                ? { decision: 'deny', code: 'needs_human', reason: 'an earlier call was held for a human' }
+                : { decision: 'deny', code: AGENT_NOT_LOADED, reason: 'an earlier call showed the CLI did not load the requested agent' };
             emitDecision(later);
             return deny(later.reason);
           }
@@ -437,22 +441,39 @@ export function createAgentSdkHarnessAdapter(config: AgentSdkHarnessAdapterConfi
         try {
           stream = queryFn({ prompt: call.prompt, options });
           let index = 0;
+          let sawInit = false;
           for await (const message of stream) {
             call.onProgress?.();
             resetIdleTimer();
             const m = message as unknown as Record<string, unknown>;
             // The CLI emits init at the start of each turn. Before any API call, so ending the call here
-            // bills nothing.
-            if (
-              agent !== undefined &&
-              m.type === 'system' &&
-              m.subtype === 'init' &&
-              !(Array.isArray(m.agents) && m.agents.includes(agent))
-            ) {
-              st.agentNotLoaded ??= 'the init message does not list it';
-              abortController.abort();
-              killAll();
-              break;
+            // bills nothing. A session that reaches an assistant or result message with no init at all is
+            // a miss too: the list was never seen, so the agent cannot be confirmed.
+            if (agent !== undefined) {
+              let initMiss: string | undefined;
+              if (m.type === 'system' && m.subtype === 'init') {
+                sawInit = true;
+                if (!Array.isArray(m.agents)) initMiss = 'the init message carries no agents list';
+                else if (!m.agents.includes(agent)) initMiss = `the init message lists agents [${m.agents.join(', ')}]`;
+              } else if (!sawInit && (m.type === 'assistant' || m.type === 'result')) {
+                initMiss = `no init message arrived before the first ${m.type} message`;
+              }
+              if (initMiss !== undefined) {
+                st.agentNotLoaded ??= initMiss;
+                // A result before init means the turn ran and was billed: keep it so the hold carries its usage.
+                if (m.type === 'result') result = m as unknown as ClaudeResultPayload;
+                // No tool call here, so the event names the stream message that tripped it.
+                emit?.({
+                  type: 'gate-decision',
+                  toolName: 'init',
+                  decision: 'hold',
+                  code: AGENT_NOT_LOADED,
+                  reason: `the CLI did not load agent '${agent}': ${initMiss}`,
+                });
+                abortController.abort();
+                killAll();
+                break;
+              }
             }
             if (m.type === 'result') result = m as unknown as ClaudeResultPayload;
             else if (m.type === 'assistant' && typeof m.error === 'string') assistantError = m.error;

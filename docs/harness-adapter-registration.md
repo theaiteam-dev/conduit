@@ -669,7 +669,10 @@ can gate every tool call ([containment profile](harness-containment.md#a-middle-
   allowlist needs `PATH`, and `HOME` for subscription auth unless `_ISOLATE_CONFIG` is on.
 - It supports `_ENV`, `_COMMAND`, `_MODEL`, `_ISOLATE_CONFIG`, `_AGENT` and `_PLUGIN_DIRS`.
   Named agents work as on `claude-headless` ([Named agents and plugin dirs](#named-agents-and-plugin-dirs)).
-  Plugin hooks run alongside the gate, and a deny from either wins.
+  Plugin hooks run alongside the gate, and a deny from either wins. The gate cannot stop a
+  plugin hook's `updatedInput` from replacing an input it approved: the adapter detects the
+  rewritten input after the call runs and holds the card with code `input_rewritten`
+  ([containment profile](harness-containment.md#a-middle-claim-supervised-adapters)).
 - A station's `tools` list is the gate's allowlist: `Bash` alone allows no executable, so
   list `Bash(git:*)` style entries for the commands it may run.
 

@@ -357,6 +357,84 @@ describe('agent-sdk: fails closed when the CLI did not load the agent', () => {
   });
 });
 
+describe('agent-sdk: agent miss journaling and identity verification', () => {
+  const holds = (events: HarnessEvent[]) => events.filter((e) => e.type === 'gate-decision');
+
+  it('journals a gate-decision hold when init does not list the agent, naming the observed agents', async () => {
+    const { query } = scripted(async function* () {
+      yield initWith(['team:helper', 'team:other']);
+      yield RESULT_OK;
+    });
+    const events: HarnessEvent[] = [];
+    const err = await rejection(makeAdapter(query).invoke(invocation({ agent: 'team:coder', onEvent: (e) => events.push(e) })));
+    expect(err.code).toBe(HARNESS_GATE_HOLD_CODE);
+    const [hold] = holds(events);
+    expect(holds(events)).toHaveLength(1);
+    expect(hold).toMatchObject({ decision: 'hold', code: 'agent_not_loaded' });
+    expect((hold as { reason: string }).reason).toContain("'team:coder'");
+    expect((hold as { reason: string }).reason).toContain('[team:helper, team:other]');
+    expect(err.message).toContain('[team:helper, team:other]');
+  });
+
+  it('says so when init carries no agents list', async () => {
+    const { query } = scripted(async function* () {
+      yield initWith(undefined);
+      yield RESULT_OK;
+    });
+    const events: HarnessEvent[] = [];
+    await rejection(makeAdapter(query).invoke(invocation({ agent: 'team:coder', onEvent: (e) => events.push(e) })));
+    expect((holds(events)[0] as { reason: string }).reason).toContain('carries no agents list');
+  });
+
+  it('holds when the result arrives with no init message, and journals the hold', async () => {
+    const { query } = scripted(async function* () {
+      yield { type: 'system', subtype: 'hook_started' };
+      yield RESULT_OK;
+    });
+    const events: HarnessEvent[] = [];
+    const err = await rejection(makeAdapter(query).invoke(invocation({ agent: 'team:coder', onEvent: (e) => events.push(e) })));
+    expect(err.code).toBe(HARNESS_GATE_HOLD_CODE);
+    expect(err.message).toContain('no init message');
+    expect(holds(events)[0]).toMatchObject({ decision: 'hold', code: 'agent_not_loaded' });
+    // The turn ran and was billed, so the hold carries its usage.
+    expect(usageFromThrow(err)).toMatchObject({ tokens: 100, cost: 0.0123 });
+  });
+
+  it('holds when an assistant message arrives with no init message, ending the stream', async () => {
+    let after = false;
+    const { query, closedEarly } = scripted(async function* () {
+      yield { type: 'assistant', message: { content: [] } };
+      after = true;
+      yield RESULT_OK;
+    });
+    const err = await rejection(makeAdapter(query).invoke(invocation({ agent: 'team:coder' })));
+    expect(err.code).toBe(HARNESS_GATE_HOLD_CODE);
+    expect(after).toBe(false);
+    expect(closedEarly()).toBe(true);
+  });
+
+  it('does not require init when no agent was requested', async () => {
+    const { query } = scripted(async function* () {
+      yield RESULT_OK;
+    });
+    await makeAdapter(query).invoke(invocation());
+  });
+
+  it('journals a later call after a miss as agent_not_loaded, not needs_human', async () => {
+    const { query } = scripted(async function* (ctx) {
+      yield initWith(['team:coder']);
+      await ctx.hook({ tool_name: 'Bash', tool_input: { command: 'ls' } });
+      await ctx.hook({ tool_name: 'Read', tool_input: { file_path: 'a' }, agent_type: 'team:coder', tool_use_id: 'tu-2' });
+      yield RESULT_OK;
+    });
+    const events: HarnessEvent[] = [];
+    await rejection(makeAdapter(query).invoke(invocation({ agent: 'team:coder', onEvent: (e) => events.push(e) })));
+    const decisions = holds(events);
+    expect(decisions).toHaveLength(2);
+    expect(decisions[1]).toMatchObject({ toolName: 'Read', decision: 'deny', code: 'agent_not_loaded' });
+  });
+});
+
 describe('agent-sdk: registration with agent and plugin dirs', () => {
   it('accepts _AGENT and _PLUGIN_DIRS and threads them into the bound adapter', async () => {
     const registry = buildHarnessDefinitionRegistry([
