@@ -217,9 +217,11 @@ takes about three seconds. Two obligations follow:
   the script exists to catch. `--list` prints each site and what goes wrong
   without it.
 
-The manifest is small on purpose — five lines that move money — and its guard
-lists were found by mutating and seeing what broke, not by guessing. Keep them
-that way.
+The manifest is small on purpose: the five fold sites, plus the line in
+`src/worker/harness-events-claude.ts` (`claudeResultBreakdown`) that makes a
+Claude harness call's token figure the session total from `modelUsage` rather
+than the last result message's `usage` (issue #108). Its guard lists were
+found by mutating and seeing what broke, not by guessing. Keep them that way.
 
 ## Design principles to apply consistently
 

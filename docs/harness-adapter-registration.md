@@ -675,6 +675,12 @@ can gate every tool call ([containment profile](harness-containment.md#a-middle-
   ([containment profile](harness-containment.md#a-middle-claim-supervised-adapters)).
 - A station's `tools` list is the gate's allowlist: `Bash` alone allows no executable, so
   list `Bash(git:*)` style entries for the commands it may run.
+- Its usage, like `claude-headless`'s, comes from the last `result` message: the cost is
+  `total_cost_usd`, and the tokens are the four classes summed across every `modelUsage` entry
+  (the main model and the side-task model). Both are cumulative for the session. The message's
+  `usage` covers only the turns since the previous result and leaves out the side-task model,
+  so it is read only when `modelUsage` is missing. A call that runs a background subagent emits
+  two result messages, and its last `usage` can be a quarter of the session's tokens (issue #108).
 
 ## The `codex-app-server` adapter
 

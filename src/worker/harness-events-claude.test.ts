@@ -187,6 +187,29 @@ describe('mapClaudeStreamLine: per event class', () => {
     ]);
   });
 
+  it('a result with modelUsage reports its cumulative sum, the figure KnownUsage.tokens carries (issue #108)', () => {
+    const events = mapClaudeStreamLine(
+      line({
+        type: 'result',
+        subtype: 'success',
+        total_cost_usd: 0.0267,
+        usage: { input_tokens: 10, output_tokens: 363, cache_read_input_tokens: 16826, cache_creation_input_tokens: 826 },
+        modelUsage: {
+          side: { inputTokens: 989, outputTokens: 20, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
+          main: { inputTokens: 54, outputTokens: 2312, cacheReadInputTokens: 63946, cacheCreationInputTokens: 4535 },
+        },
+      }),
+    );
+    expect(events).toEqual([
+      {
+        type: 'usage',
+        tokens: 71_856,
+        breakdown: { inputTokens: 1043, outputTokens: 2332, cacheReadInputTokens: 63_946, cacheCreationInputTokens: 4535 },
+        costUsd: 0.0267,
+      },
+    ]);
+  });
+
   it('a result without a usage object yields no usage event, and a non-numeric cost is left out', () => {
     expect(mapClaudeStreamLine(line({ type: 'result', subtype: 'error_during_execution' }))).toEqual([]);
     expect(
