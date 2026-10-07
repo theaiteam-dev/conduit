@@ -72,3 +72,57 @@ describe("fake-claude — call numbering", () => {
     expect(stderr).toContain(`"ROLE:REVIEW the gate"`);
   });
 });
+
+describe("fake-claude — result shape", () => {
+  const root = mkdtempSync(join(tmpdir(), "conduit-bb-fake-claude-shape-"));
+
+  afterAll(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  test("every result's modelUsage entries carry costUSD and canonicalModel, as the real CLI's do", async () => {
+    const scenarioPath = join(root, "scenario.json");
+    writeFileSync(
+      scenarioPath,
+      JSON.stringify({
+        stateDir: join(root, "counters"),
+        logPath: join(root, "invocations.ndjson"),
+        roles: [
+          {
+            name: "maker",
+            promptIncludes: "ROLE:MAKER",
+            calls: [
+              {
+                earlierResults: [
+                  { usage: { input_tokens: 10, output_tokens: 5 }, modelUsage: { "claude-a": { inputTokens: 10, outputTokens: 5, costUSD: 0.01 } } },
+                ],
+                modelUsage: {
+                  "claude-a": { inputTokens: 20, outputTokens: 10, costUSD: 0.02 },
+                  "claude-b": { inputTokens: 3, outputTokens: 1, canonicalModel: "claude-b-canonical" },
+                },
+              },
+            ],
+          },
+        ],
+      }),
+    );
+    const proc = Bun.spawn([process.execPath, FAKE_CLAUDE, "-p", "--", "ROLE:MAKER"], {
+      env: { ...process.env, FAKE_CLAUDE_SCENARIO: scenarioPath },
+      stdout: "pipe",
+      stderr: "ignore",
+    });
+    const [stdout] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+    const results = stdout
+      .split("\n")
+      .filter((l) => l.length > 0)
+      .map((l) => JSON.parse(l) as Record<string, any>)
+      .filter((e) => e.type === "result");
+    expect(results.map((r) => r.modelUsage)).toEqual([
+      { "claude-a": expect.objectContaining({ costUSD: 0.01, canonicalModel: "claude-a" }) },
+      {
+        "claude-a": expect.objectContaining({ costUSD: 0.02, canonicalModel: "claude-a" }),
+        "claude-b": expect.objectContaining({ costUSD: 0, canonicalModel: "claude-b-canonical" }),
+      },
+    ]);
+  });
+});

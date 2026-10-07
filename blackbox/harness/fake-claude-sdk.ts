@@ -91,6 +91,10 @@ export interface FakeClaudeSdkModelUsage {
   outputTokens: number;
   cacheReadInputTokens?: number;
   cacheCreationInputTokens?: number;
+  /** Default 0. */
+  costUSD?: number;
+  /** Default: the model key. */
+  canonicalModel?: string;
 }
 
 /**
@@ -230,7 +234,7 @@ function emit(obj: unknown): void {
   writeSync(1, JSON.stringify(obj) + "\n");
 }
 
-/** `modelUsage` entries with every token class present, as the CLI sends them. */
+/** `modelUsage` entries with every token class, the cost and the canonical model, as the CLI sends them on every result. */
 function modelUsageEntries(entries: Record<string, FakeClaudeSdkModelUsage>): Record<string, Record<string, unknown>> {
   const out: Record<string, Record<string, unknown>> = {};
   for (const [model, e] of Object.entries(entries)) {
@@ -239,6 +243,8 @@ function modelUsageEntries(entries: Record<string, FakeClaudeSdkModelUsage>): Re
       outputTokens: e.outputTokens,
       cacheReadInputTokens: e.cacheReadInputTokens ?? 0,
       cacheCreationInputTokens: e.cacheCreationInputTokens ?? 0,
+      costUSD: e.costUSD ?? 0,
+      canonicalModel: e.canonicalModel ?? model,
     };
   }
   return out;
@@ -576,6 +582,7 @@ async function main(): Promise<number> {
             cacheReadInputTokens: usage.cache_read_input_tokens ?? 0,
             cacheCreationInputTokens: usage.cache_creation_input_tokens ?? 0,
             costUSD: costUsd,
+            canonicalModel,
           },
         };
     emit(resultMessage(usage, modelUsage, costUsd, "00000000-0000-4000-8000-000000000099", true));
