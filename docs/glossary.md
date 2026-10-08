@@ -276,13 +276,15 @@ so high-volume writes never contend with transactional state. WAL + `busy_timeou
 (SPEC §11)
 
 **card log** — the per-card journal trail: every lane change, gate verdict, terminal
-reason. The substrate kaizen reads.
+reason. Available for inspection today and intended as input to planned kaizen work.
 
-**War Room** *(genba)* — the live view over the journal: watch the floor, not a report
-about the floor.
+**War Room** *(planned; genba)* — a proposed live view over the journal. Today,
+inspect runs through the CLI and configured channels.
 
-**tagging** — stamping every shipped asset with a stable ID (`output.tag_assets`) so
-market signals can be joined back to the producing card. (SPEC §13)
+**tagging** *(planned)* — stamping delivered assets with stable IDs so external
+outcomes can be joined to their production history. `output.tag_assets` is a
+proposed configuration field in the design, not a supported runtime option.
+(SPEC §13)
 
 ---
 
@@ -291,13 +293,15 @@ market signals can be joined back to the producing card. (SPEC §13)
 **skill** *(standard work)* — a crystallized, named, reusable unit of work — a prompt +
 contract that proved itself and got promoted from ad-hoc to standard.
 
-**kaizen** — the continuous-improvement loop (build step 10): mine the journal for
-patterns (chronic rework edges, scrap clusters), propose flow mutations, A/B them.
-Improvement is itself a flow.
+**kaizen** *(planned, build step 10)* — a continuous-improvement process that
+would mine execution history and feedback for patterns, propose changes,
+evaluate them, and require human approval before promotion. Today, Conduit
+supports bounded artifact revision and manual investigation; it does not
+implement this learning loop. See [feedback loops](./feedback-loops.md).
 
-**calibration cascade** — the three-judge alignment: internal critic ↔ human ↔ market.
-Each cheaper judge is periodically calibrated against the more expensive one above it.
-(SPEC §12)
+**calibration cascade** *(planned)* — the proposed alignment of internal critic,
+human preference, and market outcomes, using evidence from later stages to
+improve earlier checks. See [feedback loops](./feedback-loops.md).
 
 ---
 

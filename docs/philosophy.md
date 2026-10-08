@@ -4,6 +4,19 @@ Why this thing is shaped the way it is. [`SPEC.md`](../SPEC.md) is the *what*; t
 *why*. If a design decision ever seems arbitrary, it should trace back to one of the beliefs
 below.
 
+## The Product Promise
+
+**Conduit makes recurring AI work configurable, inspectable, and repeatable.**
+
+The flow definition, prompts, and scripts capture how a piece of work should be
+produced and checked. The runtime executes that process, records its path, and
+bounds revision. Domain expertise lives in the flow; Conduit supplies the
+execution and inspection machinery.
+
+Today, improvement means revising work within a run and helping a developer
+understand what to change next. Learning from delivered outcomes is planned;
+see the [feedback-loop design](./feedback-loops.md).
+
 ---
 
 ## The core bet: LLMs are labor, not a brain in the loop
@@ -71,10 +84,11 @@ smart call; you get it from **make → inspect → revise**, with the maker and 
 kept separate (different prompt, often different model). The back-edge is what makes output
 *converge* toward good instead of merely *happening once*.
 
-And this is precisely what lets you run **cheap models**. A sharp critic covering for a
-cheaper maker beats an expensive maker you never check. The flow is the mechanism that makes
-frontier-quality output reachable with non-frontier labor. Cheap models, the flow, and
-(eventually) a real market signal are not three features — they're one strategy.
+This also gives you a way to evaluate **cheaper models**. Assign a cheaper maker
+and a stronger critic, then measure accepted output quality and total cost,
+including revisions. Savings depend on the task and the checks; the architecture
+does not guarantee that a cheaper model will produce acceptable work. Eventually,
+feedback from delivered artifacts could help evaluate those choices across runs.
 
 ---
 
@@ -123,14 +137,16 @@ filter in a stream. Keep the filters pure and the flow stays simple.
 
 ## Escalate ambiguity; never guess. The Law is load-bearing.
 
-When state is contradictory or recovery is unclear, the kernel **hard-pauses and asks a
-human** — it does not auto-reverse or auto-guess. Forward-only across waves; no "nuclear
-reversal" that rots state.
+When recovery is ambiguous, the kernel can **hold work for operator attention**.
+Configured Slack selection steps have a reply-and-resume path; an operational
+hold may instead require manual diagnosis and reconciliation. Forward-only
+across waves; no "nuclear reversal" that rots state.
 
-And because Conduit runs its own runtime with no provider safety net, **the Law — enforcement
-hooks, path ownership, the allowlist — is the only guardrail.** It is not optional and it is
-not best-effort. A disabled hook is how a flow learns to `rm -rf` the wrong directory; we've
-seen it. The Law gets unit tests like any load-bearing code.
+Containment needs enforceable boundaries: tool gates, path ownership, process
+limits, and deployment isolation. The shipped harness adapters provide different
+levels of control, documented in the [containment profile](./harness-containment.md).
+The full in-kernel Tool-Bridge remains planned. Describe a deployment's guarantees
+in terms of the adapter and isolation it actually uses.
 
 ---
 
@@ -139,9 +155,9 @@ seen it. The Law gets unit tests like any load-bearing code.
 If quality comes from the flow and the model is interchangeable, then the durable advantage
 isn't the prompts and isn't the model — it's the **flow**: which stations, what each one's
 definition-of-done is, where the checks sit, how rework routes. Domain expertise gets
-encoded as *topology and check rubrics*, not one giant system prompt. **The flow is config;
-the kernel is the product.** "I know how to make great X" becomes "here is the flow that
-makes great X."
+encoded as topology, prompts, and check rubrics. **The product is a configurable
+production process you can run and inspect.** The kernel supports that promise
+by executing the rules and recording what happened.
 
 ---
 
@@ -152,8 +168,9 @@ makes great X."
 - **Not a DAG runner.** The rework back-edge is the point; acyclic engines can't express it.
 - **Not frontier-only.** Cheap-model viability is a design target, not an afterthought.
 - **Not host-locked.** It owns its runtime so it can own its model and its cost.
-- **Not self-modifying.** Kaizen *proposes* improvements; a human (or a passing test) gates
-  every change. A self-modifying flow is a self-degrading flow.
+- **Not self-modifying.** The planned kaizen system would propose improvements,
+  evaluate them, and require human approval before promotion. Today, developers
+  make those changes themselves.
 
 ---
 
