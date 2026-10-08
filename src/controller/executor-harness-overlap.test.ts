@@ -559,12 +559,12 @@ describe('overlap integrity rule', () => {
     for (const c of ['c1', 'c2', 'c3']) expect(lane(c)).toBe('done');
     // Every member wrote before any returned, so each diff held both siblings' result.json.
     expect(spans('c1')[0]?.attributes?.overlap_attributed).toEqual([
-      { card: 'c2', paths: 1 },
-      { card: 'c3', paths: 1 },
+      { card: 'c2', paths: 1, sample: ['evidence/c2/result.json'] },
+      { card: 'c3', paths: 1, sample: ['evidence/c3/result.json'] },
     ]);
     expect(spans('c2')[0]?.attributes?.overlap_attributed).toEqual([
-      { card: 'c1', paths: 1 },
-      { card: 'c3', paths: 1 },
+      { card: 'c1', paths: 1, sample: ['evidence/c1/result.json'] },
+      { card: 'c3', paths: 1, sample: ['evidence/c3/result.json'] },
     ]);
   });
 
@@ -603,9 +603,14 @@ describe('overlap integrity rule', () => {
     await run(flow, registry, 3);
 
     for (const c of ['c1', 'c2', 'c3']) expect(lane(c)).toBe('done');
-    expect(spans('c1')[0]?.attributes?.overlap_attributed).toEqual([
-      { card: 'c2', paths: 2 },
-      { card: 'c3', paths: 1 },
+    // The sample is in snapshot walk order, so compare it sorted.
+    const attributed = (spans('c1')[0]?.attributes?.overlap_attributed as Array<{ card: string; paths: number; sample: string[] }>).map((a) => ({
+      ...a,
+      sample: [...a.sample].sort(),
+    }));
+    expect(attributed).toEqual([
+      { card: 'c2', paths: 2, sample: ['evidence/c2/planted.txt', 'evidence/c2/result.json'] },
+      { card: 'c3', paths: 1, sample: ['evidence/c3/result.json'] },
     ]);
   });
 

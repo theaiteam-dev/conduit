@@ -1489,6 +1489,7 @@ export async function runExecutor(args: RunEngineArgs): Promise<void> {
       // under the serial rule, exactly as a station without `overlap` does.
       for (const item of overlapPlan.serial) {
         if (halted) break;
+        dispatchedThisTick = true;
         currentCardId = item.cardId;
         cardDispatches.set(item.cardId, (cardDispatches.get(item.cardId) ?? 0) + 1);
         const laneChanged = await executeStation({
@@ -3915,6 +3916,21 @@ interface HarnessArgs {
  * outbox discipline.
  */
 async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
+  // Issue #30, ADR-0012: whatever happens inside an attempt, including an error
+  // thrown between opening the overlap window and the post-invoke
+  // classification, the member's windows are closed on the way out. A window
+  // left open would count as intersecting every later one, widening the
+  // attribution for siblings. The normal close points inside the body stay in
+  // place (close is idempotent, the first end wins) so the window ends before
+  // `intersecting()` is computed.
+  try {
+    return await executeHarnessStationBody(args);
+  } finally {
+    if (args.overlap !== undefined) args.overlap.windows.closeOpenFor(args.cardId);
+  }
+}
+
+async function executeHarnessStationBody(args: HarnessArgs): Promise<boolean> {
   const {
     db, stateDb, runId, stationConfig, stationId, cardId, trackingAdapter, happyPathNext, terminalLanes,
     maxExecutionAttempts, projectRoot, flow, currentNow, now, runStartedAt, wallClockSeconds, maxTokens,
@@ -4576,6 +4592,8 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
           projectRoot, overlap.ownedCanonical, touchedPaths, overlap.windows.intersecting(overlapWindow),
         );
         touchedPaths = classified.remaining;
+        // An array of {card, paths, sample}: the journal's secret-key filter
+        // would drop an object keyed by a name containing "token" or "auth".
         if (classified.attributed.length > 0) overlapAttrs['overlap_attributed'] = classified.attributed;
       }
       const integrityViolation: IntegrityResult | null =

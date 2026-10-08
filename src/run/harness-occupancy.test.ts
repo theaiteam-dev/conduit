@@ -369,6 +369,23 @@ describe('issue #30, ADR-0012: occupancy with overlapped calls', () => {
     expect(report.stations.map((s) => s.unsampledCalls)).toEqual([1, 1]);
   });
 
+  it('counts an overlapped span without ready_waiting in busy time but not in waited card-time', () => {
+    insertRun('uns');
+    const t0 = 1_700_000_000_000;
+    // A [0,20s) sampled, waiting 2. B [10s,40s) unsampled, extends past A.
+    overlappedSpan('uns', 'walk', 'u1', t0, 20_000, 2);
+    overlappedSpan('uns', 'walk', 'u2', t0 + 10_000, 30_000);
+    setWallClock('uns', 100);
+    const report = getHarnessOccupancy(db, 'uns')!;
+    // busy: the union [0,40s) includes B's tail, which A alone would not cover.
+    expect(report.stations[0]!.busyMs).toBe(40_000);
+    expect(report.totalBusyMs).toBe(40_000);
+    // waited: only A's sample counts, 2 cards for A's 20 s. B adds nothing, not even 0 samples averaged in.
+    expect(report.stations[0]!.waitedCardMs).toBe(40_000);
+    expect(report.stations[0]!.unsampledCalls).toBe(1);
+    expect(report.stations[0]!.overlappedCalls).toBe(2);
+  });
+
   it('still reports a journal written before ADR-0012 (no started_at_ms or concurrent)', () => {
     insertRun('old');
     span('old', 'research', 'maker', 30_000, 1);

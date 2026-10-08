@@ -20,7 +20,7 @@
  *     reports those paths per member. Everything else is left for the serial
  *     integrity check to judge unchanged.
  */
-import { isAbsolute, join } from 'node:path';
+import { isAbsolute, join, relative } from 'node:path';
 import type { StationConfig } from '../types/kernel';
 import { isContainedIn, resolveOwnedPath } from '../worker/integrity';
 
@@ -103,6 +103,17 @@ export class OverlapWindows {
   }
 
   /**
+   * Close every window of `cardId` still open. The executor calls it on every
+   * exit from a member's call, so an error thrown between open and the normal
+   * close point cannot leave a window open.
+   */
+  closeOpenFor(cardId: string): void {
+    this.windows.forEach((w, handle) => {
+      if (w.cardId === cardId && w.end === null) this.close(handle);
+    });
+  }
+
+  /**
    * The other cards whose windows intersected window `handle`, one entry per
    * card (a card that retried has several windows). Call after `close(handle)`.
    */
@@ -122,12 +133,19 @@ export class OverlapWindows {
   }
 }
 
+/** Most attributed paths journaled per sibling; `paths` still holds the full count. */
+export const OVERLAP_ATTRIBUTED_SAMPLE_CAP = 20;
+
 /** Attribution of one member's diff: what is left to check, and what went to whom. */
 export interface OverlapClassification {
   /** Touched paths the serial integrity check still judges, in input order. */
   remaining: string[];
-  /** Per sibling, how many touched paths lay inside its owned paths. Sorted by card id. */
-  attributed: Array<{ card: string; paths: number }>;
+  /**
+   * Per sibling, how many touched paths lay inside its owned paths (`paths`)
+   * and the first `OVERLAP_ATTRIBUTED_SAMPLE_CAP` of them, project-root-relative
+   * (`sample`). Sorted by card id.
+   */
+  attributed: Array<{ card: string; paths: number; sample: string[] }>;
 }
 
 /**
@@ -150,7 +168,7 @@ export function classifyOverlapTouched(
   siblings: readonly OverlapSibling[],
 ): OverlapClassification {
   const remaining: string[] = [];
-  const counts = new Map<string, number>();
+  const found = new Map<string, string[]>();
   for (const touched of touchedPaths) {
     const canonical = resolveOwnedPath(isAbsolute(touched) ? touched : join(projectRoot, touched));
     if (ownCanonical.some((owned) => isContainedIn(canonical, owned))) {
@@ -164,10 +182,12 @@ export function classifyOverlapTouched(
       remaining.push(touched);
       continue;
     }
-    counts.set(owner.cardId, (counts.get(owner.cardId) ?? 0) + 1);
+    const list = found.get(owner.cardId) ?? [];
+    list.push(isAbsolute(touched) ? relative(projectRoot, touched) : touched);
+    found.set(owner.cardId, list);
   }
-  const attributed = [...counts.entries()]
+  const attributed = [...found.entries()]
     .sort(([a], [b]) => a.localeCompare(b))
-    .map(([card, paths]) => ({ card, paths }));
+    .map(([card, list]) => ({ card, paths: list.length, sample: list.slice(0, OVERLAP_ATTRIBUTED_SAMPLE_CAP) }));
   return { remaining, attributed };
 }

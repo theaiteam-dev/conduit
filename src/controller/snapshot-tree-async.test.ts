@@ -6,7 +6,7 @@
  * stdout handling and idle timer are not held up for the whole snapshot.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
-import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { snapshotTree, snapshotTreeAsync } from './executor';
@@ -58,5 +58,35 @@ describe('snapshotTreeAsync', () => {
     }, 0);
     snapshotTree(root);
     expect(ran).toBe(false);
+  });
+
+  it('does not throw and matches snapshotTree after a subdirectory is deleted', async () => {
+    mkdirSync(join(root, 'gone', 'inner'), { recursive: true });
+    writeFileSync(join(root, 'gone', 'a.txt'), 'a');
+    writeFileSync(join(root, 'gone', 'inner', 'b.txt'), 'b');
+    writeFileSync(join(root, 'keep.txt'), 'k');
+    rmSync(join(root, 'gone'), { recursive: true, force: true });
+
+    const sync = snapshotTree(root);
+    const async = await snapshotTreeAsync(root);
+    expect([...async.entries()].sort()).toEqual([...sync.entries()].sort());
+    expect(async.size).toBe(1);
+  });
+
+  // Root ignores directory permissions, so chmod 000 cannot make readdir fail.
+  const isRoot = typeof process.getuid === 'function' && process.getuid() === 0;
+  (isRoot ? it.skip : it)('skips an unreadable subdirectory as snapshotTree does, without throwing', async () => {
+    mkdirSync(join(root, 'locked'), { recursive: true });
+    writeFileSync(join(root, 'locked', 'secret.txt'), 's');
+    writeFileSync(join(root, 'open.txt'), 'o');
+    chmodSync(join(root, 'locked'), 0o000);
+    try {
+      const sync = snapshotTree(root);
+      const async = await snapshotTreeAsync(root);
+      expect([...async.entries()].sort()).toEqual([...sync.entries()].sort());
+      expect(async.size).toBe(1);
+    } finally {
+      chmodSync(join(root, 'locked'), 0o755);
+    }
   });
 });

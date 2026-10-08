@@ -8,7 +8,7 @@ sig = "c589b70ef7bb72cd"
 [[bindings]]
 doc = "CLAUDE.md"
 target = "src/controller/executor.ts#runExecutor"
-sig = "c72198ef31dad547"
+sig = "47f9a2e953d37a63"
 
 [[bindings]]
 doc = "CLAUDE.md"
@@ -23,12 +23,12 @@ sig = "c285309b07a9de1d"
 [[bindings]]
 doc = "SPEC.md"
 target = "src/controller/harness-overlap.ts#OverlapWindows"
-sig = "ef3d391b1167bc61"
+sig = "92ccb841810270de"
 
 [[bindings]]
 doc = "SPEC.md"
 target = "src/controller/harness-overlap.ts#classifyOverlapTouched"
-sig = "5f90c19e73477259"
+sig = "f77a500a8734fc9e"
 
 [[bindings]]
 doc = "SPEC.md"

@@ -9,6 +9,7 @@ import { mkdtempSync, mkdirSync, realpathSync, rmSync, symlinkSync, writeFileSyn
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
+  OVERLAP_ATTRIBUTED_SAMPLE_CAP,
   OverlapWindows,
   canonicalOwnedPaths,
   classifyOverlapTouched,
@@ -36,6 +37,29 @@ function touch(rel: string): string {
 }
 
 describe('OverlapWindows', () => {
+  it('closeOpenFor ends a card\'s still-open windows, so they stop intersecting later ones', () => {
+    const w = new OverlapWindows();
+    const a = w.open('a', []);
+    w.close(a); // normal path
+    const leaked = w.open('leaked', []);
+    w.closeOpenFor('leaked'); // finally-path after an error between open and close
+    const later = w.open('later', []);
+    w.close(later);
+    expect(w.intersecting(later).map((s) => s.cardId)).toEqual([]);
+    // Idempotent: the first end wins.
+    w.closeOpenFor('leaked');
+    w.close(leaked);
+    expect(w.intersecting(later).map((s) => s.cardId)).toEqual([]);
+  });
+
+  it('a window never closed intersects every later one', () => {
+    const w = new OverlapWindows();
+    w.open('leaked', []);
+    const later = w.open('later', []);
+    w.close(later);
+    expect(w.intersecting(later).map((s) => s.cardId)).toEqual(['leaked']);
+  });
+
   it('reports the members whose windows intersected, and not one that closed before this one opened', () => {
     const w = new OverlapWindows();
     const early = w.open('early', ['/e']);
@@ -107,9 +131,20 @@ describe('classifyOverlapTouched', () => {
     const out = classifyOverlapTouched(root, own(), [mine, b1, b2, c1], siblings());
     expect(out.remaining).toEqual([mine]);
     expect(out.attributed).toEqual([
-      { card: 'b', paths: 2 },
-      { card: 'c', paths: 1 },
+      { card: 'b', paths: 2, sample: ['evidence/b/result.json', 'evidence/b/notes.txt'] },
+      { card: 'c', paths: 1, sample: ['evidence/c/result.json'] },
     ]);
+  });
+
+  it('caps the journaled sample per sibling but keeps the full count', () => {
+    const many = Array.from({ length: OVERLAP_ATTRIBUTED_SAMPLE_CAP + 5 }, (_, i) => touch(`evidence/b/f${i}.txt`));
+    const out = classifyOverlapTouched(root, own(), many, siblings());
+    expect(out.attributed).toHaveLength(1);
+    expect(out.attributed[0]?.paths).toBe(OVERLAP_ATTRIBUTED_SAMPLE_CAP + 5);
+    expect(out.attributed[0]?.sample).toEqual(
+      many.slice(0, OVERLAP_ATTRIBUTED_SAMPLE_CAP).map((p) => p.slice(root.length + 1)),
+    );
+    expect(OVERLAP_ATTRIBUTED_SAMPLE_CAP).toBe(20);
   });
 
   it('keeps a path no intersecting member owns, so the serial check fails it', () => {
@@ -134,7 +169,7 @@ describe('classifyOverlapTouched', () => {
     const gone = join(root, 'evidence', 'b', 'vanished.txt');
     const out = classifyOverlapTouched(root, own(), [gone], siblings());
     expect(out.remaining).toEqual([]);
-    expect(out.attributed).toEqual([{ card: 'b', paths: 1 }]);
+    expect(out.attributed).toEqual([{ card: 'b', paths: 1, sample: ['evidence/b/vanished.txt'] }]);
   });
 
   it('keeps a missing path that no intersecting member owns (fail closed)', () => {

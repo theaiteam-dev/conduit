@@ -901,12 +901,14 @@ transform batch, then the harness batch. Each member runs in its own attribution
 its spend folds into the run and wave budgets under its own card.
 
 **The overlap integrity rule.** A member's window runs from just before its baseline snapshot
-to just after its post-invoke snapshot, or to the moment its invoke throws. The kernel records
+to just after its post-invoke snapshot, or to the moment its invoke throws, or to the moment
+the attempt exits on any other error. The kernel records
 each window on a logical clock and which other members' windows intersected it. Each path in a
 member's diff is classified as: inside its own `owned_paths` → allowed; inside the
 `owned_paths` of a member whose window intersected its own → attributed to that member, not a
 breach, and journaled on the member's `<station>.harness` span as `overlap_attributed` (each
-sibling card id with its count of paths); anywhere else → a breach, and the card holds. Paths
+sibling card id with its count of paths and the first 20 of those paths, project-root-relative);
+anywhere else → a breach, and the card holds. Paths
 are canonicalized as the integrity check canonicalizes them: a symlink by its target, and a
 path removed since the snapshot (a sibling deleting a temporary file in its own directory) by
 its parent directory. The serial checks apply to every path not attributed: symlink canonicalization, fail-closed on a

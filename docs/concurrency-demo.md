@@ -92,7 +92,8 @@ only; token spend and per-call context size do not change.
 
 A harness station can opt in to overlapping calls with `overlap: true`, beside
 `wip` ([ADR-0012](../adr/0012-overlapping-ungated-harness-calls.md), SPEC §7
-"Overlapping harness calls"). Its cards then run up to `min(K, wip)` at a time.
+"Overlapping harness calls"). Its cards then run up to `min(K - in-flight, wip)` at a time, where in-flight is the
+number of workers already running when the batch is admitted.
 The loader accepts it only on an ungated station (no `check:`), that is not
 effectful, not a fan-out station and has no `deliver:` block, in a flow that
 sets `defaults.enforce_owned_paths: true`, with an adapter that gates each tool
