@@ -7,7 +7,8 @@
  * alone reviews, not the whole diff every sibling sees. `input_scope.owned_dir`
  * lists which of the station's declared inputs resolve from the CARD's owned
  * directory instead — the mirror image of `output_scope: owned_dir`, which
- * already lets a child WRITE there.
+ * lets a child WRITE there (resolved by ./resolve-output.ts, which uses the
+ * same `resolve(projectRoot, ownedPaths[0])` base as this module).
  *
  * `seed.json` is RESERVED and stays card-scoped with no declaration at all
  * (WI-468): the effective owned-dir set is `declared list ∪ {'seed.json'}`, so

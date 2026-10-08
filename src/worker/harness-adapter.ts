@@ -47,6 +47,17 @@ export interface HarnessInvocation {
   prompt: string;
   /** Declared inputs mounted for the invocation. */
   inputs: MountedInput[];
+  /**
+   * Where the kernel will collect each declared output from (issue #98), in
+   * declared order, resolved by `flow/resolve-output.ts`. Under
+   * `output_scope: owned_dir` these are paths in the card's own directory, and
+   * the rendered prompt lists them as well, so the agent learns them from its
+   * task text. No shipped adapter reads this field; it is the same data in
+   * structured form for an adapter or test that needs it. The executor always
+   * sets it; it is optional so a caller that builds an invocation by hand need
+   * not.
+   */
+  declaredOutputs?: ProducedOutput[];
   /** Tools allowlist honoured by adapters that can restrict tools. */
   tools: string[];
   /** Wall-clock timeout bound in milliseconds. */
