@@ -72,7 +72,9 @@ What it does not cover:
 - The arguments of an allowlisted executable. `git -C / ...` and `git config` pass, and a
   script the agent wrote can then be run.
 - A Bash write that bypasses the path check. The MARK_DONE owned-paths integrity check
-  stays mandatory as the backstop.
+  stays mandatory as the backstop. On a station that declares `overlap: true`, the backstop
+  does not catch a Bash write into the owned paths of a card whose call overlapped this one:
+  the check attributes the path to that card (SPEC §7, "Overlapping harness calls").
 - Reads outside the project root, and a symlink swapped between the check and the write.
 - The input of `Agent` and of any other listed tool that is not a file tool.
 - On `agent-sdk`, an input rewritten by another `PreToolUse` hook after the gate approved
@@ -342,7 +344,9 @@ hold it together:
   during its run, but a write outside `owned_paths` hard-pauses the card to `hold` rather
   than advancing it. For harness stations this check is **mandatory, not opt-in** — it
   cannot be disabled via `defaults.enforce_owned_paths: false` the way it can for other
-  station kinds.
+  station kinds. Under `overlap: true` (ADR-0012) a touched path inside the owned paths of a
+  card whose call overlapped this one is attributed to that card instead of failing the
+  check; every other path is checked as above.
 - **Secrets by explicit allowlist only.** The harness child process's environment contains
   only variables named in engine configuration (e.g. the harness's own auth token) — never
   the kernel's environment inherited wholesale. Allowlisted names live in engine config

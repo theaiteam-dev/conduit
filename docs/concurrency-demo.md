@@ -80,38 +80,78 @@ time. The flag cannot exceed a station's WIP. The harness raises `ideate.wip` to
 10 so the flag is what binds; in a real flow, set the station `wip` to the
 parallelism you actually want to allow.
 
-## Gotcha: harness stations run one card at a time
+## Harness stations run one card at a time unless they declare `overlap: true`
 
-`--concurrency K` parallelises two kinds of station: plain pure `deterministic`
-stations (the out-of-process worker pool) and plain `transform` stations
-(overlapping in-process model calls). A `kind: harness` station is neither. It
-runs on the synchronous path: the kernel awaits the agent CLI call and
-dispatches no other card until it returns, whatever K and the station `wip` are
-set to. A harness station with a `check:` gate is excluded a second time,
-because the critic call, the per-gate rework counter and the back-edge
-transition are serial in-process logic (SPEC §6). A pipeline of gated harness
-stations therefore runs one agent call at a time. This costs wall clock only;
-token spend and per-call context size do not change.
+`--concurrency K` parallelises plain pure `deterministic` stations (the
+out-of-process worker pool) and plain `transform` stations (overlapping
+in-process model calls). A `kind: harness` station runs on the synchronous path
+by default: the kernel awaits the agent CLI call and dispatches no other card
+until it returns, whatever K and the station `wip` are set to. A pipeline of
+harness stations therefore runs one agent call at a time. This costs wall clock
+only; token spend and per-call context size do not change.
 
-To see what it cost a finished run, run `conduit run status --run <id>`. For a
-run with harness calls it prints, per harness station, the call count, the
-summed call duration and its share of the run's wall clock, and the
+A harness station can opt in to overlapping calls with `overlap: true`, beside
+`wip` ([ADR-0012](../adr/0012-overlapping-ungated-harness-calls.md), SPEC §7
+"Overlapping harness calls"). Its cards then run up to `min(K, wip)` at a time.
+The loader accepts it only on an ungated station (no `check:`), that is not
+effectful, not a fan-out station and has no `deliver:` block, in a flow that
+sets `defaults.enforce_owned_paths: true`, with an adapter that gates each tool
+call (`agent-sdk`, `codex-app-server` or `opencode`; `claude-headless` and
+`codex-exec` cannot). The usual case is the children of a fan-out, each with its
+own owned directory and `output_scope: owned_dir`:
+
+```yaml
+defaults:
+  enforce_owned_paths: true
+stations:
+  - id: walk
+    wip: 3
+    overlap: true
+    worker:
+      kind: harness
+      harness: agent-sdk
+      tools: [Read, Write, Bash(git)]
+      # ...
+    inputs: [seed.json]
+    outputs: [result.json]
+    output_scope: owned_dir
+    next: done
+```
+
+At dispatch a card joins the batch only if it declares `owned_paths` and they do
+not overlap those of a card already in the batch; any other card runs on the
+serial path after the batch, and its spans record why as `overlap_fallback`.
+Overlap weakens one check: a Bash command in one card that writes into a
+sibling's owned directory (`cp`, `tee`, `sed -i` with a path argument) is not
+detected, because the integrity check attributes that path to the sibling. A
+write anywhere else under the project root still holds the card. A gated
+harness station cannot overlap: the critic call, the per-gate rework counter and
+the back-edge transition are serial in-process logic (SPEC §6).
+
+To see what harness calls cost a finished run, run `conduit run status --run
+<id>`. For a run with harness calls it prints, per harness station, the call
+count, the busy time and its share of the run's wall clock, and the
 card-seconds other ready cards spent waiting behind those calls:
 
 ```text
 run job-1: terminal (outcome=complete)
-harness occupancy (serial under any --concurrency; run wall clock 100.0s):
+harness occupancy (run wall clock 100.0s):
   research: 2 maker + 1 critic call(s), busy 60.0s (60.0% of wall clock), other ready cards waited 70.0 card-s
-  total: busy 60.0s (60.0% of wall clock)
+  walk: 3 maker + 0 critic call(s), 3 overlapped, busy 40.0s (40.0% of wall clock), other ready cards waited 0.0 card-s
+  total: busy 100.0s (100.0% of wall clock)
 ```
 
-Run wall clock is `runs.created_at` to the run's newest journal row, in whole
+Busy time is the union of call intervals, so three walkers that ran side by side
+for 40 s count 40 s, not 120 s; the total is the union across stations. Run
+wall clock is `runs.created_at` to the run's newest journal row, in whole
 seconds, and includes any time a resumed run spent stopped. The waiting figure
 is an estimate. It is sampled once when each call starts, so a card that
 becomes dispatchable during the call, for example when its `release_at` passes,
 is not counted. It also counts ready cards that a station `wip` cap would have
-held back anyway. Calls journaled before this report existed carry no waiting
-sample and are listed as not sampled.
+held back anyway. For overlapped calls it counts the ready cards not admitted to
+the batch, and while several calls run it takes the largest of their samples,
+so a waiting card is counted once. Calls journaled before this report existed
+carry no waiting sample and are listed as not sampled.
 
 ## What this validates
 

@@ -1,6 +1,6 @@
 # ADR-0012: Ungated harness calls may overlap under `--concurrency`, with owned-dir attribution in the integrity check
 
-Status: Proposed
+Status: Accepted (maintainer decision 2026-10-08 to build ahead of the measurement; #30 acceptance item 3 still needs a measured number)
 Date: 2026-10-07
 
 ## Context
