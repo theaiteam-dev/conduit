@@ -1,73 +1,95 @@
 # Conduit
 
-**A deterministic quality loop for AI workflows.**
+**Conduit makes recurring AI work configurable, inspectable, and repeatable.**
 
-Conduit runs AI work through a quality loop: produce, inspect, revise, then
-accept, reject, or escalate.
+Define your production flow in YAML, with prompts and scripts alongside it.
+Conduit runs the steps, applies your checks, sends findings back for bounded
+revisions, and pauses for human review where configured.
 
-It helps teams build AI workflows that are easier to trust: every step has clear
-inputs and outputs, every check leaves a trail, failed work can be retried safely,
-and human judgment has a real place in the process.
+Use it for repeatable work such as code review, marketing assets, video
+production, research, and data enrichment. Choose models per step and keep the
+production process in version control.
 
-## The Short Version
+## What You Configure
 
-Conduit turns AI work into a controlled production line.
+A **flow** describes the production process. A **station** does one piece of
+work: run a command, call a model, delegate to an agent harness, or ask a person
+to choose. A **gate** inspects an artifact against the criteria you supply.
 
-- A **flow** is the whole workflow.
-- A **station** does one piece of work: fetch data, call an API, ask a model to
-  draft something, run a command, or wait for a person.
-- A **gate** checks the work and decides what happens next.
-- The **kernel** moves work between stations, records what happened, enforces
-  limits, and resumes cleanly after failure.
+For example, this station excerpt from the
+[marketing ideas flow](./examples/tiktok-shoppable-ideas/flow.yaml) drafts an idea,
+then asks a separate critic to check it:
 
-The important part is the loop:
-
-```text
-produce -> inspect -> revise -> accept | reject | escalate
+```yaml
+- id: ideate
+  worker:
+    kind: transform
+    model: gemini-flash-lite-latest
+    prompt_file: prompts/ideate.md
+    prompt_version: "1"
+    output_schema:
+      fields:
+        - { name: featured_variant, type: string, required: true }
+        - { name: hook, type: string, required: true }
+        - { name: filming_idea, type: string, required: true }
+  inputs: [context.json, feedback]
+  outputs: [idea.json]
+  next: done
+  check:
+    kind: gate
+    critic:
+      model: gpt-4o
+      prompt_file: prompts/verify.md
+      prompt_version: "1"
+    on_reject: ideate
+    rework_cap: 2
 ```
 
-In Conduit terms, that means a station produces an artifact, a gate evaluates it,
-and the kernel either moves it forward, sends it back with feedback under a
-rework cap, scraps it, or holds it for human judgment.
+If the critic rejects the idea, Conduit passes its findings into the maker's
+`{{feedback}}` prompt placeholder and runs the revision. This gate allows at most
+two revisions; repeated findings can stop it sooner. Verdicts, findings, and
+transitions are recorded for inspection. Your prompts and checks define what
+counts as acceptable work.
 
-That is Conduit's version of loop engineering. The loop is not an agent reasoning
-forever. The loop is deterministic quality control around AI labor.
+The full example includes the context-fetching step, budgets, and security
+configuration. Models must be available through your configured endpoint; the
+example's two providers use a gateway. See the
+[example guide](./examples/tiktok-shoppable-ideas/README.md) for setup.
 
-## Why It Exists
+## What Conduit Handles
 
-Most AI workflow systems make it easy to call a model. That is not the hard part
-for production work.
+- **Execution and recovery.** Run commands, typed model calls, and agent
+  harnesses. Reuse completed work on resume when checkpoint bindings match.
+- **Inspection and revision.** Separate makers from critics, route rejection
+  findings back to a maker, and cap revisions and execution attempts.
+- **Visibility.** Inspect recorded findings, state transitions, and terminal
+  reasons with `conduit journal inspect`; view the flow with `conduit explain`.
+- **Human review.** Configure Slack selection steps that wait for a reply and
+  resume with the recorded choice. Ambiguous recovery can hold work for operator
+  attention.
+- **Effect handling.** Stations declared effectful use an intent log and
+  idempotency keys. Unresolved effects can require manual reconciliation.
+- **Model choice.** Select models per station through an OpenAI-compatible
+  endpoint, or use a supported agent harness for tool-using work.
 
-The hard part is knowing what happened, checking whether it was good enough,
-retrying without duplicating side effects, keeping costs bounded, and knowing
-when to stop or ask a person.
+Conduit runs on a single host with Bun and SQLite. You supply the prompts,
+checks, scripts, credentials, and any external services your flow needs. Launch
+runs from the CLI or configured webhook and Slack triggers; use an external
+scheduler for calendar-based runs. Repeatable refers to the process and its
+rules; model-generated outputs can vary.
 
-Conduit is built around those concerns:
-
-- **Quality checks.** Maker and checker are separate. Work can be revised with
-  specific findings instead of trusted on the first pass.
-- **Bounded rework.** A flow can improve work without spinning forever.
-- **Deterministic control.** The kernel decides legal routing. LLMs produce and
-  judge; they do not drive the conveyor.
-- **Cost recovery.** Completed stations are checkpointed with binding stamps, so
-  a resume does not repay earlier work unless inputs changed.
-- **Safe side effects.** Publishing, committing, and billed calls go through an
-  intent log and idempotency keys.
-- **Model independence.** Choose the right model per station, from frontier models
-  where judgment matters to cheap or local models where it does not.
-- **Human approval.** Human-in-the-loop decisions are durable state, not a vague
-  prompt instruction.
-
-If you are deciding between Conduit and a general workflow or agent framework,
-read [Why Conduit?](./docs/why-conduit.md). It explains where Temporal, n8n, and
-LangGraph are stronger—and the narrower problem Conduit is designed to solve.
+The value is having these production rules available in configuration. If you
+already use Temporal or another workflow platform, compare the work needed to
+build and maintain your particular flow. Read [Why Conduit?](./docs/why-conduit.md)
+for that decision.
 
 ## Quickstart
 
 This runs a real fan-out/fan-in flow with ten child lanes and no model calls, API
 keys, or external data. It exercises Conduit's loader, deterministic stations,
 SQLite state, subprocess worker pool, concurrency cap, and terminal-state
-reporting.
+reporting. To exercise model generation and inspection after this smoke test,
+follow the [marketing ideas example](./examples/tiktok-shoppable-ideas/README.md).
 
 Prerequisites: [Bun 1.3.11](https://bun.sh/) and
 [DuckDB](https://duckdb.org/docs/stable/installation/). Bash and Python 3 are
@@ -149,33 +171,31 @@ stations, gates check it, and the kernel records the path.
 
 ## How It Works
 
-Stop thinking "one agent that reasons about everything." Think **stations on a
-line**.
-
-Stations come in three execution kinds:
+The kernel follows the declared route and enforces its limits. Models produce
+and inspect artifacts at stations. The shipped worker kinds are:
 
 - **Deterministic stations** run known work with no LLM, such as SQL queries, API
   calls, `ffmpeg`, CSV export, validation, or delivery.
 - **Transformation stations** (`transform` in `flow.yaml`) make one model call
   with typed input and typed output. They are good for drafting, summarizing,
   classifying, ranking, and critique.
-- **Agentic stations** use an LLM with tools in a multi-turn loop. This is the
-  highest-risk surface and is only needed for work that truly requires open-ended
-  tool use.
+- **Harness stations** (`harness` in `flow.yaml`) delegate tool-using work to a
+  supported external agent harness. Containment depends on the adapter.
 
 The kernel itself stays deterministic. It uses Bun, TypeScript, SQLite, atomic
-claims, checkpoint binding stamps, an outbox for side effects, and a journal as
-the source of truth. No LLM sits in the control loop.
+claims, checkpoint binding stamps, an outbox for declared effects, and a journal
+of execution history. The state database tracks current work; the journal
+records how it got there.
 
-The quality loop is where the leverage comes from:
+An inspected production step follows this loop:
 
 ```text
 work -> gate -> bounded rework -> pass | scrap | hold
 ```
 
-For users, that reads as accept, reject, and escalate. In the kernel, those map
-to pass, scrap, and hold. Both describe the same thing: every loop has a gate, a
-bound, and an explicit outcome.
+A passing verdict advances work. Rejection can send it back for revision;
+exhausting a cap applies the configured policy, usually scrap. Human selection
+and recovery holds pause work for different reasons, recorded in the journal.
 
 ## Design Commitments
 
@@ -199,40 +219,40 @@ bound, and an explicit outcome.
 
 ## Current Status
 
-The MVP kernel, real-run path, and production worker pool are implemented.
-Conduit is ready for deterministic, transformation, and harness-delegated flows:
+The runtime supports deterministic, transformation, and harness flows, including:
 
-- flow loading and validation
-- real model calls through an OpenAI-compatible adapter
-- deterministic worker commands
-- typed prompts and output schemas
-- checkpoint binding stamps
-- bounded gate rework
-- deterministic fan-out and fan-in
-- Slack human-in-the-loop rank selection
-- multimodal image inputs for transformation stations
-- webhook and Slack event ingress
-- Docker-first distribution (non-root engine image, per-flow `conduit build`)
-- harness adapters for external headless agent CLIs, with explicit containment
-  limits documented separately from the planned Law-grade agentic tier
-- **per-child seeded fan-out inputs** with `{{seed.json}}` prompt rendering
-- **bounded concurrent execution** — `conduit run --concurrency K` runs fan-out lanes K-at-a-time as real out-of-process workers (START_WORK/MARK_DONE/HEARTBEAT over Bun IPC), bounded by `min(K, station.wip)`
-- **dead-PID detection** for robust worker reclaim under concurrency
-- **multi-run shared-database support** — `conduit run --run-id <id>` isolates concurrent jobs against a single SQLite database with zero cross-contamination (schema v10, run registry, all per-run tables scoped by run_id)
-- crash/resume recovery tested by the crash oracle
+- YAML loading and validation, typed output schemas, and image inputs
+- inspection gates, rejection feedback, and bounded revisions
+- checkpoint bindings and crash/resume recovery
+- fan-out/fan-in with seeded child inputs and bounded concurrency
+- separate run IDs for multiple jobs sharing a state database
+- Slack human selection, webhook and Slack triggers, and delivery steps
+- Docker packaging and CLI tools for status, inspection, and diagnostics
 
-**Step 9a status:** the worker pool is wired into the production binary — `conduit run --concurrency K>1`
-spawns real `conduit __worker` subprocesses (`Bun.spawn` ↔ harness) that run deterministic stations and
-report over IPC, with the kernel as the sole DB writer. The synchronous single-worker path (`concurrency=1`)
-is unchanged. See [`docs/concurrency-demo.md`](./docs/concurrency-demo.md) for a measured, reproducible proof.
+The operator interface is currently the CLI and configured channels. War Room,
+the planned visual run view, is not shipped. The full in-kernel agentic
+Tool-Bridge is also planned; the shipped harness adapters have the guarantees
+listed in the [containment profile](./docs/harness-containment.md).
 
-**Run namespacing status:** Multiple `conduit run --run-id job-A` and `conduit run --run-id job-B` jobs can safely share one database. Each `--run-id` is a partition; legacy runs auto-adopt a stable default run ID for backward compatibility.
+See the [concurrency demonstration](./docs/concurrency-demo.md),
+[build order](./docs/build-order.md), and [release notes](./CHANGELOG.md) for
+details.
 
-The Law-grade agentic Tool-Bridge (step 9b) and kaizen loop (step 10) remain
-post-MVP work. The shipped `kind: harness` precursor tier is step 9c and makes a
-deliberately narrower containment claim.
-See [`docs/build-order.md`](./docs/build-order.md) for the implementation sequence
-and [`CHANGELOG.md`](./CHANGELOG.md) for release notes.
+## Improving Work Today and Over Time
+
+Today, Conduit uses inspection findings to revise an artifact within a run.
+Recorded findings, human selections, and execution history also help you
+investigate failures and manually improve prompts, checks, and flow definitions.
+
+**We're building toward flows that improve from feedback on their delivered
+work.** Examples include acceptance or dismissal of code-review comments, or
+views and sales associated with published videos. Connecting those outcomes to
+the producing artifact, evaluating proposed changes, and promoting improvements
+is planned work. Conduit does not currently harvest those signals or tune a flow
+automatically.
+
+See the [roadmap](./ROADMAP.md) for direction and the
+[feedback-loop design](./docs/feedback-loops.md) for the proposed learning system.
 
 ## Repository Map
 
@@ -282,5 +302,3 @@ conduit/
   [`SECURITY.md`](./SECURITY.md) for private vulnerability reporting.
 
 Conduit is available under the [MIT License](./LICENSE).
-
-> The flow is config. The kernel is the product.

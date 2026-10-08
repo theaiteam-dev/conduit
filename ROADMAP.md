@@ -1,8 +1,10 @@
 # Conduit Roadmap
 
-Conduit is an open-source quality-control runtime for AI workflows. It turns
-model calls, deterministic work, human review, and delivery into inspected,
-retryable, auditable production steps.
+**Conduit makes recurring AI work configurable, inspectable, and repeatable.**
+
+Define your production flow in YAML, with prompts and scripts alongside it.
+Conduit runs the steps, applies your checks, sends findings back for bounded
+revisions, and pauses for human review where configured.
 
 This roadmap is directional. It describes the shape of the project and the
 current launch bar, not a promise that every item will land in this exact order.
@@ -26,6 +28,27 @@ The core runtime is implemented for deterministic and transformation flows:
 The kernel is useful today for developers who are comfortable running local
 commands, reading logs, and working directly with examples. The next launch work
 is about making that value easier to try, inspect, and explain.
+
+## From Revision to Learning
+
+Today, inspection findings guide revisions within a run. Execution history and
+recorded human selections help developers manually improve prompts and checks.
+The runtime does not yet harvest post-delivery outcomes or use them to tune
+future runs.
+
+We're building toward flows that improve from feedback on their delivered work.
+The proposed progression is:
+
+1. Make findings and production history easier to inspect and compare.
+2. Connect external feedback to the artifact and configuration that produced it.
+   Examples include code-review comment acceptance and published-video metrics.
+3. Use sufficient evidence to propose changes, evaluate them against existing
+   behavior, and put promotion through human review and regression checks.
+
+Kaizen and outcome learning remain planned. Their ingestion, attribution,
+evaluation, and promotion mechanisms are described in the
+[feedback-loop design](./docs/feedback-loops.md). The sequence is a direction,
+not a shipped capability or delivery commitment.
 
 ## Developer Preview
 
