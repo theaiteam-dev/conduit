@@ -747,6 +747,14 @@ export interface HarnessSpanTiming {
   durationMs: number | null;
   /** Other dispatchable cards when the call started; null when not recorded. */
   readyWaiting: number | null;
+  /**
+   * Issue #30, ADR-0012: epoch ms the call started, recorded only on a span
+   * of an overlapped call (`started_at_ms`); null on every serial span and on
+   * older journals, whose calls never overlapped another harness call.
+   */
+  startedAtMs: number | null;
+  /** True when the span records `concurrent: true` (an overlapped call). */
+  concurrent: boolean;
 }
 
 /** A run's harness span timings plus the time of its newest journal row. */
@@ -1906,7 +1914,9 @@ class ConduitDBImpl implements ConduitDB {
     const rows = this.journalDb
       .prepare(
         `SELECT station, name, duration_ms,
-                json_extract(attributes_json, '$.ready_waiting') AS ready_waiting
+                json_extract(attributes_json, '$.ready_waiting') AS ready_waiting,
+                json_extract(attributes_json, '$.started_at_ms') AS started_at_ms,
+                json_extract(attributes_json, '$.concurrent') AS concurrent
          FROM journal
          WHERE run_id = $run_id
            AND (name = station || '.harness' OR name = station || '.harness-critic')
@@ -1917,6 +1927,8 @@ class ConduitDBImpl implements ConduitDB {
         name: string;
         duration_ms: number | null;
         ready_waiting: number | null;
+        started_at_ms: number | null;
+        concurrent: number | null;
       }[];
     const last = this.journalDb
       .prepare('SELECT MAX(created_at) AS last FROM journal WHERE run_id = $run_id')
@@ -1927,6 +1939,9 @@ class ConduitDBImpl implements ConduitDB {
         role: row.name.endsWith('.harness-critic') ? ('critic' as const) : ('maker' as const),
         durationMs: row.duration_ms,
         readyWaiting: typeof row.ready_waiting === 'number' ? row.ready_waiting : null,
+        startedAtMs: typeof row.started_at_ms === 'number' ? row.started_at_ms : null,
+        // json_extract returns SQLite's 1 for a JSON true.
+        concurrent: row.concurrent === 1,
       })),
       lastSpanAt: last.last,
     };
