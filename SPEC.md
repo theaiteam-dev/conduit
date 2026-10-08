@@ -870,37 +870,50 @@ risk and gets the most poka-yoke.
 > unchanged. See [`docs/harness-containment.md`](docs/harness-containment.md) for the
 > full profile.
 
-### Overlapping harness calls (ADR-0012, Proposed)
+### Overlapping harness calls (ADR-0012)
 
-> **Not built.** This subsection specifies the rule [ADR-0012](adr/0012-overlapping-ungated-harness-calls.md)
-> proposes. Until it ships, every `kind: harness` station runs one card at a time under any
-> `--concurrency K`, and the harness integrity check is the serial rule: every path touched
-> under the project root between the call's baseline snapshot and its post-invoke snapshot
-> must lie inside the card's `owned_paths`, or the card holds.
+Under `--concurrency K` a `kind: harness` station runs one card at a time unless it declares
+`overlap: true`. A harness call on the serial path holds the tick loop until it returns, and
+its integrity check is the serial rule: every path touched under the project root between the
+call's baseline snapshot and its post-invoke snapshot must lie inside the card's `owned_paths`,
+or the card holds.
 
 A harness station may declare `overlap: true` (station level, beside `wip`; rejected on any
 other `kind`). Its cards then run as overlapping calls, up to `min(K, wip)` at a time, when
 every admission condition holds:
 
 - **Static, validated at load:** the station has no `check:` block, is not `effectful`, is
-  not a fan-out station, and has no `deliver` block; its adapter has `canGatePerCall` (checked
-  again at dispatch); and the flow sets `defaults.enforce_owned_paths: true`, so the per-call
-  gate confines file-tool writes to the card's `owned_paths`.
+  not a fan-out station, and has no `deliver` block; the flow sets
+  `defaults.enforce_owned_paths: true`, so the per-call gate confines file-tool writes to the
+  card's `owned_paths`; and its adapter has `canGatePerCall`. The loader checks the adapter
+  when it is given the adapter registry. The executor checks it again at dispatch, since the
+  registry is engine configuration, and runs a card whose adapter cannot gate per call on the
+  serial path, journaling `overlap_fallback` on its spans and warning once per station.
 - **Dynamic, at dispatch:** the card declares non-empty `owned_paths`, and they are disjoint
-  (canonicalized) from those of every member already in flight. A card that fails either
-  runs on the serial path under the serial rule.
+  (canonicalized) from those of every member already admitted to the batch. A card that fails
+  either runs on the serial path under the serial rule after the batch, with the reason
+  journaled as `overlap_fallback`. A card over the K or `wip` cap stays `ready` for a later
+  pass. A batch of one card runs on the serial path.
 
-Harness members and transform members never overlap each other: a dispatch pass runs them as
-separate batches.
+Harness members and transform members never overlap each other: a dispatch pass runs the
+transform batch, then the harness batch. Each member runs in its own attribution scope, so
+its spend folds into the run and wave budgets under its own card.
 
-**The overlap integrity rule.** A member's window runs from its baseline snapshot to its
-post-invoke snapshot, and the kernel records which other members' windows intersected it.
-Each path in a member's diff is classified as: inside its own `owned_paths` → allowed; inside
-the `owned_paths` of a member whose window intersected its own → attributed to that member
-(journaled on the span), not a breach; anywhere else → a breach, and the card holds. The
-disjoint ownership invariant (§9) makes the attribution unambiguous. Because a path that no
-member owns cannot be attributed, a breach by one member holds every member whose diff
-contains it.
+**The overlap integrity rule.** A member's window runs from just before its baseline snapshot
+to just after its post-invoke snapshot, or to the moment its invoke throws. The kernel records
+each window on a logical clock and which other members' windows intersected it. Each path in a
+member's diff is classified as: inside its own `owned_paths` → allowed; inside the
+`owned_paths` of a member whose window intersected its own → attributed to that member, not a
+breach, and journaled on the member's `<station>.harness` span as `overlap_attributed` (each
+sibling card id with its count of paths); anywhere else → a breach, and the card holds. The
+serial checks apply to every path not attributed: symlink canonicalization, fail-closed on a
+path that does not resolve, and a hold, not a retry, on a breach. The disjoint ownership
+invariant (§9) makes the attribution unambiguous. Because a path that no member owns cannot be
+attributed, a breach by one member holds every member whose diff contains it.
+
+An overlapped call takes both snapshots with a walk that yields to the event loop every 10 ms,
+so one member's snapshot does not stall the other members' stdout handling, idle timers or
+gate answers. The serial path's snapshots stay synchronous.
 
 **The gap.** The overlap rule cannot detect a write by one member into another overlapping
 member's `owned_paths`: both diffs attribute it to the owner. The per-call gate denies such a
@@ -909,6 +922,19 @@ allowlisted Bash executable that writes to a path given as an argument (`cp`, `t
 `sed -i`, a script the agent wrote); shell redirects are already denied as metacharacters.
 `overlap: true` is the flow author's acceptance of that gap for the station. A write outside
 every member's `owned_paths` is still detected.
+
+**Per card, unchanged.** Rate-limit parks, retries and their backoff, idle and wall-clock
+timeouts, `child_stagger_seconds` and the consumption andon act on each member as they do on
+a serial call. The batch waits for its slowest member, retries included, before the next
+dispatch pass. Each member checks the andon after its own call, so a batch can exceed the
+token budget by up to K calls (the soft ceiling of §8).
+
+**Reporting.** Each span of an overlapped call records `concurrent: true` and the call's start
+(`started_at_ms`). `ready_waiting` on such a span counts the dispatchable cards not admitted
+to its batch. `conduit run status` reports busy time per station and in total as the union of
+call intervals, and waited card-time over overlapped calls as, at each moment, the largest
+`ready_waiting` among the calls running then. A span without `started_at_ms`, including every
+span of a journal written before overlap existed, adds its full duration.
 
 ### The atomic claim (rev-1 C6)
 deps + WIP + worker-slot must become true at a **single linearization point**. They live

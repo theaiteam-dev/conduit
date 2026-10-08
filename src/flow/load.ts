@@ -199,6 +199,11 @@ interface RawStation {
   effectful?: boolean;
   /** Untrusted: validated to an integer >= 1 in collectErrors. */
   wip?: unknown;
+  /**
+   * Issue #30, ADR-0012: opt a harness station in to overlapping calls under
+   * `--concurrency`. Untrusted: validated by validateOverlap in collectErrors.
+   */
+  overlap?: unknown;
   inputs?: string[];
   outputs?: string[];
   check?: RawCheckConfig;
@@ -388,6 +393,11 @@ function buildStationConfig(
     fan_in: buildFanIn(raw.fan_in),
     fan_out: raw.fan_out as number | undefined,
   };
+
+  // Issue #30: validateOverlap has already rejected every value but a boolean
+  // on an eligible harness station. Absent unless true, so a station that
+  // declares nothing (or `overlap: false`) keeps today's config shape.
+  if (raw.overlap === true) config.overlap = true;
 
   // WI-351: real-run config surface (populated when present in the YAML).
   if (raw.next !== undefined) config.next = raw.next;
@@ -1982,6 +1992,79 @@ function collectErrors(
   // ── skip_when predicates (issue #32) ──────────────────────────────────────
   errors.push(...validateSkipWhen(stations));
 
+  // ── overlap: true (issue #30, ADR-0012) ───────────────────────────────────
+  errors.push(...validateOverlap(stations, yaml.defaults?.enforce_owned_paths === true, harnessRegistry));
+
+  return errors;
+}
+
+/**
+ * Validate every station's `overlap` (issue #30, ADR-0012). The static
+ * admission conditions are checked here, so a station that could never overlap
+ * fails at load instead of running serially without notice:
+ *
+ *   - the value is a boolean, and the station is `kind: harness`;
+ *   - for `overlap: true`: no `check:` block (this covers `rank`), not
+ *     effectful, not a fan-out station (any fan-out field declared), no
+ *     `deliver:` block, and the flow sets `defaults.enforce_owned_paths: true`,
+ *     so the per-call gate confines file-tool writes to the card's owned paths;
+ *   - with a registry injected, the adapter has `canGatePerCall`. Without one
+ *     the executor re-checks the adapter at dispatch and runs a card whose
+ *     adapter cannot gate per call on the serial path.
+ */
+function validateOverlap(
+  stations: readonly RawStation[],
+  enforceOwnedPaths: boolean,
+  harnessRegistry?: HarnessRegistry,
+): FlowValidationError[] {
+  const errors: FlowValidationError[] = [];
+  for (const station of stations) {
+    if (station.overlap === undefined) continue;
+    const reject = (why: string): void => {
+      errors.push({ code: 'INVALID_OVERLAP', message: `Station '${station.id}' sets overlap but ${why}` });
+    };
+    if (typeof station.overlap !== 'boolean') {
+      reject(`its value '${String(station.overlap)}' is not true or false`);
+      continue;
+    }
+    if (resolveStationKind(station) !== 'harness') {
+      reject(
+        `is kind=${String(station.worker?.kind ?? 'transform')}; overlap applies only to a kind: harness station ` +
+          `(a transform overlaps under --concurrency without declaring anything)`,
+      );
+      continue;
+    }
+    if (station.overlap !== true) continue;
+    if (station.check !== undefined) {
+      reject('declares a check: block; a gated harness station runs one card at a time (ADR-0012)');
+    }
+    if (station.effectful === true) {
+      reject('is effectful; an effectful station runs one card at a time');
+    }
+    if (station.fan_out !== undefined || station.child_entry !== undefined) {
+      reject('is a fan-out station; set overlap on the station its children run at instead');
+    }
+    if (station.deliver !== undefined) {
+      reject('declares a deliver: block; a delivering station runs one card at a time');
+    }
+    if (!enforceOwnedPaths) {
+      reject(
+        'the flow does not set defaults.enforce_owned_paths: true; overlapped calls need it so the per-call ' +
+          "gate confines each card's file-tool writes to its own owned_paths",
+      );
+    }
+    const adapterName = station.worker?.harness;
+    if (harnessRegistry !== undefined && adapterName !== undefined) {
+      const resolved = harnessRegistry.resolve(adapterName);
+      // An unresolved adapter is already reported as UNKNOWN_HARNESS_ADAPTER.
+      if (resolved.ok && resolved.adapter.canGatePerCall !== true) {
+        reject(
+          `uses adapter '${resolved.adapter.name}', which cannot gate each tool call; overlap needs an adapter ` +
+            'with canGatePerCall (agent-sdk, codex-app-server or opencode)',
+        );
+      }
+    }
+  }
   return errors;
 }
 

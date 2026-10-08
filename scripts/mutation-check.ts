@@ -133,6 +133,9 @@ const MUTANTS: Mutant[] = [
       'src/controller/executor-harness-journal.test.ts',
       'src/controller/executor-harness.test.ts',
       'src/controller/executor-harness-liveness.test.ts',
+      // Issue #30: the same fold under an overlap batch, where it must also
+      // credit the right card (the wave budget scraps only the costly subtree).
+      'src/controller/executor-harness-overlap.test.ts',
     ],
     why:
       'the ordinary successful harness maker call — the single largest line ' +
