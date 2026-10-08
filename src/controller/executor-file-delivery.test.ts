@@ -644,3 +644,89 @@ describe('executor file delivery — pool mode does not skip delivery (concurren
     expect(spans.some((s) => /deliver/i.test(s.name))).toBe(true);
   });
 });
+
+// ===========================================================================
+// issue #98 — deliver.files naming a card-scoped harness output is delivered
+//             from each card's own directory, not from a shared project-root
+//             file of the same name.
+// ===========================================================================
+
+describe('executor file delivery — card-scoped harness outputs (issue #98)', () => {
+  it("delivers each sibling's own report from its owned dir", async () => {
+    const { createHarnessRegistry } = await import('../worker/harness-adapter');
+    const walker = {
+      name: 'fake-walker',
+      reportsUsage: true,
+      canRestrictTools: true,
+      async probeBinary() {
+        return { present: true };
+      },
+      async invoke(call: import('../worker/harness-adapter').HarnessInvocation) {
+        const check = /"check":\s*"([^"]+)"/.exec(call.prompt)![1]!;
+        for (const out of call.declaredOutputs ?? []) {
+          writeFileSync(out.path, out.name === 'result.json' ? JSON.stringify({ verdict: check }) : `REPORT-${check}`);
+        }
+        return { outputs: [], usage: { tokens: 1, cost: 0 } };
+      },
+    };
+    const registry = createHarnessRegistry([walker]);
+    mkdirSync(join(projectDir, 'prompts'), { recursive: true });
+    writeFileSync(join(projectDir, 'prompts', 'walk.md'), 'Walk {{seed.json}}');
+    writeFileSync(
+      join(projectDir, 'flow.yaml'),
+      `
+flow: harness-delivery
+project_root: .
+flow_version: 1
+budgets:
+  run: { wall_clock_minutes: 10, max_tokens: 100000 }
+  per_card: { max_execution_attempts: 2 }
+  liveness: { no_progress_minutes: 3 }
+terminal_lanes: [done, scrap, hold]
+channels:
+  egress:
+    - type: slack
+      target: "#deliveries"
+      uses: [delivery]
+stations:
+  - id: ${STATION}
+    worker:
+      kind: harness
+      harness: fake-walker
+      prompt_file: prompts/walk.md
+      prompt_version: "1"
+      tools: [Read, Write]
+      output_schema:
+        fields:
+          - { name: verdict, type: string, required: true }
+    inputs: [seed.json]
+    outputs: [result.json, report.md]
+    output_scope: owned_dir
+    deliver:
+      files: [report.md]
+    next: done
+`,
+    );
+    const loaded = loadFlow(join(projectDir, 'flow.yaml'), { harnessRegistry: registry });
+    if (!loaded.ok) throw new Error(`fixture flow invalid: ${JSON.stringify(loaded.errors)}`);
+    // A decoy at the shared name: delivering it would ship the wrong bytes.
+    stageFile(projectDir, 'report.md', 'DECOY');
+    db = openDb();
+    for (const check of ['c1', 'c2']) {
+      stageFile(projectDir, `evidence/${check}/seed.json`, JSON.stringify({ check }));
+      seedCard(db, { id: check, lane: STATION, owned_paths: [`evidence/${check}`] });
+    }
+    const { io } = makeIO();
+
+    await runExecutor({
+      db, flow: loaded.flow, now: SECONDS(1000), adapter: noopAdapter(), io, harnessRegistry: registry,
+    } as RunEngineArgs);
+
+    expect(db.getCard(DEFAULT_RUN_ID, 'c1')?.lane).toBe('done');
+    expect(db.getCard(DEFAULT_RUN_ID, 'c2')?.lane).toBe('done');
+    const delivered = uploads.map((u) => u.filePath).sort();
+    expect(delivered).toHaveLength(2);
+    expect(delivered[0]).toContain(join('evidence', 'c1', 'report.md'));
+    expect(delivered[1]).toContain(join('evidence', 'c2', 'report.md'));
+  });
+});

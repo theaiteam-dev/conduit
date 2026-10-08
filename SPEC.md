@@ -424,7 +424,7 @@ directory (`owned_paths[0]`, where `seed.json` already lives):
 | Knob | Governs | Applies to |
 |---|---|---|
 | `input_scope: { owned_dir: [<name>, …] }` | which declared **inputs** are READ from the card's dir | `transform` + `harness` stations |
-| `output_scope: project_root \| owned_dir` | where declared **outputs** are WRITTEN | `transform` stations |
+| `output_scope: project_root \| owned_dir` | where declared **outputs** are WRITTEN and COLLECTED | `transform` + `harness` stations |
 
 Only the names listed in `input_scope.owned_dir` move; every other declared input
 still resolves from the project root, so a child can combine one shared artifact (a
@@ -440,6 +440,42 @@ lexically via `..`, or through a symlink — is rejected on the read side exactl
 already was on the write side, so reads and writes obey one rule. The
 binding stamp (§5) hashes card-scoped inputs from the card's dir too, so sibling
 children get distinct stamps and a changed per-child file re-executes on resume.
+
+Every use of a declared output's location goes through one resolver
+(`src/flow/resolve-output.ts`), so a writer and a reader cannot disagree about where
+a file is. Under `output_scope: owned_dir` that covers the transform writer; for a
+`harness` station, the paths the agent is told, the presence check, the JSON and
+`output_schema` read of `outputs[0]`, and the artifact hashes on its journal span; the
+gate critic, whose scope is the station's inputs plus outputs and which reads those
+outputs from the card's dir; and a `deliver.files` entry that names a card-scoped
+output, which is delivered from the card's dir. A downstream station reads a child's
+output by listing it in its own `input_scope.owned_dir`.
+
+A `harness` station writes its outputs itself, so a card-scoped one has three more rules:
+
+- **Destination.** The kernel appends an "Output files" section to the rendered prompt,
+  listing the absolute path of each declared output, and passes the same list as
+  `HarnessInvocation.declaredOutputs`. The flow's template does not have to know the
+  card's directory.
+- **Checked before execution.** The card's dir must exist, must be inside the project
+  root after symlinks are resolved (the harness integrity check snapshots only the
+  project root, so it could not check writes anywhere else), and no output name may
+  escape it. A card that fails any of these goes to `hold` before the harness runs, as a
+  card-scoped input that cannot be resolved does. The harness owned-paths integrity
+  check still runs on every attempt: for `kind: harness` it is unconditional, unlike the
+  `defaults.enforce_owned_paths` opt-in that governs the transform and deterministic paths.
+- **Freshness.** Before every attempt, including a retry within one dispatch, the kernel
+  removes each card-scoped declared output that exists. A file present after the call
+  was therefore written by that call: a file from a failed attempt or an earlier run
+  is never collected as the new result, and a sibling's file is never at this card's
+  path. An attempt that writes nothing fails as `harness-output-missing` and spends an
+  execution attempt like any other output failure. Because of this removal, the loader
+  rejects a card-scoped harness output that is also one of the station's card-scoped
+  inputs or the reserved `seed.json`. A skip on resume (matching binding stamp) invokes
+  nothing and removes nothing.
+
+With the default `project_root` scope a harness station's outputs are not removed
+before an attempt and the prompt is unchanged, as before this option existed.
 
 Every knob here came from the three flows diverging or from a rev-1 finding. The seam
 is the whole product: *the flow is config; the kernel is the engine.*

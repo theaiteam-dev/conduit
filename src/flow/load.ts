@@ -47,6 +47,7 @@ import type {
 } from '../types/kernel';
 import { findCycleNodes } from './dag-utils';
 import { FEEDBACK_INPUT } from './render';
+import { harnessOutputInputOverlap } from './resolve-output';
 import { resolveSkill, type ResolveSkillResult } from '../skills/resolve';
 import type { ParsedSkill } from '../skills/parse';
 import { detectExecutionSurface, type ExecutionSurfaceWarning } from '../skills/detect-surface';
@@ -774,9 +775,12 @@ function collectErrors(
         });
       }
     }
-    // v10: output_scope — enum-valued, transform-only (the engine only writes
-    // declared outputs for transform stations; deterministic/harness stations
-    // write their own files), and meaningless without declared outputs.
+    // v10: output_scope — enum-valued, and meaningless without declared
+    // outputs. Allowed on the two kinds whose declared outputs the kernel
+    // resolves: a transform (the kernel writes them) and, since issue #98, a
+    // harness (the agent writes them and the kernel collects them). A
+    // deterministic or subflow station's outputs still resolve from the
+    // project root.
     if (station.output_scope !== undefined) {
       if (station.output_scope !== 'project_root' && station.output_scope !== 'owned_dir') {
         errors.push({
@@ -785,13 +789,12 @@ function collectErrors(
             `Station '${station.id}' has invalid output_scope '${String(station.output_scope)}' — ` +
             `must be 'project_root' or 'owned_dir'`,
         });
-      } else if (station.worker?.kind !== 'transform') {
+      } else if (station.worker?.kind !== 'transform' && station.worker?.kind !== 'harness') {
         errors.push({
           code: 'INVALID_OUTPUT_SCOPE',
           message:
             `Station '${station.id}' sets output_scope but its worker kind is ` +
-            `'${String(station.worker?.kind)}' — output_scope applies only to transform stations ` +
-            `(the engine writes declared outputs only for transforms)`,
+            `'${String(station.worker?.kind)}' — output_scope applies only to transform and harness stations`,
         });
       } else if (!Array.isArray(station.outputs) || station.outputs.length === 0) {
         errors.push({
@@ -800,6 +803,30 @@ function collectErrors(
             `Station '${station.id}' sets output_scope but declares no outputs — ` +
             `the scope only governs where declared outputs are written`,
         });
+      } else if (station.worker?.kind === 'harness') {
+        // issue #98: the kernel removes a card-scoped harness output before
+        // every attempt (the freshness rule), so an output that is also a
+        // card-scoped input, or the reserved seed, would be deleted unread.
+        const rawInputScope = station.input_scope as { owned_dir?: unknown } | null | undefined;
+        const ownedDirInputs =
+          rawInputScope !== null && typeof rawInputScope === 'object' && Array.isArray(rawInputScope.owned_dir)
+            ? rawInputScope.owned_dir.filter((n): n is string => typeof n === 'string')
+            : [];
+        const overlap = harnessOutputInputOverlap({
+          outputs: station.outputs.filter((n): n is string => typeof n === 'string'),
+          output_scope: station.output_scope,
+          input_scope: { owned_dir: ownedDirInputs },
+        });
+        if (overlap.length > 0) {
+          errors.push({
+            code: 'INVALID_OUTPUT_SCOPE',
+            message:
+              `Station '${station.id}' declares ${overlap.map((n) => `'${n}'`).join(', ')} as a card-scoped ` +
+              `harness output and a card-scoped input (or the reserved seed). The kernel removes a card-scoped ` +
+              `harness output before each attempt, so the input would be deleted before the agent reads it. ` +
+              `Give the output a different name.`,
+          });
+        }
       }
     }
     // issue #51: input_scope — which declared inputs are READ from the card's
@@ -807,10 +834,9 @@ function collectErrors(
     // surfaces here rather than as a card-scoped read that silently falls back
     // to a project-root file (or an opaque render throw mid-run).
     //
-    // Deliberately NOT transform-only, unlike output_scope: that one is scoped
-    // to transforms because the engine writes declared outputs only for
-    // transforms, but a HARNESS station reads (and mounts) its declared inputs
-    // the same way a transform does, so both kinds may scope them.
+    // Allowed on transform and harness stations, the same kinds as
+    // output_scope: a HARNESS station reads (and mounts) its declared inputs the
+    // same way a transform does, so both kinds may scope them.
     if (station.input_scope !== undefined) {
       const rawScope = station.input_scope;
       const ownedDir =

@@ -13,7 +13,7 @@
  * ~/.claude (claude-config-isolation.ts).
  *
  * `outputs` is always `[]` — the executor collects declared outputs from disk
- * (findMissingDeclaredOutputs in executor.ts); the claude JSON payload carries
+ * (at the paths flow/resolve-output.ts resolves); the claude JSON payload carries
  * no file manifest, so this adapter never fabricates output references.
  *
  * Do NOT touch ./harness.ts (unrelated worker-pool subprocess harness).

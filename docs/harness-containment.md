@@ -599,6 +599,15 @@ liveness-watchdog integration so an in-flight attempt counts as progress, and th
 idempotency discipline for effectful stations. The tool loop is the only new freedom; the
 contract around it is unchanged.
 
+Declared outputs resolve the way a transform's do. By default they are collected from the
+project root. With `output_scope: owned_dir`, which fan-out children use so that siblings
+sharing one station definition do not overwrite one file, they are collected from the
+card's `owned_paths[0]`: the kernel lists each destination path at the end of the prompt,
+holds the card before running the harness if that directory is missing, outside the
+project root, or escaped by an output name, and removes each declared output before every
+attempt so that only a file the current call wrote is collected. SPEC §4 ("Card scope")
+has the full rules.
+
 ## Recommended deployment
 
 - Run agentic/harness flows in the [ADR-0003](../adr/0003-packaging-and-distribution.md)
