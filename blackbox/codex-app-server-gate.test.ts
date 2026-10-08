@@ -14,7 +14,7 @@
  * Case 1, a mixed turn:
  *   - `cat topic.md` is accepted (allowlisted executable);
  *   - `curl -s https://example.com` is declined (not allowlisted);
- *   - `cat topic.md > copy.md` is declined (shell metacharacter);
+ *   - `cat topic.md > copy.md` is declined (a redirect, code shell_metacharacter);
  *   - a write of result.json is accepted, and the file exists;
  *   - a write to a file outside the project root is declined, and the file
  *     does not exist.

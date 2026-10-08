@@ -884,7 +884,7 @@ time (in-flight: workers already running in the run when the batch is admitted),
 every admission condition holds:
 
 - **Static, validated at load:** the station has no `check:` block, is not `effectful`, is
-  not a fan-out station, and has no `deliver` block; the flow sets
+  not a fan-out station (declares neither `fan_out` nor `child_entry`), and has no `deliver` block; the flow sets
   `defaults.enforce_owned_paths: true`, so the per-call gate confines file-tool writes to the
   card's `owned_paths`; and its adapter has `canGatePerCall`. The loader checks the adapter
   when it is given the adapter registry. The executor checks it again at dispatch, since the
@@ -917,8 +917,10 @@ invariant (§9) makes the attribution unambiguous. Because a path that no member
 attributed, a breach by one member holds every member whose diff contains it.
 
 An overlapped call takes both snapshots with a walk that yields to the event loop every 10 ms,
-so one member's snapshot does not stall the other members' stdout handling, idle timers or
-gate answers. The serial path's snapshots stay synchronous.
+so one member's snapshot stalls the other members' stdout handling, idle timers and gate
+answers for at most one step of the walk. A step reads and hashes one file synchronously, so a
+single large file can still block the event loop for as long as that read takes. The serial
+path's snapshots stay synchronous.
 
 **The gap.** The overlap rule cannot detect a write by one member into another overlapping
 member's `owned_paths`: both diffs attribute it to the owner. The per-call gate denies such a

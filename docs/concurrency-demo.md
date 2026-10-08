@@ -95,7 +95,8 @@ A harness station can opt in to overlapping calls with `overlap: true`, beside
 "Overlapping harness calls"). Its cards then run up to `min(K - in-flight, wip)` at a time, where in-flight is the
 number of workers already running when the batch is admitted.
 The loader accepts it only on an ungated station (no `check:`), that is not
-effectful, not a fan-out station and has no `deliver:` block, in a flow that
+effectful, not a fan-out station (no `fan_out` or `child_entry` declared) and
+has no `deliver:` block, in a flow that
 sets `defaults.enforce_owned_paths: true`, with an adapter that gates each tool
 call (`agent-sdk`, `codex-app-server` or `opencode`; `claude-headless` and
 `codex-exec` cannot). The usual case is the children of a fan-out, each with its

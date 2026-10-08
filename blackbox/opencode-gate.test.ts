@@ -7,8 +7,8 @@
  * it raises a `permission.asked` per tool call and records the answer the
  * adapter posts. The station allows `Bash(cat)` and `Write`, so of one
  * invocation's asks the gate allows `cat topic.md` and the write of the
- * declared output, denies `ls -la` (not allowlisted) and a pipeline (shell
- * metacharacter), and the adapter rejects an `external_directory` ask without
+ * declared output, denies `ls -la` (not allowlisted) and the pipeline
+ * `cat topic.md | wc -l` (`wc` is not allowlisted), and the adapter rejects an `external_directory` ask without
  * asking the gate. A second case sends a question, which the adapter holds.
  *
  * Asserted through public surfaces: the run's exit code, `conduit run status`,
@@ -173,7 +173,8 @@ describe("opencode journey: the tool gate answers each ask of a real opencode se
     const byStep = new Map(answers(f).map((a) => [a.step, a.message]));
     expect(byStep.get(1)).toContain("denied by conduit:");
     expect(byStep.get(1)).toContain("not allowlisted");
-    expect(byStep.get(2)).toContain("shell metacharacter");
+    // A pipe is accepted syntax; the gate refuses it because `wc` is not on the allowlist.
+    expect(byStep.get(2)).toContain('"wc" is not allowlisted');
     expect(byStep.get(3)).toContain("outside the project root");
     expect(byStep.get(0)).toBeNull();
   });
@@ -193,7 +194,7 @@ describe("opencode journey: the tool gate answers each ask of a real opencode se
     expect(decisions).toEqual([
       "gate-decision allow Bash",
       "gate-decision deny Bash code=not_allowlisted reason=Bash executable \"ls\" is not allowlisted",
-      "gate-decision deny Bash code=shell_metacharacter reason=Bash command contains a shell metacharacter",
+      "gate-decision deny Bash code=not_allowlisted reason=Bash executable \"wc\" is not allowlisted",
       "gate-decision deny external_directory code=path_escape reason=access outside the project root is not allowed",
       "gate-decision allow Write",
     ]);
