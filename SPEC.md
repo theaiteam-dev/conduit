@@ -879,7 +879,8 @@ call's baseline snapshot and its post-invoke snapshot must lie inside the card's
 or the card holds.
 
 A harness station may declare `overlap: true` (station level, beside `wip`; rejected on any
-other `kind`). Its cards then run as overlapping calls, up to `min(K, wip)` at a time, when
+other `kind`). Its cards then run as overlapping calls, up to `min(K - in-flight, wip)` at a
+time (in-flight: workers already running in the run when the batch is admitted), when
 every admission condition holds:
 
 - **Static, validated at load:** the station has no `check:` block, is not `effectful`, is

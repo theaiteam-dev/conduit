@@ -1,7 +1,7 @@
 # ADR-0012: Ungated harness calls may overlap under `--concurrency`, with owned-dir attribution in the integrity check
 
 Status: Accepted (maintainer decision 2026-10-08 to build ahead of the measurement; #30 acceptance item 3 still needs a measured number)
-Date: 2026-10-07
+Date: 2026-10-07 (written), 2026-10-08 (accepted)
 
 ## Context
 
@@ -92,7 +92,9 @@ Dynamic, per card at dispatch:
 9. The card's canonical owned paths are disjoint from those of every member already
    admitted to the batch. Fan-out validation (`validateExpansion`) already guarantees this
    among siblings of one parent; the dispatch check covers cards from different parents.
-10. The usual caps: at most `min(K, wip)` members.
+10. The usual caps: at most `min(K - in-flight, wip)` members, where in-flight is the number
+    of workers already running in the run when the batch is admitted. With nothing else in
+    flight that is `min(K, wip)`.
 
 A card that fails 8 or 9 runs on the serial path with today's integrity rule. Harness
 members and transform members never share a batch: the dispatch pass runs them as separate

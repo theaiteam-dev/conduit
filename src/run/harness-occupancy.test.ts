@@ -343,6 +343,19 @@ describe('issue #30, ADR-0012: occupancy with overlapped calls', () => {
     ]);
   });
 
+  it('charges each moment the largest ready_waiting among the overlapping calls', () => {
+    insertRun('mx');
+    const t0 = 1_700_000_000_000;
+    // A [0,40s) waiting 1, B [10s,40s) waiting 3: 1 for 10 s, then 3 for 30 s.
+    // Min, first, last or a sum of the samples would each give a different figure.
+    overlappedSpan('mx', 'walk', 'm1', t0, 40_000, 1);
+    overlappedSpan('mx', 'walk', 'm2', t0 + 10_000, 30_000, 3);
+    setWallClock('mx', 100);
+    const report = getHarnessOccupancy(db, 'mx')!;
+    expect(report.stations[0]!.waitedCardMs).toBe(100_000);
+    expect(report.stations[0]!.busyMs).toBe(40_000);
+  });
+
   it('takes the union across stations for the total when calls of two stations overlap', () => {
     insertRun('two');
     const t0 = 1_700_000_000_000;

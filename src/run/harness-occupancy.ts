@@ -79,22 +79,40 @@ function unionMs(intervals: readonly Interval[]): number {
 }
 
 /**
- * Card-ms waited over `intervals`: for each stretch between consecutive
- * interval boundaries, the stretch's length times the largest ready_waiting
- * among the sampled intervals covering it.
+ * Card-ms waited over `intervals`: at each moment, the largest ready_waiting
+ * among the sampled intervals running then, integrated over time.
+ *
+ * A sweep over the interval boundaries, O(n log n). An interval is [start,
+ * end), so at a shared timestamp the ends are applied before the starts. The
+ * active samples are kept as a value -> count multiset with the current
+ * maximum cached; the maximum is recomputed only when its last holder ends,
+ * and the number of distinct values is small.
  */
 function waitedOverlappedMs(intervals: readonly Interval[]): number {
-  const sampled = intervals.filter((i) => i.readyWaiting !== null);
-  const bounds = [...new Set(sampled.flatMap((i) => [i.start, i.end]))].sort((a, b) => a - b);
+  const events: { at: number; delta: 1 | -1; value: number }[] = [];
+  for (const i of intervals) {
+    if (i.readyWaiting === null) continue;
+    events.push({ at: i.start, delta: 1, value: i.readyWaiting });
+    events.push({ at: i.end, delta: -1, value: i.readyWaiting });
+  }
+  events.sort((a, b) => a.at - b.at || a.delta - b.delta);
+
+  const active = new Map<number, number>();
+  let most = 0;
   let total = 0;
-  for (let k = 0; k + 1 < bounds.length; k++) {
-    const from = bounds[k]!;
-    const to = bounds[k + 1]!;
-    let most = 0;
-    for (const i of sampled) {
-      if (i.start <= from && i.end >= to) most = Math.max(most, i.readyWaiting!);
+  for (let k = 0; k < events.length; k++) {
+    const { at, delta, value } = events[k]!;
+    const count = (active.get(value) ?? 0) + delta;
+    if (count > 0) active.set(value, count);
+    else active.delete(value);
+    if (delta === 1) {
+      if (value > most) most = value;
+    } else if (count === 0 && value === most) {
+      most = 0;
+      for (const v of active.keys()) if (v > most) most = v;
     }
-    total += (to - from) * most;
+    const next = events[k + 1];
+    if (next !== undefined) total += (next.at - at) * most;
   }
   return total;
 }

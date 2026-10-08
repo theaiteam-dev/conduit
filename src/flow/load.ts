@@ -394,9 +394,10 @@ function buildStationConfig(
     fan_out: raw.fan_out as number | undefined,
   };
 
-  // Issue #30: validateOverlap has already rejected every value but a boolean
-  // on an eligible harness station. Absent unless true, so a station that
-  // declares nothing (or `overlap: false`) keeps today's config shape.
+  // Issue #30: validateOverlap has already rejected the key on any station that
+  // is not kind: harness, and every non-boolean value. On a harness station,
+  // `overlap: false` is accepted and, like an absent key, leaves today's config
+  // shape: the field is set only when true.
   if (raw.overlap === true) config.overlap = true;
 
   // WI-351: real-run config surface (populated when present in the YAML).

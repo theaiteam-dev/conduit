@@ -415,6 +415,21 @@ describe('overlap: load-time validation', () => {
     expect(errorsFor(yaml, gating()).join('\n')).toMatch(/'other' sets overlap but is kind=deterministic/);
   });
 
+  it('rejects overlap: false on a station that is not kind: harness', () => {
+    const yaml = flowYaml({
+      extra: `  - id: other
+    overlap: false
+    worker: { kind: deterministic, command: "true" }
+    next: done
+`,
+    });
+    expect(errorsFor(yaml, gating()).join('\n')).toMatch(/'other' sets overlap but is kind=deterministic/);
+  });
+
+  it('accepts overlap: false on a harness station', () => {
+    expect(errorsFor(flowYaml({ overlap: false }), gating())).toEqual([]);
+  });
+
   it('rejects a gated station', () => {
     const yaml = flowYaml({}).replace(
       '    next: done\n',
@@ -437,6 +452,11 @@ describe('overlap: load-time validation', () => {
   it('rejects a fan-out station', () => {
     const yaml = flowYaml({}).replace('    overlap: true\n', '    overlap: true\n    fan_out: 2\n');
     expect(errorsFor(yaml, gating()).join('\n')).toMatch(/is a fan-out station/);
+  });
+
+  it('rejects a station that declares child_entry', () => {
+    const yaml = flowYaml({}).replace('    overlap: true\n', '    overlap: true\n    child_entry: walk\n');
+    expect(errorsFor(yaml, gating()).join('\n')).toMatch(/'walk' sets overlap but is a fan-out station/);
   });
 
   it('rejects a station with a deliver: block', () => {
