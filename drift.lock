@@ -28,7 +28,7 @@ sig = "ef3d391b1167bc61"
 [[bindings]]
 doc = "SPEC.md"
 target = "src/controller/harness-overlap.ts#classifyOverlapTouched"
-sig = "3af675dedfbbfafc"
+sig = "5f90c19e73477259"
 
 [[bindings]]
 doc = "SPEC.md"

@@ -126,8 +126,19 @@ describe('classifyOverlapTouched', () => {
     expect(out.remaining).toEqual([b1]);
   });
 
-  it('keeps a path that does not resolve (fail closed)', () => {
+  it("attributes a path a sibling removed after the snapshot, through its parent dir", () => {
+    // A sibling wrote then deleted a temp file in its own dir between this
+    // member's post-invoke snapshot and the classification. The integrity
+    // check resolves a missing leaf through its parent (resolveOwnedPath), so
+    // classification must too, or the member holds on a sibling's own file.
     const gone = join(root, 'evidence', 'b', 'vanished.txt');
+    const out = classifyOverlapTouched(root, own(), [gone], siblings());
+    expect(out.remaining).toEqual([]);
+    expect(out.attributed).toEqual([{ card: 'b', paths: 1 }]);
+  });
+
+  it('keeps a missing path that no intersecting member owns (fail closed)', () => {
+    const gone = join(root, 'outside', 'vanished.txt');
     const out = classifyOverlapTouched(root, own(), [gone], siblings());
     expect(out.remaining).toEqual([gone]);
   });

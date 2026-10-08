@@ -905,8 +905,10 @@ each window on a logical clock and which other members' windows intersected it. 
 member's diff is classified as: inside its own `owned_paths` → allowed; inside the
 `owned_paths` of a member whose window intersected its own → attributed to that member, not a
 breach, and journaled on the member's `<station>.harness` span as `overlap_attributed` (each
-sibling card id with its count of paths); anywhere else → a breach, and the card holds. The
-serial checks apply to every path not attributed: symlink canonicalization, fail-closed on a
+sibling card id with its count of paths); anywhere else → a breach, and the card holds. Paths
+are canonicalized as the integrity check canonicalizes them: a symlink by its target, and a
+path removed since the snapshot (a sibling deleting a temporary file in its own directory) by
+its parent directory. The serial checks apply to every path not attributed: symlink canonicalization, fail-closed on a
 path that does not resolve, and a hold, not a retry, on a breach. The disjoint ownership
 invariant (§9) makes the attribution unambiguous. Because a path that no member owns cannot be
 attributed, a breach by one member holds every member whose diff contains it.

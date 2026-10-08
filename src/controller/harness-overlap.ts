@@ -20,7 +20,6 @@
  *     reports those paths per member. Everything else is left for the serial
  *     integrity check to judge unchanged.
  */
-import { realpathSync } from 'node:fs';
 import { isAbsolute, join } from 'node:path';
 import type { StationConfig } from '../types/kernel';
 import { isContainedIn, resolveOwnedPath } from '../worker/integrity';
@@ -131,25 +130,18 @@ export interface OverlapClassification {
   attributed: Array<{ card: string; paths: number }>;
 }
 
-function tryRealpath(path: string): string | null {
-  try {
-    return realpathSync(path);
-  } catch {
-    return null;
-  }
-}
-
 /**
  * Apply the overlap integrity rule to one member's touched set.
  *
- * A touched path is attributed, and dropped from the set, only when it
- * canonicalizes, lies outside the member's own owned paths, and lies inside
- * the owned paths of a member whose window intersected this one. Every other
- * path is returned unchanged: a path inside the member's own owned paths
- * passes the serial check as before, and a path that does not canonicalize or
- * that no intersecting member owns fails it as before. The serial checks
- * (symlink canonicalization, fail-closed on an unresolvable path) therefore
- * still run on everything that is not attributed.
+ * A touched path is attributed, and dropped from the set, only when it lies
+ * outside the member's own owned paths and inside the owned paths of a member
+ * whose window intersected this one. Paths are canonicalized with
+ * `resolveOwnedPath`, the resolver `checkIntegrity` uses: a symlink resolves to
+ * its target, and a path removed since the snapshot (a sibling deleting a temp
+ * file in its own dir) resolves through its parent dir. Every other path is
+ * returned unchanged: a path inside the member's own owned paths passes the
+ * serial check as before, and a path no intersecting member owns fails it as
+ * before.
  */
 export function classifyOverlapTouched(
   projectRoot: string,
@@ -160,8 +152,8 @@ export function classifyOverlapTouched(
   const remaining: string[] = [];
   const counts = new Map<string, number>();
   for (const touched of touchedPaths) {
-    const canonical = tryRealpath(isAbsolute(touched) ? touched : join(projectRoot, touched));
-    if (canonical === null || ownCanonical.some((owned) => isContainedIn(canonical, owned))) {
+    const canonical = resolveOwnedPath(isAbsolute(touched) ? touched : join(projectRoot, touched));
+    if (ownCanonical.some((owned) => isContainedIn(canonical, owned))) {
       remaining.push(touched);
       continue;
     }
