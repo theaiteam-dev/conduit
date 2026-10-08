@@ -116,8 +116,9 @@ export interface StationConfig {
   wip: number;
   /**
    * Issue #30, ADR-0012: this harness station's cards may run as overlapping
-   * calls under `conduit run --concurrency K>1`, up to `min(K, wip)` at a
-   * time, under the overlap integrity rule (SPEC §7, "Overlapping harness
+   * calls under `conduit run --concurrency K>1`, up to `min(K - in-flight,
+   * wip)` at a time, where in-flight counts the workers already running in
+   * the run when the batch is admitted, under the overlap integrity rule (SPEC §7, "Overlapping harness
    * calls"). Absent unless declared `true`. Validated at load: only on
    * `kind: harness`, and only when the station has no `check:`, is not
    * effectful, is not a fan-out station, has no `deliver:`, the flow sets
