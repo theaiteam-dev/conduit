@@ -253,6 +253,8 @@ automatically.
 
 See the [roadmap](./ROADMAP.md) for direction and the
 [feedback-loop design](./docs/feedback-loops.md) for the proposed learning system.
+The [implementation proposal](./docs/kaizen-implementation.md) describes a
+Nitpick-first build sequence and the decisions open for public review.
 
 ## Repository Map
 

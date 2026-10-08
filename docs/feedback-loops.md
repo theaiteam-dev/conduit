@@ -6,6 +6,11 @@
 > **calibration cascade** — and points here for the cascade, the joins, the ingest shapes, and
 > the open questions, flagged at the end.
 
+For a proposed implementation sequence, see
+[Building Kaizen from Delivered Outcomes](./kaizen-implementation.md). It starts
+with Nitpick feedback and identifies changes to the earlier sequencing and
+evidence requirements for public review.
+
 Conduit currently uses `work → check → bounded rework` (SPEC §6) to revise
 artifacts within a run. It records findings, human selections, and execution
 history that developers can inspect when changing their flows.

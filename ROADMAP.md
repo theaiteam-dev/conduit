@@ -50,6 +50,10 @@ evaluation, and promotion mechanisms are described in the
 [feedback-loop design](./docs/feedback-loops.md). The sequence is a direction,
 not a shipped capability or delivery commitment.
 
+The [Kaizen implementation proposal](./docs/kaizen-implementation.md) lays out a
+Nitpick-first path through artifact attribution, project-specific observations,
+evidence reports, evaluated changes, and human approval. It is open for review.
+
 ## Developer Preview
 
 The developer preview is the first public OSS milestone. Its goal is simple: an
