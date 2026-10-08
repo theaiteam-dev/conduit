@@ -924,7 +924,10 @@ gate answers. The serial path's snapshots stay synchronous.
 member's `owned_paths`: both diffs attribute it to the owner. The per-call gate denies such a
 write through the file-write tools before it runs. It does not deny one made by an
 allowlisted Bash executable that writes to a path given as an argument (`cp`, `tee`,
-`sed -i`, a script the agent wrote); shell redirects are already denied as metacharacters.
+`sed -i`, a script the agent wrote). The gate refuses every shell redirect; it accepts
+literal quoting and a pipe between allowlisted programs, neither of which writes a file, so
+the gap is the same with or without them. (Issue #122, Landlock write confinement, is the
+planned way to close it.)
 `overlap: true` is the flow author's acceptance of that gap for the station. A write outside
 every member's `owned_paths` is still detected.
 
@@ -980,7 +983,14 @@ split is harder and needs this in-transaction reservation.)*
     resolution** (resolve to canonical absolute, reject escapes) (rev-1 H6).
   - **Bash positive allowlist** — only listed executables; **no shell metacharacters**
     (no pipes/redirects/`;`/backticks/`$()`) unless explicitly enabled. Denylists are
-    insufficient against a cheap model + untrusted substrate.
+    insufficient against a cheap model + untrusted substrate. The harness tier's per-call
+    gate, which runs commands in a real shell, applies this rule through a fail-closed shell
+    lexer: it accepts literal single quotes, double quotes with no `$`, backtick, `\` or `!`,
+    and `|` between programs that are each on the allowlist, and refuses every other
+    construct, including `;`, `&&`, `||`, `&`, redirects, here-docs, `$`, backticks, globs,
+    braces, `~`, control characters, and an assignment or quoted word in program position
+    (`docs/harness-containment.md`). The approved string is the string that runs, with
+    nothing expanded.
   - **Network egress denied by default** for content-processing workers (injection
     exfiltration defense). For `agentic` workers this is enforced in-process: the kernel
     spawns the worker harness via `unshare --net` (a Linux network namespace with no

@@ -16,6 +16,7 @@
 
 import { lstatSync, realpathSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
+import { lexBashCommand } from './bash-lexer';
 import { checkCommandAllowed } from './deterministic';
 import { isContainedIn, resolveOwnedPath } from './integrity';
 
@@ -25,7 +26,7 @@ export type GateDenyCode =
   | 'tool_not_allowed'
   /** Bash: the executable is not on the positive allowlist. */
   | 'not_allowlisted'
-  /** Bash: the command string carries a shell metacharacter. */
+  /** Bash: the command uses shell syntax the gate does not accept (see bash-lexer.ts), or a program word that is quoted or an assignment. */
   | 'shell_metacharacter'
   /** A write resolves outside the card's owned paths (symlinks resolved). */
   | 'path_escape'
@@ -157,22 +158,45 @@ function parseTools(tools: readonly string[]): ParsedTools {
   return { names, bashExecutables };
 }
 
+/**
+ * Decide a Bash call. The command runs in a shell, so it is read by
+ * `lexBashCommand`, which accepts plain words, literal quoting and a pipe
+ * between programs, and refuses every other construct: separators, redirects,
+ * expansions, globs and control characters. Every segment's program must be an
+ * unquoted word, not an assignment, and on the allowlist.
+ *
+ * Checks run in two passes so the verdict reveals nothing about the allowlist
+ * when the syntax is refused: first the whole command's syntax and every
+ * program word's shape, then each program against the allowlist.
+ *
+ * Arguments are not checked. An allowlisted program that runs code or writes
+ * files from its arguments (`sh`, `xargs`, `tee`, `curl -o`, ...) does so; the
+ * MARK_DONE integrity check is the backstop for such a write.
+ */
 function checkBash(input: unknown, executables: readonly string[]): GateDecision {
   const command = (input as { command?: unknown } | null | undefined)?.command;
   if (typeof command !== 'string') return deny('malformed_input', 'Bash input has no string command');
-  // Split on plain spaces only. Newline, tab and every other separator stay
-  // inside a token, where the metacharacter check refuses them.
-  const tokens = command.split(' ').filter((t) => t !== '');
-  if (tokens.length === 0) return deny('malformed_input', 'Bash command is empty');
-  const verdict = checkCommandAllowed(
-    { command: tokens[0], args: tokens.slice(1) },
-    { allowlist: executables },
-  );
-  if (verdict.allowed) return { decision: 'allow' };
-  if (verdict.reason === 'shell_metacharacter') {
-    return deny('shell_metacharacter', 'Bash command contains a shell metacharacter');
+  const lexed = lexBashCommand(command);
+  if (!lexed.ok) return deny(lexed.kind === 'empty' ? 'malformed_input' : 'shell_metacharacter', lexed.reason);
+
+  const programs = lexed.segments.map((segment) => segment[0]!);
+  for (const program of programs) {
+    if (program.quoted) return deny('shell_metacharacter', 'Bash program name must be an unquoted word');
+    if (program.text.includes('=')) {
+      return deny('shell_metacharacter', 'Bash command starts with a variable assignment, which is not allowed');
+    }
   }
-  return deny('not_allowlisted', `Bash executable ${JSON.stringify(tokens[0])} is not allowlisted`);
+  for (const program of programs) {
+    // The program check is the deterministic rule's, unchanged: safe
+    // characters, then an exact match against the allowlist.
+    const verdict = checkCommandAllowed({ command: program.text, args: [] }, { allowlist: executables });
+    if (verdict.allowed) continue;
+    if (verdict.reason === 'shell_metacharacter') {
+      return deny('shell_metacharacter', 'Bash program name contains a shell metacharacter');
+    }
+    return deny('not_allowlisted', `Bash executable ${JSON.stringify(program.text.slice(0, 64))} is not allowlisted`);
+  }
+  return { decision: 'allow' };
 }
 
 /**

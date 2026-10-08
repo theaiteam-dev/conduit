@@ -50,8 +50,25 @@ still owns the loop, and the kernel sees one call at a time. The gate
 - **Tool allowlist.** A tool not in the station's `tools` is denied.
 - **Bash positive allowlist.** Executables come only from `Bash(<exe>)` and
   `Bash(<exe>:*)` entries. A bare `Bash` entry allows the tool and no executable. A
-  narrower rule such as `Bash(git status:*)` is not widened to `git`. A command
-  containing a shell metacharacter is denied before the allowlist is consulted.
+  narrower rule such as `Bash(git status:*)` is not widened to `git`. The gate reads the
+  command with a small shell lexer (`src/worker/bash-lexer.ts`) and refuses anything it
+  does not recognise, before the allowlist is consulted (code `shell_metacharacter`). It
+  accepts:
+  - plain words made of letters, digits and `_ . / : = @ , + % -` (a word may not start
+    with `=`, which zsh expands to a path);
+  - single-quoted text, taken literally;
+  - double-quoted text that contains no `$`, backtick, `\` or `!`, also literal;
+  - quoted and plain parts joined into one word (`-H'Accept: x'`);
+  - `|` between commands. Every segment's program must be on the allowlist.
+
+  It refuses `;`, `&&`, `||`, `&`, `|&`, parentheses, every redirect (`>`, `>>`, `<`, `2>`,
+  `&>`, here-docs, `<(...)`), `$` and backticks outside single quotes, `\` outside single
+  quotes, unquoted `* ? [ ] { } ~ # ! ^`, an unterminated quote, any control character
+  (newline and tab included, quoted or not), and an empty command or pipeline segment. A
+  program name must be an unquoted word and must not be an assignment, so `FOO=bar curl x`
+  and `'curl' x` are denied. So `psql -c 'SELECT id FROM "Job"'` and
+  `curl -s URL | jq '.items[0]'` pass when `psql`, `curl` and `jq` are listed, and
+  `psql -c "SELECT id FROM \"Job\""` does not, because it uses `\` inside double quotes.
 - **Write ownership.** Write, Edit, MultiEdit and NotebookEdit targets must resolve inside
   the card's owned paths, with symlinks resolved on both sides, including a write through
   a dangling symlink, where the flow sets `defaults.enforce_owned_paths` and the card
@@ -70,8 +87,14 @@ deny every tool, so the loader rejects both (`HARNESS_GATED_ADAPTER_NEEDS_TOOLS`
 What it does not cover:
 
 - The arguments of an allowlisted executable. `git -C / ...` and `git config` pass, and a
-  script the agent wrote can then be run.
-- A Bash write that bypasses the path check. The MARK_DONE owned-paths integrity check
+  script the agent wrote can then be run. Some programs run arbitrary code or write files
+  from their arguments: `sh`, `bash`, `env`, `xargs`, `find` (`-exec`), `psql` (`\!`),
+  `curl -o`, `tee`, `sed -i`, `awk` (`system()`). Listing one of them allows what it can
+  do, so the Bash allowlist constrains only what the flow author chooses to list.
+- A Bash write that bypasses the path check. Redirects are refused, but a write by an
+  allowlisted program to a path in its arguments is not. Issue
+  [#122](https://github.com/theaiteam-dev/conduit/issues/122) (Landlock write confinement)
+  is the planned fix. The MARK_DONE owned-paths integrity check
   stays mandatory as the backstop. On a station that declares `overlap: true`, the backstop
   does not catch a Bash write into the owned paths of a card whose call overlapped this one:
   the check attributes the path to that card (SPEC §7, "Overlapping harness calls").

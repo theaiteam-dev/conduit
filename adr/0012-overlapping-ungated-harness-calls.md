@@ -126,10 +126,14 @@ on an unresolvable path, and a hold (not a retry) on breach.
 Sibling A can write into sibling B's owned paths without either card holding: both diffs
 attribute the write to B. The per-call gate closes this for the file-write tools, because
 under condition 7 it denies a Write, Edit, MultiEdit or NotebookEdit outside A's own owned
-paths before the call runs. It does not close it for Bash. The gate denies shell
-metacharacters, so a redirect (`>`) is refused, but an allowlisted executable that writes to
-a path given as an argument (`cp`, `tee`, `sed -i`, a script the agent wrote) is not checked
-against ownership. On the serial path the diff catches such a write; on the overlap path it
+paths before the call runs. It does not close it for Bash. The gate reads a Bash command with
+a fail-closed shell lexer, so a redirect (`>`, `>>`, `2>`, a here-doc) is refused, but an
+allowlisted executable that writes to a path given as an argument (`cp`, `tee`, `sed -i`,
+`curl -o`, a script the agent wrote) is not checked against ownership. Since the lexer
+replaced the original space split, the gate also accepts literal quoting and a `|` between
+allowlisted programs. Neither writes a file, so the gap is unchanged. Issue
+[#122](https://github.com/theaiteam-dev/conduit/issues/122) (Landlock write confinement) is
+the planned fix. On the serial path the diff catches such a write; on the overlap path it
 does not, when the target is inside an overlapping sibling's owned paths. A write outside
 every member's owned paths is still caught.
 

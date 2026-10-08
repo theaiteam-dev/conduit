@@ -674,7 +674,11 @@ can gate every tool call ([containment profile](harness-containment.md#a-middle-
   rewritten input after the call runs and holds the card with code `input_rewritten`
   ([containment profile](harness-containment.md#a-middle-claim-supervised-adapters)).
 - A station's `tools` list is the gate's allowlist: `Bash` alone allows no executable, so
-  list `Bash(git:*)` style entries for the commands it may run.
+  list `Bash(git:*)` style entries for the commands it may run. The gate accepts literal
+  quoting and a pipe between listed programs, and refuses redirects, expansions and command
+  separators ([Bash rule](harness-containment.md#a-middle-claim-supervised-adapters)). Some
+  programs run code or write files from their arguments (`sh`, `xargs`, `tee`, `curl -o`, ...):
+  listing one allows that.
 - Its usage, like `claude-headless`'s, comes from the last `result` message: the cost is
   `total_cost_usd`, and the tokens are the four classes summed across every `modelUsage` entry
   (the main model and the side-task model). Both are cumulative for the session. The message's
