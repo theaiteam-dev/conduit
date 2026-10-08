@@ -36,7 +36,8 @@ project root). Two things block it:
 2. **Declared outputs resolve under the project root.** Siblings of one station declare the
    same output name and overwrite each other's file.
    [#98](https://github.com/theaiteam-dev/conduit/issues/98) (card-scoped harness outputs)
-   fixes this and is a prerequisite.
+   fixes this and is a prerequisite. It merged in #118: a harness station with
+   `output_scope: owned_dir` writes and collects its outputs under the card's `owned_paths[0]`.
 
 Gated harness stations are a separate problem. Their gate path (`runGateCheckOrAdvance`:
 critic call, per-gate rework counter, back-edge transition) is serial in-process logic that
@@ -234,7 +235,7 @@ Needs `runGateCheckOrAdvance` to be re-entrant. Not required by the Shakedown sh
   worker writes to the project root during an overlapped call.
 
 **Prerequisites**
-- #98 (card-scoped harness outputs) merged.
+- #98 (card-scoped harness outputs) merged. Done in #118.
 - The overlap set and the attribution journaled on each span.
 - The occupancy and conformance changes above.
 
