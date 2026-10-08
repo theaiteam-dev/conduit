@@ -131,7 +131,8 @@ a fail-closed shell lexer, so a redirect (`>`, `>>`, `2>`, a here-doc) is refuse
 allowlisted executable that writes to a path given as an argument (`cp`, `tee`, `sed -i`,
 `curl -o`, a script the agent wrote) is not checked against ownership. Since the lexer
 replaced the original space split, the gate also accepts literal quoting and a `|` between
-allowlisted programs. Neither writes a file, so the gap is unchanged. Issue
+allowlisted programs. Neither construct writes a file by itself; a program receiving a pipe
+can write to a path in its arguments (`cat a | tee b`), which is the same gap. Issue
 [#122](https://github.com/theaiteam-dev/conduit/issues/122) (Landlock write confinement) is
 the planned fix. On the serial path the diff catches such a write; on the overlap path it
 does not, when the target is inside an overlapping sibling's owned paths. A write outside

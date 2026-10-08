@@ -927,9 +927,10 @@ member's `owned_paths`: both diffs attribute it to the owner. The per-call gate 
 write through the file-write tools before it runs. It does not deny one made by an
 allowlisted Bash executable that writes to a path given as an argument (`cp`, `tee`,
 `sed -i`, a script the agent wrote). The gate refuses every shell redirect; it accepts
-literal quoting and a pipe between allowlisted programs, neither of which writes a file, so
-the gap is the same with or without them. (Issue #122, Landlock write confinement, is the
-planned way to close it.)
+literal quoting and a pipe between allowlisted programs. Neither construct writes a file by
+itself, but a program receiving a pipe can write to a path in its arguments (`cat a | tee b`),
+which is the same gap. (Issue #122, Landlock write confinement, is the planned way to close
+it.)
 `overlap: true` is the flow author's acceptance of that gap for the station. A write outside
 every member's `owned_paths` is still detected.
 

@@ -80,7 +80,7 @@ Rework is bounded by **four independent guards**: per-card, **per-gate** rework 
 
 Because Conduit runs its own runtime with no provider safety net, the Law is the **only guardrail**:
 - Path ownership — writes ⊆ card's `owned_paths`, symlink-resolved
-- Bash positive allowlist — only listed executables, no shell metacharacters
+- Bash positive allowlist: only listed executables. Deterministic stations allow no shell metacharacters; the harness per-call gate reads the command with a fail-closed shell lexer that also accepts literal quoting and `|` between allowlisted programs, and refuses separators, redirects and expansions
 - Network egress denied by default for content workers
 
 The Law applies to `agentic` stations only. It is load-bearing; hooks must have unit tests. A disabled hook is how a flow learns to `rm -rf` the wrong directory.

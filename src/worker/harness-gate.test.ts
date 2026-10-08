@@ -125,6 +125,8 @@ describe('createHarnessToolGate Bash', () => {
   it.each([
     ['git status', 'allow', undefined],
     ['git', 'allow', undefined],
+    ['', 'deny', 'malformed_input'],
+    ['   ', 'deny', 'malformed_input'],
     ['ls -la src', 'allow', undefined],
     ['  git   log  ', 'allow', undefined],
     ['rm -rf x', 'deny', 'not_allowlisted'],

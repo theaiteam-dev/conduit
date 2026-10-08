@@ -279,21 +279,15 @@ function rateLimitAttributes(snapshot: RateLimitSnapshot | undefined): Record<st
  * call, and it counts cards a station `wip` cap would have held back anyway.
  */
 function countReadyWaiting(stateDb: Database, runId: string, cardId: string, nowSeconds: number): number {
-  const row = stateDb
-    .prepare(
-      `SELECT COUNT(*) AS n FROM cards
-       WHERE run_id = $runId AND id != $cardId AND status = 'ready'
-         AND (release_at IS NULL OR release_at <= $now)`,
-    )
-    .get({ $runId: runId, $cardId: cardId, $now: nowSeconds }) as { n: number };
-  return row.n;
+  return countReadyNotAdmitted(stateDb, runId, new Set([cardId]), nowSeconds);
 }
 
 /**
- * Issue #30, ADR-0012: `ready_waiting` for an overlapped harness call. The
- * cards dispatchable now (countReadyWaiting's rule) that are not members of
- * the call's overlap batch, so a sibling running alongside is not counted as
- * waiting even before its own claim has moved it off `ready`.
+ * Issue #30, ADR-0012: the cards dispatchable now (status 'ready', release
+ * gate passed, planTick's rule) that are not in `memberIds`. The one query for
+ * `ready_waiting`: an overlapped harness call passes its batch, so a sibling
+ * running alongside is not counted as waiting even before its own claim has
+ * moved it off `ready`, and `countReadyWaiting` passes the one card.
  */
 export function countReadyNotAdmitted(
   stateDb: Database,
