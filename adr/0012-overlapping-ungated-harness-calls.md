@@ -144,14 +144,15 @@ measurement existed, so this section now states what the measurement must show f
 feature to stay, rather than a gate on building it.
 
 Issue #30 acceptance item 3 requires the decision to cite a measured number. None exists
-yet, because no Conduit run of a multi-card harness flow has been recorded. This ADR moves
-to Accepted only after a Conduit run of the Shakedown flow at today's serial dispatch
-supplies one from `conduit run status`: per-station harness busy time for the walker
-station, the share of run wall clock it took, and the card-seconds ready walkers waited.
+yet, because no Conduit run of a multi-card harness flow has been recorded. The number that
+decides whether the opt-in stays comes from a Conduit run of the Shakedown flow with serial
+dispatch (no `overlap: true`), read from `conduit run status`: per-station harness busy time
+for the walker station, the share of run wall clock it took, and the card-seconds ready
+walkers waited.
 Shakedown v1's own walker timings (it ships first as a Node orchestrator spawning
 `claude -p`) are a preliminary figure, not the cited one.
 
-The figure that justifies shipping: the walker station's serial busy time exceeds the
+The figure that justifies keeping it: the walker station's serial busy time exceeds the
 roughly 300 s walk budget left by the 10-minute job on a typical PR, while the same measured
 per-call durations, packed three-wide, fit under 300 s. With walkers near the 150 s cap,
 serial is 450 to 900 s for 3 to 6 walkers against 300 s at three-wide. If the measured
@@ -223,11 +224,13 @@ Needs `runGateCheckOrAdvance` to be re-entrant. Not required by the Shakedown sh
   cache) but can delay later siblings past their release time when the first call is long.
 - **More provider rate limits under K.** Each card parks on its own, through the existing
   `RATE_LIMITED` path, and `MAX_CONSECUTIVE_RATE_LIMIT_PARKS` stays per card.
-- **K snapshots of the project root per pass.** `snapshotTree` reads and hashes every file
-  synchronously, so one member's snapshot blocks the event loop for all members, including
-  stdout handling that resets the idle timeout. Snapshot time must stay well under the
-  shortest `worker.idle_timeout_seconds` in the batch, or the snapshot must become
-  asynchronous before this ships.
+- **K snapshots of the project root per pass.** The serial path's `snapshotTree` reads and
+  hashes every file synchronously. An overlapped call uses `snapshotTreeAsync`, which yields
+  to the event loop every 10 ms, but each file is still read and hashed in one synchronous
+  step, so a large file can block the other members' stdout handling (which resets the idle
+  timeout) for as long as its read takes. Yielding reduces the hazard and does not remove it:
+  per-file read time must stay well under the shortest `worker.idle_timeout_seconds` in the
+  batch.
 - **Occupancy reporting changes.** `src/run/harness-occupancy.ts` sums span durations,
   which overcounts busy time once calls overlap. It must report busy time as the union of
   call intervals (per station and in total), and each overlapped harness span records a

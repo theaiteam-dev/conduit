@@ -356,6 +356,19 @@ describe('issue #30, ADR-0012: occupancy with overlapped calls', () => {
     expect(report.stations[0]!.busyMs).toBe(40_000);
   });
 
+  it('ends an interval before starting one at the same instant when charging waited time', () => {
+    insertRun('tie');
+    const t0 = 1_700_000_000_000;
+    // A [0,10s) waiting 5 and B [10s,20s) waiting 2 touch at 10 s, where A has
+    // ended: 5 x 10 s + 2 x 10 s, not 5 x 20 s.
+    overlappedSpan('tie', 'walk', 't1', t0, 10_000, 5);
+    overlappedSpan('tie', 'walk', 't2', t0 + 10_000, 10_000, 2);
+    setWallClock('tie', 100);
+    const report = getHarnessOccupancy(db, 'tie')!;
+    expect(report.stations[0]!.waitedCardMs).toBe(70_000);
+    expect(report.stations[0]!.busyMs).toBe(20_000);
+  });
+
   it('takes the union across stations for the total when calls of two stations overlap', () => {
     insertRun('two');
     const t0 = 1_700_000_000_000;

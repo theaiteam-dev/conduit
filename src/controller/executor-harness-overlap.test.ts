@@ -18,6 +18,7 @@ import { ensureCheckpointSchema } from '../checkpoint/checkpoint';
 import { loadFlow } from '../flow/load';
 import type { FlowConfig } from '../types/kernel';
 import { runExecutor } from './executor';
+import { isOverlapHarnessStation } from './harness-overlap';
 import type { RunEngineArgs } from '../cli/main';
 import type { ModelAdapter } from '../worker/adapter';
 import {
@@ -33,8 +34,13 @@ const throwingModel: ModelAdapter = {
   },
 };
 
-/** A barrier that opens when `n` callers have arrived, or after `timeoutMs`. */
-function makeBarrier(n: number, timeoutMs = 3_000): { arrive: () => Promise<boolean> } {
+/**
+ * A barrier that opens when `n` callers have arrived, or after `timeoutMs`.
+ * The tests assert it opened by count; the timeout only bounds a serial run, so
+ * it is generous enough that a slow CI runner reaching the third call late does
+ * not open it early.
+ */
+function makeBarrier(n: number, timeoutMs = 20_000): { arrive: () => Promise<boolean> } {
   let count = 0;
   let open!: (byCount: boolean) => void;
   const opened = new Promise<boolean>((r) => {
@@ -398,6 +404,18 @@ describe('overlap: load-time validation', () => {
 
   it('accepts an eligible station', () => {
     expect(errorsFor(flowYaml({}), gating())).toEqual([]);
+  });
+
+  it('admits at dispatch every station the loader accepts with overlap: true', () => {
+    // validateOverlap (load) and isOverlapHarnessStation (dispatch) encode the
+    // same static conditions in two places. A station the loader accepts but
+    // the dispatch check refuses would run serially without any error.
+    const flow = loadOk({}, gating());
+    const overlapping = Object.values(flow.stations).filter((st) => st.overlap === true);
+    expect(overlapping.length).toBeGreaterThan(0);
+    for (const st of overlapping) {
+      expect(isOverlapHarnessStation(st, flow.defaults?.enforceOwnedPaths === true)).toBe(true);
+    }
   });
 
   it('rejects a value that is not a boolean', () => {

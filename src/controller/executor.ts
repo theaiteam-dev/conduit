@@ -295,20 +295,23 @@ function countReadyWaiting(stateDb: Database, runId: string, cardId: string, now
  * the call's overlap batch, so a sibling running alongside is not counted as
  * waiting even before its own claim has moved it off `ready`.
  */
-function countReadyNotAdmitted(
+export function countReadyNotAdmitted(
   stateDb: Database,
   runId: string,
   memberIds: ReadonlySet<string>,
   nowSeconds: number,
 ): number {
-  const rows = stateDb
+  // The member ids go in as one JSON array, so the count stays in SQL whatever
+  // the batch size (at most K).
+  const row = stateDb
     .prepare(
-      `SELECT id FROM cards
+      `SELECT COUNT(*) AS n FROM cards
        WHERE run_id = $runId AND status = 'ready'
-         AND (release_at IS NULL OR release_at <= $now)`,
+         AND (release_at IS NULL OR release_at <= $now)
+         AND id NOT IN (SELECT value FROM json_each($members))`,
     )
-    .all({ $runId: runId, $now: nowSeconds }) as Array<{ id: string }>;
-  return rows.filter((r) => !memberIds.has(r.id)).length;
+    .get({ $runId: runId, $now: nowSeconds, $members: JSON.stringify([...memberIds]) }) as { n: number };
+  return row.n;
 }
 
 /** True when some ready card is still gated behind a future release_at. */
