@@ -204,5 +204,9 @@ describe('isOverlapHarnessStation', () => {
     expect(
       isOverlapHarnessStation({ ...base, gateCheck: {} as NonNullable<StationConfig['gateCheck']> }, true),
     ).toBe(false);
+    expect(
+      isOverlapHarnessStation({ ...base, rankCheck: {} as NonNullable<StationConfig['rankCheck']> }, true),
+    ).toBe(false);
+    expect(isOverlapHarnessStation({ ...base, child_entry: 'walk' }, true)).toBe(false);
   });
 });
