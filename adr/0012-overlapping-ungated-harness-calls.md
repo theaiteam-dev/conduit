@@ -48,8 +48,9 @@ enforces SPEC §6, and making it re-entrant is not needed for the Shakedown shap
 **A harness station may opt in to overlapping calls. Its overlapped calls use an integrity
 rule that attributes a touched path inside an overlapping sibling's owned paths to that
 sibling. The rule cannot detect a Bash write from one sibling into another's owned paths,
-and SPEC §7 states that gap.** This ADR is Proposed: shipping it is conditional on the
-measurement described under *Ship condition* below.
+and SPEC §7 states that gap.** The maintainer decided on 2026-10-08 to build it ahead of the
+measurement described under *Ship condition* below; that measurement is still owed to #30,
+and its result decides whether the station opt-in stays.
 
 ### Opt-in: `overlap: true` on the station
 
@@ -136,6 +137,10 @@ file-writing executable in their Bash allowlist does not have the gap in practic
 
 ### Ship condition
 
+Written while this ADR was Proposed. The maintainer accepted it on 2026-10-08 before the
+measurement existed, so this section now states what the measurement must show for the
+feature to stay, rather than a gate on building it.
+
 Issue #30 acceptance item 3 requires the decision to cite a measured number. None exists
 yet, because no Conduit run of a multi-card harness flow has been recorded. This ADR moves
 to Accepted only after a Conduit run of the Shakedown flow at today's serial dispatch
@@ -148,9 +153,9 @@ The figure that justifies shipping: the walker station's serial busy time exceed
 roughly 300 s walk budget left by the 10-minute job on a typical PR, while the same measured
 per-call durations, packed three-wide, fit under 300 s. With walkers near the 150 s cap,
 serial is 450 to 900 s for 3 to 6 walkers against 300 s at three-wide. If the measured
-serial busy time for the walker station usually fits in 300 s, #30 closes as documented and
-accepted, and this ADR is marked rejected. After shipping, an overlapped run's measured wall
-clock replaces the packed estimate in the #30 record.
+serial busy time for the walker station usually fits in 300 s, a new ADR decides whether to
+remove the opt-in and its integrity gap, superseding this one. An overlapped run's measured
+wall clock replaces the packed estimate in the #30 record.
 
 ## Alternatives
 

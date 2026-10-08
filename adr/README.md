@@ -42,7 +42,7 @@ Date: YYYY-MM-DD
 | [0009](./0009-per-concern-decomposition-on-shared-impl-file.md) | Concerns sharing an impl file stay a dependency chain, not a consolidated item | Accepted |
 | [0010](./0010-thread-address-convention-for-egress-sends.md) | Thread-address convention for egress sends — conventional substrate field, resolved per run | Accepted |
 | [0011](./0011-file-egress-reconciliation.md) | File-egress reconciliation — a real `files.info` probe narrows the hold window; ambiguity still holds | Accepted |
-| [0012](./0012-overlapping-ungated-harness-calls.md) | Ungated harness calls may overlap under `--concurrency`, with owned-dir attribution in the integrity check | Proposed |
+| [0012](./0012-overlapping-ungated-harness-calls.md) | Ungated harness calls may overlap under `--concurrency`, with owned-dir attribution in the integrity check | Accepted (measurement pending) |
 
 ## Candidate ADRs (decisions worth recording next)
 
