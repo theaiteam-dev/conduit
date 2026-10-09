@@ -92,7 +92,9 @@ function unionMs(intervals: readonly Interval[]): number {
 function waitedOverlappedMs(intervals: readonly Interval[]): number {
   const events: { at: number; delta: 1 | -1; value: number }[] = [];
   for (const i of intervals) {
-    if (i.readyWaiting === null) continue;
+    // A zero-length interval covers no time. Its end would sort before its
+    // start and leave it active for the rest of the sweep.
+    if (i.readyWaiting === null || i.end <= i.start) continue;
     events.push({ at: i.start, delta: 1, value: i.readyWaiting });
     events.push({ at: i.end, delta: -1, value: i.readyWaiting });
   }

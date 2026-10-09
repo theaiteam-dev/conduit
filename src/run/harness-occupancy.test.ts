@@ -369,6 +369,19 @@ describe('issue #30, ADR-0012: occupancy with overlapped calls', () => {
     expect(report.stations[0]!.busyMs).toBe(20_000);
   });
 
+  it('charges nothing for a zero-length call, before or after it', () => {
+    insertRun('zero');
+    const t0 = 1_700_000_000_000;
+    // Z is [10s,10s) waiting 9; A [0,30s) waiting 1. Z covers no time, so the
+    // waited figure is A's alone: 1 x 30 s.
+    overlappedSpan('zero', 'walk', 'z1', t0 + 10_000, 0, 9);
+    overlappedSpan('zero', 'walk', 'z2', t0, 30_000, 1);
+    setWallClock('zero', 100);
+    const report = getHarnessOccupancy(db, 'zero')!;
+    expect(report.stations[0]!.waitedCardMs).toBe(30_000);
+    expect(report.stations[0]!.busyMs).toBe(30_000);
+  });
+
   it('takes the union across stations for the total when calls of two stations overlap', () => {
     insertRun('two');
     const t0 = 1_700_000_000_000;

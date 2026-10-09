@@ -929,8 +929,10 @@ allowlisted Bash executable that writes to a path given as an argument (`cp`, `t
 `sed -i`, a script the agent wrote). The gate refuses every shell redirect; it accepts
 literal quoting and a pipe between allowlisted programs. Neither construct writes a file by
 itself, but a program receiving a pipe can write to a path in its arguments (`cat a | tee b`),
-which is the same gap. (Issue #122, Landlock write confinement, is the planned way to close
-it.)
+which is the same gap. So is a write through a symlink a member creates or retargets inside
+its own `owned_paths`: owned paths are canonicalized once, when the batch is admitted, and a
+touched path that resolves into a sibling's owned paths is attributed to that sibling.
+(Issue #122, Landlock write confinement, is the planned way to close it.)
 `overlap: true` is the flow author's acceptance of that gap for the station. A write outside
 every member's `owned_paths` is still detected.
 

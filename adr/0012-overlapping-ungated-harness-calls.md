@@ -132,7 +132,10 @@ allowlisted executable that writes to a path given as an argument (`cp`, `tee`, 
 `curl -o`, a script the agent wrote) is not checked against ownership. Since the lexer
 replaced the original space split, the gate also accepts literal quoting and a `|` between
 allowlisted programs. Neither construct writes a file by itself; a program receiving a pipe
-can write to a path in its arguments (`cat a | tee b`), which is the same gap. Issue
+can write to a path in its arguments (`cat a | tee b`), which is the same gap. So is a write
+through a symlink a member creates or retargets inside its own owned paths: owned paths are
+canonicalized once, at admission, and a touched path that resolves into a sibling's owned
+paths is attributed to that sibling. Issue
 [#122](https://github.com/theaiteam-dev/conduit/issues/122) (Landlock write confinement) is
 the planned fix. On the serial path the diff catches such a write; on the overlap path it
 does not, when the target is inside an overlapping sibling's owned paths. A write outside
