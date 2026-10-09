@@ -356,6 +356,20 @@ describe('issue #30, ADR-0012: occupancy with overlapped calls', () => {
     expect(report.stations[0]!.busyMs).toBe(40_000);
   });
 
+  it('drops to the next largest ready_waiting when the largest holder ends first', () => {
+    insertRun('drop');
+    const t0 = 1_700_000_000_000;
+    // A [0,40s) waiting 3, B [10s,50s) waiting 1: 3 for 40 s, then 1 for the
+    // 10 s B runs alone. Keeping the stale 3 would give 150, dropping to 0
+    // would give 120.
+    overlappedSpan('drop', 'walk', 'd1', t0, 40_000, 3);
+    overlappedSpan('drop', 'walk', 'd2', t0 + 10_000, 40_000, 1);
+    setWallClock('drop', 100);
+    const report = getHarnessOccupancy(db, 'drop')!;
+    expect(report.stations[0]!.waitedCardMs).toBe(130_000);
+    expect(report.stations[0]!.busyMs).toBe(50_000);
+  });
+
   it('ends an interval before starting one at the same instant when charging waited time', () => {
     insertRun('tie');
     const t0 = 1_700_000_000_000;
