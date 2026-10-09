@@ -5,8 +5,9 @@
  * A `kind: harness` station runs on the serial in-process dispatch path under
  * any `--concurrency K` unless it declares `overlap: true` (ADR-0012): the
  * tick loop awaits the call and dispatches nothing else until it returns. An
- * overlapped call runs in a batch with up to `min(K, wip)` others, and the
- * loop waits for the whole batch. Each harness span records how many other
+ * overlapped call runs in a batch of up to `min(K - in-flight, wip)` calls,
+ * where in-flight counts the workers already running when the batch is
+ * admitted, and the loop waits for the whole batch. Each harness span records how many other
  * cards were dispatchable when the call started and were not running with it
  * (`ready_waiting`, see `countReadyWaiting` and `countReadyNotAdmitted` in
  * controller/executor.ts). A span of an overlapped call also records
