@@ -100,6 +100,7 @@ import { commitFanOut, evaluateFanIn } from '../dag/expand';
 import type { ArchitectProposal, FanInPolicy, FanInState } from '../dag/expand';
 import { runRankCheck, decideFromCandidates, parseCandidatesArtifact, type RankDecision } from '../quality/rank';
 import { aggregateByWave, checkWaveBudget, countGateReworks, decideExecutionRetry } from '../quality/rework';
+import { allSettledOrThrow } from './settle-all';
 import type { CardUsage, BudgetCaps } from '../quality/rework';
 import {
   egressSend,
@@ -1413,7 +1414,7 @@ export async function runExecutor(args: RunEngineArgs): Promise<void> {
       if (concurrentBatch.length > toRun.length) capBlocked = true;
       if (toRun.length > 0) dispatchedThisTick = true;
 
-      const laneChanges = await Promise.all(
+      const laneChanges = await allSettledOrThrow(
         toRun.map((item) => {
           cardDispatches.set(item.cardId, (cardDispatches.get(item.cardId) ?? 0) + 1);
           return attributionStore.run({ cardId: item.cardId }, () =>
@@ -1464,7 +1465,7 @@ export async function runExecutor(args: RunEngineArgs): Promise<void> {
       const memberIds = new Set(overlapPlan.admitted.map((m) => m.cardId));
       if (overlapPlan.admitted.length > 1) {
         dispatchedThisTick = true;
-        const laneChanges = await Promise.all(
+        const laneChanges = await allSettledOrThrow(
           overlapPlan.admitted.map((member) => {
             cardDispatches.set(member.cardId, (cardDispatches.get(member.cardId) ?? 0) + 1);
             return attributionStore.run({ cardId: member.cardId }, () =>

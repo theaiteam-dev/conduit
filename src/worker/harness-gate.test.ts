@@ -3,7 +3,7 @@ import { mkdtempSync, mkdirSync, symlinkSync, unlinkSync, writeFileSync, rmSync,
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { checkCommandAllowed } from './deterministic';
-import { callGateFailClosed, createHarnessToolGate, type HarnessToolGate } from './harness-gate';
+import { callGateFailClosed, createHarnessToolGate, gateBuiltinToolNames, type HarnessToolGate } from './harness-gate';
 
 const call = { toolName: 'Bash', input: { command: 'echo hi' } };
 
@@ -553,5 +553,17 @@ describe('createHarnessToolGate totality', () => {
     for (const c of [null, undefined, 5, {}, { toolName: 'Bash' }]) {
       expect(callGateFailClosed(gate, c as never).decision).not.toBe('allow');
     }
+  });
+});
+
+describe('gateBuiltinToolNames: the built-in tools a station list lets the gate allow', () => {
+  it('maps Bash rule forms to Bash, Task to Agent, and leaves out MCP tools and unrecognised forms', () => {
+    expect(gateBuiltinToolNames(['Read', 'mcp__srv__tool', 'Bash(git)'])).toEqual(['Read', 'Bash']);
+    expect(gateBuiltinToolNames(['Bash(git:*)', 'Bash(git status:*)', 'Task', 'Read(./x)'])).toEqual(['Bash', 'Agent']);
+  });
+
+  it('returns no built-ins for an empty or MCP-only list', () => {
+    expect(gateBuiltinToolNames([])).toEqual([]);
+    expect(gateBuiltinToolNames(['mcp__srv__tool'])).toEqual([]);
   });
 });
