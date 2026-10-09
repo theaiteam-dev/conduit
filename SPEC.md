@@ -933,8 +933,9 @@ which is the same gap. So is a write through a symlink a member creates or retar
 its own `owned_paths`: owned paths are canonicalized once, when the batch is admitted, and a
 touched path that resolves into a sibling's owned paths is attributed to that sibling.
 (Issue #122, Landlock write confinement, is the planned way to close it.)
-`overlap: true` is the flow author's acceptance of that gap for the station. A write outside
-every member's `owned_paths` is still detected.
+`overlap: true` is the flow author's acceptance of that gap for the station. A write under the
+project root and outside every member's `owned_paths` is still detected; as on the serial path,
+the diff does not see a write outside the project root.
 
 **Per card, unchanged.** Rate-limit parks, retries and their backoff, idle and wall-clock
 timeouts, `child_stagger_seconds` and the consumption andon act on each member as they do on

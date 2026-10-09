@@ -138,8 +138,9 @@ canonicalized once, at admission, and a touched path that resolves into a siblin
 paths is attributed to that sibling. Issue
 [#122](https://github.com/theaiteam-dev/conduit/issues/122) (Landlock write confinement) is
 the planned fix. On the serial path the diff catches such a write; on the overlap path it
-does not, when the target is inside an overlapping sibling's owned paths. A write outside
-every member's owned paths is still caught.
+does not, when the target is inside an overlapping sibling's owned paths. A write under the
+project root and outside every member's owned paths is still caught; as on the serial path,
+the diff does not see a write outside the project root.
 
 A flow author who opts in accepts that a Bash write by one overlapped sibling can change
 another sibling's artifacts undetected. A flow whose overlapped stations allow no
