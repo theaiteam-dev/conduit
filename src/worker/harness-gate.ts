@@ -159,6 +159,16 @@ function parseTools(tools: readonly string[]): ParsedTools {
 }
 
 /**
+ * The built-in tool names a station's `tools` list lets the gate allow: the
+ * names the gate's allowlist check accepts, without MCP tools (`mcp__*`),
+ * which come from MCP servers rather than the built-in set. An adapter offers
+ * the model only these, so it is never shown a built-in the gate would refuse.
+ */
+export function gateBuiltinToolNames(tools: readonly string[]): string[] {
+  return [...parseTools(tools).names].filter((name) => !name.startsWith('mcp__'));
+}
+
+/**
  * Decide a Bash call. The command runs in a shell, so it is read by
  * `lexBashCommand`, which accepts plain words, literal quoting and a pipe
  * between programs, and refuses every other construct: separators, redirects,

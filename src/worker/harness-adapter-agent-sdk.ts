@@ -59,7 +59,13 @@ import {
 } from './harness-adapter-claude';
 import { createHarnessEventEmitter } from './harness-events';
 import { mapClaudeStreamMessage, rateLimitWindowsFromInfo, type ClaudeRateLimitInfo } from './harness-events-claude';
-import { HARNESS_GATE_HOLD_CODE, callGateFailClosed, type GateDecision, type GateDenyCode } from './harness-gate';
+import {
+  HARNESS_GATE_HOLD_CODE,
+  callGateFailClosed,
+  gateBuiltinToolNames,
+  type GateDecision,
+  type GateDenyCode,
+} from './harness-gate';
 import { buildHarnessChildEnv } from './harness-runner';
 import { resolveClaudePluginAgent } from './claude-plugin-agents';
 import { createRunScopedClaudeConfigDir, removeRunScopedClaudeConfigDir } from './claude-config-isolation';
@@ -390,9 +396,11 @@ export function createAgentSdkHarnessAdapter(config: AgentSdkHarnessAdapterConfi
             PostToolUse: [{ hooks: [postToolUse] }],
             PostToolUseFailure: [{ hooks: [postToolUse] }],
           },
-          // Defence in depth: the gate is the enforcement. Empty tools is the executor's encoding of a
-          // waived `unrestricted_tools` station and passes no narrowing.
-          ...(call.tools.length > 0 ? { allowedTools: call.tools } : {}),
+          // The gate is the enforcement. `tools` sets which built-in tools the model is offered at all
+          // (`allowedTools` only pre-approves, and leaves every other definition in each request), so
+          // the model never sees a built-in the gate would refuse. Empty tools is the executor's
+          // encoding of a waived `unrestricted_tools` station and passes no narrowing.
+          ...(call.tools.length > 0 ? { tools: gateBuiltinToolNames(call.tools), allowedTools: call.tools } : {}),
           ...(model !== undefined ? { model } : {}),
           ...(agent !== undefined ? { agent } : {}),
           ...(pluginDirs.length > 0 ? { plugins: pluginDirs.map((path) => ({ type: 'local' as const, path })) } : {}),

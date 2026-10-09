@@ -36,7 +36,11 @@ kernel, and the kernel decides every tool call before it runs. Three are shipped
 
 - `agent-sdk` drives the Claude Code CLI through `@anthropic-ai/claude-agent-sdk` `query()`
   and calls the kernel's gate from `hooks.PreToolUse`. The hook fires for the main agent and
-  for subagents, and an `allowedTools` rule does not bypass it.
+  for subagents, and an `allowedTools` rule does not bypass it. The adapter also passes the
+  SDK's `tools` option, set to the built-in tools the station's `tools` list allows
+  (`Bash(curl:*)` gives `Bash`), so the model is not offered a built-in the gate would refuse
+  and each request carries fewer tool definitions. A waived `unrestricted_tools` station is
+  offered every built-in.
 - `codex-app-server` drives `codex app-server` and answers Codex's approval requests from the
   gate. See [the Codex adapter](#the-codex-app-server-adapter) below for how Codex's tools
   map onto the gate, and for what is not gated.
