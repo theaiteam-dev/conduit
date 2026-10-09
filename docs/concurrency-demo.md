@@ -123,10 +123,13 @@ stations:
 At dispatch a card joins the batch only if it declares `owned_paths` and they do
 not overlap those of a card already in the batch; any other card runs on the
 serial path after the batch, and its spans record why as `overlap_fallback`.
-Overlap weakens one check: a Bash command in one card that writes into a
-sibling's owned directory (`cp`, `tee`, `sed -i` with a path argument) is not
-detected, because the integrity check attributes that path to the sibling. A
-write anywhere else under the project root still holds the card. A gated
+Overlap weakens one check: a write by one card into a sibling's owned directory
+is not detected, because the integrity check attributes that path to the
+sibling. The write can come from a Bash command with a path argument (`cp`,
+`tee`, `sed -i`) or go through a symlink the card creates or retargets inside
+its own owned paths, since owned paths are canonicalized once, when the batch is
+admitted (SPEC §7, "The gap"). A write anywhere else under the project root
+still holds the card. A gated
 harness station cannot overlap: the critic call, the per-gate rework counter and
 the back-edge transition are serial in-process logic (SPEC §6).
 
