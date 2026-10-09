@@ -420,6 +420,9 @@ export function describeContainmentConformance(
       'two live invocations: killing one leaves the other running until its own end',
       async () => {
         const second = realpathSync(mkdtempSync(join(tmpdir(), 'conduit-containment-2-')));
+        // Both runs, so the finally can wait for them when an assertion fails
+        // before they are awaited: a rejection then is reported, not orphaned.
+        const runs: Promise<unknown>[] = [];
         try {
           let firstDone = false;
           let secondDone = false;
@@ -435,6 +438,7 @@ export function describeContainmentConformance(
           }).finally(() => {
             secondDone = true;
           });
+          runs.push(firstRun, secondRun);
 
           // Both were live together: each one's grandchildren touched their sentinels.
           const [firstWatch, secondWatch] = await Promise.all([
@@ -454,6 +458,7 @@ export function describeContainmentConformance(
           expect(await secondRun).toBe(options.timeoutClass);
           await expectGrandchildReaped(second);
         } finally {
+          await Promise.allSettled(runs);
           killRecordedGrandchild(second);
           rmSync(second, { recursive: true, force: true });
         }
