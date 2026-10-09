@@ -29,4 +29,17 @@ describe('allSettledOrThrow', () => {
     const early = Promise.reject(new Error('second member'));
     await expect(allSettledOrThrow([late, early])).rejects.toThrow('first member');
   });
+
+  it('reports every rejection after the first, so a halt shows all of them', async () => {
+    const others: [unknown, number][] = [];
+    const run = allSettledOrThrow(
+      [Promise.resolve(1), Promise.reject(new Error('a')), Promise.reject(new Error('b')), Promise.reject('c')],
+      (reason, index) => others.push([reason, index]),
+    );
+    await expect(run).rejects.toThrow('a');
+    expect(others.map(([r, i]) => [r instanceof Error ? r.message : r, i])).toEqual([
+      ['b', 2],
+      ['c', 3],
+    ]);
+  });
 });

@@ -117,6 +117,15 @@ import {
 import type { OnTimeout } from '../channels/slack';
 import { resolveDeliveryChannel } from '../flow/load';
 
+/**
+ * Reports a batch member's throw that `allSettledOrThrow` does not rethrow, so
+ * a halt caused by several members failing at once names each of them.
+ */
+function reportOtherBatchThrow(err: (msg: string) => void): (reason: unknown) => void {
+  return (reason) =>
+    err(`batch: another member also threw: ${reason instanceof Error ? reason.message : String(reason)}`);
+}
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -1448,6 +1457,7 @@ export async function runExecutor(args: RunEngineArgs): Promise<void> {
             }),
           );
         }),
+        reportOtherBatchThrow(io.err),
       );
       if (laneChanges.some((changed) => changed)) lastLaneChangeAt = currentNow;
     }
@@ -1475,6 +1485,7 @@ export async function runExecutor(args: RunEngineArgs): Promise<void> {
               }),
             );
           }),
+          reportOtherBatchThrow(io.err),
         );
         if (laneChanges.some((changed) => changed)) lastLaneChangeAt = currentNow;
       } else {

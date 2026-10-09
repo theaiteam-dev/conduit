@@ -163,7 +163,8 @@ export function getHarnessOccupancy(db: ConduitDB, runId: string): HarnessOccupa
     const entry = byStation.get(station)!;
     entry.busyMs += unionMs(intervals);
     entry.waitedCardMs += waitedOverlappedMs(intervals);
-    allIntervals.push(...intervals);
+    // A loop, not a spread: a spread passes every interval as an argument.
+    for (const interval of intervals) allIntervals.push(interval);
   }
 
   const run = db.getRun(runId);

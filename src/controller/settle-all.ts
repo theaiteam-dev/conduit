@@ -5,14 +5,21 @@
  * `Promise.all` rejects at the first rejection while the other members are
  * still running, so the executor could return, or the run end, with a
  * member still writing card state. This waits for every member to settle,
- * then rethrows the first rejection in member order.
+ * then rethrows the first rejection in member order. Each later rejection is
+ * passed to `onOtherRejection` first, so the caller can report it.
  */
-export async function allSettledOrThrow<T>(promises: readonly Promise<T>[]): Promise<T[]> {
+export async function allSettledOrThrow<T>(
+  promises: readonly Promise<T>[],
+  onOtherRejection?: (reason: unknown, index: number) => void,
+): Promise<T[]> {
   const settled = await Promise.allSettled(promises);
   const results: T[] = [];
-  for (const s of settled) {
-    if (s.status === 'rejected') throw s.reason;
-    results.push(s.value);
-  }
+  let first: { reason: unknown } | undefined;
+  settled.forEach((s, index) => {
+    if (s.status === 'fulfilled') results.push(s.value);
+    else if (first === undefined) first = { reason: s.reason };
+    else onOtherRejection?.(s.reason, index);
+  });
+  if (first !== undefined) throw first.reason;
   return results;
 }
