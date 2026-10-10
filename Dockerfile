@@ -1,4 +1,16 @@
+# Issue #122: the Landlock write-confinement helper (native/llexec/llexec.c),
+# built statically against musl so the binary runs in the Debian-based runtime
+# image below without any library from this stage.
+FROM alpine:3.20 AS llexec
+RUN apk add --no-cache gcc musl-dev
+COPY native/llexec/llexec.c /src/llexec.c
+RUN gcc -static -O2 -Wall -Wextra -Werror -o /llexec /src/llexec.c
+
 FROM oven/bun:1.3.11-slim
+
+# The helper the executor runs each overlapped harness call under (ADR-0013).
+# On PATH, where src/worker/landlock-confinement.ts looks for it.
+COPY --from=llexec /llexec /usr/local/bin/llexec
 
 # Create a non-root system group and user for least-privilege execution.
 # All container processes run as `conduit` — never as root.

@@ -282,6 +282,7 @@ against the matrix.
 | `hold` with no human | does **not** consume budget; if `hold_timeout` is set, the kernel applies the card's `on_timeout` action — `scrap`, `proceed_with_findings`, or `escalate` (§4A). If `hold_timeout` is omitted, the card holds indefinitely. `on_timeout` is **required** when `hold_timeout` is set; the kernel rejects the config at load otherwise. |
 | Andon trips mid-flight | new claims blocked; in-flight workers **drain-and-checkpoint** (§8). |
 | Parent fanned-out, child scraps | fan-in policy decides (§6): `all` → parent holds/scraps; `quorum(k)`/`best_effort` → proceed. |
+| Parent fanned-out, child lands in `hold` | the child is not a survivor (§6): `all` → parent holds (`child_held`); `quorum(k)` counts it as missing; `best_effort` drops it. |
 
 ---
 
@@ -704,7 +705,8 @@ interpret.
 2. **EXECUTION_LOOP** — worker reasons and invokes tools through the Tool-Bridge (§7).
 3. **MARK_DONE** — worker emits a structured Work Summary + the typed station output.
 4. **The Hook Gateway — deterministic only.** Runs the **Summary Hook**: a *pure code*
-   integrity check (files touched ⊆ owned paths, output schema valid, artifacts exist).
+   integrity check (files created, modified or deleted ⊆ owned paths, output schema valid,
+   artifacts exist).
    It does **not** run an LLM. *(Rev-1 H7 fix: the quality critic is a separate **QC
    station**, §6 — not inside this transaction.)*
 5. **ACK_DONE** — Kernel commits the Work Summary, **checkpoints the station output**,
@@ -820,11 +822,14 @@ express it (this is why Conduit is a state machine, not Airflow). It is bounded 
    budgets miss.
 
 ### Fan-in failure policy (rev-1 C4)
-`fan_in: { policy: all | quorum(k) | best_effort }`. Defines what a scrapped child does
-to the assembler and parent. `all` → one scrap holds/scraps the parent (A(i)-Team:
-don't ship a partial product). `quorum(k)`/`best_effort` → proceed and record the
-dropped children. **`k` is a count (integer, `1 ≤ k ≤ fan_out`):** the minimum number of
-children that must reach a non-scrap terminal lane for the fan-in to proceed. `k: 9` with
+`fan_in: { policy: all | quorum(k) | best_effort }`. Defines what a scrapped or held child
+does to the assembler and parent. A **survivor** is a child in a terminal lane other than
+`scrap` or `hold`. A child in `hold` was escalated to a human, not finished: its output is
+unchecked, and an integrity breach leaves the out-of-bounds write on disk, so no policy merges
+it. `all` → one scrap or hold holds the parent (A(i)-Team: don't ship a partial product),
+journaled as `fan-in child_scrapped` or `fan-in child_held`. `quorum(k)`/`best_effort` →
+proceed and record the dropped children, held ones included. **`k` is a count (integer,
+`1 ≤ k ≤ fan_out`):** the minimum number of survivors for the fan-in to proceed. `k: 9` with
 `fan_out: 10` = tolerate one scrapped child. A count, not a ratio — no rounding ambiguity
 on small fan-outs, and the loader validates it against `fan_out` at load time. A child
 that can never complete must not deadlock the parent — the liveness watchdog (§8) is the
@@ -865,18 +870,24 @@ risk and gets the most poka-yoke.
 > pre-execution the way it does here; containment is a documented **profile** at the
 > process boundary (mandatory owned-paths integrity, secrets-by-allowlist, process-tree
 > termination through a per-invocation cgroup where the host allows it and the
-> process-group kill otherwise, the ADR-0003 container wall, and the adversarial gate as
+> process-group kill otherwise, Landlock write confinement of overlapped calls (ADR-0013),
+> the ADR-0003 container wall, and the adversarial gate as
 > the quality control) rather than the Law. `agentic` keeps its Law-grade meaning in this section
 > unchanged. See [`docs/harness-containment.md`](docs/harness-containment.md) for the
 > full profile.
 
-### Overlapping harness calls (ADR-0012)
+### Overlapping harness calls (ADR-0012, ADR-0013)
 
 Under `--concurrency K` a `kind: harness` station runs one card at a time unless it declares
 `overlap: true`. A harness call on the serial path holds the tick loop until it returns, and
-its integrity check is the serial rule: every path touched under the project root between the
-call's baseline snapshot and its post-invoke snapshot must lie inside the card's `owned_paths`,
-or the card holds.
+its integrity check is the serial rule: every path created, modified or deleted under the
+project root between the call's baseline snapshot and its post-invoke snapshot must lie inside
+the card's `owned_paths`, or the card holds. A delete is a write. A deleted path no longer
+resolves, so it is checked at the location it had in the baseline snapshot: the canonical
+project root joined with its path below the root, with no symlink below the root resolved
+(the snapshot walk never descends a symlink), against the owned paths mapped the same way.
+Resolving it after the call would let a call delete a sibling's file and then replace the
+sibling's directory with a symlink into its own owned dir.
 
 A harness station may declare `overlap: true` (station level, beside `wip`; rejected on any
 other `kind`). Its cards then run as overlapping calls, up to `min(K - in-flight, wip)` at a
@@ -890,11 +901,16 @@ every admission condition holds:
   when it is given the adapter registry. The executor checks it again at dispatch, since the
   registry is engine configuration, and runs a card whose adapter cannot gate per call on the
   serial path, journaling `overlap_fallback` on its spans and warning once per station.
-- **Dynamic, at dispatch:** the card declares non-empty `owned_paths`, and they are disjoint
+- **Write confinement, at dispatch (ADR-0013):** the adapter has `canConfineWrites`, and
+  the host's write-confinement probe succeeded (below). When either fails, every candidate
+  runs on the serial path with the reason journaled as `overlap_fallback`; an unavailable
+  probe is also warned once per run. No overlapped call runs unconfined.
+- **Dynamic, at dispatch:** the card declares non-empty `owned_paths`, every one of them exists
+  (a confinement rule names an existing file or directory), and they are disjoint
   (canonicalized) from those of every member already admitted to the batch. A card that fails
-  either runs on the serial path under the serial rule after the batch, with the reason
+  any of these runs on the serial path under the serial rule after the batch, with the reason
   journaled as `overlap_fallback`. A card over the K or `wip` cap stays `ready` for a later
-  pass. A batch of one card runs on the serial path.
+  pass. A batch of one card runs on the serial path, unconfined, as any serial call does.
 
 Harness members and transform members never overlap each other: a dispatch pass runs the
 transform batch, then the harness batch. Each member runs in its own attribution scope, so
@@ -912,7 +928,8 @@ anywhere else → a breach, and the card holds. Paths
 are canonicalized as the integrity check canonicalizes them: a symlink by its target, and a
 path removed since the snapshot (a sibling deleting a temporary file in its own directory) by
 its parent directory. The serial checks apply to every path not attributed: symlink canonicalization, fail-closed on a
-path that does not resolve, and a hold, not a retry, on a breach. The disjoint ownership
+path that does not resolve (a deleted path is checked at its baseline location, as above), and a
+hold, not a retry, on a breach. The disjoint ownership
 invariant (§9) makes the attribution unambiguous. Because a path that no member owns cannot be
 attributed, a breach by one member holds every member whose diff contains it.
 
@@ -922,20 +939,47 @@ answers for at most one step of the walk. A step reads and hashes one file synch
 single large file can still block the event loop for as long as that read takes. The serial
 path's snapshots stay synchronous.
 
-**The gap.** The overlap rule cannot detect a write by one member into another overlapping
-member's `owned_paths`: both diffs attribute it to the owner. The per-call gate denies such a
-write through the file-write tools before it runs. It does not deny one made by an
-allowlisted Bash executable that writes to a path given as an argument (`cp`, `tee`,
-`sed -i`, a script the agent wrote). The gate refuses every shell redirect; it accepts
-literal quoting and a pipe between allowlisted programs. Neither construct writes a file by
-itself, but a program receiving a pipe can write to a path in its arguments (`cat a | tee b`),
-which is the same gap. So is a write through a symlink a member creates or retargets inside
-its own `owned_paths`: owned paths are canonicalized once, when the batch is admitted, and a
-touched path that resolves into a sibling's owned paths is attributed to that sibling.
-(Issue #122, Landlock write confinement, is the planned way to close it.)
-`overlap: true` is the flow author's acceptance of that gap for the station. A write under the
-project root and outside every member's `owned_paths` is still detected; as on the serial path,
-the diff does not see a write outside the project root.
+**Write confinement (ADR-0013).** Every member of a harness overlap batch runs its whole
+process tree under Landlock, through the `llexec` helper, which the adapter's spawn chains
+after the cgroup wrapper (the shell joins the invocation's cgroup, execs `llexec`, and
+`llexec` applies the ruleset and execs the CLI). The ruleset handles the write-type file
+rights of the highest Landlock ABI the kernel reports and grants them only beneath the call's
+writable set: the card's canonical `owned_paths`, a per-call temp dir (`TMPDIR` points at it,
+and the XDG cache and state dirs on adapters that do not already run-scope them), the
+adapter's run-scoped config dirs (`CLAUDE_CONFIG_DIR`, which is created for a confined call
+whatever the adapter's isolation setting, `CODEX_HOME`, the opencode `HOME` and XDG root),
+and `/dev`. Reads and executes are not restricted. The ruleset is inherited by every
+descendant and cannot be removed, so a command that calls `setsid()` or double-forks stays
+confined. A write outside the set fails at the syscall with `EACCES`, before anything changes
+on disk: into a sibling's `owned_paths` by an allowlisted executable (`cp`, `tee`, `sed -i`,
+`mv`, a script the agent wrote), through a symlink into them, or to a shared project file.
+`llexec` never runs the command unconfined: any failure to build or apply the ruleset exits
+before the exec, and the call fails as a spawn failure does. Each overlapped span records
+`write_confinement: "landlock"`.
+
+The kernel decides once per process whether confinement is available: it locates the
+helper (`CONDUIT_LLEXEC`, a source-checkout build, or `llexec` on `PATH`), reads the ABI,
+and runs a real write test through it: a write inside the writable path must succeed, and
+creating a file outside it, truncating an existing file outside it, and hardlinking that
+file into the writable path must each be refused. The same commands run unconfined first
+and must all succeed, so a refusal is Landlock's and not an unwritable scratch dir. The ABI must be 3 or higher (Linux 6.2 or later): ABI 1 and 2 do not
+check `truncate(2)`, so a member could empty a sibling's file, and the diff would attribute
+that to the sibling. On a lower ABI the probe reports confinement unavailable, naming the
+kernel minimum, and the cards run serially. `conduit doctor` reports the result.
+
+**The overlap rule with confinement.** The overlap integrity rule above is unchanged and
+stays the backstop. On its own it cannot detect a write by one member into another
+overlapping member's `owned_paths`, because both diffs attribute it to the owner (ADR-0012's
+gap). Confinement closes that gap for file contents: the write is refused before it happens,
+so a path the rule attributes to a sibling was written by that sibling. A write under the
+project root and outside every member's `owned_paths` is refused too, and the diff would still
+hold the card if one appeared. These remain outside confinement:
+
+- metadata changes: `chmod`, `chown`, `utimes` and extended attributes are not write rights
+  in Landlock, so a member can change a sibling's file modes but not its contents;
+- writes made on the call's behalf by a process that is not confined (a daemon reached over
+  a socket);
+- network egress, which Landlock does not filter here.
 
 **Per card, unchanged.** Rate-limit parks, retries and their backoff, idle and wall-clock
 timeouts, `child_stagger_seconds` and the consumption andon act on each member as they do on
@@ -985,8 +1029,9 @@ split is harder and needs this in-transaction reservation.)*
   to the kernel tool protocol. A model with no function-calling falls back to the prompted
   adapter or is rejected at the Bench (§14) before it's allowed on a flow.
 - **The Law (permissioning).** Before any tool runs the Kernel checks Hooks:
-  - **Path ownership** — writes ⊆ the card's `owned_paths`, with **symlink + relative-path
-    resolution** (resolve to canonical absolute, reject escapes) (rev-1 H6).
+  - **Path ownership** — writes, deletes included, ⊆ the card's `owned_paths`, with
+    **symlink + relative-path resolution** (resolve to canonical absolute, reject escapes)
+    (rev-1 H6).
   - **Bash positive allowlist** — only listed executables; **no shell metacharacters**
     (no pipes/redirects/`;`/backticks/`$()`) unless explicitly enabled. Denylists are
     insufficient against a cheap model + untrusted substrate. The harness tier's per-call

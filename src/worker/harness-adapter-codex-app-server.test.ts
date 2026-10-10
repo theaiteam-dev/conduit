@@ -6,10 +6,11 @@
  * requests and notifications and records what the adapter answers. No test
  * here starts codex or calls a model.
  */
-import { describe, it, expect, afterAll } from 'bun:test';
+import { describe, it, expect, afterAll, spyOn } from 'bun:test';
 import { existsSync, lstatSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, mkdirSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import * as landlock from './landlock-confinement';
 import { describeHarnessContainmentConformance } from './harness-containment.conformance';
 import {
   CODEX_APP_SERVER_ARGS,
@@ -476,6 +477,25 @@ describe('codex-app-server adapter: handshake', () => {
   });
 });
 
+/**
+ * Run `body` with createCallTempDir forced to throw, and return the run-scoped dirs (under `prefix`) that
+ * existed at the moment it threw. The adapter has made its config/home dir by then and nothing else.
+ */
+async function withFailingCallTempDir(prefix: string, body: () => Promise<void>): Promise<string[]> {
+  const before = new Set(readdirSync(tmpdir()).filter((n) => n.startsWith(prefix)));
+  let live: string[] = [];
+  const spy = spyOn(landlock, 'createCallTempDir').mockImplementation(() => {
+    live = readdirSync(tmpdir()).filter((n) => n.startsWith(prefix) && !before.has(n)).map((n) => join(tmpdir(), n));
+    throw new Error('simulated call temp dir failure');
+  });
+  try {
+    await body();
+  } finally {
+    spy.mockRestore();
+  }
+  return live;
+}
+
 describe('codex-app-server adapter: process, env and CODEX_HOME', () => {
   it('starts app-server first, with web search and the login shell turned off', async () => {
     const server = fakeServer((p) => p.completeTurn());
@@ -555,6 +575,17 @@ describe('codex-app-server adapter: process, env and CODEX_HOME', () => {
     const err = await rejection(adapterWith(server).invoke(invocation()));
     expect(err.message).toContain('spawn boom');
     expect(existsSync(server.state.spec!.env.CODEX_HOME!)).toBe(false);
+  });
+
+  it('removes the codex home when the per-call temp dir cannot be created, before anything is spawned', async () => {
+    const server = fakeServer((p) => p.completeTurn());
+    const live = await withFailingCallTempDir('conduit-codex-home-', async () => {
+      const err = await rejection(adapterWith(server).invoke(invocation({ confinement: { helper: '/nonexistent/helper', writable: [ROOT] } })));
+      expect(err.message).toBe('simulated call temp dir failure');
+    });
+    expect(server.state.spec).toBeUndefined();
+    expect(live.length).toBe(1);
+    expect(existsSync(live[0]!)).toBe(false);
   });
 
   it('removes the codex home after a timeout kill', async () => {

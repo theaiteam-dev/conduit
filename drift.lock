@@ -8,7 +8,7 @@ sig = "c589b70ef7bb72cd"
 [[bindings]]
 doc = "CLAUDE.md"
 target = "src/controller/executor.ts#runExecutor"
-sig = "6139ed7101a01e6d"
+sig = "c70615989b6d00f0"
 
 [[bindings]]
 doc = "CLAUDE.md"
@@ -77,8 +77,23 @@ sig = "42305bed0d797a53"
 
 [[bindings]]
 doc = "SPEC.md"
+target = "src/worker/cgroup-containment.ts#prepareContainedCommand"
+sig = "bf83f0fe33877f0f"
+
+[[bindings]]
+doc = "SPEC.md"
 target = "src/worker/integrity.ts#checkIntegrity"
-sig = "ec86cf6e6cd93960"
+sig = "0ecc19b228398767"
+
+[[bindings]]
+doc = "SPEC.md"
+target = "src/worker/landlock-confinement.ts#confinedWritableSet"
+sig = "04caef8b326c4a8f"
+
+[[bindings]]
+doc = "SPEC.md"
+target = "src/worker/landlock-confinement.ts#detectWriteConfinement"
+sig = "789d8a3c7b448ad9"
 
 [[bindings]]
 doc = "docs/ingress-listener.md"
@@ -88,4 +103,4 @@ sig = "bd240b0922e20e22"
 [[bindings]]
 doc = "docs/installation.md"
 target = "src/cli/main.ts"
-sig = "830ca0f79891a0e1"
+sig = "f9730a52426e4310"

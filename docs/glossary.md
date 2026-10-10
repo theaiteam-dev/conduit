@@ -181,11 +181,13 @@ subtree (`scrap_subtree`) kills its children too.
 decomposed tasks. Children get disjoint `owned_paths`, validated at expansion. (SPEC §9)
 
 **fan-in** — the join: a downstream station that collects a parent's children. Its
-failure policy defines what a scrapped child does to the parent:
-`all` (one scrap holds/scraps the parent), `quorum(k)`, or `best_effort`. (SPEC §6)
+failure policy defines what a scrapped or held child does to the parent:
+`all` (one scrap or hold holds the parent), `quorum(k)`, or `best_effort`. A child in
+`hold` is never merged. (SPEC §6)
 
 **k (quorum)** — an **integer count**, `1 ≤ k ≤ fan_out`: the minimum number of children
-that must reach a non-scrap terminal for the fan-in to proceed. A count, not a ratio.
+that must reach a terminal lane other than `scrap` or `hold` for the fan-in to proceed. A
+count, not a ratio.
 
 **no_selection_policy** — what a rank station does when no selection is recorded by
 timeout: e.g., `scrap`. (See the branching example.)

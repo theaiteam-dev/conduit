@@ -10,7 +10,7 @@
  */
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import { join } from 'node:path';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 
 import { openConduitDB, type ConduitDB, DEFAULT_RUN_ID } from '../persistence/db';
@@ -27,6 +27,16 @@ import {
   type HarnessInvocation,
   type HarnessRegistry,
 } from '../worker/harness-adapter';
+import { prepareContainedCommand } from '../worker/cgroup-containment';
+import {
+  confinedWritableSet,
+  resolveWriteConfinement,
+  type WriteConfinement,
+} from '../worker/landlock-confinement';
+import { writeConfinementRequired } from '../worker/containment-fixture-files';
+
+/** Issue #122: what the probe reports in tests that do not exercise it. */
+const CONFINED: WriteConfinement = { available: true, helper: '/opt/conduit/llexec', abi: 4 };
 
 const throwingModel: ModelAdapter = {
   async call() {
@@ -70,6 +80,14 @@ type Step = 'valid' | { throw: string; resetAtMs?: number; tokens?: number };
 
 interface WalkerOpts {
   canGatePerCall?: boolean;
+  /** Issue #122: whether the adapter honours `HarnessInvocation.confinement`. Default true. */
+  canConfineWrites?: boolean;
+  /**
+   * Run the call's writes in a real child process, under the confinement the
+   * executor passed (issue #122). Each entry is a path relative to the project
+   * root that the process tries to write. Absent: the fake writes in-process.
+   */
+  processWrites?: (check: string) => string[];
   /** Calls that must have started before any proceeds. 1 = no wait. */
   startBarrier?: number;
   /** Calls that must have written before any returns. Absent = no wait. */
@@ -101,6 +119,7 @@ function makeWalker(root: () => string, opts: WalkerOpts = {}) {
     reportsUsage: true,
     canRestrictTools: true,
     ...(opts.canGatePerCall !== false ? { canGatePerCall: true } : {}),
+    ...(opts.canConfineWrites !== false ? { canConfineWrites: true } : {}),
     async probeBinary() {
       return { present: true };
     },
@@ -125,6 +144,23 @@ function makeWalker(root: () => string, opts: WalkerOpts = {}) {
         }
         for (const out of call.declaredOutputs ?? []) {
           writeFileSync(out.path, JSON.stringify({ verdict: `pass-${check}` }), 'utf-8');
+        }
+        const processWrites = opts.processWrites?.(check) ?? [];
+        if (processWrites.length > 0) {
+          // A real process, confined the way an adapter confines its CLI. The
+          // shell ignores each write that fails, so the call itself succeeds.
+          const script = processWrites.map((rel) => `echo ${check} > '${rel}' 2>/dev/null`).join('; ') + '; exit 0';
+          const prepared = prepareContainedCommand(
+            { mechanism: 'process-group', reason: 'test' },
+            ['/bin/sh', '-c', script],
+            { cwd: root(), env: { PATH: '/usr/bin:/bin' } },
+            call.confinement !== undefined
+              ? { helper: call.confinement.helper, writable: confinedWritableSet(call.confinement.writable, []) }
+              : undefined,
+          );
+          const proc = Bun.spawn(prepared.argv, { cwd: root(), env: { PATH: '/usr/bin:/bin' }, stdout: 'ignore', stderr: 'pipe' });
+          const [stderr, code] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
+          if (code !== 0) throw new Error(`confined write process exited ${code}: ${stderr}`);
         }
         for (const rel of opts.extraWrites?.(check) ?? []) {
           const abs = join(root(), rel);
@@ -249,12 +285,14 @@ async function run(
   registry: HarnessRegistry,
   concurrency: number,
   errLines: string[] = [],
+  writeConfinement: WriteConfinement = CONFINED,
 ): Promise<void> {
   const clock = virtualClock();
   await runExecutor({
     db, flow, now: clock.now, sleep: clock.sleep, adapter: throwingModel,
     io: { out: () => {}, err: (l: string) => errLines.push(l) },
     harnessRegistry: registry, concurrency,
+    resolveWriteConfinement: async () => writeConfinement,
   } as unknown as RunEngineArgs);
 }
 
@@ -608,7 +646,10 @@ describe('overlap integrity rule', () => {
     }
   });
 
-  it("does not detect one member's write into a sibling's owned dir (the gap SPEC §7 states)", async () => {
+  // The fake writes in-process here, so nothing confines it: this pins what
+  // the diff rule alone does. A confined call's process cannot make the write
+  // at all (see "overlap: write confinement" below).
+  it("attributes one member's write into a sibling's owned dir to the sibling (the diff rule alone)", async () => {
     const walker = makeWalker(() => dir, {
       startBarrier: 3,
       writeBarrier: 3,
@@ -739,4 +780,140 @@ describe('overlap: rate-limit parks and retries inside a batch', () => {
     // The retry is the same batch member: both spans share the card's attempt base.
     expect(c2.map((s) => s.attempt)).toEqual([0, 1]);
   });
+});
+
+// ---------------------------------------------------------------------------
+// Issue #122, ADR-0013: overlapped calls run write-confined, or not at all.
+// ---------------------------------------------------------------------------
+
+const hostConfinement = await resolveWriteConfinement();
+const required = writeConfinementRequired();
+
+describe('overlap: write confinement', () => {
+  it("passes each member the probe's helper and its own canonical owned paths, and journals it", async () => {
+    const walker = makeWalker(() => dir, { startBarrier: 3 });
+    const registry = createHarnessRegistry([walker.adapter]);
+    const flow = loadOk({}, registry);
+    for (const c of ['c1', 'c2', 'c3']) seedChild(c);
+
+    await run(flow, registry, 3);
+
+    for (const c of ['c1', 'c2', 'c3']) expect(lane(c)).toBe('done');
+    expect(walker.records.map((r) => r.releasedByBarrier)).toEqual([true, true, true]);
+    const byCheck = new Map(walker.calls.map((call) => [checkFromPrompt(call.prompt), call.confinement]));
+    for (const c of ['c1', 'c2', 'c3']) {
+      expect(byCheck.get(c)).toEqual({ helper: CONFINED.helper, writable: [realpathSync(join(dir, 'evidence', c))] });
+      expect(spans(c)[0]?.attributes?.write_confinement).toBe('landlock');
+    }
+  });
+
+  it('resolves confinement once per run, even across several overlap passes and an injected resolver', async () => {
+    const walker = makeWalker(() => dir, { startBarrier: 2 });
+    const registry = createHarnessRegistry([walker.adapter]);
+    const flow = loadOk({}, registry);
+    for (const c of ['c1', 'c2', 'c3']) seedChild(c);
+    let resolves = 0;
+    const clock = virtualClock();
+
+    await runExecutor({
+      db, flow, now: clock.now, sleep: clock.sleep, adapter: throwingModel,
+      io: { out: () => {}, err: () => {} },
+      harnessRegistry: registry, concurrency: 2,
+      resolveWriteConfinement: async () => {
+        resolves += 1;
+        return CONFINED;
+      },
+    } as unknown as RunEngineArgs);
+
+    for (const c of ['c1', 'c2', 'c3']) expect(lane(c)).toBe('done');
+    // K = 2 with three cards: the third runs in a later pass that also had candidates.
+    expect(resolves).toBe(1);
+  });
+
+  it('runs every candidate serially, journaling why and warning once, when the probe reports confinement unavailable', async () => {
+    const walker = makeWalker(() => dir);
+    const registry = createHarnessRegistry([walker.adapter]);
+    const flow = loadOk({}, registry);
+    for (const c of ['c1', 'c2', 'c3']) seedChild(c);
+    const errLines: string[] = [];
+
+    await run(flow, registry, 3, errLines, { available: false, reason: 'the llexec helper was not found' });
+
+    for (const c of ['c1', 'c2', 'c3']) expect(lane(c)).toBe('done');
+    expect(walker.maxInFlight()).toBe(1);
+    expect(walker.calls.every((call) => call.confinement === undefined)).toBe(true);
+    for (const c of ['c1', 'c2', 'c3']) {
+      const attrs = spans(c)[0]?.attributes ?? {};
+      expect(attrs.concurrent).toBeUndefined();
+      expect(attrs.write_confinement).toBeUndefined();
+      expect(attrs.overlap_fallback).toBe('write confinement unavailable: the llexec helper was not found');
+    }
+    expect(errLines.filter((l) => l.includes('write confinement is unavailable'))).toHaveLength(1);
+  });
+
+  it('runs serially, journaling why, when the adapter cannot confine writes', async () => {
+    const walker = makeWalker(() => dir, { canConfineWrites: false });
+    const registry = createHarnessRegistry([walker.adapter]);
+    const flow = loadOk({}, registry);
+    for (const c of ['c1', 'c2']) seedChild(c);
+
+    await run(flow, registry, 3);
+
+    for (const c of ['c1', 'c2']) expect(lane(c)).toBe('done');
+    expect(walker.maxInFlight()).toBe(1);
+    expect(walker.calls.every((call) => call.confinement === undefined)).toBe(true);
+    for (const c of ['c1', 'c2']) {
+      expect(spans(c)[0]?.attributes?.overlap_fallback).toBe("adapter 'fake-walker' cannot confine writes");
+    }
+  });
+
+  it('runs a card serially when one of its owned paths does not exist yet, since no rule can name it', async () => {
+    const walker = makeWalker(() => dir, { startBarrier: 2 });
+    const registry = createHarnessRegistry([walker.adapter]);
+    const flow = loadOk({}, registry);
+    seedChild('c1');
+    seedChild('c2');
+    seedChild('c3', ['evidence/c3', 'reports/c3']);
+
+    await run(flow, registry, 3);
+
+    for (const c of ['c1', 'c2', 'c3']) expect(lane(c)).toBe('done');
+    const rec = (c: string) => walker.records.find((r) => r.check === c)!;
+    expect(rec('c1').releasedByBarrier).toBe(true);
+    expect(rec('c2').releasedByBarrier).toBe(true);
+    expect(rec('c3').startedAt).toBeGreaterThanOrEqual(Math.max(rec('c1').endedAt, rec('c2').endedAt));
+    expect(spans('c3')[0]?.attributes?.overlap_fallback).toBe(
+      "owned path 'reports/c3' does not exist, and write confinement needs it before the call",
+    );
+  });
+
+  // The real helper and kernel: a member's process cannot write into a
+  // sibling's dir, so the attribution rule never sees the write.
+  if (!hostConfinement.available && !required) {
+    it.skip(`refuses a member's write into a sibling's dir at the syscall (host has no write confinement: ${hostConfinement.reason})`, () => {});
+  } else {
+    it("refuses a member's write into a sibling's dir at the syscall, with the real helper", async () => {
+      expect(hostConfinement).toMatchObject({ available: true });
+      const walker = makeWalker(() => dir, {
+        startBarrier: 3,
+        writeBarrier: 3,
+        processWrites: (check) =>
+          check === 'c1' ? ['evidence/c1/own.txt', 'evidence/c2/planted.txt', 'rogue.txt'] : [`evidence/${check}/own.txt`],
+      });
+      const registry = createHarnessRegistry([walker.adapter]);
+      const flow = loadOk({}, registry);
+      for (const c of ['c1', 'c2', 'c3']) seedChild(c);
+
+      await run(flow, registry, 3, [], hostConfinement);
+
+      for (const c of ['c1', 'c2', 'c3']) {
+        expect(lane(c)).toBe('done');
+        expect(readFileSync(join(dir, 'evidence', c, 'own.txt'), 'utf-8')).toBe(`${c}\n`);
+      }
+      expect(existsSync(join(dir, 'evidence', 'c2', 'planted.txt'))).toBe(false);
+      expect(existsSync(join(dir, 'rogue.txt'))).toBe(false);
+      const attributed = spans('c1')[0]?.attributes?.overlap_attributed as Array<{ sample: string[] }>;
+      expect(attributed.flatMap((a) => a.sample)).not.toContain('evidence/c2/planted.txt');
+    }, 30_000);
+  }
 });

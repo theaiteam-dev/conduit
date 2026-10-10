@@ -33,6 +33,7 @@
  */
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmdirSync, statfsSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
+import { buildConfinedArgv, type SpawnWriteConfinement } from './landlock-confinement';
 
 /** statfs f_type of a cgroup v2 filesystem. */
 const CGROUP2_SUPER_MAGIC = 0x63677270;
@@ -515,6 +516,12 @@ function lookupPath(env: Record<string, string | undefined> | undefined): string
  * returned unchanged. Under cgroup containment this creates the invocation's
  * cgroup and wraps the command so the child joins it before it runs.
  *
+ * With `confinement` (issue #122), the command also runs under the llexec
+ * helper (./landlock-confinement.ts), which applies a Landlock write ruleset
+ * and then execs it. The order is fixed: the cgroup wrapper joins the cgroup
+ * and execs llexec, and llexec execs the command, so every process the
+ * command starts is both in the cgroup and confined.
+ *
  * The command is resolved to an absolute path here, against the same PATH
  * Bun.spawn would use, because the wrapper shell would otherwise resolve it
  * against its own default PATH. A command that is not found throws the same
@@ -524,8 +531,9 @@ export function prepareContainedCommand(
   containment: Containment,
   argv: readonly string[],
   spawnOptions: { cwd?: string; env?: Record<string, string | undefined> },
+  confinement?: SpawnWriteConfinement,
 ): ContainedCommand {
-  if (containment.mechanism === 'process-group') return { argv: [...argv], cgroup: undefined };
+  if (containment.mechanism === 'process-group' && confinement === undefined) return { argv: [...argv], cgroup: undefined };
 
   const [command, ...args] = argv;
   if (command === undefined) throw new Error('prepareContainedCommand: empty argv');
@@ -541,6 +549,11 @@ export function prepareContainedCommand(
     }
     throw Object.assign(new Error(`Executable not found in $PATH: "${command}"`), { code: 'ENOENT' });
   }
+  const inner =
+    confinement !== undefined
+      ? buildConfinedArgv(confinement.helper, confinement.writable, [resolved, ...args])
+      : [resolved, ...args];
+  if (containment.mechanism === 'process-group') return { argv: inner, cgroup: undefined };
 
   cgroupSequence += 1;
   const cgroup = join(containment.parent, `${CGROUP_PREFIX}${ownerTag()}-${cgroupSequence}`);
@@ -550,7 +563,7 @@ export function prepareContainedCommand(
     throw new Error(`conduit: cannot create containment cgroup ${cgroup} (${errorText(err)})`);
   }
   return {
-    argv: [WRAPPER_SHELL, '-c', WRAPPER_SCRIPT, join(cgroup, 'cgroup.procs'), resolved, ...args],
+    argv: [WRAPPER_SHELL, '-c', WRAPPER_SCRIPT, join(cgroup, 'cgroup.procs'), ...inner],
     cgroup,
   };
 }

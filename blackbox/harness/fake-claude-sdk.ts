@@ -70,6 +70,16 @@
  * FakeClaudeLogEntry, so harness-flow's `stubLog()` and orphan reaper read it
  * unchanged.
  *
+ * Write-confined calls (issue #122). When the kernel runs the fake under the
+ * llexec helper, the fake can write only inside the call's writable set, so
+ * it cannot claim a counter file or append to `logPath`. With `sinkUrl` in the
+ * scenario (harness-flow's `stubSink` option) it claims its call number and
+ * sends its log line over HTTP instead, and harness-flow writes them. A call's
+ * `barrier` also goes through the sink: the fake waits, before its first step,
+ * until `parties` calls have reached the barrier of that name, and logs
+ * whether it was released or timed out. Two calls released by one barrier
+ * were both running at once, which is how a journey proves an overlap.
+ *
  * Launched through a generated `#!/bin/sh` wrapper that execs the running bun
  * binary on this file (see harness-flow.ts). The wrapper has no `.js`/`.ts`
  * extension, so the SDK runs it directly, as it runs a native `claude`.
@@ -161,6 +171,11 @@ export interface FakeClaudeSdkCall {
    */
   setsidSleeperPidFile?: string;
   /**
+   * Wait before the first step until `parties` calls have reached the barrier
+   * `name`, or `timeoutMs` (default 15000) has passed. Needs `sinkUrl`.
+   */
+  barrier?: { name: string; parties: number; timeoutMs?: number };
+  /**
    * Do not load the `--agent` the SDK asked for, even when a plugin dir
    * defines it: run the default agent, leave it out of init's `agents`, and
    * send no `agent_type`. Stands for a CLI that resolves plugin agents
@@ -179,6 +194,8 @@ export interface FakeClaudeSdkRole {
 export interface FakeClaudeSdkScenario {
   stateDir: string;
   logPath: string;
+  /** harness-flow's stub sink: claim call numbers, log and wait at barriers over HTTP instead of files. */
+  sinkUrl?: string;
   roles: FakeClaudeSdkRole[];
 }
 
@@ -212,6 +229,10 @@ export interface FakeClaudeSdkLogEntry {
   prompt: string;
   model: string | null;
   startedAt: number;
+  /** When the steps finished, just before the log line was sent. */
+  endedAt: number;
+  /** Whether the call's barrier released it (true) or timed out (false); null without a barrier. */
+  barrierReleased: boolean | null;
   /** The `hookCallbackIds` the SDK registered for PreToolUse at initialize. */
   preToolUseCallbackIds: string[];
   /** The `hookCallbackIds` the SDK registered for PostToolUse and PostToolUseFailure at initialize. */
@@ -258,6 +279,12 @@ function modelUsageEntries(entries: Record<string, FakeClaudeSdkModelUsage>): Re
 function argValue(argv: string[], flag: string): string | null {
   const i = argv.indexOf(flag);
   return i === -1 || i + 1 >= argv.length ? null : argv[i + 1]!;
+}
+
+async function sinkPost(sinkUrl: string, path: string, body: string): Promise<Json> {
+  const res = await fetch(`${sinkUrl}${path}`, { method: "POST", body, headers: { "content-type": "application/json" } });
+  if (!res.ok) throw new Error(`stub sink ${path} answered ${res.status}`);
+  return (await res.json()) as Json;
 }
 
 /** Same exclusive-create claim as fake-claude, so concurrent calls never share a number. */
@@ -355,7 +382,11 @@ async function main(): Promise<number> {
       process.exit(65);
     }
     const role = matches[0]!;
-    const callNumber = nextCallNumber(scenario.stateDir, role.name);
+    const sinkUrl = scenario.sinkUrl;
+    const callNumber =
+      sinkUrl !== undefined
+        ? Number((await sinkPost(sinkUrl, "/call", JSON.stringify({ role: role.name }))).call)
+        : nextCallNumber(scenario.stateDir, role.name);
     const call = role.calls[Math.min(callNumber, role.calls.length) - 1] ?? {};
     const startedAt = Date.now();
     const cwd = process.cwd();
@@ -375,6 +406,12 @@ async function main(): Promise<number> {
     });
 
     if (call.setsidSleeperPidFile !== undefined) spawnSetsidSleeper(resolve(cwd, call.setsidSleeperPidFile));
+
+    let barrierReleased: boolean | null = null;
+    if (call.barrier !== undefined) {
+      if (sinkUrl === undefined) throw new Error("a barrier needs the scenario's sinkUrl");
+      barrierReleased = (await sinkPost(sinkUrl, "/barrier", JSON.stringify(call.barrier))).released === true;
+    }
 
     const ungated = preToolUseCallbackIds.length === 0;
     const answers: FakeClaudeSdkAnswer[] = [];
@@ -520,6 +557,8 @@ async function main(): Promise<number> {
       prompt,
       model,
       startedAt,
+      endedAt: Date.now(),
+      barrierReleased,
       preToolUseCallbackIds,
       postToolUseCallbackIds,
       postToolUseFailureCallbackIds,
@@ -530,7 +569,8 @@ async function main(): Promise<number> {
       agent: requestedAgent,
       agentLoaded,
     };
-    appendFileSync(scenario.logPath, JSON.stringify(entry) + "\n");
+    if (sinkUrl !== undefined) await sinkPost(sinkUrl, "/log", JSON.stringify(entry));
+    else appendFileSync(scenario.logPath, JSON.stringify(entry) + "\n");
 
     const usage = call.usage ?? { input_tokens: 100, output_tokens: 50 };
     const costUsd = call.costUsd ?? 0.001;

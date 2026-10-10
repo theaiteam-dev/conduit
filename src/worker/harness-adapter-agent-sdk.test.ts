@@ -4,13 +4,14 @@
  * process (the kill paths) starts one through `options.spawnClaudeCodeProcess`,
  * the same hook the SDK would call.
  */
-import { describe, it, expect } from 'bun:test';
+import { describe, it, expect, spyOn } from 'bun:test';
 import type { ChildProcess } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Options, SDKMessage } from '@anthropic-ai/claude-agent-sdk';
 import { describeHarnessContainmentConformance } from './harness-containment.conformance';
+import * as landlock from './landlock-confinement';
 import { createAgentSdkHarnessAdapter, type AgentSdkHarnessAdapterConfig, type AgentSdkQueryFn } from './harness-adapter-agent-sdk';
 import {
   bindHarnessDefinitionsForIntrospection, buildHarnessDefinitionRegistry, shippedHarnessAdapterNames,
@@ -19,8 +20,14 @@ import {
 import type { HarnessEvent } from './harness-events';
 import { HARNESS_GATE_HOLD_CODE, type GateToolCall, type HarnessToolGate } from './harness-gate';
 
+// The API key is a dummy: a write-confined call always builds a run-scoped config dir (issue #122), which
+// needs a credential source, and the stand-in binary never authenticates.
 describeHarnessContainmentConformance('agent-sdk', (opts) =>
-  createAgentSdkHarnessAdapter({ ...opts, envAllowlist: [] }),
+  createAgentSdkHarnessAdapter({
+    ...opts,
+    envAllowlist: ['ANTHROPIC_API_KEY'],
+    sourceEnv: { PATH: process.env.PATH, ANTHROPIC_API_KEY: 'sk-conformance' },
+  }),
 );
 
 const ROOT = tmpdir();
@@ -321,6 +328,25 @@ describe('agent-sdk adapter: options handed to the SDK', () => {
   });
 });
 
+/**
+ * Run `body` with createCallTempDir forced to throw, and return the run-scoped dirs (under `prefix`) that
+ * existed at the moment it threw. The adapter has made its config/home dir by then and nothing else.
+ */
+async function withFailingCallTempDir(prefix: string, body: () => Promise<void>): Promise<string[]> {
+  const before = new Set(readdirSync(tmpdir()).filter((n) => n.startsWith(prefix)));
+  let live: string[] = [];
+  const spy = spyOn(landlock, 'createCallTempDir').mockImplementation(() => {
+    live = readdirSync(tmpdir()).filter((n) => n.startsWith(prefix) && !before.has(n)).map((n) => join(tmpdir(), n));
+    throw new Error('simulated call temp dir failure');
+  });
+  try {
+    await body();
+  } finally {
+    spy.mockRestore();
+  }
+  return live;
+}
+
 describe('agent-sdk adapter: isolateConfig', () => {
   function home(): string {
     const dir = mkdtempSync(join(tmpdir(), 'conduit-sdk-home-'));
@@ -383,6 +409,21 @@ describe('agent-sdk adapter: isolateConfig', () => {
       rmSync(scratch, { recursive: true, force: true });
       rmSync(h, { recursive: true, force: true });
     }
+  });
+
+  it('removes the run-scoped config dir when the per-call temp dir cannot be created, before anything is spawned', async () => {
+    const { query, seen } = scripted(async function* () { yield RESULT_OK; });
+    const live = await withFailingCallTempDir('conduit-claude-config-', async () => {
+      const err = await rejection(
+        makeAdapter(query, { sourceEnv: { ANTHROPIC_API_KEY: 'sk-test' }, envAllowlist: ['ANTHROPIC_API_KEY'] }).invoke(
+          invocation({ gate: allowAll, confinement: { helper: '/nonexistent/helper', writable: [ROOT] } }),
+        ),
+      );
+      expect(err.message).toBe('simulated call temp dir failure');
+    });
+    expect(seen).toEqual([]);
+    expect(live.length).toBe(1);
+    expect(existsSync(live[0]!)).toBe(false);
   });
 
   it('fails before spawning when there is nothing to authenticate with', async () => {

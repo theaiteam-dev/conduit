@@ -28,7 +28,7 @@
  */
 
 import { readFileSync, writeFileSync, existsSync, realpathSync, readdirSync, statSync, readlinkSync, mkdirSync, unlinkSync, rmSync, type Dirent } from 'node:fs';
-import { join, resolve, sep, dirname } from 'node:path';
+import { join, resolve, sep, dirname, relative } from 'node:path';
 import { createHash } from 'node:crypto';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import type { Database } from 'bun:sqlite';
@@ -49,6 +49,11 @@ import {
   isOverlapHarnessStation,
   ownedPathSetsIntersect,
 } from './harness-overlap';
+import {
+  createWriteConfinementResolver,
+  resolveWriteConfinement,
+  type WriteConfinement,
+} from '../worker/landlock-confinement';
 import { attemptClaim, beginWork, renewLease, reconcile } from '../dispatch/claim';
 import { checkCommandAllowed, runDeterministic, deterministicCardEnv } from '../worker/deterministic';
 import { runTransformStation, coerciveParse, computeFindingsHash } from '../worker/transform';
@@ -523,6 +528,15 @@ export async function runExecutor(args: RunEngineArgs): Promise<void> {
   // not to gate per call, so the operator is told once per station, not once
   // per card.
   const overlapAdapterWarned = new Set<string>();
+  // Issue #122: told once per run when the host cannot write-confine an
+  // overlapped call, so every overlap candidate runs on the serial path.
+  let overlapConfinementWarned = false;
+  // Detection runs on the first pass with an overlap candidate, then never
+  // again this run, whatever resolver was injected.
+  const resolveRunWriteConfinement =
+    args.resolveWriteConfinement !== undefined
+      ? createWriteConfinementResolver(args.resolveWriteConfinement)
+      : resolveWriteConfinement;
 
   // Wrap the adapter to track cumulative token spend (NFR-3: adapter is the
   // ONLY model surface; the control loop itself never calls it).
@@ -1115,12 +1129,13 @@ export async function runExecutor(args: RunEngineArgs): Promise<void> {
     // stays ready for a later pass.
     const admitHarnessOverlap = (
       candidates: ReadonlyArray<{ cardId: string; station: string }>,
+      writeConfinement: WriteConfinement,
     ): {
-      admitted: Array<{ cardId: string; station: string; ownedCanonical: string[] }>;
+      admitted: Array<{ cardId: string; station: string; ownedCanonical: string[]; confinementHelper: string }>;
       serial: Array<{ cardId: string; station: string; reason?: string }>;
       deferred: boolean;
     } => {
-      const admitted: Array<{ cardId: string; station: string; ownedCanonical: string[] }> = [];
+      const admitted: Array<{ cardId: string; station: string; ownedCanonical: string[]; confinementHelper: string }> = [];
       const serial: Array<{ cardId: string; station: string; reason?: string }> = [];
       let deferred = false;
       const { n: inFlight } = stateDb
@@ -1150,12 +1165,40 @@ export async function runExecutor(args: RunEngineArgs): Promise<void> {
           serial.push({ ...item, reason: `adapter '${resolved.adapter.name}' cannot gate each tool call` });
           continue;
         }
+        // Issue #122, ADR-0013: an overlapped call runs only write-confined.
+        // An adapter that cannot run its process tree under the helper, or a
+        // host where the probe failed, sends the card to the serial path.
+        if (resolved.adapter.canConfineWrites !== true) {
+          serial.push({ ...item, reason: `adapter '${resolved.adapter.name}' cannot confine writes` });
+          continue;
+        }
+        if (!writeConfinement.available) {
+          if (!overlapConfinementWarned) {
+            overlapConfinementWarned = true;
+            io.err(
+              `overlap: write confinement is unavailable (${writeConfinement.reason}); ` +
+                'cards of overlap: true stations run one at a time',
+            );
+          }
+          serial.push({ ...item, reason: `write confinement unavailable: ${writeConfinement.reason}` });
+          continue;
+        }
         const ownedPaths = db.getCard(runId, item.cardId)?.owned_paths ?? [];
         if (ownedPaths.length === 0) {
           serial.push({ ...item, reason: 'card declares no owned_paths' });
           continue;
         }
         const ownedCanonical = canonicalOwnedPaths(projectRoot, ownedPaths);
+        // A Landlock rule is attached to an existing file or directory, so an
+        // owned path the call would create cannot be granted.
+        const missing = ownedCanonical.find((p) => !existsSync(p));
+        if (missing !== undefined) {
+          serial.push({
+            ...item,
+            reason: `owned path '${relative(projectRoot, missing) || '.'}' does not exist, and write confinement needs it before the call`,
+          });
+          continue;
+        }
         const clash = admitted.find((m) => ownedPathSetsIntersect(m.ownedCanonical, ownedCanonical));
         if (clash !== undefined) {
           serial.push({ ...item, reason: `owned_paths overlap those of card '${clash.cardId}' in the same batch` });
@@ -1167,7 +1210,7 @@ export async function runExecutor(args: RunEngineArgs): Promise<void> {
           continue;
         }
         perStation.set(item.station, stationCount + 1);
-        admitted.push({ ...item, ownedCanonical });
+        admitted.push({ ...item, ownedCanonical, confinementHelper: writeConfinement.helper });
       }
       return { admitted, serial, deferred };
     };
@@ -1468,7 +1511,8 @@ export async function runExecutor(args: RunEngineArgs): Promise<void> {
     // member's diff and could be attributed to no member.
     if (harnessCandidates.length > 0 && !halted) {
       currentCardId = null;
-      const overlapPlan = admitHarnessOverlap(harnessCandidates);
+      const writeConfinement = await resolveRunWriteConfinement();
+      const overlapPlan = admitHarnessOverlap(harnessCandidates, writeConfinement);
       if (overlapPlan.deferred) capBlocked = true;
 
       const windows = new OverlapWindows();
@@ -1481,7 +1525,12 @@ export async function runExecutor(args: RunEngineArgs): Promise<void> {
             return attributionStore.run({ cardId: member.cardId }, () =>
               executeStation({
                 ...stationArgs(member.cardId, member.station),
-                overlap: { windows, memberIds, ownedCanonical: member.ownedCanonical },
+                overlap: {
+                  windows,
+                  memberIds,
+                  ownedCanonical: member.ownedCanonical,
+                  confinementHelper: member.confinementHelper,
+                },
               }),
             );
           }),
@@ -1796,6 +1845,11 @@ interface HarnessOverlapMember {
   memberIds: ReadonlySet<string>;
   /** This card's owned paths, canonical (canonicalOwnedPaths). */
   ownedCanonical: readonly string[];
+  /**
+   * Issue #122: the llexec helper the call runs under. The call's writable set
+   * is `ownedCanonical` plus the adapter's own dirs.
+   */
+  confinementHelper: string;
 }
 
 /**
@@ -2222,13 +2276,24 @@ export async function snapshotTreeAsync(
   return snap;
 }
 
-/** Absolute paths of files created or modified between two tree snapshots. */
-function diffTouched(before: Map<string, string>, after: Map<string, string>): string[] {
+/**
+ * Absolute paths of files created or modified (`touched`) and of files removed
+ * (`deleted`) between two tree snapshots. A delete is a write (SPEC §7), so the
+ * integrity gate checks both sets against owned_paths.
+ */
+function diffTouched(
+  before: Map<string, string>,
+  after: Map<string, string>,
+): { touched: string[]; deleted: string[] } {
   const touched: string[] = [];
   for (const [path, sig] of after) {
     if (before.get(path) !== sig) touched.push(path);
   }
-  return touched;
+  const deleted: string[] = [];
+  for (const path of before.keys()) {
+    if (!after.has(path)) deleted.push(path);
+  }
+  return { touched, deleted };
 }
 
 /**
@@ -2247,12 +2312,14 @@ function runOwnedPathsIntegrity(
   projectRoot: string,
   ownedPaths: readonly string[],
   touchedPaths: readonly string[],
+  deletedPaths: readonly string[] = [],
 ): IntegrityResult | null {
   if (ownedPaths.length === 0) return null;
   return checkIntegrity({
     projectRoot,
     ownedPaths,
     touchedPaths,
+    deletedPaths,
     declaredArtifacts: [],
     output: null,
     validateOutput: () => true,
@@ -2468,8 +2535,8 @@ async function executeDeterministicStation(args: DeterministicArgs): Promise<boo
       : null;
   const checkDeterministicIntegrity = (): IntegrityResult | null => {
     if (!integrityBaseline) return null;
-    const touched = diffTouched(integrityBaseline, snapshotTree(projectRoot));
-    const result = runOwnedPathsIntegrity(projectRoot, card.owned_paths, touched);
+    const { touched, deleted } = diffTouched(integrityBaseline, snapshotTree(projectRoot));
+    const result = runOwnedPathsIntegrity(projectRoot, card.owned_paths, touched, deleted);
     return result && !result.ok ? result : null;
   };
 
@@ -4311,7 +4378,7 @@ async function executeHarnessStationBody(args: HarnessArgs): Promise<boolean> {
       // Absent on every other span, so the serial journal is unchanged.
       const overlapAttrs: Record<string, unknown> =
         overlap !== undefined
-          ? { concurrent: true, started_at_ms: invokeStartedAt }
+          ? { concurrent: true, started_at_ms: invokeStartedAt, write_confinement: 'landlock' }
           : overlapFallback !== undefined
             ? { overlap_fallback: overlapFallback }
             : {};
@@ -4339,6 +4406,11 @@ async function executeHarnessStationBody(args: HarnessArgs): Promise<boolean> {
           onEvent,
           ...(idleTimeoutMs !== undefined ? { idleTimeoutMs } : {}),
           ...(effectiveAgent !== undefined ? { agent: effectiveAgent } : {}),
+          // Issue #122, ADR-0013: an overlapped call runs write-confined to the
+          // card's owned paths (plus the adapter's temp and config dirs).
+          ...(overlap !== undefined
+            ? { confinement: { helper: overlap.confinementHelper, writable: overlap.ownedCanonical } }
+            : {}),
           // Issue #21: an adapter that gates per call gets this invocation's gate. Owned paths are
           // enforced by the gate only where the flow opted in AND the card declares some, the same
           // condition as runOwnedPathsIntegrity (empty owned_paths is an opt-out there, so passing []
@@ -4591,26 +4663,30 @@ async function executeHarnessStationBody(args: HarnessArgs): Promise<boolean> {
       // left out of the check; the count per member is journaled on this
       // attempt's span. Every other path is checked exactly as above.
       const ownedPaths = card.owned_paths ?? [];
-      let touchedPaths = diffTouched(
+      let { touched: touchedPaths, deleted: deletedPaths } = diffTouched(
         integrityBaseline,
         overlap !== undefined ? await snapshotTreeAsync(projectRoot) : snapshotTree(projectRoot),
       );
       if (overlap !== undefined) {
         overlap.windows.close(overlapWindow);
+        // Created, modified and deleted paths are disjoint (a deleted path is
+        // absent from the after-snapshot), so one classification serves both.
         const classified = classifyOverlapTouched(
-          projectRoot, overlap.ownedCanonical, touchedPaths, overlap.windows.intersecting(overlapWindow),
+          projectRoot, overlap.ownedCanonical, [...touchedPaths, ...deletedPaths], overlap.windows.intersecting(overlapWindow),
         );
-        touchedPaths = classified.remaining;
+        const deletedSet = new Set(deletedPaths);
+        touchedPaths = classified.remaining.filter((p) => !deletedSet.has(p));
+        deletedPaths = classified.remaining.filter((p) => deletedSet.has(p));
         // An array of {card, paths, sample}: the journal's secret-key filter
         // would drop an object keyed by a name containing "token" or "auth".
         if (classified.attributed.length > 0) overlapAttrs['overlap_attributed'] = classified.attributed;
       }
       const integrityViolation: IntegrityResult | null =
         ownedPaths.length === 0
-          ? touchedPaths.length > 0
-            ? { ok: false, failures: touchedPaths.map((p) => ({ code: 'path_escape' as const, path: p })) }
+          ? touchedPaths.length + deletedPaths.length > 0
+            ? { ok: false, failures: [...touchedPaths, ...deletedPaths].map((p) => ({ code: 'path_escape' as const, path: p })) }
             : null
-          : runOwnedPathsIntegrity(projectRoot, ownedPaths, touchedPaths);
+          : runOwnedPathsIntegrity(projectRoot, ownedPaths, touchedPaths, deletedPaths);
       if (integrityViolation && !integrityViolation.ok) {
         db.appendJournalSpan({
           runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.harness`, ...provenance, invocationId,
@@ -6568,7 +6644,7 @@ function pollAwaitingChildren(
         .immediate();
       anyAdvanced = true;
     } else {
-      // decision.action === 'hold_parent': quorum unmet or a child scrapped.
+      // decision.action === 'hold_parent': quorum unmet, or a child scrapped or held.
       // Set status='held' — NOT left in awaiting_children which would deadlock.
       db.appendCardLog({
         runId,
@@ -6602,7 +6678,7 @@ function pollAwaitingChildren(
  * Convert the flow-config fan_in declaration (number | FanInPolicyConfig | undefined)
  * to the dag/expand.ts FanInPolicy shape that evaluateFanIn expects.
  *
- * - undefined  → 'all' (every child must reach a non-scrap terminal lane)
+ * - undefined  → 'all' (every child must reach a terminal lane other than scrap or hold)
  * - number k   → quorum(k) shorthand
  * - structured → map policy field to kind field
  */

@@ -434,18 +434,24 @@ export interface FanInState {
 
 export type FanInDecision =
   | { action: 'proceed'; dropped: string[] }
-  | { action: 'hold_parent'; reason: 'child_scrapped' | 'quorum_unmet' }
+  | { action: 'hold_parent'; reason: 'child_scrapped' | 'child_held' | 'quorum_unmet' }
   | { action: 'wait' };
 
 /**
  * Evaluate the fan-in policy against the current child completion state.
  *
- * - all:         all children must reach a terminal lane; any scrap → hold_parent.
- * - quorum(k):   at least k children (a COUNT, not a ratio) must be survivors
- *                (non-scrap terminals): proceeds iff survivorCount >= k.
+ * A survivor is a child in a terminal lane other than `scrap` or `hold`. A
+ * held child is escalated to a human, not finished: its output is unchecked
+ * (an integrity breach holds the card with the out-of-bounds write on disk),
+ * so no policy merges it.
+ *
+ * - all:         all children must reach a terminal lane; any scrap → hold_parent
+ *                (child_scrapped), else any hold → hold_parent (child_held).
+ * - quorum(k):   at least k children (a COUNT, not a ratio) must be survivors:
+ *                proceeds iff survivorCount >= k.
  *                Proceeds without deadlock when a child can never complete — it
  *                is recorded as dropped.
- * - best_effort: proceed with whatever survivors exist; scrapped = dropped.
+ * - best_effort: proceed with whatever survivors exist; scrapped and held = dropped.
  *
  * Empty children (total === 0) is a defined no-op: every policy returns
  * `proceed` with no dropped children, matching the `all` policy's behaviour.
@@ -462,7 +468,7 @@ export function evaluateFanIn(policy: FanInPolicy, state: FanInState): FanInDeci
   }
 
   const survivorIds = new Set(
-    terminalOutcomes.filter((o) => o.lane !== 'scrap').map((o) => o.id),
+    terminalOutcomes.filter((o) => o.lane !== 'scrap' && o.lane !== 'hold').map((o) => o.id),
   );
   const survivorCount = survivorIds.size;
   const terminalCount = terminalOutcomes.length;
@@ -473,6 +479,9 @@ export function evaluateFanIn(policy: FanInPolicy, state: FanInState): FanInDeci
       if (terminalCount < total) return { action: 'wait' };
       if (terminalOutcomes.some((o) => o.lane === 'scrap')) {
         return { action: 'hold_parent', reason: 'child_scrapped' };
+      }
+      if (terminalOutcomes.some((o) => o.lane === 'hold')) {
+        return { action: 'hold_parent', reason: 'child_held' };
       }
       return { action: 'proceed', dropped: [] };
     }
