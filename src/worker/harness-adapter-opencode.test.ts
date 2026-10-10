@@ -7,10 +7,11 @@
  * events an `opencode serve` would send and observe the replies it gets back.
  * No test here starts opencode or calls a model.
  */
-import { describe, it, expect, afterAll } from 'bun:test';
+import { describe, it, expect, afterAll, spyOn } from 'bun:test';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
+import * as landlock from './landlock-confinement';
 import { describeHarnessContainmentConformance } from './harness-containment.conformance';
 import {
   OPENCODE_SERVE_ARGS,
@@ -427,6 +428,25 @@ const gateDecisions = (o: Outcome) => o.events.filter((e) => e.type === 'gate-de
 
 // ---------------------------------------------------------------------------
 
+/**
+ * Run `body` with createCallTempDir forced to throw, and return the run-scoped dirs (under `prefix`) that
+ * existed at the moment it threw. The adapter has made its config/home dir by then and nothing else.
+ */
+async function withFailingCallTempDir(prefix: string, body: () => Promise<void>): Promise<string[]> {
+  const before = new Set(readdirSync(tmpdir()).filter((n) => n.startsWith(prefix)));
+  let live: string[] = [];
+  const spy = spyOn(landlock, 'createCallTempDir').mockImplementation(() => {
+    live = readdirSync(tmpdir()).filter((n) => n.startsWith(prefix) && !before.has(n)).map((n) => join(tmpdir(), n));
+    throw new Error('simulated call temp dir failure');
+  });
+  try {
+    await body();
+  } finally {
+    spy.mockRestore();
+  }
+  return live;
+}
+
 describe('opencode adapter: process, auth and environment', () => {
   it('starts `opencode serve` on a random loopback port and pins the arguments', async () => {
     const o = await run((s) => finish(s));
@@ -539,6 +559,22 @@ describe('opencode adapter: process, auth and environment', () => {
     const env = o.fake.state.spec!.env;
     expect(env.XDG_CONFIG_HOME).toContain('conduit-opencode-');
     expect(JSON.parse(env.OPENCODE_CONFIG_CONTENT!).permission).toEqual({ '*': 'ask' });
+  });
+
+  it('removes the run-scoped dirs when the per-call temp dir cannot be created, before anything is spawned', async () => {
+    const fake = fakeOpenCode((s) => finish(s));
+    const live = await withFailingCallTempDir('conduit-opencode-', async () => {
+      let thrown: Error | undefined;
+      try {
+        await adapterWith(fake).invoke(invocation({ confinement: { helper: '/nonexistent/helper', writable: [ROOT] } }));
+      } catch (err) {
+        thrown = err as Error;
+      }
+      expect(thrown?.message).toBe('simulated call temp dir failure');
+    });
+    expect(fake.state.spec).toBeUndefined();
+    expect(live.length).toBe(1);
+    for (const dir of live) expect(existsSync(dir)).toBe(false);
   });
 
   it('creates the XDG directories before the call and removes them on success', async () => {

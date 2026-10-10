@@ -10,7 +10,7 @@
  */
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import {
-  chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync,
+  chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -99,6 +99,12 @@ function fakeRun(opts: {
   writes?: { allowed: boolean; denied: boolean };
   writeExit?: number;
   writeStderr?: string;
+  /** The confined run truncates the existing file outside the writable path. */
+  truncates?: boolean;
+  /** The confined run hardlinks that file into the writable path. */
+  links?: boolean;
+  /** The unconfined control run cannot write, as in a full or read-only scratch. */
+  controlFails?: boolean;
 }): { run: (argv: string[], cwd: string) => Promise<ProbeRunResult>; argvs: string[][] } {
   const argvs: string[][] = [];
   return {
@@ -106,12 +112,23 @@ function fakeRun(opts: {
     run: async (argv) => {
       argvs.push(argv);
       if (argv[1] === '--abi') return opts.abi ?? { exitCode: 0, stdout: '4\n', stderr: '' };
-      const sep = argv.indexOf('--');
       const [allowed, denied] = argv.slice(-2) as [string, string];
+      if (argv[0] === '/bin/sh') {
+        // The control: no helper, so everything the command tries succeeds.
+        if (opts.controlFails) return { exitCode: 0, stdout: '', stderr: '' };
+        writeFileSync(join(allowed, 'probe'), 'ok');
+        writeFileSync(join(denied, 'probe'), 'no');
+        writeFileSync(join(denied, 'existing'), '');
+        linkSync(join(denied, 'existing'), join(allowed, 'link'));
+        return { exitCode: 0, stdout: '', stderr: '' };
+      }
+      const sep = argv.indexOf('--');
       expect(argv.slice(1, sep)).toEqual([allowed]);
       const writes = opts.writes ?? { allowed: true, denied: false };
       if (writes.allowed) writeFileSync(join(allowed, 'probe'), 'ok');
       if (writes.denied) writeFileSync(join(denied, 'probe'), 'no');
+      if (opts.truncates) writeFileSync(join(denied, 'existing'), '');
+      if (opts.links) linkSync(join(denied, 'existing'), join(allowed, 'link'));
       return { exitCode: opts.writeExit ?? 0, stdout: '', stderr: opts.writeStderr ?? '' };
     },
   };
@@ -197,12 +214,37 @@ describe('detectWriteConfinement: each reason it is unavailable, with the depend
     expect(!result.available && result.reason).toBe('Landlock did not refuse a write outside the writable path');
   });
 
+  it('is unavailable when the confined command truncated an existing file outside the writable path', async () => {
+    const { run } = fakeRun({ truncates: true });
+    const result = await detectWriteConfinement(deps(run));
+    expect(!result.available && result.reason).toBe(
+      'Landlock did not refuse truncating an existing file outside the writable path',
+    );
+  });
+
+  it('is unavailable when the confined command hardlinked a file from outside into the writable path', async () => {
+    const { run } = fakeRun({ links: true });
+    const result = await detectWriteConfinement(deps(run));
+    expect(!result.available && result.reason).toBe(
+      'Landlock did not refuse hardlinking a file from outside the writable path into it',
+    );
+  });
+
+  it('is unavailable, without a confined run, when the unconfined control cannot write', async () => {
+    const { run, argvs } = fakeRun({ controlFails: true });
+    const result = await detectWriteConfinement(deps(run));
+    expect(!result.available && result.reason).toBe(
+      'the probe could not write its scratch dir unconfined (write inside, write outside, truncate, link failed)',
+    );
+    expect(argvs.some((a) => a[0] === helper && a.includes('/bin/sh'))).toBe(false);
+  });
+
   it('is available, with the helper and ABI, only after the write test passes, and removes its scratch dir', async () => {
     const { run, argvs } = fakeRun({});
     expect(await detectWriteConfinement(deps(run))).toEqual({ available: true, helper, abi: 4 });
-    expect(argvs.map((a) => a[0])).toEqual([helper, helper]);
+    expect(argvs.map((a) => a[0])).toEqual([helper, '/bin/sh', helper]);
     // The write test ran a real command under the helper, not a version check alone.
-    expect(argvs[1]).toContain('/bin/sh');
+    expect(argvs[2]).toContain('/bin/sh');
     const leftovers = new Bun.Glob('conduit-landlock-probe-*').scanSync({ cwd: scratch, onlyFiles: false });
     expect([...leftovers]).toEqual([]);
   });

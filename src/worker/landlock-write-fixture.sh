@@ -16,6 +16,9 @@
 #   env-writes.txt   one `NAME=ok|denied` line per run-scoped dir variable
 #                    that is set (TMPDIR, the config dirs, the XDG dirs)
 #   setsid.done      written by a setsid child after its own sibling write
+#   setsid.timeout   written instead of setsid.done's wait ending in success:
+#                    the setsid child had not finished within the wait, so a
+#                    missing setsid.txt cannot be read as a denied write
 #   fixture.done     written last
 #
 # and then exits 0. A spawn path that cannot speak its protocol then reports
@@ -54,6 +57,7 @@ if command -v setsid >/dev/null 2>&1; then
     i=$((i + 1))
     sleep 0.05
   done
+  [ -f cards/a/setsid.done ] || echo timeout > cards/a/setsid.timeout
 fi
 
 echo done > cards/a/fixture.done

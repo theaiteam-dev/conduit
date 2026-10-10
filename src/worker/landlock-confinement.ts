@@ -33,7 +33,7 @@
  * run on the serial path instead, with the reason journaled as
  * `overlap_fallback`. `conduit doctor` reports which applies.
  */
-import { accessSync, constants, existsSync, mkdirSync, mkdtempSync, rmSync, statSync } from 'node:fs';
+import { accessSync, constants, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { isAbsolute, join, resolve } from 'node:path';
 
@@ -168,8 +168,11 @@ function firstLine(text: string): string {
 /**
  * Decide whether overlapped harness calls can be write-confined on this host.
  * Returns `available` only after a real write test through the helper: a file
- * created inside the writable path exists afterwards, and a file the same
- * command tried to create outside it does not.
+ * created inside the writable path exists afterwards, and the same command's
+ * attempts to create a file outside it, truncate an existing file outside it
+ * and hardlink such a file into the writable path all left no trace. An
+ * unconfined control run of the same command must first do all four, so a
+ * refusal cannot be an unwritable scratch dir.
  */
 export async function detectWriteConfinement(deps: DetectWriteConfinementDeps = {}): Promise<WriteConfinement> {
   const unavailable = (reason: string): WriteConfinement => ({ available: false, reason });
@@ -197,14 +200,39 @@ export async function detectWriteConfinement(deps: DetectWriteConfinementDeps = 
       );
     }
 
-    const allowed = join(scratch, 'allowed');
-    const denied = join(scratch, 'denied');
-    mkdirSync(allowed);
-    mkdirSync(denied);
-    const writeRun = await run(
-      [helper, allowed, '--', '/bin/sh', '-c', 'echo ok > "$1/probe"; echo no > "$2/probe" 2>/dev/null; exit 0', 'sh', allowed, denied],
-      scratch,
-    );
+    // POSIX sh only. Arguments: $1 is the writable dir, $2 the dir outside it.
+    // `true > file` truncates through open(O_TRUNC), and `ln` of a file from
+    // $2 into $1 needs REFER on the source, so Landlock must refuse both. A
+    // truncate(2) by path cannot be exercised from sh, which is why ABI 3 is
+    // required: llexec handles LANDLOCK_ACCESS_FS_TRUNCATE only from there.
+    const script =
+      'echo ok > "$1/probe"; echo no > "$2/probe" 2>/dev/null; ' +
+      'true > "$2/existing" 2>/dev/null; ln "$2/existing" "$1/link" 2>/dev/null; exit 0';
+    const seed = 'keep\n';
+    const prepare = (root: string): { allowed: string; denied: string } => {
+      const dirs = { allowed: join(root, 'allowed'), denied: join(root, 'denied') };
+      mkdirSync(dirs.allowed, { recursive: true });
+      mkdirSync(dirs.denied, { recursive: true });
+      writeFileSync(join(dirs.denied, 'existing'), seed);
+      return dirs;
+    };
+
+    // Control: the same command with no helper must do every write, truncate
+    // and link, or the confined run below could pass because its scratch dir
+    // was unwritable rather than because Landlock refused anything.
+    const control = prepare(join(scratch, 'control'));
+    await run(['/bin/sh', '-c', script, 'sh', control.allowed, control.denied], scratch);
+    const controlFailed: string[] = [];
+    if (!existsSync(join(control.allowed, 'probe'))) controlFailed.push('write inside');
+    if (!existsSync(join(control.denied, 'probe'))) controlFailed.push('write outside');
+    if (readFileSync(join(control.denied, 'existing'), 'utf8') === seed) controlFailed.push('truncate');
+    if (!existsSync(join(control.allowed, 'link'))) controlFailed.push('link');
+    if (controlFailed.length > 0) {
+      return unavailable(`the probe could not write its scratch dir unconfined (${controlFailed.join(', ')} failed)`);
+    }
+
+    const { allowed, denied } = prepare(join(scratch, 'confined'));
+    const writeRun = await run([helper, allowed, '--', '/bin/sh', '-c', script, 'sh', allowed, denied], scratch);
     if (writeRun.exitCode === LLEXEC_FAILED_EXIT) {
       return unavailable(`the helper could not apply a Landlock ruleset (${firstLine(writeRun.stderr)})`);
     }
@@ -214,6 +242,12 @@ export async function detectWriteConfinement(deps: DetectWriteConfinementDeps = 
     }
     if (existsSync(join(denied, 'probe'))) {
       return unavailable('Landlock did not refuse a write outside the writable path');
+    }
+    if (readFileSync(join(denied, 'existing'), 'utf8') !== seed) {
+      return unavailable('Landlock did not refuse truncating an existing file outside the writable path');
+    }
+    if (existsSync(join(allowed, 'link'))) {
+      return unavailable('Landlock did not refuse hardlinking a file from outside the writable path into it');
     }
     return { available: true, helper, abi };
   } catch (err) {
@@ -277,8 +311,10 @@ export function confinedWritableSet(granted: readonly string[], adapterDirs: rea
 /**
  * The spawn confinement for a call the executor asked to confine: the granted
  * paths plus the adapter's per-call temp dir and run-scoped dirs. Throws,
- * before anything is spawned, when any of those is missing, so a call that
- * asked for confinement can never run unconfined.
+ * before anything is spawned, when the per-call temp dir or any adapter dir is
+ * undefined (not created), so a call that asked for confinement can never run
+ * unconfined. It does not stat paths: a writable path that does not exist
+ * fails later in llexec (exit 121) before the command runs.
  */
 export function requireSpawnConfinement(
   granted: { helper: string; writable: readonly string[] },

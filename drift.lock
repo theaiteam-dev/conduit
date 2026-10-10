@@ -8,7 +8,7 @@ sig = "c589b70ef7bb72cd"
 [[bindings]]
 doc = "CLAUDE.md"
 target = "src/controller/executor.ts#runExecutor"
-sig = "40330e84d798b910"
+sig = "c70615989b6d00f0"
 
 [[bindings]]
 doc = "CLAUDE.md"
@@ -93,7 +93,7 @@ sig = "04caef8b326c4a8f"
 [[bindings]]
 doc = "SPEC.md"
 target = "src/worker/landlock-confinement.ts#detectWriteConfinement"
-sig = "c75206ccab1115be"
+sig = "789d8a3c7b448ad9"
 
 [[bindings]]
 doc = "docs/ingress-listener.md"

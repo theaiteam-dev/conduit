@@ -948,8 +948,10 @@ before the exec, and the call fails as a spawn failure does. Each overlapped spa
 
 The kernel decides once per process whether confinement is available: it locates the
 helper (`CONDUIT_LLEXEC`, a source-checkout build, or `llexec` on `PATH`), reads the ABI,
-and runs a real write test through it, which must succeed inside the writable path and be
-refused outside it. The ABI must be 3 or higher (Linux 6.2 or later): ABI 1 and 2 do not
+and runs a real write test through it: a write inside the writable path must succeed, and
+creating a file outside it, truncating an existing file outside it, and hardlinking that
+file into the writable path must each be refused. The same commands run unconfined first
+and must all succeed, so a refusal is Landlock's and not an unwritable scratch dir. The ABI must be 3 or higher (Linux 6.2 or later): ABI 1 and 2 do not
 check `truncate(2)`, so a member could empty a sibling's file, and the diff would attribute
 that to the sibling. On a lower ABI the probe reports confinement unavailable, naming the
 kernel minimum, and the cards run serially. `conduit doctor` reports the result.

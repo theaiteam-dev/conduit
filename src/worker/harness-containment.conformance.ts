@@ -593,6 +593,8 @@ interface WriteFixtureResult {
   ran: boolean;
   ownWritten: boolean;
   setsidRan: boolean;
+  /** The fixture gave up waiting for the setsid child (a slow child, not a confinement result). */
+  setsidTimedOut: boolean;
   envWrites: Map<string, string>;
   /** Files present in the sibling's dir afterwards. */
   siblingFiles: string[];
@@ -648,11 +650,21 @@ async function runWriteFixture(
     ran: existsSync(join(own, 'fixture.done')),
     ownWritten: existsSync(join(own, 'own.txt')),
     setsidRan: existsSync(join(own, 'setsid.done')),
+    setsidTimedOut: existsSync(join(own, 'setsid.timeout')),
     envWrites,
     siblingFiles: readdirSync(sibling).sort(),
     shared: readFileSync(join(projectRoot, 'shared.txt'), 'utf-8'),
   };
 }
+
+/**
+ * Whether the fixture will start its setsid child. It looks the binary up
+ * with `command -v` under this same PATH prefix, so the suite must too.
+ */
+const hasSetsid =
+  Bun.which('setsid', {
+    PATH: `/usr/local/bin:/usr/bin:/bin${process.env.PATH ? `:${process.env.PATH}` : ''}`,
+  }) !== null;
 
 /** Bound on one write-fixture invocation; the fixture itself exits within about 3 seconds. */
 const WRITE_FIXTURE_TIMEOUT_MS = 10_000;
@@ -695,7 +707,13 @@ function describeWriteConfinementConformance(
         const result = await runWriteFixture(name, factory, projectRoot, true);
         expect(result.ran, 'the fixture did not run to its end').toBe(true);
         expect(result.ownWritten, "the call could not write its own dir").toBe(true);
-        expect(result.setsidRan, 'the setsid child did not run').toBe(true);
+        if (hasSetsid) {
+          expect(
+            result.setsidTimedOut,
+            "the setsid child did not finish within the fixture's wait",
+          ).toBe(false);
+          expect(result.setsidRan, 'the setsid child did not run').toBe(true);
+        }
         expect(result.siblingFiles).toEqual([]);
         expect(result.shared).toBe('shared\n');
         // The per-call temp dir and every run-scoped dir the adapter set stay writable.
@@ -715,7 +733,11 @@ function describeWriteConfinementConformance(
         expect(result.siblingFiles).toContain('cp.txt');
         expect(result.siblingFiles).toContain('link.txt');
         expect(result.shared).toBe('shared\nappended\n');
-        if (existsSync('/usr/bin/setsid') || existsSync('/bin/setsid')) {
+        if (hasSetsid) {
+          expect(
+            result.setsidTimedOut,
+            "the setsid child did not finish within the fixture's wait",
+          ).toBe(false);
           expect(result.siblingFiles).toContain('setsid.txt');
         }
       },

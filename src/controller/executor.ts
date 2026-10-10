@@ -49,7 +49,11 @@ import {
   isOverlapHarnessStation,
   ownedPathSetsIntersect,
 } from './harness-overlap';
-import { resolveWriteConfinement, type WriteConfinement } from '../worker/landlock-confinement';
+import {
+  createWriteConfinementResolver,
+  resolveWriteConfinement,
+  type WriteConfinement,
+} from '../worker/landlock-confinement';
 import { attemptClaim, beginWork, renewLease, reconcile } from '../dispatch/claim';
 import { checkCommandAllowed, runDeterministic, deterministicCardEnv } from '../worker/deterministic';
 import { runTransformStation, coerciveParse, computeFindingsHash } from '../worker/transform';
@@ -527,6 +531,12 @@ export async function runExecutor(args: RunEngineArgs): Promise<void> {
   // Issue #122: told once per run when the host cannot write-confine an
   // overlapped call, so every overlap candidate runs on the serial path.
   let overlapConfinementWarned = false;
+  // Detection runs on the first pass with an overlap candidate, then never
+  // again this run, whatever resolver was injected.
+  const resolveRunWriteConfinement =
+    args.resolveWriteConfinement !== undefined
+      ? createWriteConfinementResolver(args.resolveWriteConfinement)
+      : resolveWriteConfinement;
 
   // Wrap the adapter to track cumulative token spend (NFR-3: adapter is the
   // ONLY model surface; the control loop itself never calls it).
@@ -1501,7 +1511,7 @@ export async function runExecutor(args: RunEngineArgs): Promise<void> {
     // member's diff and could be attributed to no member.
     if (harnessCandidates.length > 0 && !halted) {
       currentCardId = null;
-      const writeConfinement = await (args.resolveWriteConfinement ?? resolveWriteConfinement)();
+      const writeConfinement = await resolveRunWriteConfinement();
       const overlapPlan = admitHarnessOverlap(harnessCandidates, writeConfinement);
       if (overlapPlan.deferred) capBlocked = true;
 

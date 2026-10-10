@@ -807,6 +807,29 @@ describe('overlap: write confinement', () => {
     }
   });
 
+  it('resolves confinement once per run, even across several overlap passes and an injected resolver', async () => {
+    const walker = makeWalker(() => dir, { startBarrier: 2 });
+    const registry = createHarnessRegistry([walker.adapter]);
+    const flow = loadOk({}, registry);
+    for (const c of ['c1', 'c2', 'c3']) seedChild(c);
+    let resolves = 0;
+    const clock = virtualClock();
+
+    await runExecutor({
+      db, flow, now: clock.now, sleep: clock.sleep, adapter: throwingModel,
+      io: { out: () => {}, err: () => {} },
+      harnessRegistry: registry, concurrency: 2,
+      resolveWriteConfinement: async () => {
+        resolves += 1;
+        return CONFINED;
+      },
+    } as unknown as RunEngineArgs);
+
+    for (const c of ['c1', 'c2', 'c3']) expect(lane(c)).toBe('done');
+    // K = 2 with three cards: the third runs in a later pass that also had candidates.
+    expect(resolves).toBe(1);
+  });
+
   it('runs every candidate serially, journaling why and warning once, when the probe reports confinement unavailable', async () => {
     const walker = makeWalker(() => dir);
     const registry = createHarnessRegistry([walker.adapter]);

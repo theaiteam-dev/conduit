@@ -407,8 +407,9 @@ hold it together:
   user for agentic/harness flows. [`deployment-hardening.md`](deployment-hardening.md) is
   that guidance in full.
 - **Write confinement of overlapped calls.** A call that runs as a member of a harness
-  overlap batch runs under Landlock, which refuses a write outside the card's owned paths
-  and the call's own temp and config dirs before it happens. Serial calls are not confined.
+  overlap batch runs under Landlock, which refuses a write outside the card's owned paths,
+  the call's own temp and config dirs, and `/dev` before it happens. Serial calls are not
+  confined.
   See [Write confinement of overlapped calls](#write-confinement-of-overlapped-calls).
 - **Optional idle timeout.** `timeout_seconds` bounds the whole invocation, so a harness
   stuck on a hung tool call runs until that bound. `idle_timeout_seconds` adds a second
@@ -571,8 +572,11 @@ verification runs.
 finds the helper (`CONDUIT_LLEXEC`, which must name an executable file; else
 `native/llexec/build/llexec` in a source checkout, built by `bun run build:llexec`; else
 `llexec` on `PATH`, where the engine image installs it), asks it for the Landlock ABI, and
-runs a real write test through it: a write inside the writable path must succeed and one
-outside it must be refused. `conduit doctor` reports the result as the `write-confinement`
+runs a real write test through it: a write inside the writable path must succeed, and
+creating a file outside it, truncating an existing file outside it, and hardlinking that
+file into the writable path must each be refused. The same commands first run unconfined
+and must all succeed, so a refusal comes from Landlock and not from an unwritable scratch
+dir. `conduit doctor` reports the result as the `write-confinement`
 probe. When the probe fails, every card of an `overlap: true` station runs on the serial
 path, its spans carry `overlap_fallback: "write confinement unavailable: <reason>"`, and the
 run warns once. No overlapped call runs unconfined. An adapter without `canConfineWrites`
