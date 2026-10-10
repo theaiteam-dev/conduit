@@ -578,11 +578,13 @@ path, its spans carry `overlap_fallback: "write confinement unavailable: <reason
 run warns once. No overlapped call runs unconfined. An adapter without `canConfineWrites`
 is treated the same way, with its own reason.
 
-This requires Linux 5.13 or later with `landlock` in the active LSM list
-(`/sys/kernel/security/lsm`). Linux 5.19 (ABI 2) adds cross-directory rename and link;
-under ABI 1 every cross-directory rename or link is refused, including inside the set.
-Linux 6.2 (ABI 3) adds `truncate(2)`; before it, a confined process can truncate a file
-outside the set. A default Docker container allows the Landlock syscalls: the engine image
+This requires Linux 6.2 or later (Landlock ABI 3) with `landlock` in the active LSM list
+(`/sys/kernel/security/lsm`). ABI 3 is the first that checks `truncate(2)`; on ABI 1 or 2 a
+confined member could empty a sibling's file and the diff would attribute it to the
+sibling, so the probe reports confinement unavailable there ("the kernel reports Landlock
+ABI 2, and overlap needs ABI 3 (Linux 6.2 or later)") and the cards run serially. `llexec`
+itself works from ABI 1 (Linux 5.13); under ABI 1 it refuses every cross-directory rename or
+link, even inside the writable paths. A default Docker container allows the Landlock syscalls: the engine image
 probe passes in one (Docker on a 6.8 host kernel). Docker Desktop's VM kernel was not
 checked. CI builds the helper and sets `CONDUIT_REQUIRE_LANDLOCK=1`, so the
 write-confinement tests fail rather than skip if the runner loses Landlock; on a

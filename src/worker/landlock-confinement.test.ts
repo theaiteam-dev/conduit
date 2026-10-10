@@ -18,6 +18,7 @@ import {
   DEV_DIR,
   LLEXEC_ENV,
   LLEXEC_FAILED_EXIT,
+  MIN_OVERLAP_LANDLOCK_ABI,
   buildConfinedArgv,
   callTempDirEnv,
   confinedWritableSet,
@@ -27,6 +28,7 @@ import {
   detectWriteConfinement,
   locateLlexec,
   removeCallTempDir,
+  requireSpawnConfinement,
   resolveWriteConfinement,
   type ProbeRunResult,
   type WriteConfinement,
@@ -155,6 +157,22 @@ describe('detectWriteConfinement: each reason it is unavailable, with the depend
     });
   });
 
+  it('is unavailable on Landlock ABI 2, naming the kernel minimum, before any write test runs', async () => {
+    const { run, argvs } = fakeRun({ abi: { exitCode: 0, stdout: '2\n', stderr: '' } });
+    const result = await detectWriteConfinement(deps(run));
+    expect(result).toEqual({
+      available: false,
+      reason:
+        'the kernel reports Landlock ABI 2, and overlap needs ABI 3 (Linux 6.2 or later), the first that checks truncate(2)',
+    });
+    expect(argvs).toHaveLength(1);
+  });
+
+  it(`is available on Landlock ABI ${MIN_OVERLAP_LANDLOCK_ABI}, the minimum`, async () => {
+    const { run } = fakeRun({ abi: { exitCode: 0, stdout: '3\n', stderr: '' } });
+    expect(await detectWriteConfinement(deps(run))).toEqual({ available: true, helper, abi: 3 });
+  });
+
   it('is unavailable when the helper cannot apply the ruleset', async () => {
     const { run } = fakeRun({
       writes: { allowed: false, denied: false },
@@ -247,6 +265,26 @@ describe('buildConfinedArgv and confinedWritableSet', () => {
   it('refuses a relative path from either source', () => {
     expect(() => confinedWritableSet(['cards/a'], [])).toThrow('is not absolute');
     expect(() => confinedWritableSet([], ['tmp'])).toThrow('is not absolute');
+  });
+});
+
+describe('requireSpawnConfinement: a call that asked for confinement never runs unconfined', () => {
+  const granted = { helper: '/opt/llexec', writable: ['/p/cards/a'] };
+  const tmp = { root: '/t/call', cache: '/t/call/cache', state: '/t/call/state' };
+
+  it('builds the full writable set from the granted paths, the temp dir and the run-scoped dirs', () => {
+    expect(requireSpawnConfinement(granted, tmp, ['/t/cfg'])).toEqual({
+      helper: '/opt/llexec',
+      writable: ['/p/cards/a', '/t/call', '/t/cfg', DEV_DIR],
+    });
+  });
+
+  it('throws when the per-call temp dir is missing', () => {
+    expect(() => requireSpawnConfinement(granted, undefined, ['/t/cfg'])).toThrow('refusing to run unconfined');
+  });
+
+  it('throws when a run-scoped dir is missing', () => {
+    expect(() => requireSpawnConfinement(granted, tmp, [undefined])).toThrow('refusing to run unconfined');
   });
 });
 

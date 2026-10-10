@@ -75,7 +75,7 @@ import { existsSync, statSync } from 'node:fs';
 import { isDeepStrictEqual } from 'node:util';
 import { resolveExecutable } from './harness-contained-spawn';
 import {
-  confinedWritableSet, callTempDirEnv, createCallTempDir, removeCallTempDir, type CallTempDir, type SpawnWriteConfinement,
+  callTempDirEnv, createCallTempDir, removeCallTempDir, requireSpawnConfinement, type CallTempDir, type SpawnWriteConfinement,
 } from './landlock-confinement';
 
 /** The part of the SDK's `Query` this adapter uses. */
@@ -213,10 +213,9 @@ export function createAgentSdkHarnessAdapter(config: AgentSdkHarnessAdapterConfi
 
       // Every throw from here on, including one while building the options, must remove the dirs.
       try {
+        // Throws before anything is spawned if the confinement cannot be built: never run unconfined.
         const spawnConfinement: SpawnWriteConfinement | undefined =
-          confined !== undefined && callTmp !== undefined && configDir !== undefined
-            ? { helper: confined.helper, writable: confinedWritableSet(confined.writable, [callTmp.root, configDir]) }
-            : undefined;
+          confined !== undefined ? requireSpawnConfinement(confined, callTmp, [configDir]) : undefined;
         const emit = call.onEvent !== undefined ? createHarnessEventEmitter(call.onEvent) : undefined;
         const abortController = new AbortController();
         // Mutated from callbacks, so held in an object: a bare `let` would be narrowed to its initial value.

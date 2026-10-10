@@ -949,7 +949,10 @@ before the exec, and the call fails as a spawn failure does. Each overlapped spa
 The kernel decides once per process whether confinement is available: it locates the
 helper (`CONDUIT_LLEXEC`, a source-checkout build, or `llexec` on `PATH`), reads the ABI,
 and runs a real write test through it, which must succeed inside the writable path and be
-refused outside it. `conduit doctor` reports the result.
+refused outside it. The ABI must be 3 or higher (Linux 6.2 or later): ABI 1 and 2 do not
+check `truncate(2)`, so a member could empty a sibling's file, and the diff would attribute
+that to the sibling. On a lower ABI the probe reports confinement unavailable, naming the
+kernel minimum, and the cards run serially. `conduit doctor` reports the result.
 
 **The overlap rule with confinement.** The overlap integrity rule above is unchanged and
 stays the backstop. On its own it cannot detect a write by one member into another
@@ -963,10 +966,7 @@ hold the card if one appeared. These remain outside confinement:
   in Landlock, so a member can change a sibling's file modes but not its contents;
 - writes made on the call's behalf by a process that is not confined (a daemon reached over
   a socket);
-- network egress, which Landlock does not filter here;
-- on kernels before 6.2 (Landlock ABI 1 and 2), `truncate(2)` on a path outside the set;
-  on ABI 1 (before 5.19), every cross-directory rename or link is refused, including inside
-  the set.
+- network egress, which Landlock does not filter here.
 
 **Per card, unchanged.** Rate-limit parks, retries and their backoff, idle and wall-clock
 timeouts, `child_stagger_seconds` and the consumption andon act on each member as they do on

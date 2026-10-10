@@ -49,6 +49,14 @@ export const REPO_LLEXEC_PATH = resolve(import.meta.dir, '../../native/llexec/bu
 /** Always writable for a confined call: terminals, /dev/null, /dev/shm. */
 export const DEV_DIR = '/dev';
 
+/**
+ * The lowest Landlock ABI overlap accepts: ABI 3 (Linux 6.2) is the first that
+ * checks truncate(2). Below it a confined process can truncate a file outside
+ * its writable set, which changes a sibling's file contents, so the probe
+ * reports confinement unavailable. llexec itself stays ABI-generic.
+ */
+export const MIN_OVERLAP_LANDLOCK_ABI = 3;
+
 /** Upper bound on each of the probe's commands. */
 const PROBE_BUDGET_MS = 5_000;
 
@@ -182,6 +190,12 @@ export async function detectWriteConfinement(deps: DetectWriteConfinementDeps = 
       const detail = firstLine(abiRun.stderr) || `exit ${abiRun.exitCode ?? 'signal'}`;
       return unavailable(`${helper} --abi failed (${detail})`);
     }
+    if (abi < MIN_OVERLAP_LANDLOCK_ABI) {
+      return unavailable(
+        `the kernel reports Landlock ABI ${abi}, and overlap needs ABI ${MIN_OVERLAP_LANDLOCK_ABI} ` +
+          '(Linux 6.2 or later), the first that checks truncate(2)',
+      );
+    }
 
     const allowed = join(scratch, 'allowed');
     const denied = join(scratch, 'denied');
@@ -258,6 +272,30 @@ export function confinedWritableSet(granted: readonly string[], adapterDirs: rea
     if (!out.includes(path)) out.push(path);
   }
   return out;
+}
+
+/**
+ * The spawn confinement for a call the executor asked to confine: the granted
+ * paths plus the adapter's per-call temp dir and run-scoped dirs. Throws,
+ * before anything is spawned, when any of those is missing, so a call that
+ * asked for confinement can never run unconfined.
+ */
+export function requireSpawnConfinement(
+  granted: { helper: string; writable: readonly string[] },
+  callTmp: CallTempDir | undefined,
+  adapterDirs: ReadonlyArray<string | undefined>,
+): SpawnWriteConfinement {
+  if (callTmp === undefined) {
+    throw new Error('write confinement was requested but the per-call temp dir was not created; refusing to run unconfined');
+  }
+  const dirs: string[] = [];
+  for (const dir of adapterDirs) {
+    if (dir === undefined) {
+      throw new Error('write confinement was requested but a run-scoped dir was not created; refusing to run unconfined');
+    }
+    dirs.push(dir);
+  }
+  return { helper: granted.helper, writable: confinedWritableSet(granted.writable, [callTmp.root, ...dirs]) };
 }
 
 /** Temp dirs createCallTempDir made and removeCallTempDir has not yet removed. */

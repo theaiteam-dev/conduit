@@ -115,7 +115,7 @@ import { HARNESS_GATE_HOLD_CODE, callGateFailClosed, type GateDecision, type Gat
 import { buildHarnessChildEnv } from './harness-runner';
 import { isContainedIn, resolveOwnedPath } from './integrity';
 import { resolveContainment, type Containment } from './cgroup-containment';
-import { confinedWritableSet, callTempDirEnv, createCallTempDir, removeCallTempDir, type CallTempDir } from './landlock-confinement';
+import { callTempDirEnv, createCallTempDir, removeCallTempDir, requireSpawnConfinement, type CallTempDir } from './landlock-confinement';
 import {
   buildProviderAuthContent,
   createRunScopedOpenCodeDirs,
@@ -1095,14 +1095,8 @@ export function createOpenCodeHarnessAdapter(config: OpenCodeHarnessAdapterConfi
               args: [...OPENCODE_SERVE_ARGS],
               cwd: config.projectRoot,
               env,
-              ...(confined !== undefined && callTmp !== undefined
-                ? {
-                    confinement: {
-                      helper: confined.helper,
-                      writable: confinedWritableSet(confined.writable, [callTmp.root, dirs.root]),
-                    },
-                  }
-                : {}),
+              // Throws before anything is spawned if the confinement cannot be built: never run unconfined.
+              ...(confined !== undefined ? { confinement: requireSpawnConfinement(confined, callTmp, [dirs.root]) } : {}),
             },
             handlers,
           );

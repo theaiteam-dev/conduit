@@ -40,6 +40,8 @@ from ABI 3 (6.2). It grants all of them beneath each writable directory, and onl
 truncate on a writable path that is a file. It then sets `no_new_privs`, restricts itself, and
 execs the command. Reads and executes are not handled, so they stay allowed. Any failure before
 the exec prints a line starting with `llexec:` and exits 121; the command never runs unconfined.
+The helper works from ABI 1, where the kernel refuses every cross-directory rename or link even
+inside the writable paths. Overlap does not run below ABI 3 (see *Detection and fallback*).
 
 A static binary was chosen over a `conduit __confine` subcommand using `bun:ffi`. The FFI route
 hit `EINVAL` on `landlock_add_rule` in the #122 prototype, it would need proof that Bun never
@@ -89,7 +91,14 @@ A once-per-process probe, `resolveWriteConfinement` (`src/worker/landlock-confin
 modelled on `resolveContainment`, finds the helper (`CONDUIT_LLEXEC`; else the source-checkout
 build at `native/llexec/build/llexec`; else `llexec` on `PATH`), asks it for the ABI, and runs
 a real write test through it: a write inside the writable path must succeed and a write outside
-it must be refused. `conduit doctor` reports it as the `write-confinement` probe, which never
+it must be refused.
+
+The probe requires Landlock ABI 3 or higher, that is Linux 6.2 or later. ABI 1 and 2 do not
+check `truncate(2)`, so a confined member could empty a file in a sibling's owned paths. That
+changes the file's contents, and the overlap integrity rule would attribute it to the sibling,
+which is ADR-0012's gap again. On ABI 1 or 2 the probe reports confinement unavailable with a
+reason naming the minimum, and overlap candidates run serially. The helper itself stays
+ABI-generic, so the check lives in the probe, not in `llexec`. `conduit doctor` reports it as the `write-confinement` probe, which never
 fails.
 
 Admission adds two conditions to ADR-0012's list, both checked at dispatch:
@@ -120,9 +129,8 @@ fails closed: no path runs an overlapped call unconfined. Each overlapped span r
 - **Writes by an unconfined process on the call's behalf**, for example a daemon reached over a
   unix socket.
 - **Network egress.** Landlock filters TCP by port only, and every CLI needs 443.
-- **Older kernels.** Before 6.2 (ABI 1 and 2) `truncate(2)` is not checked, so a confined
-  process can truncate a file outside its set. On ABI 1 (before 5.19) the kernel refuses every
-  cross-directory rename or link, including inside the set, which a CLI may need.
+- **Kernel minimum.** Overlap needs Linux 6.2 (Landlock ABI 3); an older kernel gets no
+  overlap (see *Detection and fallback*).
 - **Platform coverage.** Verified on Linux 6.8 (ABI 4) on the host and in a default Docker
   container. Docker Desktop's VM kernel is not verified. CI builds the helper and sets
   `CONDUIT_REQUIRE_LANDLOCK=1`, so a GitHub runner without Landlock fails the suite instead of
@@ -158,8 +166,8 @@ every flow running and costs only wall clock.
 **We pay**
 - A C source file and a Dockerfile build stage. A source checkout needs a C compiler and
   static libc to build the helper (`bun run build:llexec`); without it, overlap runs serially.
-- A run on a host without Landlock (macOS, an old kernel, a kernel booted without `landlock` in
-  `lsm=`) gets no overlap.
+- A run on a host without Landlock ABI 3 (macOS, a kernel before 6.2, a kernel booted without
+  `landlock` in `lsm=`) gets no overlap.
 - The CLIs see `TMPDIR`, `TMPPREFIX` and the XDG cache and state dirs pointed at a per-call dir,
   and on `agent-sdk` an isolated config dir, on every overlapped call.
 

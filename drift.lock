@@ -93,7 +93,7 @@ sig = "04caef8b326c4a8f"
 [[bindings]]
 doc = "SPEC.md"
 target = "src/worker/landlock-confinement.ts#detectWriteConfinement"
-sig = "d2dfb4e342e678e7"
+sig = "c75206ccab1115be"
 
 [[bindings]]
 doc = "docs/ingress-listener.md"

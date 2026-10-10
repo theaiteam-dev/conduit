@@ -151,7 +151,8 @@ Every member of an overlap batch now runs under Landlock write confinement, and 
 the serial path when the host or adapter cannot provide it. The writes described above fail at
 the syscall before they happen, so the gap is closed for file contents. What confinement does
 not cover (metadata changes, writes by an unconfined process on the call's behalf, network
-egress, and `truncate(2)` on kernels before 6.2) is listed in ADR-0013.
+egress) is listed in ADR-0013. Confinement needs Linux 6.2 (Landlock ABI 3), the first ABI
+that checks `truncate(2)`; on an older kernel the cards run serially.
 
 ### Ship condition
 
