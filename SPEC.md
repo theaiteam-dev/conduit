@@ -282,6 +282,7 @@ against the matrix.
 | `hold` with no human | does **not** consume budget; if `hold_timeout` is set, the kernel applies the card's `on_timeout` action — `scrap`, `proceed_with_findings`, or `escalate` (§4A). If `hold_timeout` is omitted, the card holds indefinitely. `on_timeout` is **required** when `hold_timeout` is set; the kernel rejects the config at load otherwise. |
 | Andon trips mid-flight | new claims blocked; in-flight workers **drain-and-checkpoint** (§8). |
 | Parent fanned-out, child scraps | fan-in policy decides (§6): `all` → parent holds/scraps; `quorum(k)`/`best_effort` → proceed. |
+| Parent fanned-out, child lands in `hold` | the child is not a survivor (§6): `all` → parent holds (`child_held`); `quorum(k)` counts it as missing; `best_effort` drops it. |
 
 ---
 
@@ -704,7 +705,8 @@ interpret.
 2. **EXECUTION_LOOP** — worker reasons and invokes tools through the Tool-Bridge (§7).
 3. **MARK_DONE** — worker emits a structured Work Summary + the typed station output.
 4. **The Hook Gateway — deterministic only.** Runs the **Summary Hook**: a *pure code*
-   integrity check (files touched ⊆ owned paths, output schema valid, artifacts exist).
+   integrity check (files created, modified or deleted ⊆ owned paths, output schema valid,
+   artifacts exist).
    It does **not** run an LLM. *(Rev-1 H7 fix: the quality critic is a separate **QC
    station**, §6 — not inside this transaction.)*
 5. **ACK_DONE** — Kernel commits the Work Summary, **checkpoints the station output**,
@@ -820,11 +822,14 @@ express it (this is why Conduit is a state machine, not Airflow). It is bounded 
    budgets miss.
 
 ### Fan-in failure policy (rev-1 C4)
-`fan_in: { policy: all | quorum(k) | best_effort }`. Defines what a scrapped child does
-to the assembler and parent. `all` → one scrap holds/scraps the parent (A(i)-Team:
-don't ship a partial product). `quorum(k)`/`best_effort` → proceed and record the
-dropped children. **`k` is a count (integer, `1 ≤ k ≤ fan_out`):** the minimum number of
-children that must reach a non-scrap terminal lane for the fan-in to proceed. `k: 9` with
+`fan_in: { policy: all | quorum(k) | best_effort }`. Defines what a scrapped or held child
+does to the assembler and parent. A **survivor** is a child in a terminal lane other than
+`scrap` or `hold`. A child in `hold` was escalated to a human, not finished: its output is
+unchecked, and an integrity breach leaves the out-of-bounds write on disk, so no policy merges
+it. `all` → one scrap or hold holds the parent (A(i)-Team: don't ship a partial product),
+journaled as `fan-in child_scrapped` or `fan-in child_held`. `quorum(k)`/`best_effort` →
+proceed and record the dropped children, held ones included. **`k` is a count (integer,
+`1 ≤ k ≤ fan_out`):** the minimum number of survivors for the fan-in to proceed. `k: 9` with
 `fan_out: 10` = tolerate one scrapped child. A count, not a ratio — no rounding ambiguity
 on small fan-outs, and the loader validates it against `fan_out` at load time. A child
 that can never complete must not deadlock the parent — the liveness watchdog (§8) is the
@@ -875,9 +880,14 @@ risk and gets the most poka-yoke.
 
 Under `--concurrency K` a `kind: harness` station runs one card at a time unless it declares
 `overlap: true`. A harness call on the serial path holds the tick loop until it returns, and
-its integrity check is the serial rule: every path touched under the project root between the
-call's baseline snapshot and its post-invoke snapshot must lie inside the card's `owned_paths`,
-or the card holds.
+its integrity check is the serial rule: every path created, modified or deleted under the
+project root between the call's baseline snapshot and its post-invoke snapshot must lie inside
+the card's `owned_paths`, or the card holds. A delete is a write. A deleted path no longer
+resolves, so it is checked at the location it had in the baseline snapshot: the canonical
+project root joined with its path below the root, with no symlink below the root resolved
+(the snapshot walk never descends a symlink), against the owned paths mapped the same way.
+Resolving it after the call would let a call delete a sibling's file and then replace the
+sibling's directory with a symlink into its own owned dir.
 
 A harness station may declare `overlap: true` (station level, beside `wip`; rejected on any
 other `kind`). Its cards then run as overlapping calls, up to `min(K - in-flight, wip)` at a
@@ -918,7 +928,8 @@ anywhere else → a breach, and the card holds. Paths
 are canonicalized as the integrity check canonicalizes them: a symlink by its target, and a
 path removed since the snapshot (a sibling deleting a temporary file in its own directory) by
 its parent directory. The serial checks apply to every path not attributed: symlink canonicalization, fail-closed on a
-path that does not resolve, and a hold, not a retry, on a breach. The disjoint ownership
+path that does not resolve (a deleted path is checked at its baseline location, as above), and a
+hold, not a retry, on a breach. The disjoint ownership
 invariant (§9) makes the attribution unambiguous. Because a path that no member owns cannot be
 attributed, a breach by one member holds every member whose diff contains it.
 
@@ -1018,8 +1029,9 @@ split is harder and needs this in-transaction reservation.)*
   to the kernel tool protocol. A model with no function-calling falls back to the prompted
   adapter or is rejected at the Bench (§14) before it's allowed on a flow.
 - **The Law (permissioning).** Before any tool runs the Kernel checks Hooks:
-  - **Path ownership** — writes ⊆ the card's `owned_paths`, with **symlink + relative-path
-    resolution** (resolve to canonical absolute, reject escapes) (rev-1 H6).
+  - **Path ownership** — writes, deletes included, ⊆ the card's `owned_paths`, with
+    **symlink + relative-path resolution** (resolve to canonical absolute, reject escapes)
+    (rev-1 H6).
   - **Bash positive allowlist** — only listed executables; **no shell metacharacters**
     (no pipes/redirects/`;`/backticks/`$()`) unless explicitly enabled. Denylists are
     insufficient against a cheap model + untrusted substrate. The harness tier's per-call

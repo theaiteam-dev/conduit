@@ -78,7 +78,7 @@ const QUORUM_K = 2;
 // fan-in policy (quorum k=2) lives on the resume_at station `assemble`, mirroring
 // the reference flow. Children enter at `cwork`.
 // ---------------------------------------------------------------------------
-function setupFanInFlow(dir: string): FlowConfig {
+function setupFanInFlow(dir: string, fanIn = `{ policy: quorum, k: ${QUORUM_K} }`): FlowConfig {
   mkdirSync(join(dir, 'prompts'), { recursive: true });
   writeFileSync(join(dir, 'prompts', 'plan.md'), 'Propose the child decomposition.');
 
@@ -120,7 +120,7 @@ stations:
     next: done
   - id: assemble
     worker: { kind: deterministic, command: "true" }
-    fan_in: { policy: quorum, k: ${QUORUM_K} }
+    fan_in: ${fanIn}
     next: done
 `;
   writeFileSync(join(dir, 'flow.yaml'), flowYaml);
@@ -233,8 +233,8 @@ function seedChild(
 }
 
 /** Drive runExecutor over the fan-in flow with whatever cards are already seeded. */
-async function run(adapter: ModelAdapter): Promise<void> {
-  const flow = setupFanInFlow(projectDir);
+async function run(adapter: ModelAdapter, fanIn?: string): Promise<void> {
+  const flow = setupFanInFlow(projectDir, fanIn);
   const { io } = makeIO();
   await runExecutor({
     db: db!,
@@ -382,5 +382,47 @@ describe('runExecutor fan-in — does not fire while a child is still non-termin
     expect(parent?.status).toBe('awaiting_children');
     // The parent must NOT have resumed at resume_at while a child is in flight.
     expect(departedFromLane(db, PARENT_ID, RESUME_AT)).toBe(false);
+  });
+});
+
+// ===========================================================================
+// A child in the `hold` lane is escalated to a human, not finished. The `all`
+// policy used to count it as a survivor, so the parent merged and reached done
+// while the child sat in hold (an integrity breach holds a harness card there).
+// ===========================================================================
+
+describe('runExecutor fan-in — a child in the hold lane is not a survivor', () => {
+  function terminalReasons(id: string): string[] {
+    return db!.getCardLog(id)
+      .filter((e): e is Extract<typeof e, { kind: 'terminal' }> => e.kind === 'terminal')
+      .map((e) => e.reason);
+  }
+
+  it('holds the parent under policy all (fan-in child_held)', async () => {
+    db = openFreshDb();
+    seedParentAwaitingChildren(db);
+    seedChild(db, 'c1', 'done', 'complete', ['out/c1.json']);
+    seedChild(db, 'c2', 'done', 'complete', ['out/c2.json']);
+    seedChild(db, 'c3', 'hold', 'held', ['out/c3.json']);
+
+    await run(noopAdapter(), '{ policy: all }');
+
+    expect(db.getCard(DEFAULT_RUN_ID, PARENT_ID)?.status).toBe('held');
+    expect(departedFromLane(db, PARENT_ID, RESUME_AT)).toBe(false);
+    expect(terminalReasons(PARENT_ID)).toContain('fan-in child_held');
+  });
+
+  it('counts it against the quorum', async () => {
+    db = openFreshDb();
+    seedParentAwaitingChildren(db);
+    seedChild(db, 'c1', 'done', 'complete', ['out/c1.json']);
+    seedChild(db, 'c2', 'hold', 'held', ['out/c2.json']);
+    seedChild(db, 'c3', 'scrap', 'scrapped', ['out/c3.json']);
+
+    await run(noopAdapter());
+
+    // survivors = 1 < k(2).
+    expect(db.getCard(DEFAULT_RUN_ID, PARENT_ID)?.status).toBe('held');
+    expect(terminalReasons(PARENT_ID)).toContain('fan-in quorum_unmet');
   });
 });

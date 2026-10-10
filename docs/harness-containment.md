@@ -98,7 +98,8 @@ What it does not cover:
 - A Bash write that bypasses the path check. Redirects are refused, but a write by an
   allowlisted program to a path in its arguments is not. On the serial path the MARK_DONE
   owned-paths integrity check stays mandatory as the backstop and holds the card after the
-  call. An overlapped call (`overlap: true`) runs under Landlock write confinement, which
+  call. It sees files created, changed and deleted, so an `rm` outside the owned paths holds
+  the card too. An overlapped call (`overlap: true`) runs under Landlock write confinement, which
   refuses such a write at the syscall when it targets anything outside the call's writable
   set, including the owned paths of a card whose call overlapped this one (see
   [Write confinement of overlapped calls](#write-confinement-of-overlapped-calls)).

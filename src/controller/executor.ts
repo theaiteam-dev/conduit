@@ -2276,13 +2276,24 @@ export async function snapshotTreeAsync(
   return snap;
 }
 
-/** Absolute paths of files created or modified between two tree snapshots. */
-function diffTouched(before: Map<string, string>, after: Map<string, string>): string[] {
+/**
+ * Absolute paths of files created or modified (`touched`) and of files removed
+ * (`deleted`) between two tree snapshots. A delete is a write (SPEC §7), so the
+ * integrity gate checks both sets against owned_paths.
+ */
+function diffTouched(
+  before: Map<string, string>,
+  after: Map<string, string>,
+): { touched: string[]; deleted: string[] } {
   const touched: string[] = [];
   for (const [path, sig] of after) {
     if (before.get(path) !== sig) touched.push(path);
   }
-  return touched;
+  const deleted: string[] = [];
+  for (const path of before.keys()) {
+    if (!after.has(path)) deleted.push(path);
+  }
+  return { touched, deleted };
 }
 
 /**
@@ -2301,12 +2312,14 @@ function runOwnedPathsIntegrity(
   projectRoot: string,
   ownedPaths: readonly string[],
   touchedPaths: readonly string[],
+  deletedPaths: readonly string[] = [],
 ): IntegrityResult | null {
   if (ownedPaths.length === 0) return null;
   return checkIntegrity({
     projectRoot,
     ownedPaths,
     touchedPaths,
+    deletedPaths,
     declaredArtifacts: [],
     output: null,
     validateOutput: () => true,
@@ -2522,8 +2535,8 @@ async function executeDeterministicStation(args: DeterministicArgs): Promise<boo
       : null;
   const checkDeterministicIntegrity = (): IntegrityResult | null => {
     if (!integrityBaseline) return null;
-    const touched = diffTouched(integrityBaseline, snapshotTree(projectRoot));
-    const result = runOwnedPathsIntegrity(projectRoot, card.owned_paths, touched);
+    const { touched, deleted } = diffTouched(integrityBaseline, snapshotTree(projectRoot));
+    const result = runOwnedPathsIntegrity(projectRoot, card.owned_paths, touched, deleted);
     return result && !result.ok ? result : null;
   };
 
@@ -4650,26 +4663,30 @@ async function executeHarnessStationBody(args: HarnessArgs): Promise<boolean> {
       // left out of the check; the count per member is journaled on this
       // attempt's span. Every other path is checked exactly as above.
       const ownedPaths = card.owned_paths ?? [];
-      let touchedPaths = diffTouched(
+      let { touched: touchedPaths, deleted: deletedPaths } = diffTouched(
         integrityBaseline,
         overlap !== undefined ? await snapshotTreeAsync(projectRoot) : snapshotTree(projectRoot),
       );
       if (overlap !== undefined) {
         overlap.windows.close(overlapWindow);
+        // Created, modified and deleted paths are disjoint (a deleted path is
+        // absent from the after-snapshot), so one classification serves both.
         const classified = classifyOverlapTouched(
-          projectRoot, overlap.ownedCanonical, touchedPaths, overlap.windows.intersecting(overlapWindow),
+          projectRoot, overlap.ownedCanonical, [...touchedPaths, ...deletedPaths], overlap.windows.intersecting(overlapWindow),
         );
-        touchedPaths = classified.remaining;
+        const deletedSet = new Set(deletedPaths);
+        touchedPaths = classified.remaining.filter((p) => !deletedSet.has(p));
+        deletedPaths = classified.remaining.filter((p) => deletedSet.has(p));
         // An array of {card, paths, sample}: the journal's secret-key filter
         // would drop an object keyed by a name containing "token" or "auth".
         if (classified.attributed.length > 0) overlapAttrs['overlap_attributed'] = classified.attributed;
       }
       const integrityViolation: IntegrityResult | null =
         ownedPaths.length === 0
-          ? touchedPaths.length > 0
-            ? { ok: false, failures: touchedPaths.map((p) => ({ code: 'path_escape' as const, path: p })) }
+          ? touchedPaths.length + deletedPaths.length > 0
+            ? { ok: false, failures: [...touchedPaths, ...deletedPaths].map((p) => ({ code: 'path_escape' as const, path: p })) }
             : null
-          : runOwnedPathsIntegrity(projectRoot, ownedPaths, touchedPaths);
+          : runOwnedPathsIntegrity(projectRoot, ownedPaths, touchedPaths, deletedPaths);
       if (integrityViolation && !integrityViolation.ok) {
         db.appendJournalSpan({
           runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.harness`, ...provenance, invocationId,
@@ -6627,7 +6644,7 @@ function pollAwaitingChildren(
         .immediate();
       anyAdvanced = true;
     } else {
-      // decision.action === 'hold_parent': quorum unmet or a child scrapped.
+      // decision.action === 'hold_parent': quorum unmet, or a child scrapped or held.
       // Set status='held' — NOT left in awaiting_children which would deadlock.
       db.appendCardLog({
         runId,
@@ -6661,7 +6678,7 @@ function pollAwaitingChildren(
  * Convert the flow-config fan_in declaration (number | FanInPolicyConfig | undefined)
  * to the dag/expand.ts FanInPolicy shape that evaluateFanIn expects.
  *
- * - undefined  → 'all' (every child must reach a non-scrap terminal lane)
+ * - undefined  → 'all' (every child must reach a terminal lane other than scrap or hold)
  * - number k   → quorum(k) shorthand
  * - structured → map policy field to kind field
  */

@@ -83,7 +83,7 @@ sig = "bf83f0fe33877f0f"
 [[bindings]]
 doc = "SPEC.md"
 target = "src/worker/integrity.ts#checkIntegrity"
-sig = "ec86cf6e6cd93960"
+sig = "0ecc19b228398767"
 
 [[bindings]]
 doc = "SPEC.md"

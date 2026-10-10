@@ -37,10 +37,11 @@
  * doctor` says so, the run warns once on stderr, and every child runs on the
  * serial path (c2 starts after c1's call ended) with an `overlap_fallback`
  * naming the reason and no `concurrent` or `write_confinement`. c1's attacks
- * now land, the serial integrity check holds c1 for the files it created or
- * changed outside its owned dir, and `run status` reports the run held. That
- * is the evidence that the attacks in case 1 were real and that only the
- * confinement stopped them.
+ * now land, and the serial integrity check holds c1 for the files it created,
+ * changed or deleted outside its owned dir. The fan-in station's `fan_in: all`
+ * holds the parent with `fan-in child_held` rather than merging past c1, and
+ * `run status` reports two held cards. That is the evidence that the attacks
+ * in case 1 were real and that only the confinement stopped them.
  *
  * Skip rule: case 1 needs a kernel with Landlock ABI 3 or later and the
  * helper (scripts/build-llexec.sh, found at native/llexec/build/llexec, or
@@ -387,16 +388,13 @@ describe("landlock journey: without write confinement, overlap falls back to ser
     expect(readFileSync(join(f.projectRoot, "shared.md"), "utf8")).toBe("");
   });
 
-  test("the serial integrity check holds c1 for the writes outside its owned dir, and the others finish", async () => {
+  test("the serial integrity check holds c1 for every write outside its owned dir, the delete included", async () => {
     const escalation = run.stderr.split("\n").find((l) => l.startsWith("escalation: card c1 held"));
     expect(escalation).toBeDefined();
     expect(escalation).toContain("integrity violation (owned_paths)");
-    for (const rel of ["evidence/c2/planted.json", "evidence/c2/via-link.json", "shared.md"]) {
+    for (const rel of ["evidence/c2/planted.json", "evidence/c2/via-link.json", "shared.md", "evidence/c2/notes.md"]) {
       expect(escalation).toContain(`path_escape:${join(f.projectRoot, rel)}`);
     }
-    const status = await f.runStatus();
-    expect(status.exitCode).toBe(0);
-    expect(status.stdout).toContain(`run ${f.runId}: held (1 held card)`);
     const inspect = await f.journalInspect("c1");
     expect(inspect.exitCode).toBe(0);
     expect(inspect.stdout).toContain("[c1] entered_lane: probe → hold (hold)");
@@ -404,5 +402,17 @@ describe("landlock journey: without write confinement, overlap falls back to ser
       const other = await f.journalInspect(child);
       expect(other.stdout).toContain(`[${child}] entered_lane: probe → done (forward)`);
     }
+  });
+
+  test("fan_in: all holds the parent instead of merging past the held child", async () => {
+    expect(run.exitCode).not.toBe(0);
+    const status = await f.runStatus();
+    expect(status.exitCode).toBe(0);
+    expect(status.stdout).toContain(`run ${f.runId}: held (2 held cards)`);
+    const parent = await f.journalInspect();
+    expect(parent.exitCode).toBe(0);
+    expect(parent.stdout).toContain("fan-in child_held");
+    expect(parent.stdout).not.toContain("→ gather");
+    expect(parent.stdout).not.toContain("→ done");
   });
 });

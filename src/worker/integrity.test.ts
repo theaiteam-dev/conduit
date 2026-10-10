@@ -364,6 +364,39 @@ describe('checkIntegrity — purity (AC6)', () => {
 // runMarkDoneHook — pass → checkpoint; fail → BLOCK checkpoint + INTEGRITY_FAIL.
 // ---------------------------------------------------------------------------
 
+describe('checkIntegrity — deleted paths (a delete is a write, SPEC §7)', () => {
+  it('passes a deleted path inside owned_paths', () => {
+    expect(checkIntegrity(mkInput({ deletedPaths: ['owned/gone.txt'] })).ok).toBe(true);
+  });
+
+  it('passes a deleted path whose parent directory was deleted too', () => {
+    expect(checkIntegrity(mkInput({ deletedPaths: [join(root, 'owned', 'sub', 'gone.txt')] })).ok).toBe(true);
+  });
+
+  it('flags a deleted path outside owned_paths', () => {
+    const result = checkIntegrity(mkInput({ deletedPaths: ['outside/gone.txt'] }));
+    expect(result).toEqual({ ok: false, failures: [{ code: 'path_escape', path: 'outside/gone.txt' }] });
+  });
+
+  it('flags a deleted path outside the project root', () => {
+    expect(checkIntegrity(mkInput({ deletedPaths: ['/etc/gone'] })).ok).toBe(false);
+  });
+
+  it('flags a deleted path whose directory was replaced by a symlink into owned_paths', () => {
+    // The call deleted outside/gone.txt, then swapped outside/ for a symlink to
+    // owned/. Resolving the deleted path now would place it inside owned/.
+    rmSync(join(root, 'outside'), { recursive: true });
+    symlinkSync(join(root, 'owned'), join(root, 'outside'));
+    expect(checkIntegrity(mkInput({ deletedPaths: ['outside/gone.txt'] })).ok).toBe(false);
+  });
+
+  it('flags a sibling delete when the owned dir was replaced by a symlink to the sibling', () => {
+    rmSync(join(root, 'owned'), { recursive: true });
+    symlinkSync(join(root, 'outside'), join(root, 'owned'));
+    expect(checkIntegrity(mkInput({ deletedPaths: ['outside/gone.txt'] })).ok).toBe(false);
+  });
+});
+
 describe('runMarkDoneHook — checkpoint gating (AC4/AC5)', () => {
   it('on a clean station emits INTEGRITY_PASS and allows the checkpoint', () => {
     writeFileSync(join(root, 'owned', 'result.txt'), 'data');

@@ -14,7 +14,7 @@
  */
 
 import { realpathSync, existsSync } from 'node:fs';
-import { join, isAbsolute, dirname } from 'node:path';
+import { join, isAbsolute, dirname, relative, resolve, sep } from 'node:path';
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -27,6 +27,11 @@ export interface IntegrityInput {
   ownedPaths: readonly string[];
   /** Paths the station wrote or touched during this execution attempt. */
   touchedPaths: readonly string[];
+  /**
+   * Paths that existed before this execution attempt and are gone after it.
+   * A delete is a write (SPEC §7), so each must lie inside owned_paths too.
+   */
+  deletedPaths?: readonly string[];
   /** Output artifacts that MUST exist after the station completes. */
   declaredArtifacts: readonly string[];
   /** The station's typed output value. */
@@ -119,6 +124,28 @@ export function resolveOwnedPath(absPath: string): string {
   }
 }
 
+/**
+ * Map a path under projectRoot to the canonical project root plus its lexical
+ * remainder, resolving no symlink below the root. Returns null for a path
+ * outside projectRoot.
+ *
+ * A deleted path can no longer be canonicalised by realpath. It is checked at
+ * the location it had in the baseline snapshot instead: the snapshot walk never
+ * descends a symlink, so every component of a recorded path below the root was
+ * a real directory when the baseline was taken. Resolving symlinks now would
+ * let a call delete a sibling's file and then swap the sibling's directory for
+ * a symlink into its own owned dir, so that the deleted path appears to be
+ * inside it.
+ */
+function lexicalUnderRoot(canonicalRoot: string, projectRoot: string, absPath: string): string | null {
+  for (const root of [projectRoot, canonicalRoot]) {
+    const rel = relative(root, resolve(absPath));
+    if (rel === '') return canonicalRoot;
+    if (rel !== '..' && !rel.startsWith('..' + sep) && !isAbsolute(rel)) return join(canonicalRoot, rel);
+  }
+  return null;
+}
+
 /** True when `target` is equal to `ownedDir` or is contained within it. */
 export function isContainedIn(target: string, ownedDir: string): boolean {
   return target === ownedDir || target.startsWith(ownedDir + '/');
@@ -160,6 +187,25 @@ export function checkIntegrity(input: IntegrityInput): IntegrityResult {
     const inside = canonicalOwned.some((owned) => isContainedIn(canonical, owned));
     if (!inside) {
       failures.push({ code: 'path_escape', path: touched });
+    }
+  }
+
+  // ── 1b. Deleted paths, checked lexically against the baseline layout ──────
+  // Owned paths are compared lexically too, for the same reason: a call could
+  // otherwise replace its own (empty) owned dir with a symlink to a sibling's
+  // dir and make the sibling's deleted files look owned. An owned path reached
+  // through a symlink below the root therefore fails closed here.
+  const deleted = input.deletedPaths ?? [];
+  if (deleted.length > 0) {
+    const canonicalRoot = tryRealpath(input.projectRoot) ?? resolve(input.projectRoot);
+    const lexicalOwned = input.ownedPaths
+      .map((p) => lexicalUnderRoot(canonicalRoot, input.projectRoot, toAbsolute(input.projectRoot, p)))
+      .filter((p): p is string => p !== null);
+    for (const path of deleted) {
+      const location = lexicalUnderRoot(canonicalRoot, input.projectRoot, toAbsolute(input.projectRoot, path));
+      if (location === null || !lexicalOwned.some((owned) => isContainedIn(location, owned))) {
+        failures.push({ code: 'path_escape', path });
+      }
     }
   }
 
