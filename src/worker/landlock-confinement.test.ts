@@ -467,6 +467,23 @@ describe('the real helper (issue #122)', () => {
     expect(existsSync(marker)).toBe(false);
   });
 
+  itWithLandlock('never runs the command when a writable path is a symlink, so a swapped path cannot redirect the grant', async () => {
+    if (!hostConfinement.available) throw new Error(`write confinement unavailable: ${hostConfinement.reason}`);
+    const target = join(scratch, 'target');
+    mkdirSync(target);
+    const link = join(scratch, 'link');
+    symlinkSync(target, link);
+    const marker = join(scratch, 'ran');
+    const proc = Bun.spawn(
+      buildConfinedArgv(hostConfinement.helper, [link], ['/bin/sh', '-c', `echo > ${marker}`]),
+      { stdout: 'pipe', stderr: 'pipe' },
+    );
+    const [stderr, code] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
+    expect(code).toBe(LLEXEC_FAILED_EXIT);
+    expect(stderr).toContain('llexec: cannot open writable path');
+    expect(existsSync(marker)).toBe(false);
+  });
+
   itWithLandlock('grants a writable file only the file rights: writing it works, creating a file beside it does not', async () => {
     if (!hostConfinement.available) throw new Error(`write confinement unavailable: ${hostConfinement.reason}`);
     const file = join(scratch, 'owned.txt');

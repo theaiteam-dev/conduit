@@ -20,7 +20,7 @@
  * A writable path that is a directory gets every handled right beneath it.
  * A path that is a regular file or another non-directory gets only the rights
  * that apply to a file (write, and truncate where handled). A path that does
- * not exist is an error.
+ * not exist, or whose final component is a symlink, is an error.
  *
  * The helper never runs the command unconfined. Any failure before the exec
  * (no Landlock, a path that cannot be opened, a syscall error) prints a
@@ -152,7 +152,11 @@ int main(int argc, char **argv) {
 
   for (int i = 1; i < sep; i++) {
     const char *path = argv[i];
-    int fd = open(path, O_PATH | O_CLOEXEC);
+    /* O_NOFOLLOW: the kernel passes canonical paths, so a final symlink means
+     * the path was swapped after admission; refuse it rather than grant the
+     * link's target. With O_PATH the open succeeds on the link itself, so
+     * the fstat below checks for it. */
+    int fd = open(path, O_PATH | O_NOFOLLOW | O_CLOEXEC);
     if (fd < 0) {
       fprintf(stderr, "llexec: cannot open writable path %s: %s\n", path, strerror(errno));
       return LLEXEC_FAILED;
@@ -160,6 +164,10 @@ int main(int argc, char **argv) {
     struct stat st;
     if (fstat(fd, &st) != 0) {
       fprintf(stderr, "llexec: cannot stat writable path %s: %s\n", path, strerror(errno));
+      return LLEXEC_FAILED;
+    }
+    if (S_ISLNK(st.st_mode)) {
+      fprintf(stderr, "llexec: cannot open writable path %s: it is a symbolic link\n", path);
       return LLEXEC_FAILED;
     }
     struct ll_path_beneath_attr rule = {
