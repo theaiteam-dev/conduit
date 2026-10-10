@@ -86,6 +86,13 @@ const REAP_BUDGET_MS = 3_000;
 /** Five sentinel intervals: a live grandchild always advances the mtime in this window. */
 const STALL_WINDOW_MS = 500;
 const TEST_TIMEOUT_MS = 20_000;
+/**
+ * The second invocation's timeout in the two-invocation scenario (issue #30,
+ * ADR-0012). Long enough that it is still running for the whole window in
+ * which the suite checks that its grandchildren survived the first
+ * invocation's kill.
+ */
+const SECOND_INVOCATION_TIMEOUT_MS = TIMEOUT_MS + 2_500;
 
 /** What a spawn path receives for one conformance run. */
 export interface ContainmentRun {
@@ -400,6 +407,61 @@ export function describeContainmentConformance(
         }
 
         await expectGrandchildReaped(projectRoot);
+      },
+      TEST_TIMEOUT_MS,
+    );
+
+    // Issue #30, ADR-0012: overlapped harness calls put two or more
+    // invocations of one spawn path live at once. Each must be contained on
+    // its own: the kill that ends one invocation must not reach the other's
+    // process tree (a shared process group or cgroup would), and the second
+    // must still be reaped at its own end.
+    reaps(
+      'two live invocations: killing one leaves the other running until its own end',
+      async () => {
+        const second = realpathSync(mkdtempSync(join(tmpdir(), 'conduit-containment-2-')));
+        // Both runs, so the finally can wait for them when an assertion fails
+        // before they are awaited: a rejection then is reported, not orphaned.
+        const runs: Promise<unknown>[] = [];
+        try {
+          let firstDone = false;
+          let secondDone = false;
+          const firstRun = spawnPath({ projectRoot, fixture: CONTAINMENT_FIXTURE, timeoutMs: TIMEOUT_MS, fixtureArgs: [] })
+            .finally(() => {
+              firstDone = true;
+            });
+          const secondRun = spawnPath({
+            projectRoot: second,
+            fixture: CONTAINMENT_FIXTURE,
+            timeoutMs: SECOND_INVOCATION_TIMEOUT_MS,
+            fixtureArgs: [],
+          }).finally(() => {
+            secondDone = true;
+          });
+          runs.push(firstRun, secondRun);
+
+          // Both were live together: each one's grandchildren touched their sentinels.
+          const [firstWatch, secondWatch] = await Promise.all([
+            watchSentinelAdvance(projectRoot, () => firstDone),
+            watchSentinelAdvance(second, () => secondDone),
+          ]);
+          expect(firstWatch.advanced).toBe(true);
+          expect(secondWatch.advanced).toBe(true);
+
+          expect(await firstRun).toBe(options.timeoutClass);
+          expect(secondDone, 'the second invocation ended with the first').toBe(false);
+          // The second invocation's grandchildren outlived the first's kill.
+          const afterKill = await watchSentinelAdvance(second, () => secondDone);
+          expect(afterKill.advanced, "the first invocation's kill reached the second's grandchildren").toBe(true);
+          await expectGrandchildReaped(projectRoot);
+
+          expect(await secondRun).toBe(options.timeoutClass);
+          await expectGrandchildReaped(second);
+        } finally {
+          await Promise.allSettled(runs);
+          killRecordedGrandchild(second);
+          rmSync(second, { recursive: true, force: true });
+        }
       },
       TEST_TIMEOUT_MS,
     );

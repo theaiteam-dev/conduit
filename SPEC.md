@@ -870,6 +870,86 @@ risk and gets the most poka-yoke.
 > unchanged. See [`docs/harness-containment.md`](docs/harness-containment.md) for the
 > full profile.
 
+### Overlapping harness calls (ADR-0012)
+
+Under `--concurrency K` a `kind: harness` station runs one card at a time unless it declares
+`overlap: true`. A harness call on the serial path holds the tick loop until it returns, and
+its integrity check is the serial rule: every path touched under the project root between the
+call's baseline snapshot and its post-invoke snapshot must lie inside the card's `owned_paths`,
+or the card holds.
+
+A harness station may declare `overlap: true` (station level, beside `wip`; rejected on any
+other `kind`). Its cards then run as overlapping calls, up to `min(K - in-flight, wip)` at a
+time (in-flight: workers already running in the run when the batch is admitted), when
+every admission condition holds:
+
+- **Static, validated at load:** the station has no `check:` block, is not `effectful`, is
+  not a fan-out station (declares neither `fan_out` nor `child_entry`), and has no `deliver` block; the flow sets
+  `defaults.enforce_owned_paths: true`, so the per-call gate confines file-tool writes to the
+  card's `owned_paths`; and its adapter has `canGatePerCall`. The loader checks the adapter
+  when it is given the adapter registry. The executor checks it again at dispatch, since the
+  registry is engine configuration, and runs a card whose adapter cannot gate per call on the
+  serial path, journaling `overlap_fallback` on its spans and warning once per station.
+- **Dynamic, at dispatch:** the card declares non-empty `owned_paths`, and they are disjoint
+  (canonicalized) from those of every member already admitted to the batch. A card that fails
+  either runs on the serial path under the serial rule after the batch, with the reason
+  journaled as `overlap_fallback`. A card over the K or `wip` cap stays `ready` for a later
+  pass. A batch of one card runs on the serial path.
+
+Harness members and transform members never overlap each other: a dispatch pass runs the
+transform batch, then the harness batch. Each member runs in its own attribution scope, so
+its spend folds into the run and wave budgets under its own card.
+
+**The overlap integrity rule.** A member's window runs from just before its baseline snapshot
+to just after its post-invoke snapshot, or to the moment its invoke throws, or to the moment
+the attempt exits on any other error. The kernel records
+each window on a logical clock and which other members' windows intersected it. Each path in a
+member's diff is classified as: inside its own `owned_paths` → allowed; inside the
+`owned_paths` of a member whose window intersected its own → attributed to that member, not a
+breach, and journaled on the member's `<station>.harness` span as `overlap_attributed` (each
+sibling card id with its count of paths and the first 20 of those paths, project-root-relative);
+anywhere else → a breach, and the card holds. Paths
+are canonicalized as the integrity check canonicalizes them: a symlink by its target, and a
+path removed since the snapshot (a sibling deleting a temporary file in its own directory) by
+its parent directory. The serial checks apply to every path not attributed: symlink canonicalization, fail-closed on a
+path that does not resolve, and a hold, not a retry, on a breach. The disjoint ownership
+invariant (§9) makes the attribution unambiguous. Because a path that no member owns cannot be
+attributed, a breach by one member holds every member whose diff contains it.
+
+An overlapped call takes both snapshots with a walk that yields to the event loop every 10 ms,
+so one member's snapshot stalls the other members' stdout handling, idle timers and gate
+answers for at most one step of the walk. A step reads and hashes one file synchronously, so a
+single large file can still block the event loop for as long as that read takes. The serial
+path's snapshots stay synchronous.
+
+**The gap.** The overlap rule cannot detect a write by one member into another overlapping
+member's `owned_paths`: both diffs attribute it to the owner. The per-call gate denies such a
+write through the file-write tools before it runs. It does not deny one made by an
+allowlisted Bash executable that writes to a path given as an argument (`cp`, `tee`,
+`sed -i`, a script the agent wrote). The gate refuses every shell redirect; it accepts
+literal quoting and a pipe between allowlisted programs. Neither construct writes a file by
+itself, but a program receiving a pipe can write to a path in its arguments (`cat a | tee b`),
+which is the same gap. So is a write through a symlink a member creates or retargets inside
+its own `owned_paths`: owned paths are canonicalized once, when the batch is admitted, and a
+touched path that resolves into a sibling's owned paths is attributed to that sibling.
+(Issue #122, Landlock write confinement, is the planned way to close it.)
+`overlap: true` is the flow author's acceptance of that gap for the station. A write under the
+project root and outside every member's `owned_paths` is still detected; as on the serial path,
+the diff does not see a write outside the project root.
+
+**Per card, unchanged.** Rate-limit parks, retries and their backoff, idle and wall-clock
+timeouts, `child_stagger_seconds` and the consumption andon act on each member as they do on
+a serial call. The batch waits for its slowest member, retries included, before the next
+dispatch pass. Each member checks the andon after its own call, so a batch can exceed the
+token budget by up to K calls (the soft ceiling of §8).
+
+**Reporting.** Each span of an overlapped call records `concurrent: true` and the call's start
+(`started_at_ms`). `ready_waiting` on such a span counts the dispatchable cards not admitted
+to its batch. `conduit run status` reports busy time per station and in total as the union of
+call intervals, and waited card-time over overlapped calls as, at each moment, the largest
+`ready_waiting` among the calls running then. A span without `started_at_ms`, including every
+span of a journal written before overlap existed, adds its full duration.
+
 ### The atomic claim (rev-1 C6)
 deps + WIP + worker-slot must become true at a **single linearization point**. They live
 in different substrates (deps/WIP in SQLite; worker slot is physical), so the claim is a
@@ -909,7 +989,14 @@ split is harder and needs this in-transaction reservation.)*
     resolution** (resolve to canonical absolute, reject escapes) (rev-1 H6).
   - **Bash positive allowlist** — only listed executables; **no shell metacharacters**
     (no pipes/redirects/`;`/backticks/`$()`) unless explicitly enabled. Denylists are
-    insufficient against a cheap model + untrusted substrate.
+    insufficient against a cheap model + untrusted substrate. The harness tier's per-call
+    gate, which runs commands in a real shell, applies this rule through a fail-closed shell
+    lexer: it accepts literal single quotes, double quotes with no `$`, backtick, `\` or `!`,
+    and `|` between programs that are each on the allowlist, and refuses every other
+    construct, including `;`, `&&`, `||`, `&`, redirects, here-docs, `$`, backticks, globs,
+    braces, `~`, control characters, and an assignment or quoted word in program position
+    (`docs/harness-containment.md`). The approved string is the string that runs, with
+    nothing expanded.
   - **Network egress denied by default** for content-processing workers (injection
     exfiltration defense). For `agentic` workers this is enforced in-process: the kernel
     spawns the worker harness via `unshare --net` (a Linux network namespace with no
@@ -973,7 +1060,9 @@ Conduit unfurls the plan at runtime rather than following a static script.
   **validates that owned-path sets across concurrently-eligible cards are disjoint** —
   or forces a `depends_on` serialization edge for a shared path. The Architect (an LLM)
   proposes; the Kernel (deterministic) enforces. This closes the "two cards both own
-  `config.ts`" race that path-ownership alone misses.
+  `config.ts`" race that path-ownership alone misses. The overlap integrity rule for
+  harness calls (§7) depends on this invariant: it attributes a touched path to the one
+  in-flight card that owns it.
 - **Two axes of motion, deliberately different:**
   - **Forward-only across waves.** An implementation failure → **hard pause for a human**
     (`hold`), never an automatic "nuclear reversal" to Wave 1 (state rot).

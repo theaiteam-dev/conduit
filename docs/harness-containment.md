@@ -36,7 +36,11 @@ kernel, and the kernel decides every tool call before it runs. Three are shipped
 
 - `agent-sdk` drives the Claude Code CLI through `@anthropic-ai/claude-agent-sdk` `query()`
   and calls the kernel's gate from `hooks.PreToolUse`. The hook fires for the main agent and
-  for subagents, and an `allowedTools` rule does not bypass it.
+  for subagents, and an `allowedTools` rule does not bypass it. The adapter also passes the
+  SDK's `tools` option, set to the built-in tools the station's `tools` list allows
+  (`Bash(curl:*)` gives `Bash`), so the model is not offered a built-in the gate would refuse
+  and each request carries fewer tool definitions. A waived `unrestricted_tools` station is
+  offered every built-in.
 - `codex-app-server` drives `codex app-server` and answers Codex's approval requests from the
   gate. See [the Codex adapter](#the-codex-app-server-adapter) below for how Codex's tools
   map onto the gate, and for what is not gated.
@@ -50,8 +54,25 @@ still owns the loop, and the kernel sees one call at a time. The gate
 - **Tool allowlist.** A tool not in the station's `tools` is denied.
 - **Bash positive allowlist.** Executables come only from `Bash(<exe>)` and
   `Bash(<exe>:*)` entries. A bare `Bash` entry allows the tool and no executable. A
-  narrower rule such as `Bash(git status:*)` is not widened to `git`. A command
-  containing a shell metacharacter is denied before the allowlist is consulted.
+  narrower rule such as `Bash(git status:*)` is not widened to `git`. The gate reads the
+  command with a small shell lexer (`src/worker/bash-lexer.ts`) and refuses anything it
+  does not recognise, before the allowlist is consulted (code `shell_metacharacter`). It
+  accepts:
+  - plain words made of letters, digits and `_ . / : = @ , + % -` (a word may not start
+    with `=`, which zsh expands to a path);
+  - single-quoted text, taken literally;
+  - double-quoted text that contains no `$`, backtick, `\` or `!`, also literal;
+  - quoted and plain parts joined into one word (`-H'Accept: x'`);
+  - `|` between commands. Every segment's program must be on the allowlist.
+
+  It refuses `;`, `&&`, `||`, `&`, `|&`, parentheses, every redirect (`>`, `>>`, `<`, `2>`,
+  `&>`, here-docs, `<(...)`), `$` and backticks outside single quotes, `\` outside single
+  quotes, unquoted `* ? [ ] { } ~ # ! ^`, an unterminated quote, any control character
+  (newline and tab included, quoted or not), and an empty command or pipeline segment. A
+  program name must be an unquoted word and must not be an assignment, so `FOO=bar curl x`
+  and `'curl' x` are denied. So `psql -c 'SELECT id FROM "Job"'` and
+  `curl -s URL | jq '.items[0]'` pass when `psql`, `curl` and `jq` are listed, and
+  `psql -c "SELECT id FROM \"Job\""` does not, because it uses `\` inside double quotes.
 - **Write ownership.** Write, Edit, MultiEdit and NotebookEdit targets must resolve inside
   the card's owned paths, with symlinks resolved on both sides, including a write through
   a dangling symlink, where the flow sets `defaults.enforce_owned_paths` and the card
@@ -70,9 +91,17 @@ deny every tool, so the loader rejects both (`HARNESS_GATED_ADAPTER_NEEDS_TOOLS`
 What it does not cover:
 
 - The arguments of an allowlisted executable. `git -C / ...` and `git config` pass, and a
-  script the agent wrote can then be run.
-- A Bash write that bypasses the path check. The MARK_DONE owned-paths integrity check
-  stays mandatory as the backstop.
+  script the agent wrote can then be run. Some programs run arbitrary code or write files
+  from their arguments: `sh`, `bash`, `env`, `xargs`, `find` (`-exec`), `psql` (`\!`),
+  `curl -o`, `tee`, `sed -i`, `awk` (`system()`). Listing one of them allows what it can
+  do, so the Bash allowlist constrains only what the flow author chooses to list.
+- A Bash write that bypasses the path check. Redirects are refused, but a write by an
+  allowlisted program to a path in its arguments is not. Issue
+  [#122](https://github.com/theaiteam-dev/conduit/issues/122) (Landlock write confinement)
+  is the planned fix. The MARK_DONE owned-paths integrity check
+  stays mandatory as the backstop. On a station that declares `overlap: true`, the backstop
+  does not catch a Bash write into the owned paths of a card whose call overlapped this one:
+  the check attributes the path to that card (SPEC §7, "Overlapping harness calls").
 - Reads outside the project root, and a symlink swapped between the check and the write.
 - The input of `Agent` and of any other listed tool that is not a file tool.
 - On `agent-sdk`, an input rewritten by another `PreToolUse` hook after the gate approved
@@ -342,7 +371,9 @@ hold it together:
   during its run, but a write outside `owned_paths` hard-pauses the card to `hold` rather
   than advancing it. For harness stations this check is **mandatory, not opt-in** — it
   cannot be disabled via `defaults.enforce_owned_paths: false` the way it can for other
-  station kinds.
+  station kinds. Under `overlap: true` (ADR-0012) a touched path inside the owned paths of a
+  card whose call overlapped this one is attributed to that card instead of failing the
+  check; every other path is checked as above.
 - **Secrets by explicit allowlist only.** The harness child process's environment contains
   only variables named in engine configuration (e.g. the harness's own auth token) — never
   the kernel's environment inherited wholesale. Allowlisted names live in engine config

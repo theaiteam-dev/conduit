@@ -186,6 +186,7 @@ function renderNode(
   if (station.effectful) markers.push('(!)');
   if (station.gateCheck) markers.push('(check)');
   else if (station.rankCheck) markers.push('(rank)');
+  if (station.overlap === true) markers.push('(overlap)');
   if (station.fan_in !== undefined) markers.push(`(fan-in: ${describeFanIn(station.fan_in)})`);
 
   if (isNoWorker(station)) {
@@ -316,6 +317,9 @@ function renderLegend(flow: FlowConfig): string {
   }
   if (stations.some((s) => s.rankCheck)) {
     entries.push('  (rank) = station that ranks fan-out candidates');
+  }
+  if (stations.some((s) => s.overlap === true)) {
+    entries.push('  (overlap) = harness station whose cards may run as overlapping calls under --concurrency');
   }
 
   // Back-edge marker — only when the flow has at least one back-edge.
@@ -819,6 +823,7 @@ function noteSummary(station: StationConfig): string {
   if (station.gateCheck) notes.push(`reject -> ${station.gateCheck.onReject}`);
   if (station.rankCheck) notes.push(station.rankCheck.hitlEnabled ? 'HITL rank' : 'rank no-HITL');
   if (station.effectful) notes.push('effectful');
+  if (station.overlap === true) notes.push('overlap');
   if (station.child_terminal !== undefined) notes.push(`child terminal ${station.child_terminal}`);
   return notes.join(', ') || '-';
 }

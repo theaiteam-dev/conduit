@@ -114,6 +114,18 @@ export interface StationConfig {
   effectful: boolean;
   /** Maximum concurrent cards allowed in this station (WIP cap). */
   wip: number;
+  /**
+   * Issue #30, ADR-0012: this harness station's cards may run as overlapping
+   * calls under `conduit run --concurrency K>1`, up to `min(K - in-flight,
+   * wip)` at a time, where in-flight counts the workers already running in
+   * the run when the batch is admitted, under the overlap integrity rule (SPEC §7, "Overlapping harness
+   * calls"). Absent unless declared `true`. Validated at load: only on
+   * `kind: harness`, and only when the station has no `check:`, is not
+   * effectful, is not a fan-out station, has no `deliver:`, the flow sets
+   * `defaults.enforce_owned_paths: true`, and (when the adapter registry is
+   * known at load) the adapter has `canGatePerCall`.
+   */
+  overlap?: boolean;
   /** Artifact names this station reads as input. */
   inputs: string[];
   /** Artifact names this station produces as output. */

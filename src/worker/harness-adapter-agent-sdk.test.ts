@@ -279,6 +279,26 @@ describe('agent-sdk adapter: options handed to the SDK', () => {
     const b = ok();
     await makeAdapter(b.query).invoke(invocation({ gate: allowAll, tools: [] }));
     expect(b.seen[0]!.allowedTools).toBeUndefined();
+    expect(b.seen[0]!.tools).toBeUndefined();
+  });
+
+  it('offers the model only the built-in tools the gate allows', async () => {
+    const a = ok();
+    await makeAdapter(a.query).invoke(invocation({ gate: allowAll, tools: ['Bash(curl:*)', 'Read'] }));
+    expect(a.seen[0]!.tools).toEqual(['Bash', 'Read']);
+    // One Bash entry per rule form collapses to one tool; Task is the subagent tool's other name;
+    // an MCP tool is not a built-in, and a form the gate does not recognise is not offered.
+    const b = ok();
+    await makeAdapter(b.query).invoke(
+      invocation({
+        gate: allowAll,
+        tools: ['Bash(git)', 'Bash(jq:*)', 'Bash(git status:*)', 'Task', 'mcp__db__query', 'Read(./x)'],
+      }),
+    );
+    expect(b.seen[0]!.tools).toEqual(['Bash', 'Agent']);
+    const c = ok();
+    await makeAdapter(c.query).invoke(invocation({ gate: allowAll, tools: ['mcp__db__query'] }));
+    expect(c.seen[0]!.tools).toEqual([]);
   });
 
   it('lets the call model win over the adapter default, and omits it when neither is set', async () => {

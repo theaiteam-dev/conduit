@@ -671,7 +671,7 @@ describe('opencode adapter: mapping asks to the gate', () => {
     const o = await run(async (s) => {
       const body = await s.bash('c1', 'cat a.txt && ls', { patterns: ['cat a.txt', 'ls'] });
       expect(body?.reply).toBe('reject');
-      expect(body?.message).toContain('metacharacter');
+      expect(body?.message).toContain('unquoted "&"');
       finish(s);
     }, { gate: gateFor(tools) });
     expect(o.gateCalls[0]?.input).toEqual({ command: 'cat a.txt && ls' });

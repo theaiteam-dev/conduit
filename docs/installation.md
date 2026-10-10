@@ -541,8 +541,8 @@ to retry`. There is nothing to resume, so `conduit resume` refuses it; the
 same `conduit run --run-id job-1 ...` command retries it in place, and may
 carry a corrected `--input`, since nothing ran under the first one. For a run with `kind: harness`
 stations, `run status` also prints how much of the run's wall clock each
-harness station held the serial dispatch path
-(see [`concurrency-demo.md`](./concurrency-demo.md#gotcha-harness-stations-run-one-card-at-a-time)).
+harness station was busy, counting overlapped calls once
+(see [`concurrency-demo.md`](./concurrency-demo.md#harness-stations-run-one-card-at-a-time-unless-they-declare-overlap-true)).
 
 Under the operator stack the listener does this for you — it recognises a
 parked child, tells the channel once, and resumes the run itself when the gate

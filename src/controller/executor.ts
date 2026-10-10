@@ -27,7 +27,7 @@
  *   - halt/escalation reasons — io.out / io.err
  */
 
-import { readFileSync, writeFileSync, existsSync, realpathSync, readdirSync, statSync, readlinkSync, mkdirSync, unlinkSync, rmSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, realpathSync, readdirSync, statSync, readlinkSync, mkdirSync, unlinkSync, rmSync, type Dirent } from 'node:fs';
 import { join, resolve, sep, dirname } from 'node:path';
 import { createHash } from 'node:crypto';
 import { AsyncLocalStorage } from 'node:async_hooks';
@@ -42,6 +42,13 @@ import { DEFAULT_RUN_ID, parseColumn, type ConduitDB, type JournalSpanInput, typ
 import type { FlowConfig, StationConfig, FanInPolicyConfig, StationOutput, Card } from '../types/kernel';
 import { planTick } from './tick';
 import { evaluateSkipWhen, describeSkipWhen } from './skip-when';
+import {
+  OverlapWindows,
+  canonicalOwnedPaths,
+  classifyOverlapTouched,
+  isOverlapHarnessStation,
+  ownedPathSetsIntersect,
+} from './harness-overlap';
 import { attemptClaim, beginWork, renewLease, reconcile } from '../dispatch/claim';
 import { checkCommandAllowed, runDeterministic, deterministicCardEnv } from '../worker/deterministic';
 import { runTransformStation, coerciveParse, computeFindingsHash } from '../worker/transform';
@@ -93,6 +100,7 @@ import { commitFanOut, evaluateFanIn } from '../dag/expand';
 import type { ArchitectProposal, FanInPolicy, FanInState } from '../dag/expand';
 import { runRankCheck, decideFromCandidates, parseCandidatesArtifact, type RankDecision } from '../quality/rank';
 import { aggregateByWave, checkWaveBudget, countGateReworks, decideExecutionRetry } from '../quality/rework';
+import { allSettledOrThrow } from './settle-all';
 import type { CardUsage, BudgetCaps } from '../quality/rework';
 import {
   egressSend,
@@ -108,6 +116,15 @@ import {
 } from '../channels/slack';
 import type { OnTimeout } from '../channels/slack';
 import { resolveDeliveryChannel } from '../flow/load';
+
+/**
+ * Reports a batch member's throw that `allSettledOrThrow` does not rethrow, so
+ * a halt caused by several members failing at once names each of them.
+ */
+function reportOtherBatchThrow(err: (msg: string) => void): (reason: unknown) => void {
+  return (reason) =>
+    err(`batch: another member also threw: ${reason instanceof Error ? reason.message : String(reason)}`);
+}
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -272,13 +289,32 @@ function rateLimitAttributes(snapshot: RateLimitSnapshot | undefined): Record<st
  * call, and it counts cards a station `wip` cap would have held back anyway.
  */
 function countReadyWaiting(stateDb: Database, runId: string, cardId: string, nowSeconds: number): number {
+  return countReadyNotAdmitted(stateDb, runId, new Set([cardId]), nowSeconds);
+}
+
+/**
+ * Issue #30, ADR-0012: the cards dispatchable now (status 'ready', release
+ * gate passed, planTick's rule) that are not in `memberIds`. The one query for
+ * `ready_waiting`: an overlapped harness call passes its batch, so a sibling
+ * running alongside is not counted as waiting even before its own claim has
+ * moved it off `ready`, and `countReadyWaiting` passes the one card.
+ */
+export function countReadyNotAdmitted(
+  stateDb: Database,
+  runId: string,
+  memberIds: ReadonlySet<string>,
+  nowSeconds: number,
+): number {
+  // The member ids go in as one JSON array, so the count stays in SQL whatever
+  // the batch size (at most K).
   const row = stateDb
     .prepare(
       `SELECT COUNT(*) AS n FROM cards
-       WHERE run_id = $runId AND id != $cardId AND status = 'ready'
-         AND (release_at IS NULL OR release_at <= $now)`,
+       WHERE run_id = $runId AND status = 'ready'
+         AND (release_at IS NULL OR release_at <= $now)
+         AND id NOT IN (SELECT value FROM json_each($members))`,
     )
-    .get({ $runId: runId, $cardId: cardId, $now: nowSeconds }) as { n: number };
+    .get({ $runId: runId, $now: nowSeconds, $members: JSON.stringify([...memberIds]) }) as { n: number };
   return row.n;
 }
 
@@ -482,6 +518,11 @@ export async function runExecutor(args: RunEngineArgs): Promise<void> {
   const attributionStore = new AsyncLocalStorage<{ cardId: string }>();
   const attributedCardId = (): string | null =>
     attributionStore.getStore()?.cardId ?? currentCardId;
+
+  // Issue #30: `overlap: true` stations whose adapter turned out at dispatch
+  // not to gate per call, so the operator is told once per station, not once
+  // per card.
+  const overlapAdapterWarned = new Set<string>();
 
   // Wrap the adapter to track cumulative token spend (NFR-3: adapter is the
   // ONLY model surface; the control loop itself never calls it).
@@ -1027,6 +1068,109 @@ export async function runExecutor(args: RunEngineArgs): Promise<void> {
     // v10: transform siblings collected during this pass for concurrent execution
     // afterwards (the fan-out reviewer case). Empty at concurrency===1.
     const concurrentBatch: Array<{ cardId: string; station: string }> = [];
+    // Issue #30, ADR-0012: cards of `overlap: true` harness stations collected
+    // during this pass. Admitted to a harness overlap batch, or sent to the
+    // serial path, after the transform batch has finished. Empty at
+    // concurrency===1.
+    const harnessCandidates: Array<{ cardId: string; station: string }> = [];
+
+    // Issue #30: the arguments every executeStation call in this pass shares,
+    // for the harness overlap batch and its serial fallback below.
+    const stationArgs = (cardId: string, station: string): ExecuteStationArgs => ({
+      db,
+      stateDb,
+      runId,
+      flow,
+      stationConfig: flow.stations[station]!,
+      stationId: station,
+      cardId,
+      trackingAdapter,
+      commandAllowlist,
+      happyPathNext,
+      terminalLanes,
+      maxExecutionAttempts,
+      projectRoot,
+      currentNow,
+      now,
+      runStartedAt,
+      wallClockSeconds,
+      maxTokens,
+      getTokensSpent: () => tokensSpent,
+      onAndonTrip: haltOnStationAndon,
+      err: io.err,
+      harnessRegistry: args.harnessRegistry,
+      foldHarnessUsage,
+      stampHarnessActivity,
+      sleep,
+      runSubflow: args.runSubflow,
+    });
+
+    // Issue #30, ADR-0012: apply the dynamic admission conditions to this
+    // pass's harness overlap candidates, in plan order. A card is admitted
+    // when its adapter gates per call (re-checked here, since the registry is
+    // engine configuration), it declares owned_paths, they are disjoint from
+    // every member already admitted, and the batch is under the run's K
+    // ceiling and the station's wip. A card failing one of the first three
+    // runs on the serial path, with the reason journaled; a card over a cap
+    // stays ready for a later pass.
+    const admitHarnessOverlap = (
+      candidates: ReadonlyArray<{ cardId: string; station: string }>,
+    ): {
+      admitted: Array<{ cardId: string; station: string; ownedCanonical: string[] }>;
+      serial: Array<{ cardId: string; station: string; reason?: string }>;
+      deferred: boolean;
+    } => {
+      const admitted: Array<{ cardId: string; station: string; ownedCanonical: string[] }> = [];
+      const serial: Array<{ cardId: string; station: string; reason?: string }> = [];
+      let deferred = false;
+      const { n: inFlight } = stateDb
+        .prepare('SELECT COUNT(*) AS n FROM active_workers WHERE run_id = $runId')
+        .get({ $runId: runId }) as { n: number };
+      const slots = Math.max(0, concurrency - inFlight);
+      const perStation = new Map<string, number>();
+      for (const item of candidates) {
+        const sc = flow.stations[item.station]!;
+        const resolved =
+          sc.harness !== undefined && args.harnessRegistry !== undefined
+            ? args.harnessRegistry.resolve(sc.harness)
+            : undefined;
+        if (resolved === undefined || !resolved.ok) {
+          // The serial path holds the card with the resolution error.
+          serial.push(item);
+          continue;
+        }
+        if (resolved.adapter.canGatePerCall !== true) {
+          if (!overlapAdapterWarned.has(item.station)) {
+            overlapAdapterWarned.add(item.station);
+            io.err(
+              `overlap: station '${item.station}' declares overlap: true but adapter '${resolved.adapter.name}' ` +
+                `cannot gate each tool call; its cards run one at a time`,
+            );
+          }
+          serial.push({ ...item, reason: `adapter '${resolved.adapter.name}' cannot gate each tool call` });
+          continue;
+        }
+        const ownedPaths = db.getCard(runId, item.cardId)?.owned_paths ?? [];
+        if (ownedPaths.length === 0) {
+          serial.push({ ...item, reason: 'card declares no owned_paths' });
+          continue;
+        }
+        const ownedCanonical = canonicalOwnedPaths(projectRoot, ownedPaths);
+        const clash = admitted.find((m) => ownedPathSetsIntersect(m.ownedCanonical, ownedCanonical));
+        if (clash !== undefined) {
+          serial.push({ ...item, reason: `owned_paths overlap those of card '${clash.cardId}' in the same batch` });
+          continue;
+        }
+        const stationCount = perStation.get(item.station) ?? 0;
+        if (admitted.length >= slots || stationCount >= sc.wip) {
+          deferred = true;
+          continue;
+        }
+        perStation.set(item.station, stationCount + 1);
+        admitted.push({ ...item, ownedCanonical });
+      }
+      return { admitted, serial, deferred };
+    };
 
     for (const action of plan.actions) {
       if (action.kind === 'reclaim') continue; // handled in second pass below
@@ -1189,6 +1333,14 @@ export async function runExecutor(args: RunEngineArgs): Promise<void> {
             }
           }
         }
+      } else if (concurrency > 1 && isOverlapHarnessStation(stationConfig, flow.defaults?.enforceOwnedPaths === true)) {
+        // ── Harness overlap candidates (issue #30, ADR-0012) ─────────────────
+        // A harness station that declared `overlap: true` and meets the static
+        // conditions (re-checked here; the loader rejects a station that fails
+        // them). The dynamic conditions are applied once the pass is collected,
+        // below, because the disjointness condition compares cards with each
+        // other.
+        harnessCandidates.push({ cardId: action.cardId, station: action.station });
       } else if (
         concurrency > 1 &&
         stationConfig.kind === 'transform' &&
@@ -1271,7 +1423,7 @@ export async function runExecutor(args: RunEngineArgs): Promise<void> {
       if (concurrentBatch.length > toRun.length) capBlocked = true;
       if (toRun.length > 0) dispatchedThisTick = true;
 
-      const laneChanges = await Promise.all(
+      const laneChanges = await allSettledOrThrow(
         toRun.map((item) => {
           cardDispatches.set(item.cardId, (cardDispatches.get(item.cardId) ?? 0) + 1);
           return attributionStore.run({ cardId: item.cardId }, () =>
@@ -1305,8 +1457,57 @@ export async function runExecutor(args: RunEngineArgs): Promise<void> {
             }),
           );
         }),
+        reportOtherBatchThrow(io.err),
       );
       if (laneChanges.some((changed) => changed)) lastLaneChangeAt = currentNow;
+    }
+
+    // ── Harness overlap batch (issue #30, ADR-0012) ───────────────────────
+    // Runs after the transform batch, never with it: a transform member's
+    // kernel-written output under the project root would show up in a harness
+    // member's diff and could be attributed to no member.
+    if (harnessCandidates.length > 0 && !halted) {
+      currentCardId = null;
+      const overlapPlan = admitHarnessOverlap(harnessCandidates);
+      if (overlapPlan.deferred) capBlocked = true;
+
+      const windows = new OverlapWindows();
+      const memberIds = new Set(overlapPlan.admitted.map((m) => m.cardId));
+      if (overlapPlan.admitted.length > 1) {
+        dispatchedThisTick = true;
+        const laneChanges = await allSettledOrThrow(
+          overlapPlan.admitted.map((member) => {
+            cardDispatches.set(member.cardId, (cardDispatches.get(member.cardId) ?? 0) + 1);
+            return attributionStore.run({ cardId: member.cardId }, () =>
+              executeStation({
+                ...stationArgs(member.cardId, member.station),
+                overlap: { windows, memberIds, ownedCanonical: member.ownedCanonical },
+              }),
+            );
+          }),
+          reportOtherBatchThrow(io.err),
+        );
+        if (laneChanges.some((changed) => changed)) lastLaneChangeAt = currentNow;
+      } else {
+        // A batch of one has nothing to overlap with: it runs on the serial
+        // path, whose integrity rule is the same when no window intersects.
+        overlapPlan.serial.unshift(...overlapPlan.admitted.map((m) => ({ cardId: m.cardId, station: m.station })));
+      }
+
+      // Cards a dynamic condition kept out of the batch run one at a time
+      // under the serial rule, exactly as a station without `overlap` does.
+      for (const item of overlapPlan.serial) {
+        if (halted) break;
+        dispatchedThisTick = true;
+        currentCardId = item.cardId;
+        cardDispatches.set(item.cardId, (cardDispatches.get(item.cardId) ?? 0) + 1);
+        const laneChanged = await executeStation({
+          ...stationArgs(item.cardId, item.station),
+          ...(item.reason !== undefined ? { overlapFallback: item.reason } : {}),
+        });
+        currentCardId = null;
+        if (laneChanged) lastLaneChangeAt = currentNow;
+      }
     }
 
     // ── Consumption andon (block new claims when budget is exhausted) ──────
@@ -1572,6 +1773,29 @@ interface ExecuteStationArgs {
    * escalate to hold (configuration failure, never a silent skip).
    */
   runSubflow?: SubflowSeam;
+  /**
+   * Issue #30, ADR-0012: set when this card is a member of a harness overlap
+   * batch. The harness station then records its call's window, takes its
+   * snapshots with snapshotTreeAsync, and applies the overlap integrity rule.
+   * Absent on every other dispatch.
+   */
+  overlap?: HarnessOverlapMember;
+  /**
+   * Issue #30: why a card of an `overlap: true` station runs on the serial
+   * path instead (a dispatch condition failed). Journaled as `overlap_fallback`
+   * on its harness spans. Absent otherwise.
+   */
+  overlapFallback?: string;
+}
+
+/** Issue #30, ADR-0012: one member's view of its harness overlap batch. */
+interface HarnessOverlapMember {
+  /** The batch's recorded windows, shared by every member. */
+  windows: OverlapWindows;
+  /** Every card admitted to the batch. */
+  memberIds: ReadonlySet<string>;
+  /** This card's owned paths, canonical (canonicalOwnedPaths). */
+  ownedCanonical: readonly string[];
 }
 
 /**
@@ -1735,6 +1959,8 @@ async function executeStation(args: ExecuteStationArgs): Promise<boolean> {
       stampHarnessActivity,
       sleep,
       err,
+      ...(args.overlap !== undefined ? { overlap: args.overlap } : {}),
+      ...(args.overlapFallback !== undefined ? { overlapFallback: args.overlapFallback } : {}),
     });
   }
 
@@ -1891,7 +2117,7 @@ function cascadeInvalidateDownstream(
  * and hashing adds roughly 10ms on a 33k-file tree, which is acceptable for a
  * once-per-station integrity gate.
  */
-function snapshotTree(root: string): Map<string, string> {
+export function snapshotTree(root: string): Map<string, string> {
   const snap = new Map<string, string>();
   const walk = (dir: string): void => {
     let entries;
@@ -1904,34 +2130,95 @@ function snapshotTree(root: string): Map<string, string> {
       const full = join(dir, e.name);
       if (e.isDirectory()) {
         walk(full);
-      } else if (e.isFile()) {
-        try {
-          snap.set(full, createHash('sha256').update(readFileSync(full)).digest('hex'));
-        } catch {
-          /* race: file removed between readdir and read — skip */
-        }
-      } else if (e.isSymbolicLink()) {
-        // WI-568 rework: a symlink dirent is NEITHER isDirectory() NOR isFile()
-        // (readdir's withFileTypes reports the link itself, not its target), so
-        // it was previously invisible to this snapshot entirely — a harness
-        // laundering an owned_paths escape through a freshly-created symlink
-        // would never appear in diffTouched's touched-set. Record a hash of the
-        // symlink's OWN target string (readlinkSync — do NOT follow the link,
-        // both to detect the symlink's creation/retargeting and to avoid a
-        // cycle) so its creation or retargeting is itself a touched-path event;
-        // checkIntegrity resolves the link's real target via resolveOwnedPath
-        // when the touched path is later validated. the integrity-hash work: hash the target
-        // string rather than record mtime, for the same forgeability reason as
-        // the file case above.
-        try {
-          snap.set(full, `symlink:${createHash('sha256').update(readlinkSync(full)).digest('hex')}`);
-        } catch {
-          /* race: link removed between readdir and readlink — skip */
-        }
+      } else {
+        recordSnapshotEntry(snap, full, e);
       }
     }
   };
   walk(root);
+  return snap;
+}
+
+/**
+ * Record one non-directory entry in a tree snapshot. Shared by snapshotTree
+ * and snapshotTreeAsync, so the two cannot disagree on what a signature is.
+ */
+function recordSnapshotEntry(snap: Map<string, string>, full: string, e: Dirent): void {
+  if (e.isFile()) {
+    try {
+      snap.set(full, createHash('sha256').update(readFileSync(full)).digest('hex'));
+    } catch {
+      /* race: file removed between readdir and read — skip */
+    }
+  } else if (e.isSymbolicLink()) {
+    // WI-568 rework: a symlink dirent is NEITHER isDirectory() NOR isFile()
+    // (readdir's withFileTypes reports the link itself, not its target), so
+    // it was previously invisible to this snapshot entirely — a harness
+    // laundering an owned_paths escape through a freshly-created symlink
+    // would never appear in diffTouched's touched-set. Record a hash of the
+    // symlink's OWN target string (readlinkSync — do NOT follow the link,
+    // both to detect the symlink's creation/retargeting and to avoid a
+    // cycle) so its creation or retargeting is itself a touched-path event;
+    // checkIntegrity resolves the link's real target via resolveOwnedPath
+    // when the touched path is later validated. the integrity-hash work: hash the target
+    // string rather than record mtime, for the same forgeability reason as
+    // the file case above.
+    try {
+      snap.set(full, `symlink:${createHash('sha256').update(readlinkSync(full)).digest('hex')}`);
+    } catch {
+      /* race: link removed between readdir and readlink — skip */
+    }
+  }
+}
+
+/**
+ * How long snapshotTreeAsync reads before it yields to the event loop. Well
+ * under any idle timeout a station can declare (whole seconds), so a sibling's
+ * stdout handler, which resets that timeout, runs at least this often.
+ */
+const SNAPSHOT_YIELD_MS = 10;
+
+/**
+ * snapshotTree for an overlapped harness call (issue #30, ADR-0012). Same walk,
+ * same signatures (recordSnapshotEntry), same result; it yields to the event
+ * loop whenever it has read for SNAPSHOT_YIELD_MS, so one member's snapshot
+ * does not hold up the other members' stdout handling, idle timers and
+ * per-call gate answers for the whole walk. A single large file is still read
+ * and hashed in one synchronous step. The serial path keeps snapshotTree.
+ * `yieldEveryMs` exists for tests; production uses SNAPSHOT_YIELD_MS.
+ */
+export async function snapshotTreeAsync(
+  root: string,
+  yieldEveryMs: number = SNAPSHOT_YIELD_MS,
+): Promise<Map<string, string>> {
+  const snap = new Map<string, string>();
+  let sliceStart = Date.now();
+  const maybeYield = async (): Promise<void> => {
+    if (Date.now() - sliceStart >= yieldEveryMs) {
+      // A timer, not setImmediate: a sibling's idle timeout is a timer, and
+      // the timers phase must get its turn, not only the I/O poll.
+      await new Promise<void>((r) => setTimeout(r, 0));
+      sliceStart = Date.now();
+    }
+  };
+  const walk = async (dir: string): Promise<void> => {
+    let entries;
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return; // dir vanished or unreadable — nothing to record
+    }
+    for (const e of entries) {
+      const full = join(dir, e.name);
+      if (e.isDirectory()) {
+        await walk(full);
+      } else {
+        recordSnapshotEntry(snap, full, e);
+      }
+      await maybeYield();
+    }
+  };
+  await walk(root);
   return snap;
 }
 
@@ -3597,6 +3884,10 @@ interface HarnessArgs {
    */
   sleep: (ms: number) => Promise<void>;
   err: (msg: string) => void;
+  /** See ExecuteStationArgs.overlap. */
+  overlap?: HarnessOverlapMember;
+  /** See ExecuteStationArgs.overlapFallback. */
+  overlapFallback?: string;
 }
 
 /**
@@ -3634,10 +3925,26 @@ interface HarnessArgs {
  * outbox discipline.
  */
 async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
+  // Issue #30, ADR-0012: whatever happens inside an attempt, including an error
+  // thrown between opening the overlap window and the post-invoke
+  // classification, the member's windows are closed on the way out. A window
+  // left open would count as intersecting every later one, widening the
+  // attribution for siblings. The normal close points inside the body stay in
+  // place (close is idempotent, the first end wins) so the window ends before
+  // `intersecting()` is computed.
+  try {
+    return await executeHarnessStationBody(args);
+  } finally {
+    if (args.overlap !== undefined) args.overlap.windows.closeOpenFor(args.cardId);
+  }
+}
+
+async function executeHarnessStationBody(args: HarnessArgs): Promise<boolean> {
   const {
     db, stateDb, runId, stationConfig, stationId, cardId, trackingAdapter, happyPathNext, terminalLanes,
     maxExecutionAttempts, projectRoot, flow, currentNow, now, runStartedAt, wallClockSeconds, maxTokens,
     getTokensSpent, onAndonTrip, harnessRegistry, foldHarnessUsage, stampHarnessActivity, sleep, err,
+    overlap, overlapFallback,
   } = args;
 
   const card = db.getCard(runId, cardId);
@@ -3983,11 +4290,31 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
           return false;
         }
       }
-      const integrityBaseline = snapshotTree(projectRoot);
+      // Issue #30, ADR-0012: an overlapped call records its window, opened
+      // before the baseline snapshot starts reading the tree, and takes both
+      // snapshots without blocking the other members' calls. The serial path
+      // takes them synchronously, as before.
+      const overlapWindow = overlap !== undefined ? overlap.windows.open(cardId, overlap.ownedCanonical) : -1;
+      const integrityBaseline =
+        overlap !== undefined ? await snapshotTreeAsync(projectRoot) : snapshotTree(projectRoot);
 
       // Issue #30: read the clock fresh, since a retry runs after this loop's
-      // backoff sleep. Written on every span this attempt produces.
-      const readyWaiting = countReadyWaiting(stateDb, runId, cardId, now());
+      // backoff sleep. Written on every span this attempt produces. An
+      // overlapped call counts the ready cards not admitted to its batch.
+      const readyWaiting =
+        overlap !== undefined
+          ? countReadyNotAdmitted(stateDb, runId, overlap.memberIds, now())
+          : countReadyWaiting(stateDb, runId, cardId, now());
+      // Issue #30: an overlapped call's spans say so, and carry the call's
+      // start so `conduit run status` can take the union of call intervals. A
+      // card that a dispatch condition sent to the serial path says why.
+      // Absent on every other span, so the serial journal is unchanged.
+      const overlapAttrs: Record<string, unknown> =
+        overlap !== undefined
+          ? { concurrent: true, started_at_ms: invokeStartedAt }
+          : overlapFallback !== undefined
+            ? { overlap_fallback: overlapFallback }
+            : {};
 
       // Issue #71: one invocation id per invoke(), stamped on every event row
       // it produces and on every `<station>.harness` span below that reports
@@ -4030,6 +4357,9 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
             : {}),
         });
       } catch (invokeErr) {
+        // Issue #30: the adapter has ended the call's process tree, so this
+        // member writes nothing more in this attempt.
+        if (overlap !== undefined) overlap.windows.close(overlapWindow);
         // WI-567 FR-8 fix: stamp fresh liveness progress even on a thrown
         // attempt (timeout/nonzero-exit/untagged) — the invoke() call still
         // consumed real wall-clock time and must count as progress.
@@ -4077,6 +4407,7 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
               // its spend is unrecorded" without inferring it from duration.
               outcome: 'harness-rate-limited',
               ready_waiting: readyWaiting,
+              ...overlapAttrs,
               rate_limit_release_at: releaseAt,
               rate_limit_reset_reported: resetAtMs ?? null,
               ...rateLimitAttributes((invokeErr as { rateLimit?: RateLimitSnapshot }).rateLimit),
@@ -4174,7 +4505,7 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
           runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.harness`, ...provenance, invocationId,
           adapter: harnessAdapter.name, durationMs: Date.now() - invokeStartedAt,
           usageUnknown: !thrownUsageKnown, usage: thrownJournalUsage,
-          attributes: { outcome: scrapReason, ready_waiting: readyWaiting },
+          attributes: { outcome: scrapReason, ready_waiting: readyWaiting, ...overlapAttrs },
         });
         if (gateHeld) {
           // The pending outbox intent of an effectful station is left as it is: the call was ended
@@ -4253,8 +4584,27 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
       // for the deterministic path, which this must not change), but for a harness
       // nothing is a legal write target, so ANY touched file is a breach; only a
       // harness that touched nothing at all proceeds.
+      //
+      // Issue #30, ADR-0012 (SPEC §7, "Overlapping harness calls"): for an
+      // overlapped call, a touched path inside the owned paths of a member
+      // whose window intersected this one is attributed to that member and
+      // left out of the check; the count per member is journaled on this
+      // attempt's span. Every other path is checked exactly as above.
       const ownedPaths = card.owned_paths ?? [];
-      const touchedPaths = diffTouched(integrityBaseline, snapshotTree(projectRoot));
+      let touchedPaths = diffTouched(
+        integrityBaseline,
+        overlap !== undefined ? await snapshotTreeAsync(projectRoot) : snapshotTree(projectRoot),
+      );
+      if (overlap !== undefined) {
+        overlap.windows.close(overlapWindow);
+        const classified = classifyOverlapTouched(
+          projectRoot, overlap.ownedCanonical, touchedPaths, overlap.windows.intersecting(overlapWindow),
+        );
+        touchedPaths = classified.remaining;
+        // An array of {card, paths, sample}: the journal's secret-key filter
+        // would drop an object keyed by a name containing "token" or "auth".
+        if (classified.attributed.length > 0) overlapAttrs['overlap_attributed'] = classified.attributed;
+      }
       const integrityViolation: IntegrityResult | null =
         ownedPaths.length === 0
           ? touchedPaths.length > 0
@@ -4265,7 +4615,7 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
         db.appendJournalSpan({
           runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.harness`, ...provenance, invocationId,
           adapter: harnessAdapter.name, durationMs, usageUnknown: !usageKnown, usage: journalUsage,
-          attributes: { outcome: `integrity_violation: ${describeIntegrity(integrityViolation)}`, ready_waiting: readyWaiting },
+          attributes: { outcome: `integrity_violation: ${describeIntegrity(integrityViolation)}`, ready_waiting: readyWaiting, ...overlapAttrs },
         });
         escalateToHold(
           stateDb, db, cardId, stationId, card,
@@ -4293,7 +4643,7 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
         db.appendJournalSpan({
           runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.harness`, ...provenance, invocationId,
           adapter: harnessAdapter.name, durationMs, usageUnknown: !usageKnown, usage: journalUsage,
-          attributes: { outcome: scrapReason, ready_waiting: readyWaiting },
+          attributes: { outcome: scrapReason, ready_waiting: readyWaiting, ...overlapAttrs },
         });
         continue;
       }
@@ -4315,7 +4665,7 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
         db.appendJournalSpan({
           runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.harness`, ...provenance, invocationId,
           adapter: harnessAdapter.name, durationMs, usageUnknown: !usageKnown, usage: journalUsage,
-          attributes: { outcome: scrapReason, ready_waiting: readyWaiting },
+          attributes: { outcome: scrapReason, ready_waiting: readyWaiting, ...overlapAttrs },
         });
         continue;
       }
@@ -4326,7 +4676,7 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
         db.appendJournalSpan({
           runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.harness`, ...provenance, invocationId,
           adapter: harnessAdapter.name, durationMs, usageUnknown: !usageKnown, usage: journalUsage,
-          attributes: { outcome: scrapReason, ready_waiting: readyWaiting },
+          attributes: { outcome: scrapReason, ready_waiting: readyWaiting, ...overlapAttrs },
         });
         continue;
       }
@@ -4366,7 +4716,7 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
         // Issue #5: the capacity snapshot rides along on the priced row, so
         // "what did this run draw against the plan" is a query rather than an
         // inference from interactive usage bars.
-        attributes: { artifact_hashes: artifactHashes, outcome: 'success', ready_waiting: readyWaiting, ...rateLimitAttrs },
+        attributes: { artifact_hashes: artifactHashes, outcome: 'success', ready_waiting: readyWaiting, ...rateLimitAttrs, ...overlapAttrs },
       });
 
       // ── Write checkpoint (binding stamp) ───────────────────────────────────
