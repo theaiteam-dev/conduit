@@ -13,6 +13,8 @@
 # It records what happened in cards/a, which it may write:
 #
 #   own.txt          written first; proves the own dir is writable
+#   mv.txt           moved one way into cards/b; still here when the move is
+#                    refused, gone (and present in cards/b) when it is not
 #   env-writes.txt   one `NAME=ok|denied` line per run-scoped dir variable
 #                    that is set (TMPDIR, the config dirs, the XDG dirs)
 #   setsid.done      written by a setsid child after its own sibling write
@@ -36,7 +38,8 @@ echo own > cards/a/own.txt
 cp cards/a/own.txt cards/b/cp.txt 2>/dev/null
 echo link > cards/a/link/link.txt 2>/dev/null
 echo appended >> shared.txt 2>/dev/null
-mv cards/a/own.txt cards/b/moved.txt 2>/dev/null && mv cards/b/moved.txt cards/a/own.txt 2>/dev/null
+echo mv > cards/a/mv.txt
+mv cards/a/mv.txt cards/b/mv.txt 2>/dev/null
 
 : > cards/a/env-writes.txt
 for name in TMPDIR CLAUDE_CONFIG_DIR CODEX_HOME HOME XDG_CONFIG_HOME XDG_DATA_HOME XDG_STATE_HOME XDG_CACHE_HOME; do

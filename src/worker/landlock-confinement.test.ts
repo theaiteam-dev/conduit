@@ -13,7 +13,7 @@ import {
   chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import {
   DEV_DIR,
   LLEXEC_ENV,
@@ -479,4 +479,52 @@ describe('the real helper (issue #122)', () => {
     expect(readFileSync(file, 'utf-8')).toBe('new\n');
     expect(existsSync(join(scratch, 'beside.txt'))).toBe(false);
   });
+});
+
+// The production path on a cgroup host: the wrapper joins the invocation's
+// cgroup, then execs llexec, which confines and execs the command.
+const hostCgroup = await resolveContainment();
+const cgroupRequired = process.env.CONDUIT_REQUIRE_CGROUP_CONTAINMENT === '1';
+const itWithCgroupAndLandlock =
+  (hostConfinement.available && hostCgroup.mechanism === 'cgroup') || (confinementRequired && cgroupRequired) ? it : it.skip;
+
+describe('write confinement under cgroup containment (issue #122)', () => {
+  if (!(hostConfinement.available && hostCgroup.mechanism === 'cgroup') && !(confinementRequired && cgroupRequired)) {
+    const why = hostCgroup.mechanism !== 'cgroup' ? `no cgroup containment: ${hostCgroup.reason}` : hostConfinement.available ? '' : hostConfinement.reason;
+    it.skip(`joins the child cgroup and refuses the outside write (${why})`, () => {});
+  }
+
+  itWithCgroupAndLandlock('joins the child cgroup, then llexec confines the command: the inside write lands, the outside one is refused', async () => {
+    if (hostCgroup.mechanism !== 'cgroup') throw new Error(`cgroup containment unavailable: ${hostCgroup.reason}`);
+    if (!hostConfinement.available) throw new Error(`write confinement unavailable: ${hostConfinement.reason}`);
+    const own = join(scratch, 'own');
+    const outside = join(scratch, 'outside');
+    mkdirSync(own);
+    mkdirSync(outside);
+    const script = 'echo in > own/in.txt; echo out > outside/out.txt 2>/dev/null; cat /proc/self/cgroup > own/cgroup.txt';
+    const prepared = prepareContainedCommand(
+      hostCgroup,
+      ['/bin/sh', '-c', script],
+      { cwd: scratch, env: { PATH: '/usr/bin:/bin' } },
+      { helper: hostConfinement.helper, writable: [own] },
+    );
+    try {
+      // Cgroup wrapper first, then the helper, then the command.
+      expect(prepared.cgroup).toBeDefined();
+      expect(prepared.argv.slice(0, 2)).toEqual(['/bin/sh', '-c']);
+      expect(prepared.argv[3]).toBe(join(prepared.cgroup!, 'cgroup.procs'));
+      expect(prepared.argv.slice(4, 7)).toEqual([hostConfinement.helper, own, '--']);
+      expect(prepared.argv[7]).toBe('/bin/sh');
+      const proc = Bun.spawn(prepared.argv, { cwd: scratch, env: { PATH: '/usr/bin:/bin' }, stdout: 'pipe', stderr: 'pipe' });
+      await proc.exited;
+      expect(readFileSync(join(own, 'in.txt'), 'utf-8')).toBe('in\n');
+      expect(existsSync(join(outside, 'out.txt'))).toBe(false);
+      const recorded = readFileSync(join(own, 'cgroup.txt'), 'utf-8').trim();
+      // cgroup v2 prints `0::<path>`; the path ends in the invocation's cgroup, not the parent.
+      expect(recorded.endsWith(`/${basename(prepared.cgroup!)}`)).toBe(true);
+    } finally {
+      killCgroup(prepared.cgroup!);
+      await removeCgroup(prepared.cgroup!, 1_000);
+    }
+  }, 20_000);
 });

@@ -592,6 +592,8 @@ export function describeHarnessContainmentConformance(
 interface WriteFixtureResult {
   ran: boolean;
   ownWritten: boolean;
+  /** cards/a/mv.txt, which the fixture tries to move into the sibling's dir, is still in place. */
+  mvSourceKept: boolean;
   setsidRan: boolean;
   /** The fixture gave up waiting for the setsid child (a slow child, not a confinement result). */
   setsidTimedOut: boolean;
@@ -649,6 +651,7 @@ async function runWriteFixture(
   return {
     ran: existsSync(join(own, 'fixture.done')),
     ownWritten: existsSync(join(own, 'own.txt')),
+    mvSourceKept: existsSync(join(own, 'mv.txt')),
     setsidRan: existsSync(join(own, 'setsid.done')),
     setsidTimedOut: existsSync(join(own, 'setsid.timeout')),
     envWrites,
@@ -702,19 +705,13 @@ function describeWriteConfinementConformance(
     }
 
     it(
-      "refuses a confined call's writes into a sibling's dir (cp, symlink, mv, setsid child) and to a shared file",
+      "refuses a confined call's writes into a sibling's dir (cp, symlink, mv) and to a shared file",
       async () => {
         const result = await runWriteFixture(name, factory, projectRoot, true);
         expect(result.ran, 'the fixture did not run to its end').toBe(true);
         expect(result.ownWritten, "the call could not write its own dir").toBe(true);
-        if (hasSetsid) {
-          expect(
-            result.setsidTimedOut,
-            "the setsid child did not finish within the fixture's wait",
-          ).toBe(false);
-          expect(result.setsidRan, 'the setsid child did not run').toBe(true);
-        }
         expect(result.siblingFiles).toEqual([]);
+        expect(result.mvSourceKept, 'mv removed its source without landing in the sibling').toBe(true);
         expect(result.shared).toBe('shared\n');
         // The per-call temp dir and every run-scoped dir the adapter set stay writable.
         expect(result.envWrites.get('TMPDIR')).toBe('ok');
@@ -732,14 +729,56 @@ function describeWriteConfinementConformance(
         expect(result.ran, 'the fixture did not run to its end').toBe(true);
         expect(result.siblingFiles).toContain('cp.txt');
         expect(result.siblingFiles).toContain('link.txt');
+        expect(result.siblingFiles).toContain('mv.txt');
+        expect(result.mvSourceKept).toBe(false);
         expect(result.shared).toBe('shared\nappended\n');
-        if (hasSetsid) {
-          expect(
-            result.setsidTimedOut,
-            "the setsid child did not finish within the fixture's wait",
-          ).toBe(false);
-          expect(result.siblingFiles).toContain('setsid.txt');
-        }
+      },
+      TEST_TIMEOUT_MS,
+    );
+
+    // The setsid child is a separate pair so a host without setsid shows up as
+    // a skip naming the reason, or a failure when confinement is required.
+    if (!hasSetsid) {
+      const reason = 'setsid not found on PATH';
+      if (writeConfinementRequired()) {
+        it("refuses a confined setsid child's write into a sibling's dir", () => {
+          throw new Error(`write confinement is required but the setsid case cannot run: ${reason}`);
+        });
+        it('control: an unconfined setsid child does write into the sibling dir', () => {
+          throw new Error(`write confinement is required but the setsid case cannot run: ${reason}`);
+        });
+      } else {
+        it.skip(`refuses a confined setsid child's write into a sibling's dir (${reason})`, () => {});
+        it.skip(`control: an unconfined setsid child does write into the sibling dir (${reason})`, () => {});
+      }
+      return;
+    }
+
+    it(
+      "refuses a confined setsid child's write into a sibling's dir",
+      async () => {
+        const result = await runWriteFixture(name, factory, projectRoot, true);
+        expect(result.ran, 'the fixture did not run to its end').toBe(true);
+        expect(
+          result.setsidTimedOut,
+          "the setsid child did not finish within the fixture's wait",
+        ).toBe(false);
+        expect(result.setsidRan, 'the setsid child did not run').toBe(true);
+        expect(result.siblingFiles).not.toContain('setsid.txt');
+      },
+      TEST_TIMEOUT_MS,
+    );
+
+    it(
+      'control: an unconfined setsid child does write into the sibling dir',
+      async () => {
+        const result = await runWriteFixture(name, factory, projectRoot, false);
+        expect(result.ran, 'the fixture did not run to its end').toBe(true);
+        expect(
+          result.setsidTimedOut,
+          "the setsid child did not finish within the fixture's wait",
+        ).toBe(false);
+        expect(result.siblingFiles).toContain('setsid.txt');
       },
       TEST_TIMEOUT_MS,
     );
