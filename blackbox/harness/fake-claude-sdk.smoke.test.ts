@@ -6,7 +6,9 @@
  * apart from a fake that does not speak the SDK's control protocol: the SDK
  * registers its hook at initialize, the fake calls it once per tool call, an
  * allowed write happens, a denied one does not, and `continue: false` ends the
- * turn with a result message that still carries the usage.
+ * turn with a result message that still carries the usage. With a stub sink
+ * (harness-flow's `stubSink`), the call number and log line go over HTTP and
+ * a barrier releases two calls only when both are running.
  *
  * BLACK-BOX RULE: zero imports from src/. The SDK is a third-party package.
  */
@@ -17,6 +19,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { query, type HookCallback, type SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import type { FakeClaudeSdkCall, FakeClaudeSdkLogEntry } from "./fake-claude-sdk";
+import { startStubSink } from "./harness-flow";
 
 const FAKE = join(import.meta.dir, "fake-claude-sdk.ts");
 
@@ -29,16 +32,25 @@ describe("fake-claude-sdk", () => {
   });
 
   /** One query() against the fake, with a hook that answers per tool call from `decide`. */
-  async function drive(call: FakeClaudeSdkCall, decide: (toolName: string) => "allow" | "deny" | "stop") {
+  async function drive(
+    call: FakeClaudeSdkCall,
+    decide: (toolName: string) => "allow" | "deny" | "stop",
+    sink?: { url: string; logPath: string },
+  ) {
     runs += 1;
     const dir = join(root, `run-${runs}`);
     const cwd = join(dir, "project");
     mkdirSync(cwd, { recursive: true });
-    const logPath = join(dir, "invocations.ndjson");
+    const logPath = sink?.logPath ?? join(dir, "invocations.ndjson");
     const scenarioPath = join(dir, "scenario.json");
     writeFileSync(
       scenarioPath,
-      JSON.stringify({ stateDir: join(dir, "counters"), logPath, roles: [{ name: "maker", promptIncludes: "ROLE:MAKER", calls: [call] }] }),
+      JSON.stringify({
+        stateDir: join(dir, "counters"),
+        logPath,
+        ...(sink !== undefined ? { sinkUrl: sink.url } : {}),
+        roles: [{ name: "maker", promptIncludes: "ROLE:MAKER", calls: [call] }],
+      }),
     );
     // Same wrapper shape as harness-flow.ts: no script extension, so the SDK runs it directly.
     const wrapper = join(dir, "claude");
@@ -149,5 +161,28 @@ describe("fake-claude-sdk", () => {
     const { messages } = await drive({ usage: { input_tokens: 4, output_tokens: 2 } }, () => "allow");
     const result = messages.find((m) => m.type === "result") as Record<string, any> | undefined;
     expect(result?.modelUsage).toEqual({ "claude-fake": expect.objectContaining({ inputTokens: 4, costUSD: 0.001, canonicalModel: "claude-fake" }) });
+  }, 30_000);
+
+  test("with a stub sink, a barrier releases two calls only once both are running, and both log through the sink", async () => {
+    const sinkDir = join(root, "sink");
+    mkdirSync(sinkDir, { recursive: true });
+    const logPath = join(sinkDir, "invocations.ndjson");
+    const server = startStubSink(join(sinkDir, "counters"), logPath);
+    try {
+      const sink = { url: `http://127.0.0.1:${server.port}`, logPath };
+      const meet: FakeClaudeSdkCall = { barrier: { name: "pair", parties: 2, timeoutMs: 10_000 } };
+      await Promise.all([drive(meet, () => "allow", sink), drive(meet, () => "allow", sink)]);
+      const log = readFileSync(logPath, "utf8").trim().split("\n").map((l) => JSON.parse(l) as FakeClaudeSdkLogEntry);
+      // The sink's counter numbered the two calls, and both were released by the other's arrival.
+      expect(log.map((e) => e.call).sort()).toEqual([1, 2]);
+      expect(log.map((e) => e.barrierReleased)).toEqual([true, true]);
+
+      // A barrier no second call reaches times out, and the call still completes.
+      const alone = await drive({ barrier: { name: "alone", parties: 2, timeoutMs: 200 } }, () => "allow", sink);
+      expect(alone.log.at(-1)!.barrierReleased).toBe(false);
+      expect(alone.messages.some((m) => m.type === "result")).toBe(true);
+    } finally {
+      server.stop(true);
+    }
   }, 30_000);
 });
