@@ -115,6 +115,7 @@ import { HARNESS_GATE_HOLD_CODE, callGateFailClosed, type GateDecision, type Gat
 import { buildHarnessChildEnv } from './harness-runner';
 import { isContainedIn, resolveOwnedPath } from './integrity';
 import { resolveContainment, type Containment } from './cgroup-containment';
+import { confinedWritableSet, callTempDirEnv, createCallTempDir, removeCallTempDir, type CallTempDir } from './landlock-confinement';
 import {
   buildProviderAuthContent,
   createRunScopedOpenCodeDirs,
@@ -321,6 +322,7 @@ export function createOpenCodeHarnessAdapter(config: OpenCodeHarnessAdapterConfi
     // The station's `tools` list is the gate's allowlist, as for agent-sdk.
     canRestrictTools: true,
     canGatePerCall: true,
+    canConfineWrites: true,
     model: config.model,
 
     async probeBinary(): Promise<BinaryProbe> {
@@ -355,10 +357,21 @@ export function createOpenCodeHarnessAdapter(config: OpenCodeHarnessAdapterConfi
       );
       const password = randomBytes(24).toString('hex');
       const dirs = createRunScopedOpenCodeDirs();
+      // Issue #122: a write-confined call gets a per-call temp dir for TMPDIR. HOME and the XDG dirs are
+      // already run-scoped on every call, under `dirs.root`.
+      const confined = call.confinement;
+      let callTmp: CallTempDir | undefined;
+      try {
+        if (confined !== undefined) callTmp = createCallTempDir();
+      } catch (err) {
+        removeRunScopedOpenCodeDirs(dirs);
+        throw err;
+      }
       const env: Record<string, string> = {
         ...baseEnv,
         PATH: baseEnv.PATH ?? sourceEnv.PATH ?? '/usr/local/bin:/usr/bin:/bin',
         ...dirs.env,
+        ...(callTmp !== undefined ? callTempDirEnv(callTmp, { xdg: false }) : {}),
         OPENCODE_SERVER_PASSWORD: password,
         OPENCODE_CONFIG_CONTENT: JSON.stringify({
           permission: { '*': 'ask' }, mcp: {}, plugin: [], share: 'disabled', autoupdate: false,
@@ -1076,7 +1089,23 @@ export function createOpenCodeHarnessAdapter(config: OpenCodeHarnessAdapterConfi
         emit?.({ type: 'lifecycle', phase: 'start' });
         let outcome: Outcome;
         try {
-          proc = spawnFn({ command: executable, args: [...OPENCODE_SERVE_ARGS], cwd: config.projectRoot, env }, handlers);
+          proc = spawnFn(
+            {
+              command: executable,
+              args: [...OPENCODE_SERVE_ARGS],
+              cwd: config.projectRoot,
+              env,
+              ...(confined !== undefined && callTmp !== undefined
+                ? {
+                    confinement: {
+                      helper: confined.helper,
+                      writable: confinedWritableSet(confined.writable, [callTmp.root, dirs.root]),
+                    },
+                  }
+                : {}),
+            },
+            handlers,
+          );
           drive().catch((err) => {
             if (err === STOP) return;
             finish({ kind: 'rpc', message: err instanceof Error ? err.message : String(err) });
@@ -1198,6 +1227,7 @@ export function createOpenCodeHarnessAdapter(config: OpenCodeHarnessAdapterConfi
         } catch (err) {
           process.stderr.write(`opencode: ${err instanceof Error ? err.message : String(err)}\n`);
         }
+        if (callTmp !== undefined) removeCallTempDir(callTmp);
       }
     },
   };

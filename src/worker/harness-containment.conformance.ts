@@ -40,15 +40,30 @@
  * mechanism fails rather than skips. On any other host the setsid assertions
  * are registered as skipped tests that name the reason.
  *
+ * Write confinement (issue #122, ADR-0013). For an adapter with
+ * `canConfineWrites`, `describeHarnessContainmentConformance` also registers
+ * the cross-sibling write cases: the adapter is invoked with
+ * `HarnessInvocation.confinement` and the stand-in binary
+ * ./landlock-write-fixture.sh, which tries to write into a sibling card's dir
+ * by `cp`, through a symlink, by `mv`, and from a setsid child, and to append
+ * to a shared project file. Every one must be refused, while the call's own
+ * dir, its TMPDIR and its run-scoped config dirs stay writable. A control case
+ * runs the same fixture unconfined and requires the sibling writes to happen,
+ * so a broken fixture cannot pass by writing nothing. These cases need Linux
+ * with Landlock and the llexec helper (scripts/build-llexec.sh); elsewhere
+ * they are registered as skipped tests that name the reason, and
+ * CONDUIT_REQUIRE_LANDLOCK=1 makes them fail instead.
+ *
  * This file is not a test file itself. Bun only runs it through the calls in
  * the `*.test.ts` files.
  */
 import { describe, it, test, expect, beforeEach, afterEach } from 'bun:test';
-import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { HarnessAdapter } from './harness-adapter';
 import { resolveContainment, type Containment } from './cgroup-containment';
+import { resolveWriteConfinement, type WriteConfinement } from './landlock-confinement';
 import {
   PID_FILE,
   SENTINEL_FILE,
@@ -56,6 +71,7 @@ import {
   SETSID_SENTINEL_FILE,
   SETSID_SID_FILE,
   setsidContainmentRequired,
+  writeConfinementRequired,
 } from './containment-fixture-files';
 
 /** Absolute path of the stand-in binary every conformance call spawns. */
@@ -69,6 +85,12 @@ const GRANDCHILDREN = [
 
 /** The containment the runners resolve on this host, through the same resolver. */
 export const hostContainment: Containment = await resolveContainment();
+
+/** Absolute path of the stand-in binary for the write-confinement cases (issue #122). */
+export const WRITE_FIXTURE = join(import.meta.dir, 'landlock-write-fixture.sh');
+
+/** Whether overlapped calls can be write-confined on this host, through the executor's own probe. */
+export const hostWriteConfinement: WriteConfinement = await resolveWriteConfinement();
 
 /** Whether the suite requires the setsid grandchild to die on this host. */
 export const requiresSetsidContainment = setsidContainmentRequired(hostContainment);
@@ -559,5 +581,145 @@ export function describeHarnessContainmentConformance(
 ): void {
   describeContainmentConformance(name, harnessAdapterSpawnPath(name, factory), {
     timeoutClass: HARNESS_TIMEOUT_CLASS,
+  });
+  // Never invoked: built only to read the static capability flag.
+  if (factory({ projectRoot: '', command: WRITE_FIXTURE }).canConfineWrites === true) {
+    describeWriteConfinementConformance(name, factory);
+  }
+}
+
+/** What the write fixture recorded in the call's own dir. */
+interface WriteFixtureResult {
+  ran: boolean;
+  ownWritten: boolean;
+  setsidRan: boolean;
+  envWrites: Map<string, string>;
+  /** Files present in the sibling's dir afterwards. */
+  siblingFiles: string[];
+  shared: string;
+}
+
+/**
+ * Lay out a project root for the write fixture, invoke the adapter on it, and
+ * read back what the fixture managed to write. The adapter's own outcome is
+ * ignored: the fixture does not speak the adapter's protocol, so most adapters
+ * report an error once it exits.
+ */
+async function runWriteFixture(
+  name: string,
+  factory: (opts: HarnessContainmentFactoryOptions) => HarnessAdapter,
+  projectRoot: string,
+  confine: boolean,
+): Promise<WriteFixtureResult> {
+  const own = join(projectRoot, 'cards', 'a');
+  const sibling = join(projectRoot, 'cards', 'b');
+  mkdirSync(own, { recursive: true });
+  mkdirSync(sibling, { recursive: true });
+  writeFileSync(join(projectRoot, 'shared.txt'), 'shared\n');
+  symlinkSync(sibling, join(own, 'link'));
+
+  const adapter = factory({ projectRoot, command: WRITE_FIXTURE });
+  expect(adapter.name).toBe(name);
+  if (confine && !hostWriteConfinement.available) {
+    throw new Error(`write confinement unavailable: ${hostWriteConfinement.reason}`);
+  }
+  try {
+    await adapter.invoke({
+      prompt: 'write confinement conformance',
+      inputs: [],
+      tools: [],
+      timeoutMs: WRITE_FIXTURE_TIMEOUT_MS,
+      ...(confine && hostWriteConfinement.available
+        ? { confinement: { helper: hostWriteConfinement.helper, writable: [own] } }
+        : {}),
+    });
+  } catch {
+    /* expected: the fixture is not a real harness CLI */
+  }
+  const envWrites = new Map<string, string>();
+  const envPath = join(own, 'env-writes.txt');
+  if (existsSync(envPath)) {
+    for (const line of readFileSync(envPath, 'utf-8').split('\n')) {
+      const eq = line.indexOf('=');
+      if (eq > 0) envWrites.set(line.slice(0, eq), line.slice(eq + 1));
+    }
+  }
+  return {
+    ran: existsSync(join(own, 'fixture.done')),
+    ownWritten: existsSync(join(own, 'own.txt')),
+    setsidRan: existsSync(join(own, 'setsid.done')),
+    envWrites,
+    siblingFiles: readdirSync(sibling).sort(),
+    shared: readFileSync(join(projectRoot, 'shared.txt'), 'utf-8'),
+  };
+}
+
+/** Bound on one write-fixture invocation; the fixture itself exits within about 3 seconds. */
+const WRITE_FIXTURE_TIMEOUT_MS = 10_000;
+
+/**
+ * Register the write-confinement cases (issue #122) for one harness adapter
+ * that declares `canConfineWrites`. Called by
+ * `describeHarnessContainmentConformance`, so every such adapter with a
+ * containment conformance call is covered.
+ */
+function describeWriteConfinementConformance(
+  name: string,
+  factory: (opts: HarnessContainmentFactoryOptions) => HarnessAdapter,
+): void {
+  describe(`write confinement conformance: ${name}`, () => {
+    let projectRoot: string;
+
+    beforeEach(() => {
+      projectRoot = realpathSync(mkdtempSync(join(tmpdir(), 'conduit-write-confinement-')));
+    });
+
+    afterEach(() => {
+      rmSync(projectRoot, { recursive: true, force: true });
+    });
+
+    const runnable = hostWriteConfinement.available || writeConfinementRequired();
+    if (!runnable) {
+      it.skip(
+        `refuses a confined call's writes into a sibling's dir (host has no write confinement: ${
+          hostWriteConfinement.available ? '' : hostWriteConfinement.reason
+        })`,
+        () => {},
+      );
+      return;
+    }
+
+    it(
+      "refuses a confined call's writes into a sibling's dir (cp, symlink, mv, setsid child) and to a shared file",
+      async () => {
+        const result = await runWriteFixture(name, factory, projectRoot, true);
+        expect(result.ran, 'the fixture did not run to its end').toBe(true);
+        expect(result.ownWritten, "the call could not write its own dir").toBe(true);
+        expect(result.setsidRan, 'the setsid child did not run').toBe(true);
+        expect(result.siblingFiles).toEqual([]);
+        expect(result.shared).toBe('shared\n');
+        // The per-call temp dir and every run-scoped dir the adapter set stay writable.
+        expect(result.envWrites.get('TMPDIR')).toBe('ok');
+        for (const [variable, outcome] of result.envWrites) {
+          expect(`${variable}=${outcome}`).toBe(`${variable}=ok`);
+        }
+      },
+      TEST_TIMEOUT_MS,
+    );
+
+    it(
+      'control: the same fixture, unconfined, does write into the sibling dir',
+      async () => {
+        const result = await runWriteFixture(name, factory, projectRoot, false);
+        expect(result.ran, 'the fixture did not run to its end').toBe(true);
+        expect(result.siblingFiles).toContain('cp.txt');
+        expect(result.siblingFiles).toContain('link.txt');
+        expect(result.shared).toBe('shared\nappended\n');
+        if (existsSync('/usr/bin/setsid') || existsSync('/bin/setsid')) {
+          expect(result.siblingFiles).toContain('setsid.txt');
+        }
+      },
+      TEST_TIMEOUT_MS,
+    );
   });
 }

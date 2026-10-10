@@ -19,8 +19,14 @@ import {
 import type { HarnessEvent } from './harness-events';
 import { HARNESS_GATE_HOLD_CODE, type GateToolCall, type HarnessToolGate } from './harness-gate';
 
+// The API key is a dummy: a write-confined call always builds a run-scoped config dir (issue #122), which
+// needs a credential source, and the stand-in binary never authenticates.
 describeHarnessContainmentConformance('agent-sdk', (opts) =>
-  createAgentSdkHarnessAdapter({ ...opts, envAllowlist: [] }),
+  createAgentSdkHarnessAdapter({
+    ...opts,
+    envAllowlist: ['ANTHROPIC_API_KEY'],
+    sourceEnv: { PATH: process.env.PATH, ANTHROPIC_API_KEY: 'sk-conformance' },
+  }),
 );
 
 const ROOT = tmpdir();

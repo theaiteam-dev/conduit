@@ -59,7 +59,9 @@ docker build -t conduit-engine:1.0.0 .
 >
 > | Step | Purpose |
 > |------|---------|
-> | `FROM oven/bun:1.3.11-slim` | Pinned Bun runtime — see [§7](#7-bump-the-bun-version) to change it |
+> | `FROM alpine:3.20 AS llexec` + `gcc -static` | Build stage: compiles the Landlock write-confinement helper (`native/llexec/llexec.c`) as a static binary. Nothing else from this stage reaches the image |
+> | `FROM oven/bun:1.3.11-slim` | Pinned Bun runtime, the image's base — see [§7](#7-bump-the-bun-version) to change it |
+> | `COPY --from=llexec /llexec /usr/local/bin/llexec` | The helper overlapped harness calls run under (reported by the `write-confinement` doctor probe) |
 > | Create `conduit` user/group | Least-privilege execution — the container never runs as root |
 > | `WORKDIR /app` | Relative paths such as `examples/branching/flow.yaml` resolve here |
 > | `COPY package.json bun.lock ./` + `bun install --omit=optional` | Dependency layer cached independently of source changes. Optional dependencies are skipped: they are the Agent SDK's bundled platform binaries, which the `agent-sdk` adapter does not use |
@@ -324,6 +326,7 @@ These probes run whether or not a flow argument is given:
 | `state_db_volume` | Writes and deletes a temp file in the state-DB directory. Paths under `/data` must also be backed by an actual Docker mount; no-volume containers report FAIL instead of silently using ephemeral storage |
 | `project-root-present` | Checks `CONDUIT_PROJECT_ROOT` on disk. Reports FAIL only when the env var is set to a non-existent path. Reports ok (no-op) when the env var is unset or empty — the engine image sets it to an empty string so the probe is a no-op there. Per-flow images set `CONDUIT_PROJECT_ROOT=/flow` so the baked-in directory is verified |
 | `process-containment` | Which mechanism kills the processes a station or harness starts: a per-invocation cgroup v2, or the process-group kill alone. Never FAILs. On the fallback the detail starts with `warning:` and names the reason; a command that starts a new session (every command Claude Code's Bash tool runs) can then outlive its invocation. A default Docker or Podman container reports the fallback, because `/sys/fs/cgroup` is read-only there. See [Process-tree termination](harness-containment.md#process-tree-termination) for the requirements and a Podman recipe |
+| `write-confinement` | Whether overlapped harness calls (`overlap: true` stations under `--concurrency`) can run under Landlock write confinement: the `llexec` helper is found and a real write test through it is refused outside its writable path. Never FAILs. When it is unavailable the detail starts with `warning:` and names the reason, and cards of `overlap: true` stations run one at a time. The engine image ships the helper at `/usr/local/bin/llexec`; a source checkout builds it with `bun run build:llexec`, and `CONDUIT_LLEXEC` names another copy. A default Docker container passes. See [Write confinement of overlapped calls](harness-containment.md#write-confinement-of-overlapped-calls) |
 | `model_api_key` | `CONDUIT_API_KEY` or `OPENAI_API_KEY` is set |
 | `gateway_base_url` | `CONDUIT_BASE_URL` is set |
 
@@ -345,6 +348,7 @@ $ docker run --rm -v conduit_data:/data \
   state_db_volume: ok
   project-root-present: ok
   process-containment: ok — warning: process group only (cannot create a cgroup under /sys/fs/cgroup (EROFS)); a command started in a new session can outlive its invocation, see docs/harness-containment.md
+  write-confinement: ok — Landlock ABI 4 via /usr/local/bin/llexec; overlapped harness calls run write-confined
   model_api_key: ok
   gateway_base_url: ok — CONDUIT_BASE_URL is configured
 ```
@@ -360,6 +364,7 @@ $ docker run --rm -v conduit_data:/data \
   state_db_volume: ok
   project-root-present: ok
   process-containment: ok — warning: process group only (cannot create a cgroup under /sys/fs/cgroup (EROFS)); a command started in a new session can outlive its invocation, see docs/harness-containment.md
+  write-confinement: ok — Landlock ABI 4 via /usr/local/bin/llexec; overlapped harness calls run write-confined
   model_api_key: ok
   gateway_base_url: ok — CONDUIT_BASE_URL is configured
   flow-prereqs-present: ok
@@ -384,16 +389,17 @@ If any probe fails, the command aborts before dispatch or boot.
 
 ## 7. Bump the Bun version
 
-The single authoritative Bun pin is the `FROM` line in the engine Dockerfile:
+The single authoritative Bun pin is the runtime stage's `FROM` line in the engine
+Dockerfile, the last `FROM` (the `llexec` build stage comes before it):
 
 ```dockerfile
-# Dockerfile (repo root), line 1
+# Dockerfile (repo root), the runtime stage
 FROM oven/bun:1.3.11-slim
 ```
 
 To upgrade:
 
-1. Edit `Dockerfile` line 1 to the desired `oven/bun:<version>-slim` tag.
+1. Edit that `FROM` line to the desired `oven/bun:<version>-slim` tag.
 2. Rebuild the engine image:
    ```bash
    docker build -t conduit-engine .

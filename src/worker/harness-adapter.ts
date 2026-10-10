@@ -99,6 +99,23 @@ export interface HarnessInvocation {
    * adapter without the flag ignores it and keeps its boundary-control profile.
    */
   gate?: HarnessToolGate;
+  /**
+   * Landlock write confinement for this call (issue #122, ADR-0013). Set by the
+   * executor only for a member of a harness overlap batch, and only to an
+   * adapter with `canConfineWrites`. The adapter runs its whole process tree
+   * under `helper`, with `writable` (the card's canonical owned paths) plus its
+   * own per-call temp dir, its run-scoped config dirs and /dev as the writable
+   * set, and must not start the process at all if it cannot.
+   */
+  confinement?: HarnessWriteConfinement;
+}
+
+/** What the executor grants a confined call (issue #122). */
+export interface HarnessWriteConfinement {
+  /** Absolute path of the llexec helper, from the write-confinement probe. */
+  helper: string;
+  /** The card's owned paths, canonical and absolute. */
+  writable: readonly string[];
 }
 
 /**
@@ -269,6 +286,13 @@ export interface HarnessAdapter {
    */
   readonly canGatePerCall?: boolean;
   /**
+   * Static capability flag (issue #122): whether this adapter honours
+   * `HarnessInvocation.confinement` by running its process tree under the
+   * llexec helper. Absent means false, and the executor then never admits the
+   * adapter's calls to a harness overlap batch.
+   */
+  readonly canConfineWrites?: boolean;
+  /**
    * Per-list expressibility negotiation (the original per-list tool-expression work): can this adapter enforce
    * THIS specific allowlist? Adapters whose containment surface is a
    * capability lattice rather than a per-tool-name flag (codex-exec's OS
@@ -392,6 +416,8 @@ export interface HarnessAdapterDefinition {
   readonly canRestrictTools: boolean;
   /** Per-call gate capability passthrough (issue #21) — see HarnessAdapter.canGatePerCall. */
   readonly canGatePerCall?: boolean;
+  /** Write-confinement capability passthrough (issue #122) — see HarnessAdapter.canConfineWrites. */
+  readonly canConfineWrites?: boolean;
   /** Per-list expressibility passthrough (the original per-list tool-expression work) — see HarnessAdapter.canExpressTools. */
   canExpressTools?(tools: readonly string[]): boolean;
   readonly envAllowlist: readonly string[];
@@ -526,6 +552,7 @@ export function buildHarnessDefinitionRegistry(
       reportsUsage: identityAdapter.reportsUsage,
       canRestrictTools: identityAdapter.canRestrictTools,
       ...(identityAdapter.canGatePerCall !== undefined ? { canGatePerCall: identityAdapter.canGatePerCall } : {}),
+      ...(identityAdapter.canConfineWrites !== undefined ? { canConfineWrites: identityAdapter.canConfineWrites } : {}),
       envAllowlist: [...configDef.envAllowlist],
       command: configDef.command,
       probeBinary: () => identityAdapter.probeBinary(),
@@ -608,6 +635,7 @@ export function bindHarnessDefinitionsForIntrospection(
         reportsUsage: def.reportsUsage,
         canRestrictTools: def.canRestrictTools,
         ...(def.canGatePerCall !== undefined ? { canGatePerCall: def.canGatePerCall } : {}),
+        ...(def.canConfineWrites !== undefined ? { canConfineWrites: def.canConfineWrites } : {}),
         // Load-time validation judges per-list expressibility (the original per-list tool-expression work), so
         // the introspection binding must carry it — omitting it here would
         // silently demote a lattice adapter back to its conservative boolean.
@@ -643,6 +671,8 @@ export interface FakeHarnessAdapterConfig {
   canRestrictTools?: boolean;
   /** Per-call gate capability fake (issue #21); absent = does not gate. */
   canGatePerCall?: boolean;
+  /** Write-confinement capability fake (issue #122); absent = cannot confine. */
+  canConfineWrites?: boolean;
   /** Per-list expressibility fake (the original per-list tool-expression work); absent = boolean-only adapter. */
   canExpressTools?: (tools: readonly string[]) => boolean;
   binaryPresent?: boolean;
@@ -658,6 +688,7 @@ export function makeFakeHarnessAdapter(config: FakeHarnessAdapterConfig = {}): {
     reportsUsage = true,
     canRestrictTools = true,
     canGatePerCall,
+    canConfineWrites,
     canExpressTools,
     binaryPresent = true,
     results = [],
@@ -669,6 +700,7 @@ export function makeFakeHarnessAdapter(config: FakeHarnessAdapterConfig = {}): {
     reportsUsage,
     canRestrictTools,
     ...(canGatePerCall !== undefined ? { canGatePerCall } : {}),
+    ...(canConfineWrites !== undefined ? { canConfineWrites } : {}),
     ...(canExpressTools !== undefined ? { canExpressTools } : {}),
     async probeBinary(): Promise<BinaryProbe> {
       return { present: binaryPresent };

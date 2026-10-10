@@ -96,12 +96,12 @@ What it does not cover:
   `curl -o`, `tee`, `sed -i`, `awk` (`system()`). Listing one of them allows what it can
   do, so the Bash allowlist constrains only what the flow author chooses to list.
 - A Bash write that bypasses the path check. Redirects are refused, but a write by an
-  allowlisted program to a path in its arguments is not. Issue
-  [#122](https://github.com/theaiteam-dev/conduit/issues/122) (Landlock write confinement)
-  is the planned fix. The MARK_DONE owned-paths integrity check
-  stays mandatory as the backstop. On a station that declares `overlap: true`, the backstop
-  does not catch a Bash write into the owned paths of a card whose call overlapped this one:
-  the check attributes the path to that card (SPEC §7, "Overlapping harness calls").
+  allowlisted program to a path in its arguments is not. On the serial path the MARK_DONE
+  owned-paths integrity check stays mandatory as the backstop and holds the card after the
+  call. An overlapped call (`overlap: true`) runs under Landlock write confinement, which
+  refuses such a write at the syscall when it targets anything outside the call's writable
+  set, including the owned paths of a card whose call overlapped this one (see
+  [Write confinement of overlapped calls](#write-confinement-of-overlapped-calls)).
 - Reads outside the project root, and a symlink swapped between the check and the write.
 - The input of `Agent` and of any other listed tool that is not a file tool.
 - On `agent-sdk`, an input rewritten by another `PreToolUse` hook after the gate approved
@@ -362,7 +362,7 @@ the directory. Every invocation is a fresh session. The model must be set as `pr
 ## The containment profile
 
 Because the kernel can't gate what happens inside the harness's own loop, containment is a
-**documented profile at the process boundary** instead of per-call enforcement. Five things
+**documented profile at the process boundary** instead of per-call enforcement. These
 hold it together:
 
 - **Mandatory owned-paths integrity gate.** Every write the harness makes is checked against
@@ -406,6 +406,10 @@ hold it together:
   Deployment guidance additionally recommends running the container as a dedicated non-root
   user for agentic/harness flows. [`deployment-hardening.md`](deployment-hardening.md) is
   that guidance in full.
+- **Write confinement of overlapped calls.** A call that runs as a member of a harness
+  overlap batch runs under Landlock, which refuses a write outside the card's owned paths
+  and the call's own temp and config dirs before it happens. Serial calls are not confined.
+  See [Write confinement of overlapped calls](#write-confinement-of-overlapped-calls).
 - **Optional idle timeout.** `timeout_seconds` bounds the whole invocation, so a harness
   stuck on a hung tool call runs until that bound. `idle_timeout_seconds` adds a second
   bound, reset by every stdout line: if no line arrives for that long, the runner kills the
@@ -518,6 +522,90 @@ and `--privileged` removes more isolation than this recovers, so under Docker ex
 fallback. The kernel's own tests require the cgroup mechanism in CI
 (`CONDUIT_REQUIRE_CGROUP_CONTAINMENT=1`); on a development host without it, the tests that
 need it are reported as skipped with the reason.
+
+## Write confinement of overlapped calls
+
+A station that declares `overlap: true` runs several cards' harness calls at once
+([ADR-0012](../adr/0012-overlapping-ungated-harness-calls.md)). Their integrity diffs
+attribute a touched path inside a sibling's owned paths to that sibling, so on its own the
+diff cannot tell a sibling's own write from one another member made there. Each member of an
+overlap batch therefore runs its whole process tree under Landlock, an unprivileged Linux
+security module ([ADR-0013](../adr/0013-os-enforced-write-confinement-of-overlapped-harness-calls.md),
+[#122](https://github.com/theaiteam-dev/conduit/issues/122)).
+
+**Mechanism.** The adapter's spawn runs the CLI through `llexec`
+([`native/llexec/llexec.c`](../native/llexec/llexec.c)), a small static helper, after the
+cgroup wrapper: the shell joins the invocation's cgroup and execs `llexec <writable
+paths> -- <cli>`, and `llexec` creates a Landlock ruleset that handles the write-type file
+rights of the highest ABI the kernel reports, grants them beneath each writable path, sets
+`no_new_privs`, restricts itself, and execs the CLI. Reads and executes are not handled, so
+they stay allowed everywhere. The ruleset is inherited by every descendant and cannot be
+removed, so a Bash-tool command that calls `setsid()` stays confined. A write outside the
+set fails with `EACCES` (`Permission denied`) and changes nothing. `llexec` never runs the
+CLI unconfined: if it cannot open a writable path or apply the ruleset, it prints a line
+starting with `llexec:` and exits 121 before the exec, and the call fails as a spawn failure
+does.
+
+**The writable set** of one call is the card's canonical `owned_paths` (each must exist
+when the batch is admitted, or the card runs on the serial path), a per-call temp dir,
+the adapter's run-scoped config dirs, and `/dev`. Per adapter:
+
+| Adapter | Run-scoped dirs granted | Env pointed into the per-call temp dir | How the set was established |
+|---|---|---|---|
+| `agent-sdk` | `CLAUDE_CONFIG_DIR`, created for every confined call whatever `_ISOLATE_CONFIG` says | `TMPDIR`, `TMPPREFIX`, `XDG_CACHE_HOME`, `XDG_STATE_HOME` | strace of `claude -p` 2.1.296, then a live confined call through the adapter |
+| `codex-app-server` | `CODEX_HOME` (run-scoped on every call) | `TMPDIR`, `TMPPREFIX`, `XDG_CACHE_HOME`, `XDG_STATE_HOME` | a live confined call through the adapter (codex 0.161.0) under strace |
+| `opencode` | the run-scoped root holding `HOME` and the four XDG dirs | `TMPDIR`, `TMPPREFIX` | a live confined call through the adapter (opencode 1.15.10, `openai/gpt-4.1-mini`) under strace |
+
+In each live call the agent wrote its own output file with its file tool and then ran
+`cp` into a sibling's dir; the copy failed with `Permission denied`, and strace showed no
+other refused write except the ones below. What the Claude Code CLI writes outside its
+config dir: version locks under `$XDG_STATE_HOME/claude/locks` and logs under
+`$XDG_CACHE_HOME/claude-cli-nodejs`, which default to the operator's home, hence the XDG
+variables; here-document files from its zsh under `$TMPPREFIX`, which defaults to `/tmp/zsh`;
+and a unix socket under `/tmp/cc-socks-<uid>`, which is refused, and the call works without
+it. The `.credentials.json` in a run-scoped config dir is a link to the operator's file, so a
+refreshed OAuth token written through the link would be refused. No refresh happened in the
+verification runs.
+
+**Detection.** The kernel decides once per process whether confinement is available. It
+finds the helper (`CONDUIT_LLEXEC`, which must name an executable file; else
+`native/llexec/build/llexec` in a source checkout, built by `bun run build:llexec`; else
+`llexec` on `PATH`, where the engine image installs it), asks it for the Landlock ABI, and
+runs a real write test through it: a write inside the writable path must succeed and one
+outside it must be refused. `conduit doctor` reports the result as the `write-confinement`
+probe. When the probe fails, every card of an `overlap: true` station runs on the serial
+path, its spans carry `overlap_fallback: "write confinement unavailable: <reason>"`, and the
+run warns once. No overlapped call runs unconfined. An adapter without `canConfineWrites`
+is treated the same way, with its own reason.
+
+This requires Linux 5.13 or later with `landlock` in the active LSM list
+(`/sys/kernel/security/lsm`). Linux 5.19 (ABI 2) adds cross-directory rename and link;
+under ABI 1 every cross-directory rename or link is refused, including inside the set.
+Linux 6.2 (ABI 3) adds `truncate(2)`; before it, a confined process can truncate a file
+outside the set. A default Docker container allows the Landlock syscalls: the engine image
+probe passes in one (Docker on a 6.8 host kernel). Docker Desktop's VM kernel was not
+checked. CI builds the helper and sets `CONDUIT_REQUIRE_LANDLOCK=1`, so the
+write-confinement tests fail rather than skip if the runner loses Landlock; on a
+development host without it they are reported as skipped with the reason.
+
+**Evidence.** The containment conformance suite runs a write-confinement case for every
+adapter with `canConfineWrites`, through its real spawn path, with a stand-in binary
+([`src/worker/landlock-write-fixture.sh`](../src/worker/landlock-write-fixture.sh)) that
+tries `cp`, `mv` and a symlink into a sibling's dir, a `setsid` child writing there, and an
+append to a shared project file. Every one must be refused while the call's own dir, its
+`TMPDIR` and its run-scoped config dirs stay writable; a control case runs the fixture
+unconfined and requires the sibling writes to land.
+
+**Not covered:**
+
+- Metadata. `chmod`, `chown`, `utimes` and extended attributes are not Landlock write
+  rights, so a member can change a sibling's file modes or times, though not its contents.
+- Writes made on the call's behalf by a process that is not confined, such as a daemon
+  reached over a socket.
+- Network egress (see [Network posture](#network-posture-full-egress-in-v1)).
+- Reads. Everything the kernel's user can read stays readable.
+- Serial calls, gate critics and deterministic stations. They run as before, with the
+  integrity diff as the backstop.
 
 ## The child's configuration surface
 

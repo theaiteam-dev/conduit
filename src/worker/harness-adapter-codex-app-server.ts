@@ -77,6 +77,7 @@ import { HARNESS_GATE_HOLD_CODE, callGateFailClosed, type GateDecision, type Gat
 import { buildHarnessChildEnv } from './harness-runner';
 import { isContainedIn, resolveOwnedPath } from './integrity';
 import { resolveContainment, type Containment } from './cgroup-containment';
+import { confinedWritableSet, callTempDirEnv, createCallTempDir, removeCallTempDir, type CallTempDir } from './landlock-confinement';
 
 export interface CodexAppServerHarnessAdapterConfig {
   /** Absolute project root: the app-server's cwd and the confinement root for commands. */
@@ -526,6 +527,7 @@ export function createCodexAppServerHarnessAdapter(config: CodexAppServerHarness
     // Grep tool: it reads through shell commands, which need `Bash(<exe>)` entries.
     canRestrictTools: true,
     canGatePerCall: true,
+    canConfineWrites: true,
     model: config.model,
 
     async probeBinary(): Promise<BinaryProbe> {
@@ -548,10 +550,21 @@ export function createCodexAppServerHarnessAdapter(config: CodexAppServerHarness
       const baseEnv = buildHarnessChildEnv(config.envAllowlist, sourceEnv);
       // Throws before anything is spawned when the child could not authenticate.
       const codexHome = createRunScopedCodexHome(sourceEnv, config.envAllowlist);
+      // Issue #122: a write-confined call gets a per-call temp dir that TMPDIR and the XDG cache and state
+      // dirs point at. CODEX_HOME is already run-scoped on every call.
+      const confined = call.confinement;
+      let callTmp: CallTempDir | undefined;
+      try {
+        if (confined !== undefined) callTmp = createCallTempDir();
+      } catch (err) {
+        removeRunScopedCodexHome(codexHome);
+        throw err;
+      }
       const env: Record<string, string> = {
         ...baseEnv,
         PATH: baseEnv.PATH ?? sourceEnv.PATH ?? '/usr/local/bin:/usr/bin:/bin',
         CODEX_HOME: codexHome,
+        ...(callTmp !== undefined ? callTempDirEnv(callTmp, { xdg: true }) : {}),
       };
 
       // Every throw from here on must remove the dir, and the process must be dead first.
@@ -992,7 +1005,20 @@ export function createCodexAppServerHarnessAdapter(config: CodexAppServerHarness
         let outcome: Outcome;
         try {
           const proc = spawnFn(
-            { command: executable, args: [...CODEX_APP_SERVER_ARGS], cwd: config.projectRoot, env },
+            {
+              command: executable,
+              args: [...CODEX_APP_SERVER_ARGS],
+              cwd: config.projectRoot,
+              env,
+              ...(confined !== undefined && callTmp !== undefined
+                ? {
+                    confinement: {
+                      helper: confined.helper,
+                      writable: confinedWritableSet(confined.writable, [callTmp.root, codexHome]),
+                    },
+                  }
+                : {}),
+            },
             handlers,
           );
           active = { proc };
@@ -1119,6 +1145,7 @@ export function createCodexAppServerHarnessAdapter(config: CodexAppServerHarness
         } catch (err) {
           process.stderr.write(`codex-app-server: ${err instanceof Error ? err.message : String(err)}\n`);
         }
+        if (callTmp !== undefined) removeCallTempDir(callTmp);
       }
     },
   };
