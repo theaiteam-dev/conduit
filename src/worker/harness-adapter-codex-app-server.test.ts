@@ -560,13 +560,13 @@ describe('codex-app-server adapter: process, env and CODEX_HOME', () => {
 
   it('removes the codex home when the per-call temp dir cannot be created, before anything is spawned', async () => {
     const server = fakeServer((p) => p.completeTurn());
-    const live = await withFailingCallTempDir('conduit-codex-home-', async () => {
+    const { live, leftBehind } = await withFailingCallTempDir('conduit-codex-home-', async () => {
       const err = await rejection(adapterWith(server).invoke(invocation({ confinement: { helper: '/nonexistent/helper', writable: [ROOT] } })));
       expect(err.message).toBe('simulated call temp dir failure');
     });
     expect(server.state.spec).toBeUndefined();
     expect(live.length).toBe(1);
-    expect(existsSync(live[0]!)).toBe(false);
+    expect(leftBehind).toEqual([]);
   });
 
   it('removes the codex home after a timeout kill', async () => {

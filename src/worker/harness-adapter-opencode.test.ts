@@ -544,7 +544,7 @@ describe('opencode adapter: process, auth and environment', () => {
 
   it('removes the run-scoped dirs when the per-call temp dir cannot be created, before anything is spawned', async () => {
     const fake = fakeOpenCode((s) => finish(s));
-    const live = await withFailingCallTempDir('conduit-opencode-', async () => {
+    const { live, leftBehind } = await withFailingCallTempDir('conduit-opencode-', async () => {
       let thrown: Error | undefined;
       try {
         await adapterWith(fake).invoke(invocation({ confinement: { helper: '/nonexistent/helper', writable: [ROOT] } }));
@@ -555,7 +555,7 @@ describe('opencode adapter: process, auth and environment', () => {
     });
     expect(fake.state.spec).toBeUndefined();
     expect(live.length).toBe(1);
-    for (const dir of live) expect(existsSync(dir)).toBe(false);
+    expect(leftBehind).toEqual([]);
   });
 
   it('creates the XDG directories before the call and removes them on success', async () => {

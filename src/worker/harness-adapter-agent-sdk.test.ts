@@ -394,7 +394,7 @@ describe('agent-sdk adapter: isolateConfig', () => {
 
   it('removes the run-scoped config dir when the per-call temp dir cannot be created, before anything is spawned', async () => {
     const { query, seen } = scripted(async function* () { yield RESULT_OK; });
-    const live = await withFailingCallTempDir('conduit-claude-config-', async () => {
+    const { live, leftBehind } = await withFailingCallTempDir('conduit-claude-config-', async () => {
       const err = await rejection(
         makeAdapter(query, { sourceEnv: { ANTHROPIC_API_KEY: 'sk-test' }, envAllowlist: ['ANTHROPIC_API_KEY'] }).invoke(
           invocation({ gate: allowAll, confinement: { helper: '/nonexistent/helper', writable: [ROOT] } }),
@@ -404,7 +404,7 @@ describe('agent-sdk adapter: isolateConfig', () => {
     });
     expect(seen).toEqual([]);
     expect(live.length).toBe(1);
-    expect(existsSync(live[0]!)).toBe(false);
+    expect(leftBehind).toEqual([]);
   });
 
   it('fails before spawning when there is nothing to authenticate with', async () => {
