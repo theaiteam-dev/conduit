@@ -182,8 +182,9 @@ decomposed tasks. Children get disjoint `owned_paths`, validated at expansion. (
 
 **fan-in** — the join: a downstream station that collects a parent's children. Its
 failure policy defines what a scrapped or held child does to the parent:
-`all` (one scrap or hold holds the parent), `quorum(k)`, or `best_effort`. A child in
-`hold` is never merged. (SPEC §6)
+`all` (one scrap or hold holds the parent), `quorum(k)`, or `best_effort` (both tolerate
+scrapped children only). A child in `hold` holds the parent under every policy and is never
+merged. (SPEC §6)
 
 **k (quorum)** — an **integer count**, `1 ≤ k ≤ fan_out`: the minimum number of children
 that must reach a terminal lane other than `scrap` or `hold` for the fan-in to proceed. A

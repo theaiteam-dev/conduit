@@ -412,17 +412,30 @@ describe('runExecutor fan-in — a child in the hold lane is not a survivor', ()
     expect(terminalReasons(PARENT_ID)).toContain('fan-in child_held');
   });
 
-  it('counts it against the quorum', async () => {
+  it('holds the parent under quorum even when the quorum is met without it (fan-in child_held)', async () => {
+    db = openFreshDb();
+    seedParentAwaitingChildren(db);
+    seedChild(db, 'c1', 'done', 'complete', ['out/c1.json']);
+    seedChild(db, 'c2', 'done', 'complete', ['out/c2.json']);
+    seedChild(db, 'c3', 'hold', 'held', ['out/c3.json']);
+
+    await run(noopAdapter());
+
+    expect(db.getCard(DEFAULT_RUN_ID, PARENT_ID)?.status).toBe('held');
+    expect(departedFromLane(db, PARENT_ID, RESUME_AT)).toBe(false);
+    expect(terminalReasons(PARENT_ID)).toContain('fan-in child_held');
+  });
+
+  it('holds the parent under best_effort (fan-in child_held)', async () => {
     db = openFreshDb();
     seedParentAwaitingChildren(db);
     seedChild(db, 'c1', 'done', 'complete', ['out/c1.json']);
     seedChild(db, 'c2', 'hold', 'held', ['out/c2.json']);
-    seedChild(db, 'c3', 'scrap', 'scrapped', ['out/c3.json']);
 
-    await run(noopAdapter());
+    await run(noopAdapter(), '{ policy: best_effort }');
 
-    // survivors = 1 < k(2).
     expect(db.getCard(DEFAULT_RUN_ID, PARENT_ID)?.status).toBe('held');
-    expect(terminalReasons(PARENT_ID)).toContain('fan-in quorum_unmet');
+    expect(departedFromLane(db, PARENT_ID, RESUME_AT)).toBe(false);
+    expect(terminalReasons(PARENT_ID)).toContain('fan-in child_held');
   });
 });

@@ -7,11 +7,11 @@
  * events an `opencode serve` would send and observe the replies it gets back.
  * No test here starts opencode or calls a model.
  */
-import { describe, it, expect, afterAll, spyOn } from 'bun:test';
+import { describe, it, expect, afterAll } from 'bun:test';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import * as landlock from './landlock-confinement';
+import { withFailingCallTempDir } from './harness-call-temp-dir.test-helper';
 import { describeHarnessContainmentConformance } from './harness-containment.conformance';
 import {
   OPENCODE_SERVE_ARGS,
@@ -427,25 +427,6 @@ const replies = (o: Outcome): Json[] =>
 const gateDecisions = (o: Outcome) => o.events.filter((e) => e.type === 'gate-decision') as Array<Extract<HarnessEvent, { type: 'gate-decision' }>>;
 
 // ---------------------------------------------------------------------------
-
-/**
- * Run `body` with createCallTempDir forced to throw, and return the run-scoped dirs (under `prefix`) that
- * existed at the moment it threw. The adapter has made its config/home dir by then and nothing else.
- */
-async function withFailingCallTempDir(prefix: string, body: () => Promise<void>): Promise<string[]> {
-  const before = new Set(readdirSync(tmpdir()).filter((n) => n.startsWith(prefix)));
-  let live: string[] = [];
-  const spy = spyOn(landlock, 'createCallTempDir').mockImplementation(() => {
-    live = readdirSync(tmpdir()).filter((n) => n.startsWith(prefix) && !before.has(n)).map((n) => join(tmpdir(), n));
-    throw new Error('simulated call temp dir failure');
-  });
-  try {
-    await body();
-  } finally {
-    spy.mockRestore();
-  }
-  return live;
-}
 
 describe('opencode adapter: process, auth and environment', () => {
   it('starts `opencode serve` on a random loopback port and pins the arguments', async () => {

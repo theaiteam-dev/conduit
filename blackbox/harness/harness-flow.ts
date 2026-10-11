@@ -201,14 +201,24 @@ export function startStubSink(stateDir: string, logPath: string): ReturnType<typ
         b.arrived += 1;
         if (b.arrived >= parties) {
           for (const r of b.release.splice(0)) r();
+          // Drop the entry so a later use of the same name starts from zero.
+          barriers.delete(name);
           return Response.json({ released: true });
         }
         const released = await new Promise<boolean>((res) => {
-          const timer = setTimeout(() => res(false), timeoutMs);
-          b.release.push(() => {
+          const onRelease = (): void => {
             clearTimeout(timer);
             res(true);
-          });
+          };
+          const timer = setTimeout(() => {
+            // A party that gave up no longer counts toward the barrier.
+            b.arrived -= 1;
+            const i = b.release.indexOf(onRelease);
+            if (i >= 0) b.release.splice(i, 1);
+            if (b.arrived <= 0 && barriers.get(name) === b) barriers.delete(name);
+            res(false);
+          }, timeoutMs);
+          b.release.push(onRelease);
         });
         return Response.json({ released });
       }

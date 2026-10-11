@@ -2312,7 +2312,7 @@ function runOwnedPathsIntegrity(
   projectRoot: string,
   ownedPaths: readonly string[],
   touchedPaths: readonly string[],
-  deletedPaths: readonly string[] = [],
+  deletedPaths: readonly string[],
 ): IntegrityResult | null {
   if (ownedPaths.length === 0) return null;
   return checkIntegrity({
@@ -3891,7 +3891,11 @@ async function executeTransformStation(args: TransformArgs): Promise<boolean> {
     // project-root locations nothing wrote to (a false violation for scoped
     // stations, a false pass for the actual writes).
     const touchedOutputs = declaredOutputs.map((output) => output.path);
-    const violation = runOwnedPathsIntegrity(projectRoot, card.owned_paths ?? [], touchedOutputs);
+    const violation = runOwnedPathsIntegrity(
+      projectRoot, card.owned_paths ?? [], touchedOutputs,
+      // The transform writer only writes its declared outputs: there is no snapshot and nothing it can delete.
+      [],
+    );
     if (violation && !violation.ok) {
       invalidateCheckpoint(stateDb, { run: runId, flow: String(flow.version), card: cardId, station: stationId, attempt: card.attempt });
       escalateToHold(stateDb, db, cardId, stationId, card, `integrity violation (owned_paths): project root modified during transform station '${stationId}' by an undeclared write — either the station escaped its owned_paths, or another process wrote to the project root while it ran: ${describeIntegrity(violation)}`, err, runId);

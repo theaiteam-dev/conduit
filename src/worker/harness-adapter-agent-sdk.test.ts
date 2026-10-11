@@ -4,14 +4,14 @@
  * process (the kill paths) starts one through `options.spawnClaudeCodeProcess`,
  * the same hook the SDK would call.
  */
-import { describe, it, expect, spyOn } from 'bun:test';
+import { describe, it, expect } from 'bun:test';
 import type { ChildProcess } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Options, SDKMessage } from '@anthropic-ai/claude-agent-sdk';
 import { describeHarnessContainmentConformance } from './harness-containment.conformance';
-import * as landlock from './landlock-confinement';
+import { withFailingCallTempDir } from './harness-call-temp-dir.test-helper';
 import { createAgentSdkHarnessAdapter, type AgentSdkHarnessAdapterConfig, type AgentSdkQueryFn } from './harness-adapter-agent-sdk';
 import {
   bindHarnessDefinitionsForIntrospection, buildHarnessDefinitionRegistry, shippedHarnessAdapterNames,
@@ -327,25 +327,6 @@ describe('agent-sdk adapter: options handed to the SDK', () => {
     expect(seen[0]!.env).toEqual({ KEEP: '1' });
   });
 });
-
-/**
- * Run `body` with createCallTempDir forced to throw, and return the run-scoped dirs (under `prefix`) that
- * existed at the moment it threw. The adapter has made its config/home dir by then and nothing else.
- */
-async function withFailingCallTempDir(prefix: string, body: () => Promise<void>): Promise<string[]> {
-  const before = new Set(readdirSync(tmpdir()).filter((n) => n.startsWith(prefix)));
-  let live: string[] = [];
-  const spy = spyOn(landlock, 'createCallTempDir').mockImplementation(() => {
-    live = readdirSync(tmpdir()).filter((n) => n.startsWith(prefix) && !before.has(n)).map((n) => join(tmpdir(), n));
-    throw new Error('simulated call temp dir failure');
-  });
-  try {
-    await body();
-  } finally {
-    spy.mockRestore();
-  }
-  return live;
-}
 
 describe('agent-sdk adapter: isolateConfig', () => {
   function home(): string {

@@ -442,16 +442,27 @@ export type FanInDecision =
  *
  * A survivor is a child in a terminal lane other than `scrap` or `hold`. A
  * held child is escalated to a human, not finished: its output is unchecked
- * (an integrity breach holds the card with the out-of-bounds write on disk),
- * so no policy merges it.
+ * (an integrity breach holds the card with the out-of-bounds write on disk).
+ * The kernel has no merge step that could filter it out, the resume station
+ * reads whatever is on disk, so a held child holds the parent under EVERY
+ * policy (child_held). Only scrapped children are tolerated by quorum and
+ * best_effort, and `dropped` therefore only ever contains scrapped children
+ * (or children still in flight once a quorum is met).
  *
  * - all:         all children must reach a terminal lane; any scrap → hold_parent
  *                (child_scrapped), else any hold → hold_parent (child_held).
- * - quorum(k):   at least k children (a COUNT, not a ratio) must be survivors:
+ * - quorum(k):   a held child → hold_parent (child_held), checked first. Else at
+ *                least k children (a COUNT, not a ratio) must be survivors:
  *                proceeds iff survivorCount >= k.
  *                Proceeds without deadlock when a child can never complete — it
  *                is recorded as dropped.
- * - best_effort: proceed with whatever survivors exist; scrapped and held = dropped.
+ * - best_effort: a held child → hold_parent (child_held). Else proceed with
+ *                whatever survivors exist; scrapped = dropped.
+ *
+ * Ordering: `all` waits for every child to be terminal before deciding. quorum
+ * and best_effort hold as soon as a held child is seen, without waiting for
+ * in-flight siblings, because the parent cannot proceed past it whatever they
+ * do. A scrapped child never takes precedence over a held one under these two.
  *
  * Empty children (total === 0) is a defined no-op: every policy returns
  * `proceed` with no dropped children, matching the `all` policy's behaviour.
@@ -473,6 +484,7 @@ export function evaluateFanIn(policy: FanInPolicy, state: FanInState): FanInDeci
   const survivorCount = survivorIds.size;
   const terminalCount = terminalOutcomes.length;
   const inFlight = total - terminalCount;
+  const hasHeld = terminalOutcomes.some((o) => o.lane === 'hold');
 
   switch (policy.kind) {
     case 'all': {
@@ -487,6 +499,7 @@ export function evaluateFanIn(policy: FanInPolicy, state: FanInState): FanInDeci
     }
 
     case 'quorum': {
+      if (hasHeld) return { action: 'hold_parent', reason: 'child_held' };
       const k = policy.k; // a COUNT: minimum number of surviving children required.
 
       // Quorum already met — proceed; non-survivors (incl. never-completed) are dropped.
@@ -505,7 +518,8 @@ export function evaluateFanIn(policy: FanInPolicy, state: FanInState): FanInDeci
     }
 
     case 'best_effort': {
-      // Always proceed; non-survivors are dropped.
+      if (hasHeld) return { action: 'hold_parent', reason: 'child_held' };
+      // Proceed; scrapped and still-in-flight children are dropped.
       const dropped = childIds.filter((id) => !survivorIds.has(id));
       return { action: 'proceed', dropped };
     }

@@ -30,6 +30,9 @@ export interface IntegrityInput {
   /**
    * Paths that existed before this execution attempt and are gone after it.
    * A delete is a write (SPEC §7), so each must lie inside owned_paths too.
+   * A caller that diffs a baseline snapshot MUST pass it, or a delete outside
+   * owned_paths goes unseen. Callers checking a single kernel-written file
+   * have no snapshot and omit it.
    */
   deletedPaths?: readonly string[];
   /** Output artifacts that MUST exist after the station completes. */

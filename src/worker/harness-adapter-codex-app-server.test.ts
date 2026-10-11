@@ -6,11 +6,11 @@
  * requests and notifications and records what the adapter answers. No test
  * here starts codex or calls a model.
  */
-import { describe, it, expect, afterAll, spyOn } from 'bun:test';
+import { describe, it, expect, afterAll } from 'bun:test';
 import { existsSync, lstatSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, mkdirSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import * as landlock from './landlock-confinement';
+import { withFailingCallTempDir } from './harness-call-temp-dir.test-helper';
 import { describeHarnessContainmentConformance } from './harness-containment.conformance';
 import {
   CODEX_APP_SERVER_ARGS,
@@ -476,25 +476,6 @@ describe('codex-app-server adapter: handshake', () => {
     expect(err.message).toContain('bad thread');
   });
 });
-
-/**
- * Run `body` with createCallTempDir forced to throw, and return the run-scoped dirs (under `prefix`) that
- * existed at the moment it threw. The adapter has made its config/home dir by then and nothing else.
- */
-async function withFailingCallTempDir(prefix: string, body: () => Promise<void>): Promise<string[]> {
-  const before = new Set(readdirSync(tmpdir()).filter((n) => n.startsWith(prefix)));
-  let live: string[] = [];
-  const spy = spyOn(landlock, 'createCallTempDir').mockImplementation(() => {
-    live = readdirSync(tmpdir()).filter((n) => n.startsWith(prefix) && !before.has(n)).map((n) => join(tmpdir(), n));
-    throw new Error('simulated call temp dir failure');
-  });
-  try {
-    await body();
-  } finally {
-    spy.mockRestore();
-  }
-  return live;
-}
 
 describe('codex-app-server adapter: process, env and CODEX_HOME', () => {
   it('starts app-server first, with web search and the login shell turned off', async () => {

@@ -281,8 +281,8 @@ against the matrix.
 | Card created (parent or child) | Starts as `(lane=intake, status=waiting)`. On the first tick the kernel evaluates deps; if satisfied, transitions to `(lane=<first_station>, status=ready)`; otherwise stays `status=waiting` until deps clear. `intake` is transient — no card lingers there. |
 | `hold` with no human | does **not** consume budget; if `hold_timeout` is set, the kernel applies the card's `on_timeout` action — `scrap`, `proceed_with_findings`, or `escalate` (§4A). If `hold_timeout` is omitted, the card holds indefinitely. `on_timeout` is **required** when `hold_timeout` is set; the kernel rejects the config at load otherwise. |
 | Andon trips mid-flight | new claims blocked; in-flight workers **drain-and-checkpoint** (§8). |
-| Parent fanned-out, child scraps | fan-in policy decides (§6): `all` → parent holds/scraps; `quorum(k)`/`best_effort` → proceed. |
-| Parent fanned-out, child lands in `hold` | the child is not a survivor (§6): `all` → parent holds (`child_held`); `quorum(k)` counts it as missing; `best_effort` drops it. |
+| Parent fanned-out, child scraps | fan-in policy decides (§6): `all` → parent holds/scraps; `quorum(k)`/`best_effort` → proceed with the child dropped. |
+| Parent fanned-out, child lands in `hold` | the child is not a survivor (§6): the parent holds (`child_held`) under every policy, `quorum(k)` and `best_effort` included. |
 
 ---
 
@@ -825,10 +825,13 @@ express it (this is why Conduit is a state machine, not Airflow). It is bounded 
 `fan_in: { policy: all | quorum(k) | best_effort }`. Defines what a scrapped or held child
 does to the assembler and parent. A **survivor** is a child in a terminal lane other than
 `scrap` or `hold`. A child in `hold` was escalated to a human, not finished: its output is
-unchecked, and an integrity breach leaves the out-of-bounds write on disk, so no policy merges
-it. `all` → one scrap or hold holds the parent (A(i)-Team: don't ship a partial product),
-journaled as `fan-in child_scrapped` or `fan-in child_held`. `quorum(k)`/`best_effort` →
-proceed and record the dropped children, held ones included. **`k` is a count (integer,
+unchecked, and an integrity breach leaves the out-of-bounds write on disk. The kernel has no
+merge step that could filter it out (the resume station reads what is on disk), so **a held
+child holds the parent under every policy**, journaled as `fan-in child_held`. `all` → one
+scrap also holds the parent (A(i)-Team: don't ship a partial product), journaled as
+`fan-in child_scrapped`. `quorum(k)`/`best_effort` tolerate **scrapped** children only: they
+proceed and record the dropped (scrapped) children. Under these two a held child holds the
+parent as soon as it is seen, without waiting for in-flight siblings. **`k` is a count (integer,
 `1 ≤ k ≤ fan_out`):** the minimum number of survivors for the fan-in to proceed. `k: 9` with
 `fan_out: 10` = tolerate one scrapped child. A count, not a ratio — no rounding ambiguity
 on small fan-outs, and the loader validates it against `fan_out` at load time. A child
