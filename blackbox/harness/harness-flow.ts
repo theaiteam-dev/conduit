@@ -289,20 +289,26 @@ export function startHarnessFlow<R = FakeClaudeRole>(opts: HarnessFlowOptions<R>
   const roles = typeof opts.roles === "function" ? opts.roles({ scratchDir }) : opts.roles;
   const sink = opts.stubSink === true ? startStubSink(stateDir, logPath) : undefined;
   const scenarioPath = join(stubDir, "scenario.json");
-  writeFileSync(
-    scenarioPath,
-    JSON.stringify(
-      { stateDir, logPath, ...(sink !== undefined ? { sinkUrl: `http://127.0.0.1:${sink.port}` } : {}), roles },
-      null,
-      2,
-    ),
-  );
-
-  // The adapter scrubs the child env to its allowlist, so `bun` may not be on
-  // the child's PATH. The wrapper names the running bun binary absolutely.
   const wrapper = join(stubDir, stub.binName);
-  writeFileSync(wrapper, `#!/bin/sh\nexec '${process.execPath}' '${stub.script}' "$@"\n`);
-  chmodSync(wrapper, 0o755);
+  // Nothing stops the sink until the flow is returned, so a setup failure stops it here.
+  try {
+    writeFileSync(
+      scenarioPath,
+      JSON.stringify(
+        { stateDir, logPath, ...(sink !== undefined ? { sinkUrl: `http://127.0.0.1:${sink.port}` } : {}), roles },
+        null,
+        2,
+      ),
+    );
+
+    // The adapter scrubs the child env to its allowlist, so `bun` may not be on
+    // the child's PATH. The wrapper names the running bun binary absolutely.
+    writeFileSync(wrapper, `#!/bin/sh\nexec '${process.execPath}' '${stub.script}' "$@"\n`);
+    chmodSync(wrapper, 0o755);
+  } catch (err) {
+    sink?.stop(true);
+    throw err;
+  }
 
   runCounter += 1;
   const runId = `bbh-${process.pid}-${runCounter}`;

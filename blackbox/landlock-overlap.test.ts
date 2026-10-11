@@ -381,7 +381,9 @@ describe("landlock journey: without write confinement, overlap falls back to ser
 
   test("unconfined, c1's attacks landed", () => {
     const c1 = byRole(f).get("c1")!;
-    for (const a of c1.answers) expect({ label: a.label, exitCode: a.exitCode ?? 0 }).toEqual({ label: a.label, exitCode: 0 });
+    for (const a of c1.answers.filter((x) => ATTACK_LABELS.includes(x.label))) {
+      expect({ label: a.label, exitCode: a.exitCode }).toEqual({ label: a.label, exitCode: 0 });
+    }
     expect(existsSync(join(f.projectRoot, "evidence", "c2", "planted.json"))).toBe(true);
     expect(existsSync(join(f.projectRoot, "evidence", "c2", "via-link.json"))).toBe(true);
     expect(existsSync(join(f.projectRoot, "evidence", "c2", "notes.md"))).toBe(false);

@@ -293,6 +293,14 @@ async function sinkPost(sinkUrl: string, path: string, body: string, timeoutMs =
   return (await res.json()) as Json;
 }
 
+/** The sink's call number for `role`. A malformed answer fails the call rather than running the default scenario. */
+async function claimSinkCallNumber(sinkUrl: string, role: string): Promise<number> {
+  const claim = (await sinkPost(sinkUrl, "/call", JSON.stringify({ role }))).call;
+  const n = Number(claim);
+  if (!Number.isInteger(n) || n < 1) throw new Error(`stub sink /call returned a bad call number: ${JSON.stringify(claim)}`);
+  return n;
+}
+
 /** Same exclusive-create claim as fake-claude, so concurrent calls never share a number. */
 function nextCallNumber(stateDir: string, role: string): number {
   mkdirSync(stateDir, { recursive: true });
@@ -390,9 +398,7 @@ async function main(): Promise<number> {
     const role = matches[0]!;
     const sinkUrl = scenario.sinkUrl;
     const callNumber =
-      sinkUrl !== undefined
-        ? Number((await sinkPost(sinkUrl, "/call", JSON.stringify({ role: role.name }))).call)
-        : nextCallNumber(scenario.stateDir, role.name);
+      sinkUrl !== undefined ? await claimSinkCallNumber(sinkUrl, role.name) : nextCallNumber(scenario.stateDir, role.name);
     const call = role.calls[Math.min(callNumber, role.calls.length) - 1] ?? {};
     const startedAt = Date.now();
     const cwd = process.cwd();
