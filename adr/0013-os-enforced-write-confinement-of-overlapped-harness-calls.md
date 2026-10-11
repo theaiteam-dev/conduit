@@ -98,8 +98,9 @@ check `truncate(2)`, so a confined member could empty a file in a sibling's owne
 changes the file's contents, and the overlap integrity rule would attribute it to the sibling,
 which is ADR-0012's gap again. On ABI 1 or 2 the probe reports confinement unavailable with a
 reason naming the minimum, and overlap candidates run serially. The helper itself stays
-ABI-generic, so the check lives in the probe, not in `llexec`. `conduit doctor` reports it as the `write-confinement` probe, which never
-fails.
+ABI-generic, so the check lives in the probe, not in `llexec`. `conduit doctor` reports it as the `write-confinement` probe. When confinement
+is unavailable the probe reports a warning naming the reason, never a FAIL, because overlap
+candidates then run serially, which is slower but not broken.
 
 Admission adds two conditions to ADR-0012's list, both checked at dispatch:
 

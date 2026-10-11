@@ -281,8 +281,14 @@ function argValue(argv: string[], flag: string): string | null {
   return i === -1 || i + 1 >= argv.length ? null : argv[i + 1]!;
 }
 
-async function sinkPost(sinkUrl: string, path: string, body: string): Promise<Json> {
-  const res = await fetch(`${sinkUrl}${path}`, { method: "POST", body, headers: { "content-type": "application/json" } });
+/** Bounded, so a stalled sink fails the call instead of hanging it. A barrier post passes its own wait plus a margin. */
+async function sinkPost(sinkUrl: string, path: string, body: string, timeoutMs = 30_000): Promise<Json> {
+  const res = await fetch(`${sinkUrl}${path}`, {
+    method: "POST",
+    body,
+    headers: { "content-type": "application/json" },
+    signal: AbortSignal.timeout(timeoutMs),
+  });
   if (!res.ok) throw new Error(`stub sink ${path} answered ${res.status}`);
   return (await res.json()) as Json;
 }
@@ -410,7 +416,8 @@ async function main(): Promise<number> {
     let barrierReleased: boolean | null = null;
     if (call.barrier !== undefined) {
       if (sinkUrl === undefined) throw new Error("a barrier needs the scenario's sinkUrl");
-      barrierReleased = (await sinkPost(sinkUrl, "/barrier", JSON.stringify(call.barrier))).released === true;
+      const waitMs = (call.barrier.timeoutMs ?? 15_000) + 30_000;
+      barrierReleased = (await sinkPost(sinkUrl, "/barrier", JSON.stringify(call.barrier), waitMs)).released === true;
     }
 
     const ungated = preToolUseCallbackIds.length === 0;
