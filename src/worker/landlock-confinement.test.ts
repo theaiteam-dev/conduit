@@ -480,7 +480,10 @@ describe('the real helper (issue #122)', () => {
     );
     const [stderr, code] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
     expect(code).toBe(LLEXEC_FAILED_EXIT);
-    expect(stderr).toContain('llexec: cannot open writable path');
+    // With O_PATH, O_NOFOLLOW opens the link itself rather than failing with ELOOP, so the refusal
+    // comes from the S_ISLNK check after fstat, not from the open.
+    expect(stderr).toContain(`llexec: cannot open writable path ${link}: it is a symbolic link`);
+    expect(stderr).not.toContain('Too many levels of symbolic links');
     expect(existsSync(marker)).toBe(false);
   });
 
