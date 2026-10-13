@@ -28,7 +28,20 @@
  * Every line of the log carries fake-claude's FakeClaudeLogEntry fields (so
  * harness-flow's stubLog() and orphan reaper work) plus a `kind`: `serve` at
  * start, `prompt` when the prompt arrives, `answer` for every permission
- * reply, `question-reject`, `abort` and `auth-rejected`.
+ * reply, `question-reject`, `abort`, `auth-rejected`, and `done` when a call
+ * that was not held has played every step.
+ *
+ * Write-confined calls (issue #122). When the kernel runs the server under the
+ * llexec helper, the fake and every command it runs can write only inside the
+ * call's writable set, so it cannot claim a counter file or append to
+ * `logPath`. With `sinkUrl` in the scenario (harness-flow's `stubSink` option)
+ * it claims its call number and sends every log line over HTTP instead, as
+ * fake-claude-sdk does. A call's `barrier` also goes through the sink: the
+ * call waits, before its first step, until `parties` calls have reached the
+ * barrier of that name. The `done` line records whether the barrier released
+ * it, when the call's steps started and ended, and the TMPDIR the server ran
+ * with, so a journey can order calls and check that the kernel's per-call
+ * temp dir is gone after the run.
  *
  * Launched through a generated `#!/bin/sh` wrapper that execs the running bun
  * binary on this file (see harness-flow.ts).
@@ -36,6 +49,7 @@
 
 import { appendFileSync, closeSync, mkdirSync, openSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
+import { awaitSinkBarrier, claimSinkCallNumber, sinkLog, type SinkBarrier } from "./stub-sink-client";
 import type { FakeClaudeLogEntry } from "./fake-claude";
 
 /** One tool call the fake asks permission for. */
@@ -56,6 +70,11 @@ export interface FakeOpenCodeCall {
   tokens?: { input: number; output: number; reasoning?: number; cacheRead?: number; cacheWrite?: number };
   /** `cost` on the assistant message. Default 0.001. */
   cost?: number;
+  /**
+   * Wait before the first step until `parties` calls have reached the barrier
+   * `name`, or `timeoutMs` (default 15000) has passed. Needs `sinkUrl`.
+   */
+  barrier?: SinkBarrier;
 }
 
 export interface FakeOpenCodeRole {
@@ -68,6 +87,8 @@ export interface FakeOpenCodeRole {
 export interface FakeOpenCodeScenario {
   stateDir: string;
   logPath: string;
+  /** harness-flow's stub sink: claim call numbers, log and wait at barriers over HTTP instead of files. */
+  sinkUrl?: string;
   roles: FakeOpenCodeRole[];
 }
 
@@ -84,10 +105,23 @@ export type FakeOpenCodeLogEntry = FakeClaudeLogEntry &
         message: string | null;
         /** Whether the step's effect ran (only on `once`). */
         performed: boolean;
+        /** Exit code of a bash command that ran. */
+        exitCode?: number;
       }
     | { kind: "question-reject"; step: number; callID: string }
     | { kind: "abort"; sessionID: string }
     | { kind: "auth-rejected"; method: string; path: string }
+    | {
+        kind: "done";
+        /** Overrides the log time: when the call's steps started (after the prompt arrived). */
+        startedAt: number;
+        /** When the last step finished, just before the call went idle. */
+        endedAt: number;
+        /** Whether the call's barrier released it (true) or timed out (false); null without a barrier. */
+        barrierReleased: boolean | null;
+        /** TMPDIR in the server's env, or null. */
+        tmpdir: string | null;
+      }
   );
 
 type Json = Record<string, unknown>;
@@ -109,7 +143,7 @@ function nextCallNumber(stateDir: string, role: string): number {
   }
 }
 
-function main(): void {
+async function main(): Promise<void> {
   const argv = process.argv.slice(2);
   const scenarioPath = process.env.FAKE_OPENCODE_SCENARIO;
   if (!scenarioPath) {
@@ -133,9 +167,11 @@ function main(): void {
   let callNumber = 0;
   let prompt = "";
   let model: string | null = null;
-  const log = (fields: Json): void => {
+  const sinkUrl = scenario.sinkUrl;
+  const log = async (fields: Json): Promise<void> => {
     const entry = { role, call: callNumber, argv, cwd, pid: process.pid, prompt, model, startedAt: Date.now(), ...fields };
-    appendFileSync(scenario.logPath, JSON.stringify(entry) + "\n");
+    if (sinkUrl !== undefined) await sinkLog(sinkUrl, entry);
+    else appendFileSync(scenario.logPath, JSON.stringify(entry) + "\n");
   };
 
   let askAll = false;
@@ -145,7 +181,7 @@ function main(): void {
   } catch {
     /* askAll stays false, which the log reports */
   }
-  log({ kind: "serve", askAll });
+  await log({ kind: "serve", askAll });
 
   let stream: ReadableStreamDefaultController<Uint8Array> | undefined;
   let eventNo = 0;
@@ -205,15 +241,20 @@ function main(): void {
         });
         const body = await answer;
         let performed = false;
+        let exitCode: number | undefined;
         if (body.reply === "once") {
           const proc = Bun.spawn(["sh", "-c", step.command], { cwd, stdout: "pipe", stderr: "pipe" });
           const [output, exit] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
           performed = true;
+          exitCode = exit;
           part(callID, "bash", { status: "completed", input, output, metadata: { exit }, title: step.command, time: { start: 0, end: 1 } });
         } else {
           part(callID, "bash", { status: "error", input, error: String(body.message ?? "rejected"), time: { start: 0, end: 1 } });
         }
-        log({ kind: "answer", step: i, permission: "bash", callID, reply: body.reply, message: body.message ?? null, performed });
+        await log({
+          kind: "answer", step: i, permission: "bash", callID, reply: body.reply, message: body.message ?? null, performed,
+          ...(exitCode !== undefined ? { exitCode } : {}),
+        });
         return;
       }
       case "write": {
@@ -235,7 +276,7 @@ function main(): void {
         } else {
           part(callID, "write", { status: "error", input, error: String(body.message ?? "rejected"), time: { start: 0, end: 1 } });
         }
-        log({ kind: "answer", step: i, permission: "edit", callID, reply: body.reply, message: body.message ?? null, performed });
+        await log({ kind: "answer", step: i, permission: "edit", callID, reply: body.reply, message: body.message ?? null, performed });
         return;
       }
       case "external_directory": {
@@ -253,7 +294,7 @@ function main(): void {
         part(callID, "read", performed
           ? { status: "completed", input, output: "", metadata: {}, title: step.path, time: { start: 0, end: 1 } }
           : { status: "error", input, error: String(body.message ?? "rejected"), time: { start: 0, end: 1 } });
-        log({ kind: "answer", step: i, permission: "external_directory", callID, reply: body.reply, message: body.message ?? null, performed });
+        await log({ kind: "answer", step: i, permission: "external_directory", callID, reply: body.reply, message: body.message ?? null, performed });
         return;
       }
       case "question": {
@@ -265,7 +306,7 @@ function main(): void {
           id: qid, sessionID: SESSION_ID, questions: input.questions, tool: { messageID: MESSAGE_ID, callID },
         });
         await answer;
-        log({ kind: "question-reject", step: i, callID });
+        await log({ kind: "question-reject", step: i, callID });
         part(callID, "question", { status: "error", input, error: "dismissed", time: { start: 0, end: 1 } });
         // The step in flight reports its tokens, which the adapter waits for before it aborts.
         send("message.updated", { sessionID: SESSION_ID, info: usageInfo(call) });
@@ -276,10 +317,18 @@ function main(): void {
 
   async function play(call: FakeOpenCodeCall): Promise<void> {
     send("session.status", { sessionID: SESSION_ID, status: { type: "busy" } });
+    const startedAt = Date.now();
+    let barrierReleased: boolean | null = null;
+    if (call.barrier !== undefined) {
+      if (sinkUrl === undefined) throw new Error("a barrier needs the scenario's sinkUrl");
+      barrierReleased = await awaitSinkBarrier(sinkUrl, call.barrier);
+    }
     for (const [i, step] of call.steps.entries()) {
       await runStep(step, i, call);
       if (step.type === "question") return; // a held call is aborted by the adapter
     }
+    // Logged before the call goes idle: the kernel may stop the server once it sees the idle.
+    await log({ kind: "done", startedAt, endedAt: Date.now(), barrierReleased, tmpdir: process.env.TMPDIR ?? null });
     send("message.updated", { sessionID: SESSION_ID, info: usageInfo(call) });
     send("session.status", { sessionID: SESSION_ID, status: { type: "idle" } });
     send("session.idle", { sessionID: SESSION_ID });
@@ -292,7 +341,7 @@ function main(): void {
     async fetch(req) {
       const url = new URL(req.url);
       if (req.headers.get("authorization") !== expectedAuth) {
-        log({ kind: "auth-rejected", method: req.method, path: url.pathname });
+        await log({ kind: "auth-rejected", method: req.method, path: url.pathname });
         return new Response("unauthorized", { status: 401 });
       }
       const text = req.method === "POST" ? await req.text() : "";
@@ -323,10 +372,17 @@ function main(): void {
         }
         const chosen = matches[0]!;
         role = chosen.name;
-        callNumber = nextCallNumber(scenario.stateDir, role);
-        log({ kind: "prompt" });
+        callNumber = sinkUrl !== undefined ? await claimSinkCallNumber(sinkUrl, role) : nextCallNumber(scenario.stateDir, role);
+        await log({ kind: "prompt" });
         const call = chosen.calls[Math.min(callNumber, chosen.calls.length) - 1] ?? { steps: [] };
-        setTimeout(() => void play(call), 0);
+        setTimeout(
+          () =>
+            void play(call).catch((err) => {
+              process.stderr.write(`fake-opencode: call failed: ${String(err)}\n`);
+              process.exit(70);
+            }),
+          0,
+        );
         return new Response(null, { status: 204 });
       }
       const reply = /^\/permission\/([^/]+)\/reply$/.exec(url.pathname);
@@ -347,7 +403,7 @@ function main(): void {
       }
       const abort = /^\/session\/([^/]+)\/abort$/.exec(url.pathname);
       if (req.method === "POST" && abort) {
-        log({ kind: "abort", sessionID: abort[1]! });
+        await log({ kind: "abort", sessionID: abort[1]! });
         return Response.json(true);
       }
       // GET /session/:id/message/:mid and anything else: every tool part was already sent on the stream.
@@ -358,4 +414,4 @@ function main(): void {
   process.stdout.write(`opencode server listening on http://127.0.0.1:${server.port}\n`);
 }
 
-main();
+await main();

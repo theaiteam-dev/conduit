@@ -70,8 +70,9 @@ export interface SweepStaleDirsDeps {
 
 /**
  * Remove the dirs under the temp root named `<prefix><pid>-<start time>-<suffix>`
- * whose owner is gone (`isOwnerPairGone`). Untagged names, this kernel's own,
- * a live owner's and anything ambiguous are kept. Best-effort: every fs error
+ * whose owner is gone (`isOwnerPairGone`). Files, symlinks, untagged names,
+ * this kernel's own, a live owner's and anything ambiguous are kept.
+ * Best-effort: every fs error
  * (another user's dir in a shared /tmp, a race with another kernel's sweep) is
  * ignored. `rmSync` removes a symlink, not its target, so a credentials link is
  * dropped without touching the operator's file. Returns the removed paths.
@@ -89,7 +90,10 @@ export function sweepStaleRunScopedDirs(deps: SweepStaleDirsDeps = {}): string[]
       processStartTime: deps.processStartTime ?? processStartTime,
     };
     const rm = deps.rm ?? ((dir: string) => rmSync(dir, { recursive: true, force: true }));
-    for (const name of readdirSync(root)) {
+    for (const entry of readdirSync(root, { withFileTypes: true })) {
+      // Only mkdtemp makes these names, so anything but a real dir is not ours.
+      if (!entry.isDirectory()) continue;
+      const name = entry.name;
       const prefix = prefixes.find((p) => name.startsWith(p));
       if (prefix === undefined) continue;
       const match = /^(\d+)-(\d+)-[^-]+$/.exec(name.slice(prefix.length));

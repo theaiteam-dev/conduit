@@ -87,6 +87,7 @@
 
 import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, writeFileSync, writeSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
+import { awaitSinkBarrier, claimSinkCallNumber, sinkLog, type SinkBarrier } from "./stub-sink-client";
 
 export interface FakeClaudeSdkUsage {
   input_tokens: number;
@@ -174,7 +175,7 @@ export interface FakeClaudeSdkCall {
    * Wait before the first step until `parties` calls have reached the barrier
    * `name`, or `timeoutMs` (default 15000) has passed. Needs `sinkUrl`.
    */
-  barrier?: { name: string; parties: number; timeoutMs?: number };
+  barrier?: SinkBarrier;
   /**
    * Do not load the `--agent` the SDK asked for, even when a plugin dir
    * defines it: run the default agent, leave it out of init's `agents`, and
@@ -279,26 +280,6 @@ function modelUsageEntries(entries: Record<string, FakeClaudeSdkModelUsage>): Re
 function argValue(argv: string[], flag: string): string | null {
   const i = argv.indexOf(flag);
   return i === -1 || i + 1 >= argv.length ? null : argv[i + 1]!;
-}
-
-/** Bounded, so a stalled sink fails the call instead of hanging it. A barrier post passes its own wait plus a margin. */
-async function sinkPost(sinkUrl: string, path: string, body: string, timeoutMs = 30_000): Promise<Json> {
-  const res = await fetch(`${sinkUrl}${path}`, {
-    method: "POST",
-    body,
-    headers: { "content-type": "application/json" },
-    signal: AbortSignal.timeout(timeoutMs),
-  });
-  if (!res.ok) throw new Error(`stub sink ${path} answered ${res.status}`);
-  return (await res.json()) as Json;
-}
-
-/** The sink's call number for `role`. A malformed answer fails the call rather than running the default scenario. */
-async function claimSinkCallNumber(sinkUrl: string, role: string): Promise<number> {
-  const claim = (await sinkPost(sinkUrl, "/call", JSON.stringify({ role }))).call;
-  // Check the type before the value: Number() would coerce true, [3] and "3\n" into a valid-looking call number.
-  if (typeof claim !== "number" || !Number.isInteger(claim) || claim < 1) throw new Error(`stub sink /call returned a bad call number: ${JSON.stringify(claim)}`);
-  return claim;
 }
 
 /** Same exclusive-create claim as fake-claude, so concurrent calls never share a number. */
@@ -422,11 +403,7 @@ async function main(): Promise<number> {
     let barrierReleased: boolean | null = null;
     if (call.barrier !== undefined) {
       if (sinkUrl === undefined) throw new Error("a barrier needs the scenario's sinkUrl");
-      const waitMs = (call.barrier.timeoutMs ?? 15_000) + 30_000;
-      const answer = await sinkPost(sinkUrl, "/barrier", JSON.stringify(call.barrier), waitMs);
-      // A body without a boolean `released` is a broken sink, not a barrier that timed out.
-      if (typeof answer.released !== "boolean") throw new Error(`stub sink /barrier returned a bad answer: ${JSON.stringify(answer)}`);
-      barrierReleased = answer.released;
+      barrierReleased = await awaitSinkBarrier(sinkUrl, call.barrier);
     }
 
     const ungated = preToolUseCallbackIds.length === 0;
@@ -585,7 +562,7 @@ async function main(): Promise<number> {
       agent: requestedAgent,
       agentLoaded,
     };
-    if (sinkUrl !== undefined) await sinkPost(sinkUrl, "/log", JSON.stringify(entry));
+    if (sinkUrl !== undefined) await sinkLog(sinkUrl, entry);
     else appendFileSync(scenario.logPath, JSON.stringify(entry) + "\n");
 
     const usage = call.usage ?? { input_tokens: 100, output_tokens: 50 };

@@ -32,12 +32,24 @@
  * params and every decision received. The fields match FakeClaudeLogEntry, so
  * harness-flow's `stubLog()` and orphan reaper read it unchanged.
  *
+ * Write-confined calls (issue #122). When the kernel runs the app-server
+ * under the llexec helper, the fake and every command it runs can write only
+ * inside the call's writable set, so it cannot claim a counter file or append
+ * to `logPath`. With `sinkUrl` in the scenario (harness-flow's `stubSink`
+ * option) it claims its call number and sends its log line over HTTP instead,
+ * as fake-claude-sdk does. A call's `barrier` also goes through the sink: the
+ * turn waits, before its first step, until `parties` calls have reached the
+ * barrier of that name, and the log records whether it was released or timed
+ * out. The log also records the TMPDIR the fake ran with, so a journey can
+ * check that the kernel's per-call temp dir is gone after the run.
+ *
  * Launched through a generated `#!/bin/sh` wrapper that execs the running bun
  * binary on this file (see harness-flow.ts).
  */
 
 import { appendFileSync, closeSync, mkdirSync, openSync, readFileSync, writeFileSync, writeSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
+import { awaitSinkBarrier, claimSinkCallNumber, sinkLog, type SinkBarrier } from "./stub-sink-client";
 
 /** The codex version the adapter's ungated built-in list was checked against, so it writes no warning. */
 const FAKE_VERSION = "codex-cli 0.159.1";
@@ -66,6 +78,11 @@ export interface FakeCodexCall {
   steps?: FakeCodexStep[];
   /** The thread's token total, sent before turn/completed. Omitted: no usage is reported. */
   usage?: FakeCodexUsage;
+  /**
+   * Wait before the first step until `parties` turns have reached the barrier
+   * `name`, or `timeoutMs` (default 15000) has passed. Needs `sinkUrl`.
+   */
+  barrier?: SinkBarrier;
 }
 
 export interface FakeCodexRole {
@@ -78,6 +95,8 @@ export interface FakeCodexRole {
 export interface FakeCodexScenario {
   stateDir: string;
   logPath: string;
+  /** harness-flow's stub sink: claim call numbers, log and wait at barriers over HTTP instead of files. */
+  sinkUrl?: string;
   roles: FakeCodexRole[];
 }
 
@@ -98,7 +117,14 @@ export interface FakeCodexLogEntry {
   pid: number;
   prompt: string;
   model: string | null;
+  /** When the turn started, before the call number was claimed. */
   startedAt: number;
+  /** When the steps finished, just before the log line was sent. */
+  endedAt: number;
+  /** Whether the call's barrier released it (true) or timed out (false); null without a barrier. */
+  barrierReleased: boolean | null;
+  /** TMPDIR in the fake's env, or null. */
+  tmpdir: string | null;
   /** The params the kernel sent on thread/start. */
   threadStart: Record<string, unknown>;
   decisions: FakeCodexDecision[];
@@ -164,9 +190,18 @@ async function appServer(argv: string[]): Promise<number> {
       process.exit(65);
     }
     const role = matches[0]!;
-    const callNumber = nextCallNumber(scenario.stateDir, role.name);
+    const startedAt = Date.now();
+    const sinkUrl = scenario.sinkUrl;
+    const callNumber =
+      sinkUrl !== undefined ? await claimSinkCallNumber(sinkUrl, role.name) : nextCallNumber(scenario.stateDir, role.name);
     const call = role.calls[Math.min(callNumber, role.calls.length) - 1] ?? {};
     const decisions: FakeCodexDecision[] = [];
+
+    let barrierReleased: boolean | null = null;
+    if (call.barrier !== undefined) {
+      if (sinkUrl === undefined) throw new Error("a barrier needs the scenario's sinkUrl");
+      barrierReleased = await awaitSinkBarrier(sinkUrl, call.barrier);
+    }
 
     for (const [i, step] of (call.steps ?? []).entries()) {
       const itemId = `item-${i + 1}`;
@@ -227,11 +262,15 @@ async function appServer(argv: string[]): Promise<number> {
       pid: process.pid,
       prompt,
       model: typeof threadStart.model === "string" ? threadStart.model : null,
-      startedAt: Date.now(),
+      startedAt,
+      endedAt: Date.now(),
+      barrierReleased,
+      tmpdir: process.env.TMPDIR ?? null,
       threadStart,
       decisions,
     };
-    appendFileSync(scenario.logPath, JSON.stringify(entry) + "\n");
+    if (sinkUrl !== undefined) await sinkLog(sinkUrl, entry);
+    else appendFileSync(scenario.logPath, JSON.stringify(entry) + "\n");
 
     if (call.usage !== undefined) {
       const u = call.usage;
@@ -277,7 +316,10 @@ async function appServer(argv: string[]): Promise<number> {
         notify("turn/started", { threadId: THREAD_ID, turn: { id: TURN_ID } });
         const input = Array.isArray(m.params?.input) ? m.params.input : [];
         const prompt = input.map((p: Json) => (typeof p?.text === "string" ? p.text : "")).join("\n");
-        void runTurn(prompt);
+        void runTurn(prompt).catch((err) => {
+          process.stderr.write(`fake-codex-app-server: turn failed: ${String(err)}\n`);
+          process.exit(70);
+        });
         break;
       }
       case "turn/interrupt":

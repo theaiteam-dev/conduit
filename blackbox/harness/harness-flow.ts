@@ -116,7 +116,8 @@ export interface HarnessFlowOptions<R = FakeClaudeRole> {
    * workspace's stub dir, so a confined stub reports here. Landlock as the
    * kernel applies it handles no network rights, so the connection is
    * allowed. The server appends to the same log file, so `stubLog()` reads it
-   * unchanged. Only fake-claude-sdk reads the scenario's `sinkUrl`.
+   * unchanged. fake-claude-sdk, fake-codex-app-server and fake-opencode read
+   * the scenario's `sinkUrl`.
    */
   stubSink?: boolean;
 }

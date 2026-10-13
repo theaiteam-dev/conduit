@@ -182,6 +182,18 @@ describe('sweepStaleRunScopedDirs', () => {
     expect(existsSync(b)).toBe(true);
   });
 
+  test('keeps a file or a symlink with a matching name: only a dir is swept', () => {
+    const file = join(root, `${CALL_TMP_PREFIX}${DEAD_PID}-77-ffffff`);
+    writeFileSync(file, 'x');
+    const target = mk('link-target');
+    const link = join(root, `${CALL_TMP_PREFIX}${DEAD_PID}-77-llllll`);
+    symlinkSync(target, link);
+    expect(sweepStaleRunScopedDirs(deps())).toEqual([]);
+    expect(readFileSync(file, 'utf-8')).toBe('x');
+    expect(existsSync(link)).toBe(true);
+    expect(existsSync(join(target, 'f'))).toBe(true);
+  });
+
   test('does not throw for a missing root', () => {
     expect(() => sweepStaleRunScopedDirs({ ...deps(), tmpRoot: join(root, 'missing') })).not.toThrow();
   });
