@@ -696,15 +696,39 @@ function describeWriteConfinementConformance(
   confinedEnv: readonly string[],
 ): void {
   describe(`write confinement conformance: ${name}`, () => {
-    let projectRoot: string;
+    /**
+     * One fixture invocation in its own project root, removed once the run has been read back. The
+     * result is plain data, so it outlives the root.
+     */
+    async function runInFreshRoot(confine: boolean): Promise<WriteFixtureResult> {
+      const projectRoot = realpathSync(mkdtempSync(join(tmpdir(), 'conduit-write-confinement-')));
+      try {
+        return await runWriteFixture(name, factory, projectRoot, confine);
+      } finally {
+        rmSync(projectRoot, { recursive: true, force: true });
+      }
+    }
 
-    beforeEach(() => {
-      projectRoot = realpathSync(mkdtempSync(join(tmpdir(), 'conduit-write-confinement-')));
-    });
+    // Each mode runs once: the setsid case reads marker files the first case's run already produced.
+    // Whichever case asks first starts the run, and bun runs a describe's cases one at a time.
+    const cached = new Map<boolean, Promise<WriteFixtureResult>>();
+    function cachedRun(confine: boolean): Promise<WriteFixtureResult> {
+      let run = cached.get(confine);
+      if (run === undefined) {
+        run = runInFreshRoot(confine);
+        cached.set(confine, run);
+      }
+      return run;
+    }
 
-    afterEach(() => {
-      rmSync(projectRoot, { recursive: true, force: true });
-    });
+    /**
+     * The cached run, or a second run when it timed out waiting for the setsid child. A timeout means
+     * the child was slow, not that confinement failed, so a loaded host gets one more attempt.
+     */
+    async function setsidRun(confine: boolean): Promise<WriteFixtureResult> {
+      const first = await cachedRun(confine);
+      return first.setsidTimedOut ? runInFreshRoot(confine) : first;
+    }
 
     const runnable = hostWriteConfinement.available || writeConfinementRequired();
     if (!runnable) {
@@ -720,7 +744,7 @@ function describeWriteConfinementConformance(
     it(
       "refuses a confined call's writes into a sibling's dir (cp, symlink, mv) and to a shared file",
       async () => {
-        const result = await runWriteFixture(name, factory, projectRoot, true);
+        const result = await cachedRun(true);
         expect(result.ran, 'the fixture did not run to its end').toBe(true);
         expect(result.ownWritten, "the call could not write its own dir").toBe(true);
         expect(result.siblingFiles).toEqual([]);
@@ -741,7 +765,7 @@ function describeWriteConfinementConformance(
     it(
       'control: the same fixture, unconfined, does write into the sibling dir',
       async () => {
-        const result = await runWriteFixture(name, factory, projectRoot, false);
+        const result = await cachedRun(false);
         expect(result.ran, 'the fixture did not run to its end').toBe(true);
         expect(result.siblingFiles).toContain('cp.txt');
         expect(result.siblingFiles).toContain('link.txt');
@@ -773,7 +797,7 @@ function describeWriteConfinementConformance(
     it(
       "refuses a confined setsid child's write into a sibling's dir",
       async () => {
-        const result = await runWriteFixture(name, factory, projectRoot, true);
+        const result = await setsidRun(true);
         expect(result.ran, 'the fixture did not run to its end').toBe(true);
         expect(
           result.setsidTimedOut,
@@ -788,7 +812,7 @@ function describeWriteConfinementConformance(
     it(
       'control: an unconfined setsid child does write into the sibling dir',
       async () => {
-        const result = await runWriteFixture(name, factory, projectRoot, false);
+        const result = await setsidRun(false);
         expect(result.ran, 'the fixture did not run to its end').toBe(true);
         expect(
           result.setsidTimedOut,

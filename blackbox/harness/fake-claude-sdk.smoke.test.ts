@@ -210,4 +210,30 @@ describe("fake-claude-sdk", () => {
       }
     }
   }, 60_000);
+
+  test("a malformed barrier answer from the sink fails the call instead of reading as a timeout", async () => {
+    for (const answer of [{}, { released: "true" }, { released: 1 }, { released: null }]) {
+      const sinkDir = join(root, "bad-barrier-sink");
+      mkdirSync(sinkDir, { recursive: true });
+      const paths: string[] = [];
+      const server = Bun.serve({
+        port: 0,
+        hostname: "127.0.0.1",
+        fetch: (req) => {
+          const path = new URL(req.url).pathname;
+          paths.push(path);
+          return Response.json(path === "/call" ? { call: 1 } : answer);
+        },
+      });
+      try {
+        const sink = { url: `http://127.0.0.1:${server.port}`, logPath: join(sinkDir, "invocations.ndjson") };
+        const call: FakeClaudeSdkCall = { barrier: { name: "pair", parties: 2, timeoutMs: 1_000 }, usage: { input_tokens: 1, output_tokens: 1 } };
+        await expect(drive(call, () => "allow", sink)).rejects.toThrow();
+        // The fake stopped at the barrier: a call that carried on would also have posted its log line.
+        expect({ answer, paths }).toEqual({ answer, paths: ["/call", "/barrier"] });
+      } finally {
+        server.stop(true);
+      }
+    }
+  }, 60_000);
 });

@@ -423,7 +423,10 @@ async function main(): Promise<number> {
     if (call.barrier !== undefined) {
       if (sinkUrl === undefined) throw new Error("a barrier needs the scenario's sinkUrl");
       const waitMs = (call.barrier.timeoutMs ?? 15_000) + 30_000;
-      barrierReleased = (await sinkPost(sinkUrl, "/barrier", JSON.stringify(call.barrier), waitMs)).released === true;
+      const answer = await sinkPost(sinkUrl, "/barrier", JSON.stringify(call.barrier), waitMs);
+      // A body without a boolean `released` is a broken sink, not a barrier that timed out.
+      if (typeof answer.released !== "boolean") throw new Error(`stub sink /barrier returned a bad answer: ${JSON.stringify(answer)}`);
+      barrierReleased = answer.released;
     }
 
     const ungated = preToolUseCallbackIds.length === 0;
