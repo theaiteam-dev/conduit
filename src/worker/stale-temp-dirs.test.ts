@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
+import { randomBytes } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
@@ -236,7 +237,8 @@ describe('sweepStaleRunScopedDirsOnce', () => {
     resetSweepStaleRunScopedDirsOnce();
     // The memoized wrapper sweeps the real tmpdir: plant a stale dir there, and
     // confirm the first call removes it while a second, after replanting, does not.
-    const name = `${CALL_TMP_PREFIX}${DEAD_PID}-77-once01`;
+    // A per-run suffix, so two concurrent runs of this test never plant the same path.
+    const name = `${CALL_TMP_PREFIX}${DEAD_PID}-77-once${randomBytes(6).toString('hex')}`;
     const dir = join(tmpdir(), name);
     mkdirSync(dir);
     try {

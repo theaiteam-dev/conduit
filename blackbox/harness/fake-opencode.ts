@@ -113,7 +113,10 @@ export type FakeOpenCodeLogEntry = FakeClaudeLogEntry &
     | { kind: "auth-rejected"; method: string; path: string }
     | {
         kind: "done";
-        /** Overrides the log time: when the call's steps started (after the prompt arrived). */
+        /**
+         * Overrides the log time: when the call began, after the prompt arrived and before any barrier
+         * wait. A serial-order check (`startedAt >= an earlier call's endedAt`) then covers the wait too.
+         */
         startedAt: number;
         /** When the last step finished, just before the call went idle. */
         endedAt: number;

@@ -229,6 +229,7 @@ export interface FakeClaudeSdkLogEntry {
   pid: number;
   prompt: string;
   model: string | null;
+  /** When the call began, after its call number was claimed and before any barrier wait. */
   startedAt: number;
   /** When the steps finished, just before the log line was sent. */
   endedAt: number;
