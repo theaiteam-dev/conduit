@@ -354,8 +354,11 @@ export interface CallTempDir {
 
 /**
  * The env a confined call's child gets for its temp dir: TMPDIR, and
- * TMPPREFIX for zsh, which ignores TMPDIR and writes here-document files
- * under /tmp/zsh by default (seen from Claude Code's Bash tool). With `xdg`,
+ * TMPPREFIX for zsh, which ignores TMPDIR and names its here-document files
+ * with the filename prefix TMPPREFIX, `/tmp/zsh` by default, so they land as
+ * `/tmp/zshXXXXXX` (seen from Claude Code's Bash tool). TMPPREFIX is a prefix,
+ * not a directory: `<root>/zsh` puts them in the temp dir itself, and nothing
+ * creates a `zsh` subdirectory. With `xdg`,
  * also the XDG cache and state dirs, for an adapter that does not already
  * point them at a run-scoped dir.
  */

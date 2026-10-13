@@ -564,7 +564,9 @@ In each live call the agent wrote its own output file with its file tool and the
 other refused write except the ones below. What the Claude Code CLI writes outside its
 config dir: version locks under `$XDG_STATE_HOME/claude/locks` and logs under
 `$XDG_CACHE_HOME/claude-cli-nodejs`, which default to the operator's home, hence the XDG
-variables; here-document files from its zsh under `$TMPPREFIX`, which defaults to `/tmp/zsh`;
+variables; here-document files from its zsh, named with the filename prefix `$TMPPREFIX`
+(default `/tmp/zsh`, so `/tmp/zshXXXXXX`; the adapters set it to `<per-call temp dir>/zsh`,
+a prefix and not a directory);
 and a unix socket under `/tmp/cc-socks-<uid>`, which is refused, and the call works without
 it. The `.credentials.json` in a run-scoped config dir is a link to the operator's file, so a
 refreshed OAuth token written through the link would be refused. No refresh happened in the

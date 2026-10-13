@@ -64,8 +64,9 @@ overlapped call; the adapter adds its own dirs.
 - The card's canonical `owned_paths`. Each must exist when the batch is admitted, since a
   Landlock rule names an existing file or directory; a card with a missing owned path runs on
   the serial path.
-- A per-call temp dir. The adapter points `TMPDIR` at it, and `TMPPREFIX` (zsh ignores
-  `TMPDIR`). On `agent-sdk` and `codex-app-server` it also points `XDG_CACHE_HOME` and
+- A per-call temp dir. The adapter points `TMPDIR` at it, and sets `TMPPREFIX` to
+  `<dir>/zsh` (zsh ignores `TMPDIR`; `TMPPREFIX` is a filename prefix, not a directory, so
+  zsh's here-document files land in the temp dir itself as `zshXXXXXX`). On `agent-sdk` and `codex-app-server` it also points `XDG_CACHE_HOME` and
   `XDG_STATE_HOME` into it; `opencode` already run-scopes all four XDG dirs.
 - The adapter's run-scoped config dirs: `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, or the opencode
   root holding `HOME` and the XDG dirs. Config isolation is mandatory for a confined call: the
