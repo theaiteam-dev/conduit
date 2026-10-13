@@ -36,6 +36,7 @@
 import { accessSync, constants, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { isAbsolute, join, resolve } from 'node:path';
+import { CALL_TMP_PREFIX, taggedTempPrefix } from './stale-temp-dirs';
 
 /** Exit status of llexec for every failure before it execs the command. Kept in step with llexec.c. */
 export const LLEXEC_FAILED_EXIT = 121;
@@ -365,7 +366,7 @@ export function callTempDirEnv(dir: CallTempDir, options: { xdg: boolean }): Rec
 
 /** Create a fresh per-call temp dir under the OS temp dir. */
 export function createCallTempDir(): CallTempDir {
-  const root = mkdtempSync(join(tmpdir(), 'conduit-call-tmp-'));
+  const root = mkdtempSync(join(tmpdir(), taggedTempPrefix(CALL_TMP_PREFIX)));
   try {
     const cache = join(root, 'cache');
     const state = join(root, 'state');

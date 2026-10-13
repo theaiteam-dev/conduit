@@ -238,11 +238,12 @@ run-scoped `CODEX_HOME` holding an empty `config.toml` and a link to the operato
 reach it. The directory is removed on every exit path. The child's env is the allowlist plus
 `PATH` and `CODEX_HOME`. Every invocation is a fresh, ephemeral thread.
 
-The run-scoped directory is created by `mkdtemp` with mode 0700, as `conduit-codex-home-*` in
-the temp dir. Only `removeRunScopedCodexHome` removes it, so a kernel killed by SIGKILL or a
-crash between creation and removal leaves it behind, and nothing sweeps it. What remains is an
-empty `config.toml` and a link to `auth.json`, not a copy of the credentials. It is safe to
-delete `conduit-codex-home-*` directories when no conduit run is active.
+The run-scoped directory is created by `mkdtemp` with mode 0700, as
+`conduit-codex-home-<pid>-<start time>-*` in the temp dir. `removeRunScopedCodexHome` removes it
+on every exit path; a kernel killed by SIGKILL or a crash between creation and removal leaves
+it behind, and the next `runExecutor` in any kernel removes it (see "Stale run-scoped temp
+dirs" below). What remains until then is an empty `config.toml` and a link to `auth.json`,
+not a copy of the credentials.
 
 ### The `opencode` adapter
 
@@ -613,6 +614,19 @@ unconfined and requires the sibling writes to land.
 - Reads. Everything the kernel's user can read stays readable.
 - Serial calls, gate critics and deterministic stations. They run as before, with the
   integrity diff as the backstop.
+
+**Stale run-scoped temp dirs.** The per-call temp dir (`conduit-call-tmp-`) and the
+adapters' run-scoped dirs (`conduit-claude-config-`, `conduit-codex-home-`,
+`conduit-opencode-`) live in the OS temp dir, and the last three can hold a link to the
+operator's credentials. Each adapter removes them on every exit path, but a kernel that is
+SIGKILLed or crashes runs no cleanup. Each dir is therefore named
+`<prefix><pid>-<start time>-<random>` after the kernel that made it, the same owner tag the
+cgroups carry, and the first `runExecutor` in each kernel process removes the dirs under
+those prefixes whose owner is gone, by the same rule as the cgroup sweep
+(`worker/stale-temp-dirs.ts` `sweepStaleRunScopedDirs`). It keeps this kernel's own dirs, a
+live owner's, an owner it cannot decide about, and untagged names, which is what a host
+without `/proc` produces. Removal drops a credentials link without touching its target, and
+a dir it cannot remove, such as another user's, is skipped.
 
 ## The child's configuration surface
 

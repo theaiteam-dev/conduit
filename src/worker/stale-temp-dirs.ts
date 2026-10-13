@@ -1,0 +1,102 @@
+/**
+ * Per-invocation dirs under the OS temp dir that a confined call can write and
+ * that may hold credential links (a Claude credentials file, a Codex auth.json,
+ * an OpenCode provider entry). Each is removed by its adapter's `finally`, but a
+ * kernel that is SIGKILLed or crashes runs no `finally`. So each dir is named
+ * `<prefix><pid>-<start time>-<random>` after its owner, the same tag the
+ * cgroups carry (`owner-tag.ts`), and the next kernel sweeps the ones whose
+ * owner is gone, as `sweepStaleCgroups` does for cgroups.
+ */
+import { readdirSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { isOwnerPairGone, isPidAlive, processStartTime, tryOwnerTag } from './owner-tag';
+
+export const CALL_TMP_PREFIX = 'conduit-call-tmp-';
+export const CLAUDE_CONFIG_PREFIX = 'conduit-claude-config-';
+export const CODEX_HOME_PREFIX = 'conduit-codex-home-';
+export const OPENCODE_PREFIX = 'conduit-opencode-';
+
+/** Every prefix the sweep covers. */
+export const RUN_SCOPED_TEMP_PREFIXES: readonly string[] = [
+  CALL_TMP_PREFIX,
+  CLAUDE_CONFIG_PREFIX,
+  CODEX_HOME_PREFIX,
+  OPENCODE_PREFIX,
+];
+
+/**
+ * `prefix` followed by this kernel's owner tag, for `mkdtemp` to add its random
+ * suffix to. Plain `prefix` when the tag cannot be read, so creation never
+ * fails because of tagging; such a dir is never swept.
+ */
+export function taggedTempPrefix(prefix: string): string {
+  const tag = tryOwnerTag();
+  return tag === undefined ? prefix : `${prefix}${tag}-`;
+}
+
+/** Injectable dependencies of `sweepStaleRunScopedDirs`, defaulted to the real ones in production. */
+export interface SweepStaleDirsDeps {
+  /** Directory to sweep. Defaults to `os.tmpdir()`. */
+  tmpRoot?: string;
+  /** Prefixes to sweep. Defaults to `RUN_SCOPED_TEMP_PREFIXES`. */
+  prefixes?: readonly string[];
+  selfPid?: number;
+  selfStartTime?: number | undefined;
+  isPidAlive?: (pid: number) => boolean;
+  processStartTime?: (pid: number) => number | undefined;
+}
+
+/**
+ * Remove the dirs under the temp root named `<prefix><pid>-<start time>-<suffix>`
+ * whose owner is gone (`isOwnerPairGone`). Untagged names, this kernel's own,
+ * a live owner's and anything ambiguous are kept. Best-effort: every fs error
+ * (another user's dir in a shared /tmp, a race with another kernel's sweep) is
+ * ignored. `rmSync` removes a symlink, not its target, so a credentials link is
+ * dropped without touching the operator's file. Returns the removed paths.
+ */
+export function sweepStaleRunScopedDirs(deps: SweepStaleDirsDeps = {}): string[] {
+  const removed: string[] = [];
+  try {
+    const root = deps.tmpRoot ?? tmpdir();
+    const prefixes = deps.prefixes ?? RUN_SCOPED_TEMP_PREFIXES;
+    const selfPid = deps.selfPid ?? process.pid;
+    const resolved = {
+      selfPid,
+      selfStartTime: 'selfStartTime' in deps ? deps.selfStartTime : processStartTime(selfPid),
+      isPidAlive: deps.isPidAlive ?? isPidAlive,
+      processStartTime: deps.processStartTime ?? processStartTime,
+    };
+    for (const name of readdirSync(root)) {
+      const prefix = prefixes.find((p) => name.startsWith(p));
+      if (prefix === undefined) continue;
+      const match = /^(\d+)-(\d+)-[^-]+$/.exec(name.slice(prefix.length));
+      if (match === null) continue;
+      try {
+        if (!isOwnerPairGone(Number(match[1]), Number(match[2]), resolved)) continue;
+        const dir = join(root, name);
+        rmSync(dir, { recursive: true, force: true });
+        removed.push(dir);
+      } catch {
+        // Not ours to remove, or already gone.
+      }
+    }
+  } catch {
+    // Missing or unreadable temp root.
+  }
+  return removed;
+}
+
+let swept = false;
+
+/** Run `sweepStaleRunScopedDirs` once per process. Later calls do nothing. */
+export function sweepStaleRunScopedDirsOnce(): void {
+  if (swept) return;
+  swept = true;
+  sweepStaleRunScopedDirs();
+}
+
+/** Test seam: let `sweepStaleRunScopedDirsOnce` run again. */
+export function resetSweepStaleRunScopedDirsOnce(): void {
+  swept = false;
+}

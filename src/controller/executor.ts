@@ -38,6 +38,7 @@ import { deriveSubflowRunId } from '../run/run-id';
 import type { StartWorkMessage } from '../worker/ipc-protocol';
 import { sanitizeStderrTail } from '../worker/ipc-protocol';
 import type { ModelAdapter } from '../worker/adapter';
+import { sweepStaleRunScopedDirsOnce } from '../worker/stale-temp-dirs';
 import { DEFAULT_RUN_ID, parseColumn, type ConduitDB, type JournalSpanInput, type JournalProvenance } from '../persistence/db';
 import type { FlowConfig, StationConfig, FanInPolicyConfig, StationOutput, Card } from '../types/kernel';
 import { planTick } from './tick';
@@ -377,6 +378,8 @@ export async function runExecutor(args: RunEngineArgs): Promise<void> {
     onMessage,
     sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)),
   } = args;
+  // Drop run-scoped temp dirs (credential links) a SIGKILLed kernel left behind.
+  sweepStaleRunScopedDirsOnce();
   const runId = args.runId ?? DEFAULT_RUN_ID;
   const stateDb = db.getStateDb();
 
