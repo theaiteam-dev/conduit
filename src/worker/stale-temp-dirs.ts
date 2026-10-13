@@ -25,14 +25,33 @@ export const RUN_SCOPED_TEMP_PREFIXES: readonly string[] = [
   OPENCODE_PREFIX,
 ];
 
+let warnedUntagged = false;
+
+/** Test seam: let `taggedTempPrefix` warn again. */
+export function resetUntaggedTempWarning(): void {
+  warnedUntagged = false;
+}
+
 /**
  * `prefix` followed by this kernel's owner tag, for `mkdtemp` to add its random
  * suffix to. Plain `prefix` when the tag cannot be read, so creation never
- * fails because of tagging; such a dir is never swept.
+ * fails because of tagging; such a dir is never swept, so the first time that
+ * happens in a process it warns once on stderr.
  */
-export function taggedTempPrefix(prefix: string): string {
-  const tag = tryOwnerTag();
-  return tag === undefined ? prefix : `${prefix}${tag}-`;
+export function taggedTempPrefix(
+  prefix: string,
+  tryTag: () => string | undefined = tryOwnerTag,
+  warn: (message: string) => void = (message) => process.stderr.write(message + '\n'),
+): string {
+  const tag = tryTag();
+  if (tag !== undefined) return `${prefix}${tag}-`;
+  if (!warnedUntagged) {
+    warnedUntagged = true;
+    warn(
+      'conduit: cannot read this process start time from /proc, so run-scoped temp dirs (which may hold credential links) are created untagged and will not be swept after a crash',
+    );
+  }
+  return prefix;
 }
 
 /** Injectable dependencies of `sweepStaleRunScopedDirs`, defaulted to the real ones in production. */

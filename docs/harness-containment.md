@@ -540,9 +540,10 @@ security module ([ADR-0013](../adr/0013-os-enforced-write-confinement-of-overlap
 ([`native/llexec/llexec.c`](../native/llexec/llexec.c)), a small static helper, after the
 cgroup wrapper: the shell joins the invocation's cgroup and execs `llexec <writable
 paths> -- <cli>`, and `llexec` creates a Landlock ruleset that handles the write-type file
-rights of the highest ABI the kernel reports, grants them beneath each writable path, sets
-`no_new_privs`, restricts itself, and execs the CLI. Reads and executes are not handled, so
-they stay allowed everywhere. The ruleset is inherited by every descendant and cannot be
+rights of the highest ABI the kernel reports, grants them beneath each writable directory,
+and only write and truncate on a writable path that is a file, sets `no_new_privs`,
+restricts itself, and execs the CLI. Reads and executes are not handled, so they stay
+allowed everywhere. The ruleset is inherited by every descendant and cannot be
 removed, so a Bash-tool command that calls `setsid()` stays confined. A write outside the
 set fails with `EACCES` (`Permission denied`) and changes nothing. `llexec` never runs the
 CLI unconfined: if it cannot open a writable path or apply the ruleset, it prints a line
@@ -628,7 +629,8 @@ SIGKILLed or crashes runs no cleanup. Each dir is therefore named
 `<prefix><pid>-<start time>-<random>` after the kernel that made it, the same owner tag the
 cgroups carry, and the first `runExecutor` in each kernel process removes the dirs under
 those prefixes whose owner is gone, by the same rule as the cgroup sweep
-(`worker/stale-temp-dirs.ts` `sweepStaleRunScopedDirs`). It keeps this kernel's own dirs, a
+(`worker/stale-temp-dirs.ts` `sweepStaleRunScopedDirsOnce`, which runs
+`sweepStaleRunScopedDirs` once per process). It keeps this kernel's own dirs, a
 live owner's, an owner it cannot decide about, and untagged names, which is what a host
 without `/proc` produces. Removal drops a credentials link without touching its target, and
 a dir it cannot remove, such as another user's, is skipped.

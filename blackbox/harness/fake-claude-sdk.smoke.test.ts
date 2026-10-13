@@ -185,4 +185,29 @@ describe("fake-claude-sdk", () => {
       server.stop(true);
     }
   }, 30_000);
+
+  test("a malformed call number from the sink fails the call instead of selecting a scenario", async () => {
+    // Number() would coerce true to 1, [3] to 3 and "3\n" to 3, so each would run a real call.
+    for (const claim of [true, [3], "3", "3\n", 0, 1.5, null]) {
+      const sinkDir = join(root, "bad-sink");
+      mkdirSync(sinkDir, { recursive: true });
+      const paths: string[] = [];
+      const server = Bun.serve({
+        port: 0,
+        hostname: "127.0.0.1",
+        fetch: (req) => {
+          paths.push(new URL(req.url).pathname);
+          return Response.json({ call: claim });
+        },
+      });
+      try {
+        const sink = { url: `http://127.0.0.1:${server.port}`, logPath: join(sinkDir, "invocations.ndjson") };
+        await expect(drive({ usage: { input_tokens: 1, output_tokens: 1 } }, () => "allow", sink)).rejects.toThrow();
+        // The fake stopped at the claim: a call that ran would also have posted its log line.
+        expect({ claim, paths }).toEqual({ claim, paths: ["/call"] });
+      } finally {
+        server.stop(true);
+      }
+    }
+  }, 60_000);
 });

@@ -296,9 +296,9 @@ async function sinkPost(sinkUrl: string, path: string, body: string, timeoutMs =
 /** The sink's call number for `role`. A malformed answer fails the call rather than running the default scenario. */
 async function claimSinkCallNumber(sinkUrl: string, role: string): Promise<number> {
   const claim = (await sinkPost(sinkUrl, "/call", JSON.stringify({ role }))).call;
-  const n = Number(claim);
-  if (!Number.isInteger(n) || n < 1) throw new Error(`stub sink /call returned a bad call number: ${JSON.stringify(claim)}`);
-  return n;
+  // Check the type before the value: Number() would coerce true, [3] and "3\n" into a valid-looking call number.
+  if (typeof claim !== "number" || !Number.isInteger(claim) || claim < 1) throw new Error(`stub sink /call returned a bad call number: ${JSON.stringify(claim)}`);
+  return claim;
 }
 
 /** Same exclusive-create claim as fake-claude, so concurrent calls never share a number. */

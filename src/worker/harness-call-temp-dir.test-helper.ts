@@ -15,8 +15,11 @@ import * as landlock from './landlock-confinement';
  *
  * TMPDIR points at a private directory for the duration, so the adapter's mkdtemp lands there and the
  * listing taken inside the mock can hold only what this call created. A same-prefix directory made
- * elsewhere in the shared OS temp dir by a concurrent test is never counted. A decoy with the same prefix is
- * planted in the real temp dir mid-call to keep that true; it is removed before this returns.
+ * elsewhere in the shared OS temp dir by a concurrent test is never counted.
+ *
+ * The helper throws, instead of returning, in two cases that would otherwise pass vacuously: createCallTempDir
+ * was never called (the adapter bypassed the spy), or no dir with `prefix` existed in the private TMPDIR when
+ * it was called (the adapter's dir did not land there, for example because it read a cached tmpdir).
  */
 export async function withFailingCallTempDir(
   prefix: string,
@@ -26,23 +29,26 @@ export async function withFailingCallTempDir(
   const priv = mkdtempSync(join(sharedTmp, 'conduit-private-tmp-'));
   const hadTmpdir = Object.prototype.hasOwnProperty.call(process.env, 'TMPDIR');
   const savedTmpdir = process.env.TMPDIR;
-  let decoyDir: string | undefined;
+  let called = false;
   let live: string[] = [];
   let leftBehind: string[] = [];
   process.env.TMPDIR = priv;
   const spy = spyOn(landlock, 'createCallTempDir').mockImplementation(() => {
-    decoyDir = mkdtempSync(join(sharedTmp, `${prefix}decoy-`));
+    called = true;
     live = readdirSync(priv).filter((n) => n.startsWith(prefix)).map((n) => join(priv, n));
     throw new Error('simulated call temp dir failure');
   });
   try {
     await body();
+    if (!called) throw new Error('createCallTempDir was never called: the adapter bypassed the spy');
+    if (live.length === 0) {
+      throw new Error(`no ${prefix}* dir existed in the private TMPDIR when createCallTempDir was called`);
+    }
     leftBehind = live.filter((dir) => existsSync(dir));
   } finally {
     spy.mockRestore();
     if (hadTmpdir) process.env.TMPDIR = savedTmpdir;
     else delete process.env.TMPDIR;
-    if (decoyDir) rmSync(decoyDir, { recursive: true, force: true });
     rmSync(priv, { recursive: true, force: true });
   }
   return { live, leftBehind };

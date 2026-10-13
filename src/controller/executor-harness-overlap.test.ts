@@ -96,6 +96,8 @@ interface WalkerOpts {
   step?: (check: string, n: number) => Step;
   /** Extra writes a call makes before the write barrier (paths relative to the project root). */
   extraWrites?: (check: string) => string[];
+  /** Files a call deletes before the write barrier (paths relative to the project root; they must exist). */
+  extraDeletes?: (check: string) => string[];
   tokens?: (check: string) => number;
 }
 
@@ -167,6 +169,7 @@ function makeWalker(root: () => string, opts: WalkerOpts = {}) {
           mkdirSync(join(abs, '..'), { recursive: true });
           writeFileSync(abs, `written by ${check}`, 'utf-8');
         }
+        for (const rel of opts.extraDeletes?.(check) ?? []) rmSync(join(root(), rel));
         if (written !== undefined) await written.arrive();
         // Hold the call open briefly so a serial run could not fake an overlap.
         await new Promise((r) => setTimeout(r, 20));
@@ -689,6 +692,97 @@ describe('overlap integrity rule', () => {
     expect(String(s?.attributes?.outcome)).toContain('planted.txt');
     expect(s?.attributes?.overlap_attributed).toBeUndefined();
     expect(lane('c2')).toBe('done');
+  });
+
+  // Deletes take the same classification as writes: the walker removes the
+  // file in-process, so these pin the diff rule alone (SPEC §7 "Overlapping
+  // harness calls": a path removed since the snapshot is checked at its
+  // baseline location).
+  it('holds a member that deletes a file no member owns, naming the deleted path as path_escape', async () => {
+    const walker = makeWalker(() => dir, {
+      startBarrier: 3,
+      writeBarrier: 3,
+      extraDeletes: (check) => (check === 'c2' ? ['shared.txt'] : []),
+    });
+    const registry = createHarnessRegistry([walker.adapter]);
+    const flow = loadOk({}, registry);
+    writeFileSync(join(dir, 'shared.txt'), 'shared', 'utf-8');
+    for (const c of ['c1', 'c2', 'c3']) seedChild(c);
+
+    await run(flow, registry, 3);
+
+    // No member owns the path, so it cannot be attributed: every diff holds it.
+    for (const c of ['c1', 'c2', 'c3']) {
+      expect(lane(c)).toBe('hold');
+      const outcome = String(spans(c)[0]?.attributes?.outcome);
+      expect(outcome).toContain('integrity_violation');
+      expect(outcome).toContain('path_escape');
+      expect(outcome).toContain('shared.txt');
+    }
+    expect(existsSync(join(dir, 'shared.txt'))).toBe(false);
+  });
+
+  it('does not hold a member that deletes a file inside its own owned dir', async () => {
+    const walker = makeWalker(() => dir, {
+      startBarrier: 3,
+      writeBarrier: 3,
+      extraDeletes: (check) => (check === 'c1' ? ['evidence/c1/scratch.txt'] : []),
+    });
+    const registry = createHarnessRegistry([walker.adapter]);
+    const flow = loadOk({}, registry);
+    for (const c of ['c1', 'c2', 'c3']) seedChild(c);
+    writeFileSync(join(dir, 'evidence/c1/scratch.txt'), 'scratch', 'utf-8');
+
+    await run(flow, registry, 3);
+
+    for (const c of ['c1', 'c2', 'c3']) expect(lane(c)).toBe('done');
+    expect(existsSync(join(dir, 'evidence/c1/scratch.txt'))).toBe(false);
+    // c2 and c3 saw the delete in their diffs and attributed it to c1 with the result.json.
+    const toC1 = (spans('c2')[0]?.attributes?.overlap_attributed as Array<{ card: string; paths: number; sample: string[] }>).find((a) => a.card === 'c1');
+    expect(toC1?.paths).toBe(2);
+    expect([...(toC1?.sample ?? [])].sort()).toEqual(['evidence/c1/result.json', 'evidence/c1/scratch.txt']);
+  });
+
+  it("attributes one member's delete of a file in a sibling's owned dir to the sibling (the diff rule alone)", async () => {
+    const walker = makeWalker(() => dir, {
+      startBarrier: 3,
+      writeBarrier: 3,
+      extraDeletes: (check) => (check === 'c1' ? ['evidence/c2/scratch.txt'] : []),
+    });
+    const registry = createHarnessRegistry([walker.adapter]);
+    const flow = loadOk({}, registry);
+    for (const c of ['c1', 'c2', 'c3']) seedChild(c);
+    writeFileSync(join(dir, 'evidence/c2/scratch.txt'), 'scratch', 'utf-8');
+
+    await run(flow, registry, 3);
+
+    for (const c of ['c1', 'c2', 'c3']) expect(lane(c)).toBe('done');
+    const attributed = (spans('c1')[0]?.attributes?.overlap_attributed as Array<{ card: string; paths: number; sample: string[] }>).map((a) => ({
+      ...a,
+      sample: [...a.sample].sort(),
+    }));
+    expect(attributed).toEqual([
+      { card: 'c2', paths: 2, sample: ['evidence/c2/result.json', 'evidence/c2/scratch.txt'] },
+      { card: 'c3', paths: 1, sample: ['evidence/c3/result.json'] },
+    ]);
+  });
+
+  it('holds the same delete of a sibling-owned file on the serial path', async () => {
+    const walker = makeWalker(() => dir, {
+      extraDeletes: (check) => (check === 'c1' ? ['evidence/c2/scratch.txt'] : []),
+    });
+    const registry = createHarnessRegistry([walker.adapter]);
+    const flow = loadOk({}, registry);
+    for (const c of ['c1', 'c2']) seedChild(c);
+    writeFileSync(join(dir, 'evidence/c2/scratch.txt'), 'scratch', 'utf-8');
+
+    await run(flow, registry, 1);
+
+    expect(lane('c1')).toBe('hold');
+    const outcome = String(spans('c1')[0]?.attributes?.outcome);
+    expect(outcome).toContain('path_escape');
+    expect(outcome).toContain('scratch.txt');
+    expect(spans('c1')[0]?.attributes?.overlap_attributed).toBeUndefined();
   });
 });
 

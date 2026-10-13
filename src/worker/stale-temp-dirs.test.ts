@@ -13,6 +13,7 @@ import {
   CODEX_HOME_PREFIX,
   OPENCODE_PREFIX,
   resetSweepStaleRunScopedDirsOnce,
+  resetUntaggedTempWarning,
   sweepStaleRunScopedDirs,
   sweepStaleRunScopedDirsOnce,
   taggedTempPrefix,
@@ -97,6 +98,25 @@ describe('creators carry this process owner tag', () => {
 describe('taggedTempPrefix', () => {
   test('appends the owner tag and a separator', () => {
     expect(taggedTempPrefix('conduit-x-')).toBe(`conduit-x-${tryOwnerTag()}-`);
+  });
+
+  test('a readable tag writes no warning', () => {
+    resetUntaggedTempWarning();
+    const warnings: string[] = [];
+    expect(taggedTempPrefix('conduit-x-', () => '12-34', (m) => warnings.push(m))).toBe('conduit-x-12-34-');
+    expect(warnings).toEqual([]);
+  });
+
+  test('an unreadable tag falls back to the plain prefix and warns once per process', () => {
+    resetUntaggedTempWarning();
+    const warnings: string[] = [];
+    const warn = (m: string) => warnings.push(m);
+    expect(taggedTempPrefix('conduit-x-', () => undefined, warn)).toBe('conduit-x-');
+    expect(taggedTempPrefix('conduit-y-', () => undefined, warn)).toBe('conduit-y-');
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain('will not be swept after a crash');
+    expect(warnings[0]).toContain('/proc');
+    resetUntaggedTempWarning();
   });
 });
 
