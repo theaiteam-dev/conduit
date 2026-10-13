@@ -44,6 +44,14 @@ jobs:
       - name: Typecheck
         run: bun run typecheck
 
+      # Issue #122: the Landlock write-confinement helper. The executor and the
+      # conformance suite find it at native/llexec/build/llexec. With
+      # CONDUIT_REQUIRE_LANDLOCK set below, the write-confinement tests fail,
+      # naming the reason, instead of skipping if the runner kernel ever stops
+      # offering Landlock.
+      - name: Build the llexec helper
+        run: scripts/build-llexec.sh
+
       # Issue #77: the containment suite proves a command that calls setsid
       # (as every Claude Code Bash-tool command does) dies with its station.
       # Only a cgroup can do that, and the runner's own cgroup belongs to root,
@@ -54,6 +62,7 @@ jobs:
       - name: Test
         env:
           CONDUIT_REQUIRE_CGROUP_CONTAINMENT: '1'
+          CONDUIT_REQUIRE_LANDLOCK: '1'
         run: |
           cg=/sys/fs/cgroup/conduit-ci
           sudo mkdir -p "$cg"

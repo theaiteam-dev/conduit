@@ -40,6 +40,10 @@ user or CI consumer actually sees, not internal implementation details.
   `conduit run`, `conduit run status`, `conduit journal inspect` and
   `conduit doctor` as subprocesses. No Slack or listener. `journalSpans()` is
   a read-only journal DB read for span usage columns, which no CLI prints.
+  With `stubSink`, it also serves the stub's call counter, log and barriers
+  over HTTP on 127.0.0.1 (`startStubSink`), for a stub that runs
+  write-confined and so cannot write the stub dir; the server appends to the
+  same log file `stubLog()` reads.
 - `harness-happy-path.test.ts`: one harness maker writes its declared output
   and the card reaches `done`; checks exit code, `run status` occupancy, the
   `<station>.harness` span and its usage, and the argv the kernel passed.
@@ -82,10 +86,13 @@ user or CI consumer actually sees, not internal implementation details.
   the command or writes the file only when the kernel answers `accept`, then
   sends `thread/tokenUsage/updated` and `turn/completed`. Each turn logs its
   role, call number, argv, cwd, pid, the thread/start params and every
-  decision received, in fields `stubLog()` reads. The message shapes are
-  copied from the adapter's unit-test peer, not imported.
+  decision received, in fields `stubLog()` reads, plus the turn's start and
+  end times and the `TMPDIR` it ran with. With a `sinkUrl` in the scenario it
+  uses harness-flow's stub sink instead of files, and a call's `barrier`
+  waits there, as fake-claude-sdk does. The message shapes are copied from
+  the adapter's unit-test peer, not imported.
   `harness/fake-codex-app-server.smoke.test.ts` drives it directly as a
-  JSON-RPC client.
+  JSON-RPC client, including the sink and a barrier.
 - `codex-app-server-gate.test.ts`: the per-call tool gate (issue #21) on a
   real `conduit run` with `enforce_owned_paths`. In one turn the fake asks
   for an allowlisted `cat`, a `curl`, a redirect, a write of the declared
@@ -110,9 +117,13 @@ user or CI consumer actually sees, not internal implementation details.
   adapter answers `once`, then reports the assistant message's tokens and
   goes idle. Every log line carries the fields `stubLog()` reads plus a
   `kind` (`serve`, `prompt`, `answer`, `question-reject`, `abort`,
-  `auth-rejected`). The shapes are copied from the adapter and its unit-test
-  fake, not imported. `harness/fake-opencode.smoke.test.ts` drives it
-  directly to prove the auth check rejects a wrong or missing password.
+  `auth-rejected`, and `done` with the call's start and end times and its
+  `TMPDIR`); a bash answer also logs the command's exit code. With a
+  `sinkUrl` it uses the stub sink and a call's `barrier`, as fake-claude-sdk
+  does. The shapes are copied from the adapter and its unit-test fake, not
+  imported. `harness/fake-opencode.smoke.test.ts` drives it directly to prove
+  the auth check rejects a wrong or missing password, and to exercise the
+  sink and a barrier.
 - `opencode-gate.test.ts`: the per-call tool gate (issue #21) on the
   `opencode` adapter in a real `conduit run`. In one invocation the fake asks
   for an allowlisted `cat`, an `ls`, a pipeline, an `external_directory` read
@@ -139,9 +150,14 @@ user or CI consumer actually sees, not internal implementation details.
   was registered nothing runs and the log says `ungated`. Each invocation logs
   its role, call number, argv, cwd, pid, the callback ids, every hook answer
   and what it did, in fields `stubLog()` reads; it can also spawn a `setsid`
-  sleeper. The protocol shapes are read from the installed SDK (`sdk.mjs`,
-  `sdk.d.ts`), not imported. `harness/fake-claude-sdk.smoke.test.ts` drives it
-  with the SDK's `query()` and a test hook, without conduit.
+  sleeper. With a `sinkUrl` in the scenario it claims its call number and
+  sends its log line through harness-flow's stub sink instead of files, and a
+  call's `barrier` waits there until a given number of calls have arrived, so
+  a journey can prove two calls ran at once. The sink client is
+  `harness/stub-sink-client.ts`, shared by all three fakes. The protocol shapes are read from
+  the installed SDK (`sdk.mjs`, `sdk.d.ts`), not imported.
+  `harness/fake-claude-sdk.smoke.test.ts` drives it with the SDK's `query()`
+  and a test hook, without conduit, including the sink and a barrier.
 - `agent-sdk-gate.test.ts`: the per-call tool gate (issue #21) on the
   `agent-sdk` adapter in a real `conduit run`. With `enforce_owned_paths`, one
   call makes an allowlisted `cat`, a `curl`, a redirect, a Write of the
@@ -159,6 +175,38 @@ user or CI consumer actually sees, not internal implementation details.
   budget. A fifth case checks that a `setsid` sleeper spawned by the CLI is
   dead after the run, with the same cgroup skip and require logic as
   `harness-idle-timeout.test.ts`.
+- `landlock-overlap.test.ts`: Landlock write confinement of overlapped
+  harness calls (issue #122, ADR-0013) on the `agent-sdk` adapter, under
+  `conduit run --concurrency 3`. A deterministic station fans out to three
+  children of an `overlap: true` station. With confinement available, c1 and
+  c2 meet at a barrier in fake-claude-sdk and their spans carry
+  `concurrent: true` and `write_confinement: landlock`; c1's allowlisted
+  `cp`, `truncate` and `rm` into c2's owned dir, over a shared project file
+  and through a symlink into c2's dir all fail and leave the files unchanged,
+  and every card reaches `done`. c3, whose second owned path does not exist,
+  runs serially with that `overlap_fallback`. `conduit doctor` reports the
+  Landlock ABI. A control run with `CONDUIT_LLEXEC` naming a missing file
+  runs every child serially with the "write confinement unavailable"
+  fallback, warns once, the same attacks land, and the serial integrity check
+  holds c1. When `conduit doctor` reports no write confinement, the confined
+  case is skipped with the doctor line, or fails when
+  `CONDUIT_REQUIRE_LANDLOCK=1`. `blackbox.yml` builds the helper with
+  `scripts/build-llexec.sh` and sets that variable, as `test.yml` does.
+- `landlock-overlap-adapters.test.ts`: the same confined and control cases on
+  the `codex-app-server` and `opencode` adapters, whose servers run each
+  command themselves, so the confinement must hold for the server's own
+  children. The confined case also checks that c1 and c2 each ran with their
+  own `conduit-call-tmp-*` TMPDIR and that the kernel's TMPDIR is empty after
+  the run: no call temp dir, run-scoped `CODEX_HOME` or opencode dir left.
+- `stale-temp-dir-sweep.test.ts`: the first run in a kernel removes the
+  run-scoped temp dirs (`conduit-call-tmp-`, `conduit-claude-config-`,
+  `conduit-codex-home-`, `conduit-opencode-`) whose owner is gone, a dead pid
+  or a reused pid with another start time, and keeps a live owner's dir,
+  untagged and malformed names, other prefixes, and a file or symlink with a
+  matching name. A dead owner's credentials link is dropped without touching
+  its target, a dir the sweep cannot remove does not stop the run, and the
+  run's own `conduit-claude-config-` dir, tagged with the kernel's pid and
+  start time, is gone after the run.
 - `no-internal-imports.test.ts` + `harness/import-scan.ts` — the zero-imports
   gate (AC-1): a TypeScript-compiler-API scan that fails if any file under
   `blackbox/` imports anything resolving into `src/`.

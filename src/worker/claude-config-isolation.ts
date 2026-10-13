@@ -21,6 +21,7 @@
 import { existsSync, mkdtempSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { CLAUDE_CONFIG_PREFIX, taggedTempPrefix } from './stale-temp-dirs';
 
 const CREDENTIALS_FILE = '.credentials.json';
 
@@ -91,7 +92,7 @@ export function createRunScopedClaudeConfigDir(
     );
   }
 
-  const dir = mkdtempSync(join(tmpdir(), 'conduit-claude-config-'));
+  const dir = mkdtempSync(join(tmpdir(), taggedTempPrefix(CLAUDE_CONFIG_PREFIX)));
   if (linkCredentials) symlinkSync(credentials!, join(dir, CREDENTIALS_FILE));
   return dir;
 }

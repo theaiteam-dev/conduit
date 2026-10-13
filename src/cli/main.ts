@@ -59,6 +59,7 @@ import type {
 } from '../worker/harness-adapter';
 import { parseHarnessConfig } from '../worker/harness-config';
 import { describeContainment, resolveContainment, type Containment } from '../worker/cgroup-containment';
+import { describeWriteConfinement, resolveWriteConfinement, type WriteConfinement } from '../worker/landlock-confinement';
 import { loadFlow, probeHarnessBinaries } from '../flow/load';
 import { reclaimOrphanedWorkers } from '../dispatch/claim';
 import { ensureCheckpointSchema, reconcileOnResume } from '../checkpoint/checkpoint';
@@ -235,6 +236,12 @@ export interface RunEngineArgs {
    * re-tick without burning wall-clock. Never used unless a card is release-gated.
    */
   sleep?: (ms: number) => Promise<void>;
+  /**
+   * Issue #122: decides whether overlapped harness calls can be write-confined
+   * with Landlock on this host. Defaults to the process-wide probe
+   * (`resolveWriteConfinement`); tests inject a fixed answer.
+   */
+  resolveWriteConfinement?: () => Promise<WriteConfinement>;
 }
 
 export interface CliDeps {
@@ -445,6 +452,26 @@ export function buildProcessContainmentProbe(
       const containment = await resolveMechanism();
       const detail = describeContainment(containment);
       return { ok: true, detail: containment.mechanism === 'cgroup' ? detail : `warning: ${detail}` };
+    },
+  };
+}
+
+/**
+ * Write-confinement probe (issue #122): reports whether overlapped harness
+ * calls can run under Landlock on this host, through the same once-per-process
+ * probe the executor uses. Never FAILs: without it, cards of `overlap: true`
+ * stations run one at a time, which is slower but not broken. Reported so an
+ * operator who expects overlap sees why it will not happen.
+ */
+export function buildWriteConfinementProbe(
+  resolveConfinement: () => Promise<WriteConfinement> = resolveWriteConfinement,
+): PrereqProbe {
+  return {
+    name: 'write-confinement',
+    async check() {
+      const confinement = await resolveConfinement();
+      const detail = describeWriteConfinement(confinement);
+      return { ok: true, detail: confinement.available ? detail : `warning: ${detail}` };
     },
   };
 }
@@ -2878,6 +2905,7 @@ export function buildProductionDeps(): CliDeps {
     buildStateDirProbe(stateDbPath),
     buildProjectRootProbe(process.env.CONDUIT_PROJECT_ROOT),
     buildProcessContainmentProbe(),
+    buildWriteConfinementProbe(),
     {
       name: 'model_api_key',
       check: () => {

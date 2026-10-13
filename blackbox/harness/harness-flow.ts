@@ -17,7 +17,18 @@
  * type-only import of fake-claude's scenario shapes.
  */
 
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  appendFileSync,
+  chmodSync,
+  closeSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  openSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { Database } from "bun:sqlite";
@@ -98,6 +109,17 @@ export interface HarnessFlowOptions<R = FakeClaudeRole> {
   stub?: HarnessStub;
   /** Extra kernel env, e.g. `CONDUIT_HARNESS_CLAUDE_HEADLESS_MODEL`. */
   env?: Record<string, string>;
+  /**
+   * Serve the stub's call counter, log and barriers over HTTP on 127.0.0.1
+   * instead of the stub writing them to files. A write-confined call (issue
+   * #122) can write only inside its writable set, which never holds this
+   * workspace's stub dir, so a confined stub reports here. Landlock as the
+   * kernel applies it handles no network rights, so the connection is
+   * allowed. The server appends to the same log file, so `stubLog()` reads it
+   * unchanged. fake-claude-sdk, fake-codex-app-server and fake-opencode read
+   * the scenario's `sinkUrl`.
+   */
+  stubSink?: boolean;
 }
 
 export interface HarnessFlow {
@@ -134,6 +156,83 @@ export interface HarnessFlow {
 }
 
 let runCounter = 0;
+
+/** Claim the next call number for `role` by exclusive create, as the fakes do, so concurrent calls never share one. */
+export function claimCallNumber(stateDir: string, role: string): number {
+  mkdirSync(stateDir, { recursive: true });
+  for (let n = 1; ; n++) {
+    try {
+      closeSync(openSync(join(stateDir, `${role}.${n}`), "wx"));
+      return n;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+    }
+  }
+}
+
+/**
+ * The HTTP side of `stubSink`. `POST /call {role}` answers `{call}`,
+ * `POST /log` appends its body as one log line, and `POST /barrier
+ * {name, parties, timeoutMs}` answers `{released: true}` once `parties`
+ * requests for `name` have arrived, or `{released: false}` after
+ * `timeoutMs`.
+ */
+export function startStubSink(stateDir: string, logPath: string): ReturnType<typeof Bun.serve> {
+  const barriers = new Map<string, { arrived: number; release: Array<() => void> }>();
+  return Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    // A barrier request waits for its siblings; keep the connection open past Bun's 10 s default.
+    idleTimeout: 120,
+    async fetch(req) {
+      const path = new URL(req.url).pathname;
+      if (req.method !== "POST") return new Response("method", { status: 405 });
+      if (path === "/log") {
+        appendFileSync(logPath, (await req.text()).trimEnd() + "\n");
+        return Response.json({ ok: true });
+      }
+      const body = (await req.json()) as Record<string, unknown>;
+      if (path === "/call") return Response.json({ call: claimCallNumber(stateDir, String(body.role)) });
+      if (path === "/barrier") {
+        const name = String(body.name);
+        const parties = body.parties;
+        if (typeof parties !== "number" || !Number.isInteger(parties) || parties < 1) {
+          return new Response("barrier: parties must be a positive integer", { status: 400 });
+        }
+        const timeoutMs = body.timeoutMs ?? 15_000;
+        if (typeof timeoutMs !== "number" || !Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+          return new Response("barrier: timeoutMs must be a positive finite number", { status: 400 });
+        }
+        const b = barriers.get(name) ?? { arrived: 0, release: [] };
+        barriers.set(name, b);
+        b.arrived += 1;
+        if (b.arrived >= parties) {
+          for (const r of b.release.splice(0)) r();
+          // Drop the entry so a later use of the same name starts from zero.
+          barriers.delete(name);
+          return Response.json({ released: true });
+        }
+        const released = await new Promise<boolean>((res) => {
+          const onRelease = (): void => {
+            clearTimeout(timer);
+            res(true);
+          };
+          const timer = setTimeout(() => {
+            // A party that gave up no longer counts toward the barrier.
+            b.arrived -= 1;
+            const i = b.release.indexOf(onRelease);
+            if (i >= 0) b.release.splice(i, 1);
+            if (b.arrived <= 0 && barriers.get(name) === b) barriers.delete(name);
+            res(false);
+          }, timeoutMs);
+          b.release.push(onRelease);
+        });
+        return Response.json({ released });
+      }
+      return new Response("not found", { status: 404 });
+    },
+  });
+}
 
 export async function waitFor(
   cond: () => boolean | Promise<boolean>,
@@ -193,18 +292,30 @@ export function startHarnessFlow<R = FakeClaudeRole>(opts: HarnessFlowOptions<R>
   writeFileSync(flowPath, opts.flowYaml);
 
   const logPath = join(stubDir, "invocations.ndjson");
+  const stateDir = join(stubDir, "counters");
   const roles = typeof opts.roles === "function" ? opts.roles({ scratchDir }) : opts.roles;
+  const sink = opts.stubSink === true ? startStubSink(stateDir, logPath) : undefined;
   const scenarioPath = join(stubDir, "scenario.json");
-  writeFileSync(
-    scenarioPath,
-    JSON.stringify({ stateDir: join(stubDir, "counters"), logPath, roles }, null, 2),
-  );
-
-  // The adapter scrubs the child env to its allowlist, so `bun` may not be on
-  // the child's PATH. The wrapper names the running bun binary absolutely.
   const wrapper = join(stubDir, stub.binName);
-  writeFileSync(wrapper, `#!/bin/sh\nexec '${process.execPath}' '${stub.script}' "$@"\n`);
-  chmodSync(wrapper, 0o755);
+  // Nothing stops the sink until the flow is returned, so a setup failure stops it here.
+  try {
+    writeFileSync(
+      scenarioPath,
+      JSON.stringify(
+        { stateDir, logPath, ...(sink !== undefined ? { sinkUrl: `http://127.0.0.1:${sink.port}` } : {}), roles },
+        null,
+        2,
+      ),
+    );
+
+    // The adapter scrubs the child env to its allowlist, so `bun` may not be on
+    // the child's PATH. The wrapper names the running bun binary absolutely.
+    writeFileSync(wrapper, `#!/bin/sh\nexec '${process.execPath}' '${stub.script}' "$@"\n`);
+    chmodSync(wrapper, 0o755);
+  } catch (err) {
+    sink?.stop(true);
+    throw err;
+  }
 
   runCounter += 1;
   const runId = `bbh-${process.pid}-${runCounter}`;
@@ -325,6 +436,7 @@ export function startHarnessFlow<R = FakeClaudeRole>(opts: HarnessFlowOptions<R>
           /* already gone */
         }
       }
+      sink?.stop(true);
       try {
         // A stub still running here was orphaned by a conduit process the
         // timeout above killed (its own group kill never ran). The reap is

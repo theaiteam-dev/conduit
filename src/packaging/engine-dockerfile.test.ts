@@ -104,7 +104,7 @@ function runImage(args: string[]): RunResult {
 // ===========================================================================
 
 describe('engine Dockerfile — static content (unconditional)', () => {
-  it('pins the first FROM to exactly oven/bun:1.3.11-slim (FR-13)', () => {
+  it('pins the runtime stage (the last FROM) to exactly oven/bun:1.3.11-slim (FR-13)', () => {
     const content = readDockerfile();
     const fromLines = content
       .split('\n')
@@ -114,8 +114,14 @@ describe('engine Dockerfile — static content (unconditional)', () => {
     expect(fromLines.length).toBeGreaterThan(0);
 
     // Image reference is the first token after FROM (drop any `AS <stage>`).
-    const firstRef = fromLines[0]!.replace(/^FROM\s+/i, '').split(/\s+/)[0];
-    expect(firstRef).toBe('oven/bun:1.3.11-slim');
+    // The image is the last stage; earlier stages only build artifacts it
+    // copies in (the llexec helper, issue #122).
+    const runtimeRef = fromLines[fromLines.length - 1]!.replace(/^FROM\s+/i, '').split(/\s+/)[0];
+    expect(runtimeRef).toBe('oven/bun:1.3.11-slim');
+    // Every earlier stage is a named build stage, so none can become the image by accident.
+    for (const line of fromLines.slice(0, -1)) {
+      expect(line).toMatch(/\sAS\s+\S+$/i);
+    }
   });
 
   it('declares no Bun version other than 1.3.11-slim (single authoritative pin)', () => {

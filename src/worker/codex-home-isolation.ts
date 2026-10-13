@@ -25,8 +25,7 @@
 import { existsSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-
-const HOME_PREFIX = 'conduit-codex-home-';
+import { CODEX_HOME_PREFIX, taggedTempPrefix } from './stale-temp-dirs';
 
 const AUTH_FILE = 'auth.json';
 
@@ -74,7 +73,7 @@ export function createRunScopedCodexHome(
     );
   }
 
-  const dir = mkdtempSync(join(tmpdir(), HOME_PREFIX));
+  const dir = mkdtempSync(join(tmpdir(), taggedTempPrefix(CODEX_HOME_PREFIX)));
   try {
     writeFileSync(join(dir, 'config.toml'), '');
     if (linkAuth) symlinkSync(auth!, join(dir, AUTH_FILE));

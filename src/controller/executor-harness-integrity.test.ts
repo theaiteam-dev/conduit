@@ -14,7 +14,7 @@
  */
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import { join, dirname } from 'node:path';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { openConduitDB, type ConduitDB, DEFAULT_RUN_ID } from '../persistence/db';
 import { ensureCheckpointSchema, readCheckpoint } from '../checkpoint/checkpoint';
@@ -58,6 +58,8 @@ function makeHarness(
     writeMode?: 'plain' | 'symlink-escape';
     escapeDir?: string;
     rogueRel?: string;
+    // When set, delete this existing file (relative to the project root).
+    deleteRel?: string;
     // Controls the DECLARED output's validity (plain writeMode only). 'valid'
     // writes schema-conformant JSON; 'invalid' writes unparseable text; 'missing'
     // writes no declared output at all. Lets a test pair a rogue write with a
@@ -101,6 +103,7 @@ function makeHarness(
         mkdirSync(dirname(rogueAbs), { recursive: true });
         writeFileSync(rogueAbs, 'rogue content the card never declared', 'utf-8');
       }
+      if (opts.deleteRel !== undefined) rmSync(join(process.cwd(), opts.deleteRel));
       return { outputs: [], usage: { tokens: 10, cost: 0.01 } };
     },
   };
@@ -413,5 +416,61 @@ describe('WI-568 AC4 — symlink-laundered escape fails closed to hold', () => {
     expect(getCard(db)?.lane).not.toBe('done');
     expect(terminalReasons(db).join(' | ')).toMatch(/integrity/i);
     expect(coderCheckpoint(db)).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A delete is a write (SPEC §7). The tree diff used to walk only the
+// after-snapshot, so a call whose only out-of-bounds action was an rm reached
+// done. It is now checked against owned_paths like any other write.
+// ---------------------------------------------------------------------------
+
+describe('a harness delete is checked against owned_paths', () => {
+  it('holds when the call deletes a file outside owned_paths', async () => {
+    db = openDb();
+    writeFileSync(join(dir, 'shared.txt'), 'not this card\'s file');
+    const { adapter } = makeHarness({ writeMode: 'plain', deleteRel: 'shared.txt' });
+    const registry = createHarnessRegistry([adapter]);
+    const flow = writeHarnessFlow(dir, registry);
+    seedCard(db, ['task.json', 'work']);
+
+    await run(flow, registry);
+
+    expect(existsSync(join(dir, 'shared.txt'))).toBe(false);
+    expect(getCard(db)?.lane).toBe('hold');
+    const reasons = terminalReasons(db).join(' | ');
+    expect(reasons).toMatch(/integrity/i);
+    expect(reasons).toContain('path_escape');
+    expect(reasons).toContain('shared.txt');
+    expect(coderCheckpoint(db)).toBeNull();
+  });
+
+  it('holds when a card with no owned_paths deletes any file', async () => {
+    db = openDb();
+    writeFileSync(join(dir, 'shared.txt'), 'x');
+    // outputMode 'missing' so the delete is the call's only change.
+    const { adapter } = makeHarness({ writeMode: 'plain', outputMode: 'missing', deleteRel: 'shared.txt' });
+    const registry = createHarnessRegistry([adapter]);
+    const flow = writeHarnessFlow(dir, registry);
+    seedCard(db, []);
+
+    await run(flow, registry);
+
+    expect(getCard(db)?.lane).toBe('hold');
+    expect(terminalReasons(db).join(' | ')).toContain('shared.txt');
+  });
+
+  it('advances when the call deletes a file inside owned_paths', async () => {
+    db = openDb();
+    mkdirSync(join(dir, 'work'), { recursive: true });
+    writeFileSync(join(dir, 'work', 'scratch.txt'), 'old');
+    const { adapter } = makeHarness({ writeMode: 'plain', deleteRel: 'work/scratch.txt' });
+    const registry = createHarnessRegistry([adapter]);
+    const flow = writeHarnessFlow(dir, registry);
+    seedCard(db, ['task.json', 'work']);
+
+    await run(flow, registry);
+
+    expect(getCard(db)?.lane).toBe('done');
   });
 });

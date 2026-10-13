@@ -74,6 +74,9 @@ import { prepareContainedCommand, removeCgroup, resolveContainment, type Contain
 import { existsSync, statSync } from 'node:fs';
 import { isDeepStrictEqual } from 'node:util';
 import { resolveExecutable } from './harness-contained-spawn';
+import {
+  callTempDirEnv, createCallTempDir, removeCallTempDir, requireSpawnConfinement, type CallTempDir, type SpawnWriteConfinement,
+} from './landlock-confinement';
 
 /** The part of the SDK's `Query` this adapter uses. */
 export type AgentSdkQuery = AsyncIterable<SDKMessage> & { close?(): void };
@@ -159,6 +162,7 @@ export function createAgentSdkHarnessAdapter(config: AgentSdkHarnessAdapterConfi
     reportsUsage: true,
     canRestrictTools: true,
     canGatePerCall: true,
+    canConfineWrites: true,
     model: config.model,
     agent: config.agent,
 
@@ -185,16 +189,33 @@ export function createAgentSdkHarnessAdapter(config: AgentSdkHarnessAdapterConfi
 
       // Built before the dir exists: nothing between the dir's creation and the try below can throw.
       const baseEnv = buildHarnessChildEnv(config.envAllowlist, sourceEnv);
+      // Issue #122: a write-confined call always gets a run-scoped config dir, since the operator's own
+      // is not in its writable set, and a per-call temp dir that TMPDIR and the XDG cache and state dirs
+      // point at (the CLI writes version locks and logs under them).
+      const confined = call.confinement;
       // Throws before anything is spawned when the child could not authenticate.
       const configDir =
-        config.isolateConfig === true ? createRunScopedClaudeConfigDir(sourceEnv, config.envAllowlist) : undefined;
+        config.isolateConfig === true || confined !== undefined
+          ? createRunScopedClaudeConfigDir(sourceEnv, config.envAllowlist)
+          : undefined;
+      let callTmp: CallTempDir | undefined;
+      try {
+        if (confined !== undefined) callTmp = createCallTempDir();
+      } catch (err) {
+        if (configDir !== undefined) removeRunScopedClaudeConfigDir(configDir);
+        throw err;
+      }
       const env: Record<string, string> = {
         ...baseEnv,
         ...(configDir !== undefined ? { CLAUDE_CONFIG_DIR: configDir } : {}),
+        ...(callTmp !== undefined ? callTempDirEnv(callTmp, { xdg: true }) : {}),
       };
 
-      // Every throw from here on, including one while building the options, must remove the dir.
+      // Every throw from here on, including one while building the options, must remove the dirs.
       try {
+        // Throws before anything is spawned if the confinement cannot be built: never run unconfined.
+        const spawnConfinement: SpawnWriteConfinement | undefined =
+          confined !== undefined ? requireSpawnConfinement(confined, callTmp, [configDir]) : undefined;
         const emit = call.onEvent !== undefined ? createHarnessEventEmitter(call.onEvent) : undefined;
         const abortController = new AbortController();
         // Mutated from callbacks, so held in an object: a bare `let` would be narrowed to its initial value.
@@ -216,10 +237,12 @@ export function createAgentSdkHarnessAdapter(config: AgentSdkHarnessAdapterConfi
         const spawnClaudeCodeProcess = (opts: SpawnOptions): SpawnedProcess => {
           const childEnv: Record<string, string> = {};
           for (const [name, value] of Object.entries(opts.env)) if (value !== undefined) childEnv[name] = value;
-          const contained = prepareContainedCommand(containment, [opts.command, ...opts.args], {
-            ...(opts.cwd !== undefined ? { cwd: opts.cwd } : {}),
-            env: childEnv,
-          });
+          const contained = prepareContainedCommand(
+            containment,
+            [opts.command, ...opts.args],
+            { ...(opts.cwd !== undefined ? { cwd: opts.cwd } : {}), env: childEnv },
+            spawnConfinement,
+          );
           let child: ChildProcess;
           try {
             child = nodeSpawn(contained.argv[0]!, contained.argv.slice(1), {
@@ -616,6 +639,7 @@ export function createAgentSdkHarnessAdapter(config: AgentSdkHarnessAdapterConfi
         return { outputs: [], usage };
       } finally {
         if (configDir !== undefined) removeRunScopedClaudeConfigDir(configDir);
+        if (callTmp !== undefined) removeCallTempDir(callTmp);
       }
     },
   };

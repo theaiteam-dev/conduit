@@ -52,7 +52,7 @@
  *   export interface FanInState { childIds: string[]; terminalOutcomes: Array<{ id: string; lane: string }> }
  *   export type FanInDecision =
  *     | { action: 'proceed'; dropped: string[] }
- *     | { action: 'hold_parent'; reason: 'child_scrapped' | 'quorum_unmet' }
+ *     | { action: 'hold_parent'; reason: 'child_scrapped' | 'child_held' | 'quorum_unmet' }
  *     | { action: 'wait' };
  *   export function evaluateFanIn(policy: FanInPolicy, state: FanInState): FanInDecision;
  *
@@ -383,6 +383,16 @@ describe('evaluateFanIn — policy=all (AC5)', () => {
     const state = { childIds: ['a', 'b'], terminalOutcomes: [{ id: 'a', lane: 'done' }] };
     expect(evaluateFanIn({ kind: 'all' }, state)).toEqual({ action: 'wait' });
   });
+
+  it('holds the parent (child_held) when a child is in the hold lane', () => {
+    const state = { childIds: ['a', 'b'], terminalOutcomes: [{ id: 'a', lane: 'done' }, { id: 'b', lane: 'hold' }] };
+    expect(evaluateFanIn({ kind: 'all' }, state)).toEqual({ action: 'hold_parent', reason: 'child_held' });
+  });
+
+  it('reports child_scrapped when one child scrapped and another is held', () => {
+    const state = { childIds: ['a', 'b'], terminalOutcomes: [{ id: 'a', lane: 'scrap' }, { id: 'b', lane: 'hold' }] };
+    expect(evaluateFanIn({ kind: 'all' }, state)).toEqual({ action: 'hold_parent', reason: 'child_scrapped' });
+  });
 });
 
 describe('evaluateFanIn — policy=quorum(k count) (AC5, AC6)', () => {
@@ -447,6 +457,59 @@ describe('evaluateFanIn — policy=quorum(k count) (AC5, AC6)', () => {
       terminalOutcomes: [{ id: 'a', lane: 'done' }, { id: 'b', lane: 'scrap' }, { id: 'c', lane: 'scrap' }],
     };
     expect(evaluateFanIn(quorum, state)).toEqual({ action: 'hold_parent', reason: 'quorum_unmet' });
+  });
+});
+
+describe('evaluateFanIn — a held child holds the parent under every policy', () => {
+  it('quorum: holds the parent (child_held) even when the quorum is met without the held child', () => {
+    const state = {
+      childIds: ['a', 'b', 'c'],
+      terminalOutcomes: [{ id: 'a', lane: 'done' }, { id: 'b', lane: 'done' }, { id: 'c', lane: 'hold' }],
+    };
+    expect(evaluateFanIn({ kind: 'quorum', k: 2 }, state)).toEqual({ action: 'hold_parent', reason: 'child_held' });
+  });
+
+  it('quorum: reports child_held, not quorum_unmet, when the held child was needed for the quorum', () => {
+    const state = {
+      childIds: ['a', 'b'],
+      terminalOutcomes: [{ id: 'a', lane: 'done' }, { id: 'b', lane: 'hold' }],
+    };
+    expect(evaluateFanIn({ kind: 'quorum', k: 2 }, state)).toEqual({ action: 'hold_parent', reason: 'child_held' });
+  });
+
+  it('best_effort: holds the parent (child_held)', () => {
+    const state = {
+      childIds: ['a', 'b'],
+      terminalOutcomes: [{ id: 'a', lane: 'done' }, { id: 'b', lane: 'hold' }],
+    };
+    expect(evaluateFanIn({ kind: 'best_effort' }, state)).toEqual({ action: 'hold_parent', reason: 'child_held' });
+  });
+
+  it('quorum and best_effort hold as soon as a held child is seen, without waiting for in-flight siblings', () => {
+    const state = {
+      childIds: ['a', 'b', 'c'],
+      terminalOutcomes: [{ id: 'a', lane: 'done' }, { id: 'b', lane: 'hold' }],
+    };
+    expect(evaluateFanIn({ kind: 'quorum', k: 2 }, state)).toEqual({ action: 'hold_parent', reason: 'child_held' });
+    expect(evaluateFanIn({ kind: 'best_effort' }, state)).toEqual({ action: 'hold_parent', reason: 'child_held' });
+  });
+
+  it('quorum and best_effort still proceed with a scrapped child dropped when none is held', () => {
+    const state = {
+      childIds: ['a', 'b', 'c'],
+      terminalOutcomes: [{ id: 'a', lane: 'done' }, { id: 'b', lane: 'done' }, { id: 'c', lane: 'scrap' }],
+    };
+    expect(evaluateFanIn({ kind: 'quorum', k: 2 }, state)).toEqual({ action: 'proceed', dropped: ['c'] });
+    expect(evaluateFanIn({ kind: 'best_effort' }, state)).toEqual({ action: 'proceed', dropped: ['c'] });
+  });
+
+  it('quorum and best_effort hold on a held child even when another child is scrapped', () => {
+    const state = {
+      childIds: ['a', 'b', 'c'],
+      terminalOutcomes: [{ id: 'a', lane: 'done' }, { id: 'b', lane: 'scrap' }, { id: 'c', lane: 'hold' }],
+    };
+    expect(evaluateFanIn({ kind: 'quorum', k: 1 }, state)).toEqual({ action: 'hold_parent', reason: 'child_held' });
+    expect(evaluateFanIn({ kind: 'best_effort' }, state)).toEqual({ action: 'hold_parent', reason: 'child_held' });
   });
 });
 

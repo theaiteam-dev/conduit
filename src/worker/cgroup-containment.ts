@@ -33,6 +33,10 @@
  */
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmdirSync, statfsSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
+import { isOwnerPairGone, isPidAlive, processStartTime, tryOwnerTag } from './owner-tag';
+import { buildConfinedArgv, type SpawnWriteConfinement } from './landlock-confinement';
+
+export { processStartTime };
 
 /** statfs f_type of a cgroup v2 filesystem. */
 const CGROUP2_SUPER_MAGIC = 0x63677270;
@@ -98,49 +102,15 @@ async function sleep(ms: number): Promise<void> {
   await new Promise((r) => setTimeout(r, ms));
 }
 
-function isPidAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (err) {
-    // EPERM: it exists but belongs to someone else.
-    return (err as { code?: string }).code === 'EPERM';
-  }
-}
-
-/**
- * The start time of process `pid`, in clock ticks since boot: field 22 of
- * /proc/<pid>/stat. Unlike a pid, the kernel does not hand the pair
- * (pid, start time) to another process. Undefined when the process is not
- * running or /proc cannot be read.
- */
-export function processStartTime(pid: number): number | undefined {
-  let stat: string;
-  try {
-    stat = readFileSync(`/proc/${pid}/stat`, 'utf-8');
-  } catch {
-    return undefined;
-  }
-  // Field 2 is the command name in parentheses and may itself contain spaces
-  // and parentheses, so count fields from the last `)`: field 3 follows it.
-  const fields = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
-  const value = Number(fields[22 - 3]);
-  return Number.isSafeInteger(value) ? value : undefined;
-}
-
-let ownerTagMemo: string | undefined;
-
 /**
  * `<pid>-<start time>` of this kernel, the owner part of every cgroup name it
  * creates. Throws when /proc/self/stat cannot be read; detection checks that
  * first and falls back to the process-group kill.
  */
 function ownerTag(): string {
-  if (ownerTagMemo !== undefined) return ownerTagMemo;
-  const startTime = processStartTime(process.pid);
-  if (startTime === undefined) throw new Error('cannot read the start time of this process from /proc/self/stat');
-  ownerTagMemo = `${process.pid}-${startTime}`;
-  return ownerTagMemo;
+  const tag = tryOwnerTag();
+  if (tag === undefined) throw new Error('cannot read the start time of this process from /proc/self/stat');
+  return tag;
 }
 
 /** Whether the cgroup at `dir` still holds any process, itself or below. */
@@ -297,23 +267,12 @@ export function isOwnerGone(name: string, deps: IsOwnerGoneDeps = {}): boolean |
 
   const match = /^conduit-(\d+)-(?:(\d+)-[^-]+|[^-]+)$/.exec(name);
   if (match === null) return undefined;
-  const owner = Number(match[1]);
-
-  if (owner === selfPid) {
-    // A legacy name cannot be told apart from this kernel's, so keep it. An
-    // unreadable own start time is ambiguous the same way.
-    if (match[2] === undefined) return false;
-    if (selfStartTime === undefined) return false;
-    return Number(match[2]) !== selfStartTime;
-  }
-
-  if (match[2] === undefined) return !isAlive(owner);
-  const startTime = getStartTime(owner);
-  // An unreadable stat for a pid that still answers kill(0) is another user's
-  // process under a `hidepid` /proc mount. Keep its cgroup: killing a live
-  // kernel's invocation is worse than leaving an orphan for a later sweep.
-  if (startTime === undefined) return !isAlive(owner);
-  return startTime !== Number(match[2]);
+  return isOwnerPairGone(Number(match[1]), match[2] === undefined ? undefined : Number(match[2]), {
+    selfPid,
+    selfStartTime,
+    isPidAlive: isAlive,
+    processStartTime: getStartTime,
+  });
 }
 
 /**
@@ -515,6 +474,12 @@ function lookupPath(env: Record<string, string | undefined> | undefined): string
  * returned unchanged. Under cgroup containment this creates the invocation's
  * cgroup and wraps the command so the child joins it before it runs.
  *
+ * With `confinement` (issue #122), the command also runs under the llexec
+ * helper (native/llexec/llexec.c; ./landlock-confinement.ts builds its argv),
+ * which applies a Landlock write ruleset and then execs it. The order is fixed: the cgroup wrapper joins the cgroup
+ * and execs llexec, and llexec execs the command, so every process the
+ * command starts is both in the cgroup and confined.
+ *
  * The command is resolved to an absolute path here, against the same PATH
  * Bun.spawn would use, because the wrapper shell would otherwise resolve it
  * against its own default PATH. A command that is not found throws the same
@@ -524,8 +489,9 @@ export function prepareContainedCommand(
   containment: Containment,
   argv: readonly string[],
   spawnOptions: { cwd?: string; env?: Record<string, string | undefined> },
+  confinement?: SpawnWriteConfinement,
 ): ContainedCommand {
-  if (containment.mechanism === 'process-group') return { argv: [...argv], cgroup: undefined };
+  if (containment.mechanism === 'process-group' && confinement === undefined) return { argv: [...argv], cgroup: undefined };
 
   const [command, ...args] = argv;
   if (command === undefined) throw new Error('prepareContainedCommand: empty argv');
@@ -541,6 +507,11 @@ export function prepareContainedCommand(
     }
     throw Object.assign(new Error(`Executable not found in $PATH: "${command}"`), { code: 'ENOENT' });
   }
+  const inner =
+    confinement !== undefined
+      ? buildConfinedArgv(confinement.helper, confinement.writable, [resolved, ...args])
+      : [resolved, ...args];
+  if (containment.mechanism === 'process-group') return { argv: inner, cgroup: undefined };
 
   cgroupSequence += 1;
   const cgroup = join(containment.parent, `${CGROUP_PREFIX}${ownerTag()}-${cgroupSequence}`);
@@ -550,7 +521,7 @@ export function prepareContainedCommand(
     throw new Error(`conduit: cannot create containment cgroup ${cgroup} (${errorText(err)})`);
   }
   return {
-    argv: [WRAPPER_SHELL, '-c', WRAPPER_SCRIPT, join(cgroup, 'cgroup.procs'), resolved, ...args],
+    argv: [WRAPPER_SHELL, '-c', WRAPPER_SCRIPT, join(cgroup, 'cgroup.procs'), ...inner],
     cgroup,
   };
 }

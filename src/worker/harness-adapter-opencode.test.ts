@@ -11,6 +11,7 @@ import { describe, it, expect, afterAll } from 'bun:test';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { withFailingCallTempDir } from './harness-call-temp-dir.test-helper';
 import { describeHarnessContainmentConformance } from './harness-containment.conformance';
 import {
   OPENCODE_SERVE_ARGS,
@@ -64,6 +65,11 @@ describeHarnessContainmentConformance('opencode', (opts) =>
     model: 'openai/gpt-conformance',
     sourceEnv: { PATH: process.env.PATH, XDG_DATA_HOME: AUTH_HOME },
   }),
+  {
+    confinedEnv: [
+      'TMPDIR', 'HOME', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_STATE_HOME', 'XDG_CACHE_HOME',
+    ],
+  },
 );
 
 const containment = { mechanism: 'process-group', reason: 'unit test' } as const;
@@ -539,6 +545,22 @@ describe('opencode adapter: process, auth and environment', () => {
     const env = o.fake.state.spec!.env;
     expect(env.XDG_CONFIG_HOME).toContain('conduit-opencode-');
     expect(JSON.parse(env.OPENCODE_CONFIG_CONTENT!).permission).toEqual({ '*': 'ask' });
+  });
+
+  it('removes the run-scoped dirs when the per-call temp dir cannot be created, before anything is spawned', async () => {
+    const fake = fakeOpenCode((s) => finish(s));
+    const { live, leftBehind } = await withFailingCallTempDir('conduit-opencode-', async () => {
+      let thrown: Error | undefined;
+      try {
+        await adapterWith(fake).invoke(invocation({ confinement: { helper: '/nonexistent/helper', writable: [ROOT] } }));
+      } catch (err) {
+        thrown = err as Error;
+      }
+      expect(thrown?.message).toBe('simulated call temp dir failure');
+    });
+    expect(fake.state.spec).toBeUndefined();
+    expect(live.length).toBe(1);
+    expect(leftBehind).toEqual([]);
   });
 
   it('creates the XDG directories before the call and removes them on success', async () => {

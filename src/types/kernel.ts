@@ -178,7 +178,8 @@ export interface StationConfig {
    *
    * Either a bare survivor COUNT (e.g. `2`) or a structured policy object.
    * For `quorum`, `k` is a COUNT (integer ≥ 1): the parent proceeds iff at
-   * least `k` children reach a non-scrap terminal lane (see evaluateFanIn).
+   * least `k` children reach a terminal lane other than `scrap` or `hold`
+   * (see evaluateFanIn).
    */
   fan_in?: number | FanInPolicyConfig;
   /** Optional fan-out count for split stations. */

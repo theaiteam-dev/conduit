@@ -199,3 +199,34 @@ describe('integrity gate — content hash vs. forged mtime (the integrity-hash w
     expect(reason).toMatch(/newfile\.txt/);
   });
 });
+
+describe('integrity gate — deletes (SPEC §7: a delete is a write)', () => {
+  it('holds when the command deletes a file outside owned_paths', async () => {
+    writeFileSync(join(projectDir, 'sibling.txt'), 'owned by another card');
+    const script = writeScript(projectDir, 'rm.sh', 'rm sibling.txt');
+    const flow = setupFlow(projectDir, script);
+    db = openDb();
+    seedCard(db, ['task.json']);
+    const { io } = makeIO();
+
+    await runExecutor({ db, flow, now: () => 1000, adapter: makeStubAdapter(), io } as RunEngineArgs);
+
+    expect(db.getCard(DEFAULT_RUN_ID, 'c')?.status).toBe('held');
+    const reason = terminalReason(db);
+    expect(reason).toMatch(/path_escape/);
+    expect(reason).toMatch(/sibling\.txt/);
+  });
+
+  it('does not hold when the command deletes a file inside owned_paths', async () => {
+    writeFileSync(join(projectDir, 'task.json'), '{}');
+    const script = writeScript(projectDir, 'rm.sh', 'rm task.json');
+    const flow = setupFlow(projectDir, script);
+    db = openDb();
+    seedCard(db, ['task.json']);
+    const { io } = makeIO();
+
+    await runExecutor({ db, flow, now: () => 1000, adapter: makeStubAdapter(), io } as RunEngineArgs);
+
+    expect(db.getCard(DEFAULT_RUN_ID, 'c')?.lane).toBe('done');
+  });
+});

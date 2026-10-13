@@ -11,6 +11,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Options, SDKMessage } from '@anthropic-ai/claude-agent-sdk';
 import { describeHarnessContainmentConformance } from './harness-containment.conformance';
+import { withFailingCallTempDir } from './harness-call-temp-dir.test-helper';
 import { createAgentSdkHarnessAdapter, type AgentSdkHarnessAdapterConfig, type AgentSdkQueryFn } from './harness-adapter-agent-sdk';
 import {
   bindHarnessDefinitionsForIntrospection, buildHarnessDefinitionRegistry, shippedHarnessAdapterNames,
@@ -19,8 +20,15 @@ import {
 import type { HarnessEvent } from './harness-events';
 import { HARNESS_GATE_HOLD_CODE, type GateToolCall, type HarnessToolGate } from './harness-gate';
 
+// The API key is a dummy: a write-confined call always builds a run-scoped config dir (issue #122), which
+// needs a credential source, and the stand-in binary never authenticates.
 describeHarnessContainmentConformance('agent-sdk', (opts) =>
-  createAgentSdkHarnessAdapter({ ...opts, envAllowlist: [] }),
+  createAgentSdkHarnessAdapter({
+    ...opts,
+    envAllowlist: ['ANTHROPIC_API_KEY'],
+    sourceEnv: { PATH: process.env.PATH, ANTHROPIC_API_KEY: 'sk-conformance' },
+  }),
+  { confinedEnv: ['TMPDIR', 'CLAUDE_CONFIG_DIR', 'XDG_CACHE_HOME', 'XDG_STATE_HOME'] },
 );
 
 const ROOT = tmpdir();
@@ -383,6 +391,21 @@ describe('agent-sdk adapter: isolateConfig', () => {
       rmSync(scratch, { recursive: true, force: true });
       rmSync(h, { recursive: true, force: true });
     }
+  });
+
+  it('removes the run-scoped config dir when the per-call temp dir cannot be created, before anything is spawned', async () => {
+    const { query, seen } = scripted(async function* () { yield RESULT_OK; });
+    const { live, leftBehind } = await withFailingCallTempDir('conduit-claude-config-', async () => {
+      const err = await rejection(
+        makeAdapter(query, { sourceEnv: { ANTHROPIC_API_KEY: 'sk-test' }, envAllowlist: ['ANTHROPIC_API_KEY'] }).invoke(
+          invocation({ gate: allowAll, confinement: { helper: '/nonexistent/helper', writable: [ROOT] } }),
+        ),
+      );
+      expect(err.message).toBe('simulated call temp dir failure');
+    });
+    expect(seen).toEqual([]);
+    expect(live.length).toBe(1);
+    expect(leftBehind).toEqual([]);
   });
 
   it('fails before spawning when there is nothing to authenticate with', async () => {

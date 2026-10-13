@@ -47,6 +47,14 @@ jobs:
       - name: Black-box typecheck
         run: bun run typecheck:blackbox
 
+      # Issue #122, as in test.yml: the Landlock write-confinement helper.
+      # The spawned `conduit` finds it at native/llexec/build/llexec. With
+      # CONDUIT_REQUIRE_LANDLOCK set below, landlock-overlap.test.ts fails,
+      # naming the `conduit doctor` line, instead of skipping its confined
+      # case if the runner kernel ever stops offering Landlock.
+      - name: Build the llexec helper
+        run: scripts/build-llexec.sh
+
       # Issue #77, as in test.yml's Test step: harness-idle-timeout.test.ts
       # proves a harness call's setsid descendant (Claude Code's Bash tool
       # starts every command in a new session) dies with the call. Only a
@@ -58,6 +66,7 @@ jobs:
       - name: Black-box test
         env:
           CONDUIT_REQUIRE_CGROUP_CONTAINMENT: '1'
+          CONDUIT_REQUIRE_LANDLOCK: '1'
         run: |
           cg=/sys/fs/cgroup/conduit-ci
           sudo mkdir -p "$cg"

@@ -1,6 +1,6 @@
 # ADR-0012: Ungated harness calls may overlap under `--concurrency`, with owned-dir attribution in the integrity check
 
-Status: Accepted (maintainer decision 2026-10-08 to build ahead of the measurement; #30 acceptance item 3 still needs a measured number)
+Status: Accepted (maintainer decision 2026-10-08 to build ahead of the measurement; #30 acceptance item 3 still needs a measured number). Amended by [ADR-0013](./0013-os-enforced-write-confinement-of-overlapped-harness-calls.md) (2026-10-10): the gap below is closed where write confinement is active.
 Date: 2026-10-07 (written), 2026-10-08 (accepted)
 
 ## Context
@@ -146,6 +146,14 @@ A flow author who opts in accepts that a Bash write by one overlapped sibling ca
 another sibling's artifacts undetected. A flow whose overlapped stations allow no
 file-writing executable in their Bash allowlist does not have the gap in practice.
 
+**Update (2026-10-10, [ADR-0013](./0013-os-enforced-write-confinement-of-overlapped-harness-calls.md)).**
+Every member of an overlap batch now runs under Landlock write confinement, and a card runs on
+the serial path when the host or adapter cannot provide it. The writes described above fail at
+the syscall before they happen, so the gap is closed for file contents. What confinement does
+not cover (metadata changes, writes by an unconfined process on the call's behalf, network
+egress) is listed in ADR-0013. Confinement needs Linux 6.2 (Landlock ABI 3), the first ABI
+that checks `truncate(2)`; on an older kernel the cards run serially.
+
 ### Ship condition
 
 Written while this ADR was Proposed. The maintainer accepted it on 2026-10-08 before the
@@ -199,7 +207,8 @@ capabilities a default container lacks. A related option is Landlock, an unprivi
 Linux LSM that could confine each harness process tree's writes to its owned dir plus its
 temp and config dirs. That would turn the gap into a pre-execution denial; it needs
 per-adapter allowances for the paths each CLI writes and a kernel that supports it.
-Recorded as a revisit trigger.
+Recorded as a revisit trigger. Landlock was adopted in
+[ADR-0013](./0013-os-enforced-write-confinement-of-overlapped-harness-calls.md).
 
 ### F. Mixed harness and transform batches, with attribution to transform outputs: *deferred*
 Attribution would also need the resolved declared-output paths of transform members. The
@@ -217,7 +226,8 @@ Needs `runGateCheckOrAdvance` to be re-entrant. Not required by the Shakedown sh
   member's owned paths.
 
 **We pay**
-- **The Bash cross-sibling gap** above, accepted per station by `overlap: true`.
+- **The Bash cross-sibling gap** above, accepted per station by `overlap: true`. Closed by
+  ADR-0013 where write confinement is active; a host without it runs the cards serially.
 - **A breach by one member can hold every member whose window overlapped it.** A path no
   member owns cannot be attributed, so each overlapping diff that contains it holds its
   card. This fails closed; the hold reason already names "another process wrote to the
