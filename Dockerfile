@@ -1,6 +1,9 @@
 # Issue #122: the Landlock write-confinement helper (native/llexec/llexec.c),
 # built statically against musl so the binary runs in the Debian-based runtime
-# image below without any library from this stage.
+# image below without any library from this stage. Pinned by tag, as the
+# runtime stage is: digest pinning belongs to both stages at once, and the
+# runtime tag is what the FR-13 test and the Bun bump procedure
+# (docs/installation.md §7) name, so it is a separate change.
 FROM alpine:3.20 AS llexec
 RUN apk add --no-cache gcc musl-dev
 COPY native/llexec/llexec.c /src/llexec.c
