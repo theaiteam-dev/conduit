@@ -42,6 +42,7 @@ describeHarnessContainmentConformance('codex-app-server', (opts) =>
     envAllowlist: ['OPENAI_API_KEY'],
     sourceEnv: { PATH: process.env.PATH, OPENAI_API_KEY: 'sk-conformance' },
   }),
+  { confinedEnv: ['TMPDIR', 'CODEX_HOME', 'XDG_CACHE_HOME', 'XDG_STATE_HOME'] },
 );
 
 const PREEXISTING_HOMES = new Set(readdirSync(tmpdir()).filter((n) => n.startsWith('conduit-codex-home-')));

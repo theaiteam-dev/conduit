@@ -41,7 +41,10 @@ export function parseStatStartTime(stat: string): number | undefined {
   // Field 2 is the command name in parentheses and may itself contain spaces
   // and parentheses, so count fields from the last `)`: field 3 follows it.
   const fields = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
-  const value = Number(fields[22 - 3]);
+  const field = fields[22 - 3];
+  // Number('') and Number(' ') are 0, so require digits before converting.
+  if (field === undefined || !/^\d+$/.test(field)) return undefined;
+  const value = Number(field);
   return Number.isSafeInteger(value) ? value : undefined;
 }
 

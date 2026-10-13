@@ -65,6 +65,11 @@ describeHarnessContainmentConformance('opencode', (opts) =>
     model: 'openai/gpt-conformance',
     sourceEnv: { PATH: process.env.PATH, XDG_DATA_HOME: AUTH_HOME },
   }),
+  {
+    confinedEnv: [
+      'TMPDIR', 'HOME', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_STATE_HOME', 'XDG_CACHE_HOME',
+    ],
+  },
 );
 
 const containment = { mechanism: 'process-group', reason: 'unit test' } as const;

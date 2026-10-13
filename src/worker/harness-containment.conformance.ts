@@ -574,17 +574,29 @@ export function harnessAdapterSpawnPath(
  * requires the adapter to reject with code `harness-timeout`. It also checks
  * that the adapter's `name` matches `name`, which is the key the registry test
  * looks for, so a call cannot cover one adapter under another's name.
+ *
+ * An adapter with `canConfineWrites` must also pass `options.confinedEnv`: the
+ * run-scoped env variables (TMPDIR, its config home, its XDG dirs) its confined
+ * call sets. The write fixture records only variables that are set, so without
+ * this list a regression that stops the adapter setting one would skip that
+ * variable's writability check instead of failing it.
  */
 export function describeHarnessContainmentConformance(
   name: string,
   factory: (opts: HarnessContainmentFactoryOptions) => HarnessAdapter,
+  options: { confinedEnv?: readonly string[] } = {},
 ): void {
   describeContainmentConformance(name, harnessAdapterSpawnPath(name, factory), {
     timeoutClass: HARNESS_TIMEOUT_CLASS,
   });
   // Never invoked: built only to read the static capability flag.
   if (factory({ projectRoot: '', command: WRITE_FIXTURE }).canConfineWrites === true) {
-    describeWriteConfinementConformance(name, factory);
+    if (options.confinedEnv === undefined || options.confinedEnv.length === 0) {
+      throw new Error(
+        `${name} declares canConfineWrites, so describeHarnessContainmentConformance needs options.confinedEnv`,
+      );
+    }
+    describeWriteConfinementConformance(name, factory, options.confinedEnv);
   }
 }
 
@@ -681,6 +693,7 @@ const WRITE_FIXTURE_TIMEOUT_MS = 10_000;
 function describeWriteConfinementConformance(
   name: string,
   factory: (opts: HarnessContainmentFactoryOptions) => HarnessAdapter,
+  confinedEnv: readonly string[],
 ): void {
   describe(`write confinement conformance: ${name}`, () => {
     let projectRoot: string;
@@ -714,7 +727,10 @@ function describeWriteConfinementConformance(
         expect(result.mvSourceKept, 'mv removed its source without landing in the sibling').toBe(true);
         expect(result.shared).toBe('shared\n');
         // The per-call temp dir and every run-scoped dir the adapter set stay writable.
-        expect(result.envWrites.get('TMPDIR')).toBe('ok');
+        // Each variable the adapter documents must be set and writable; the fixture records only set ones.
+        for (const variable of confinedEnv) {
+          expect(`${variable}=${result.envWrites.get(variable) ?? 'absent'}`).toBe(`${variable}=ok`);
+        }
         for (const [variable, outcome] of result.envWrites) {
           expect(`${variable}=${outcome}`).toBe(`${variable}=ok`);
         }

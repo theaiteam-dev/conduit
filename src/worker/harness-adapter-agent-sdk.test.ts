@@ -28,6 +28,7 @@ describeHarnessContainmentConformance('agent-sdk', (opts) =>
     envAllowlist: ['ANTHROPIC_API_KEY'],
     sourceEnv: { PATH: process.env.PATH, ANTHROPIC_API_KEY: 'sk-conformance' },
   }),
+  { confinedEnv: ['TMPDIR', 'CLAUDE_CONFIG_DIR', 'XDG_CACHE_HOME', 'XDG_STATE_HOME'] },
 );
 
 const ROOT = tmpdir();

@@ -21,6 +21,21 @@ describe('parseStatStartTime', () => {
     expect(parseStatStartTime('4242 (bun) S 1 2 3')).toBeUndefined();
   });
 
+  it('is undefined when field 22 is empty after a trailing separator', () => {
+    // Fields 3..21 present, then a space and nothing: Number('') would be 0.
+    const head = Array.from({ length: 19 }, (_, i) => String((i + 3) * 1000)).join(' ');
+    expect(parseStatStartTime(`4242 (bun) ${head} `)).toBeUndefined();
+  });
+
+  it('is undefined when a doubled space leaves field 22 empty', () => {
+    const head = Array.from({ length: 19 }, (_, i) => String((i + 3) * 1000)).join(' ');
+    expect(parseStatStartTime(`4242 (bun) ${head}  23 24`)).toBeUndefined();
+  });
+
+  it('is undefined when field 22 is not all digits', () => {
+    expect(parseStatStartTime(statLine('(bun)', 123456).replace('123456', '12a'))).toBeUndefined();
+  });
+
   it('is undefined for a line with no closing parenthesis', () => {
     expect(parseStatStartTime('garbage')).toBeUndefined();
   });
