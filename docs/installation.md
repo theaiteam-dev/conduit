@@ -59,7 +59,7 @@ docker build -t conduit-engine:1.0.0 .
 >
 > | Step | Purpose |
 > |------|---------|
-> | `FROM alpine:3.20 AS llexec` + `gcc -static` | Build stage: compiles the Landlock write-confinement helper (`native/llexec/llexec.c`) as a static binary. Nothing else from this stage reaches the image |
+> | `FROM alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc AS llexec` + `gcc -static` | Build stage: compiles the Landlock write-confinement helper (`native/llexec/llexec.c`) as a static binary. The base is pinned by the digest of the `alpine:3.20` multi-arch index, so every build uses the same toolchain; the Dockerfile comment above the `FROM` says how to move it. Nothing else from this stage reaches the image |
 > | `FROM oven/bun:1.3.11-slim` | Pinned Bun runtime, the image's base — see [§7](#7-bump-the-bun-version) to change it |
 > | `COPY --from=llexec /llexec /usr/local/bin/llexec` | The helper overlapped harness calls run under (reported by the `write-confinement` doctor probe) |
 > | Create `conduit` user/group | Least-privilege execution — the container never runs as root |
