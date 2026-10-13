@@ -30,6 +30,14 @@ export function processStartTime(pid: number): number | undefined {
   } catch {
     return undefined;
   }
+  return parseStatStartTime(stat);
+}
+
+/**
+ * Field 22 (start time) of a /proc/<pid>/stat line, or undefined when the line
+ * is truncated or the field is not an integer.
+ */
+export function parseStatStartTime(stat: string): number | undefined {
   // Field 2 is the command name in parentheses and may itself contain spaces
   // and parentheses, so count fields from the last `)`: field 3 follows it.
   const fields = stat.slice(stat.lastIndexOf(')') + 2).split(' ');

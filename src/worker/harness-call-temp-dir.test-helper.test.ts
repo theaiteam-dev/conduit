@@ -18,7 +18,7 @@ describe('withFailingCallTempDir', () => {
     ).rejects.toThrow(/private TMPDIR/);
   });
 
-  it('reports a dir the body leaves behind and one it removes', async () => {
+  it('reports no leftover for a dir the body removes', async () => {
     const r = await withFailingCallTempDir('conduit-x-', async () => {
       const dir = mkdtempSync(join(tmpdir(), 'conduit-x-'));
       try {
@@ -29,5 +29,18 @@ describe('withFailingCallTempDir', () => {
     });
     expect(r.live.length).toBe(1);
     expect(r.leftBehind).toEqual([]);
+  });
+
+  it('reports a dir the body leaves behind', async () => {
+    const r = await withFailingCallTempDir('conduit-x-', async () => {
+      mkdtempSync(join(tmpdir(), 'conduit-x-'));
+      try {
+        landlock.createCallTempDir();
+      } catch {
+        // The body deliberately does not remove its dir.
+      }
+    });
+    expect(r.live.length).toBe(1);
+    expect(r.leftBehind).toEqual(r.live);
   });
 });
