@@ -47,7 +47,10 @@ export const LLEXEC_ENV = 'CONDUIT_LLEXEC';
 /** Where scripts/build-llexec.sh puts the helper in a source checkout. */
 export const REPO_LLEXEC_PATH = resolve(import.meta.dir, '../../native/llexec/build/llexec');
 
-/** Always writable for a confined call: terminals, /dev/null, /dev/shm. */
+/**
+ * Always writable for a confined call, as one rule: the CLIs and their shells write /dev/null,
+ * and the runtime may use /dev/shm. Not narrowed to named devices; see ADR-0013.
+ */
 export const DEV_DIR = '/dev';
 
 /**

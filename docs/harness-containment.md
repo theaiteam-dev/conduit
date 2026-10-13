@@ -612,6 +612,9 @@ unconfined and requires the sibling writes to land.
   reached over a socket.
 - Network egress (see [Network posture](#network-posture-full-egress-in-v1)).
 - Reads. Everything the kernel's user can read stays readable.
+- `/dev`. The whole of `/dev` is writable, so a member can write `/dev/shm` entries a
+  sibling created and any device file the kernel's user can open. None of it is a
+  sibling's `owned_paths` (ADR-0013 records why `/dev` is not narrowed).
 - Serial calls, gate critics and deterministic stations. They run as before, with the
   integrity diff as the backstop.
 

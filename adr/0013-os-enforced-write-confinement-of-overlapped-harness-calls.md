@@ -71,7 +71,14 @@ overlapped call; the adapter adds its own dirs.
   root holding `HOME` and the XDG dirs. Config isolation is mandatory for a confined call: the
   `agent-sdk` adapter creates a run-scoped `CLAUDE_CONFIG_DIR` for it whatever `_ISOLATE_CONFIG`
   says, because the operator's own config dir is not writable under the ruleset.
-- `/dev`.
+- `/dev`, whole. The CLIs and their shells write `/dev/null`, and a Node or
+  Bun runtime may use `/dev/shm`. `/dev` is granted as one rule rather than as named device
+  files because a narrower set would have to be re-established per CLI by strace, as the rest
+  of the set was, and a device the strace missed would fail a call with `EACCES`. What the
+  grant leaves open: a member can write `/dev/shm` entries a sibling created and any device
+  file the kernel's user can open. Neither is inside the project root, so neither is a
+  sibling's `owned_paths`, which is what this ADR confines; harness calls run on pipes, so
+  there is no sibling pty to write to.
 
 How each adapter's set was established:
 
@@ -90,8 +97,11 @@ dir links to the operator's file, so a refresh written through the link would be
 A once-per-process probe, `resolveWriteConfinement` (`src/worker/landlock-confinement.ts`),
 modelled on `resolveContainment`, finds the helper (`CONDUIT_LLEXEC`; else the source-checkout
 build at `native/llexec/build/llexec`; else `llexec` on `PATH`), asks it for the ABI, and runs
-a real write test through it: a write inside the writable path must succeed and a write outside
-it must be refused.
+a real write test through it: a write inside the writable path must succeed, and creating a
+file outside it, truncating an existing file outside it (`open(O_TRUNC)`), and hardlinking that
+file into the writable path (which needs `REFER` on the source) must each be refused. The same
+commands run first with no helper and must all succeed, so a refusal is attributable to
+Landlock and not to an unwritable scratch dir.
 
 The probe requires Landlock ABI 3 or higher, that is Linux 6.2 or later. ABI 1 and 2 do not
 check `truncate(2)`, so a confined member could empty a file in a sibling's owned paths. That
