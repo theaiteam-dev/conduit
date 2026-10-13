@@ -194,8 +194,14 @@ export function startStubSink(stateDir: string, logPath: string): ReturnType<typ
       if (path === "/call") return Response.json({ call: claimCallNumber(stateDir, String(body.role)) });
       if (path === "/barrier") {
         const name = String(body.name);
-        const parties = Number(body.parties);
-        const timeoutMs = Number(body.timeoutMs ?? 15_000);
+        const parties = body.parties;
+        if (typeof parties !== "number" || !Number.isInteger(parties) || parties < 1) {
+          return new Response("barrier: parties must be a positive integer", { status: 400 });
+        }
+        const timeoutMs = body.timeoutMs ?? 15_000;
+        if (typeof timeoutMs !== "number" || !Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+          return new Response("barrier: timeoutMs must be a positive finite number", { status: 400 });
+        }
         const b = barriers.get(name) ?? { arrived: 0, release: [] };
         barriers.set(name, b);
         b.arrived += 1;

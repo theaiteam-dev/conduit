@@ -35,4 +35,30 @@ describe("startStubSink barrier state", () => {
     expect(pair).toEqual([true, true]);
     expect(await arrive("reuse", 2, 100)).toBe(false);
   });
+
+  describe("malformed barrier requests", () => {
+    const post = async (payload: Record<string, unknown>): Promise<{ status: number; ms: number }> => {
+      const start = Date.now();
+      const res = await fetch(`http://127.0.0.1:${server.port}/barrier`, {
+        method: "POST",
+        body: JSON.stringify(payload),
+      });
+      await res.text();
+      return { status: res.status, ms: Date.now() - start };
+    };
+    const cases: Array<[string, Record<string, unknown>]> = [
+      ["missing parties", { name: "bad", timeoutMs: 5000 }],
+      ["string parties", { name: "bad", parties: "2", timeoutMs: 5000 }],
+      ["zero parties", { name: "bad", parties: 0, timeoutMs: 5000 }],
+      ["fractional parties", { name: "bad", parties: 1.5, timeoutMs: 5000 }],
+      ["non-numeric timeoutMs", { name: "bad", parties: 2, timeoutMs: "x" }],
+    ];
+    for (const [label, payload] of cases) {
+      test(`${label} answers 400 promptly`, async () => {
+        const { status, ms } = await post(payload);
+        expect(status).toBe(400);
+        expect(ms).toBeLessThan(1000);
+      });
+    }
+  });
 });

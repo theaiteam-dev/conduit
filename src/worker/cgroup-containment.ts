@@ -475,8 +475,8 @@ function lookupPath(env: Record<string, string | undefined> | undefined): string
  * cgroup and wraps the command so the child joins it before it runs.
  *
  * With `confinement` (issue #122), the command also runs under the llexec
- * helper (./landlock-confinement.ts), which applies a Landlock write ruleset
- * and then execs it. The order is fixed: the cgroup wrapper joins the cgroup
+ * helper (native/llexec/llexec.c; ./landlock-confinement.ts builds its argv),
+ * which applies a Landlock write ruleset and then execs it. The order is fixed: the cgroup wrapper joins the cgroup
  * and execs llexec, and llexec execs the command, so every process the
  * command starts is both in the cgroup and confined.
  *
