@@ -166,21 +166,21 @@ describe('sweepStaleRunScopedDirs', () => {
     expect(() => sweepStaleRunScopedDirs({ ...deps(), tmpRoot: join(root, 'missing') })).not.toThrow();
   });
 
-  test('does not throw for an unremovable entry, and still sweeps the rest', () => {
+  test('skips an entry whose removal throws, and still sweeps the rest', () => {
     const locked = mk(`${CALL_TMP_PREFIX}${DEAD_PID}-77-aaaaaa`);
-    const sub = join(locked, 'sub');
-    mkdirSync(sub);
-    writeFileSync(join(sub, 'g'), 'x');
+    writeFileSync(join(locked, 'g'), 'x');
     const other = mk(`${CALL_TMP_PREFIX}${DEAD_PID}-77-bbbbbb`);
-    // A read-only dir cannot lose its entries. Root ignores the mode, so the
-    // assertion is only that nothing throws and the other entry is gone.
-    require('node:fs').chmodSync(sub, 0o500);
-    try {
-      expect(() => sweepStaleRunScopedDirs(deps())).not.toThrow();
-      expect(existsSync(other)).toBe(false);
-    } finally {
-      require('node:fs').chmodSync(sub, 0o700);
-    }
+    const rm = (dir: string) => {
+      if (dir === locked) throw new Error('EACCES');
+      rmSync(dir, { recursive: true, force: true });
+    };
+    let removed: string[] = [];
+    expect(() => {
+      removed = sweepStaleRunScopedDirs({ ...deps(), rm });
+    }).not.toThrow();
+    expect(removed).toEqual([other]);
+    expect(existsSync(locked)).toBe(true);
+    expect(existsSync(other)).toBe(false);
   });
 
   test('leaves a symlink target outside the swept dir intact', () => {

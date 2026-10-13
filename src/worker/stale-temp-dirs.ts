@@ -45,6 +45,8 @@ export interface SweepStaleDirsDeps {
   selfStartTime?: number | undefined;
   isPidAlive?: (pid: number) => boolean;
   processStartTime?: (pid: number) => number | undefined;
+  /** Removes one dir. Defaults to `rmSync(dir, { recursive: true, force: true })`. */
+  rm?: (dir: string) => void;
 }
 
 /**
@@ -67,6 +69,7 @@ export function sweepStaleRunScopedDirs(deps: SweepStaleDirsDeps = {}): string[]
       isPidAlive: deps.isPidAlive ?? isPidAlive,
       processStartTime: deps.processStartTime ?? processStartTime,
     };
+    const rm = deps.rm ?? ((dir: string) => rmSync(dir, { recursive: true, force: true }));
     for (const name of readdirSync(root)) {
       const prefix = prefixes.find((p) => name.startsWith(p));
       if (prefix === undefined) continue;
@@ -75,7 +78,7 @@ export function sweepStaleRunScopedDirs(deps: SweepStaleDirsDeps = {}): string[]
       try {
         if (!isOwnerPairGone(Number(match[1]), Number(match[2]), resolved)) continue;
         const dir = join(root, name);
-        rmSync(dir, { recursive: true, force: true });
+        rm(dir);
         removed.push(dir);
       } catch {
         // Not ours to remove, or already gone.

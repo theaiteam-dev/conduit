@@ -143,7 +143,13 @@ export function locateLlexec(
   };
 }
 
-async function defaultRun(argv: string[], cwd: string): Promise<ProbeRunResult> {
+/**
+ * Runs one probe command with `budgetMs` as its upper bound. At the budget the
+ * child is killed and the result rejects, without waiting for the output pipes:
+ * a descendant that outlived the kill can keep them open indefinitely, and the
+ * caller turns the rejection into an unavailable verdict. Exported for tests.
+ */
+export async function runProbeCommand(argv: string[], cwd: string, budgetMs: number): Promise<ProbeRunResult> {
   const proc = Bun.spawn(argv, {
     cwd,
     env: { PATH: '/usr/bin:/bin' },
@@ -151,17 +157,26 @@ async function defaultRun(argv: string[], cwd: string): Promise<ProbeRunResult> 
     stdout: 'pipe',
     stderr: 'pipe',
   });
-  const timer = setTimeout(() => proc.kill('SIGKILL'), PROBE_BUDGET_MS);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timedOut = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      proc.kill('SIGKILL');
+      reject(new Error(`probe timed out after ${budgetMs} ms`));
+    }, budgetMs);
+  });
+  const finished = Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
+  // After a timeout the reads may still fail or never settle; nobody awaits them then.
+  finished.catch(() => {});
   try {
-    const [stdout, stderr] = await Promise.all([
-      new Response(proc.stdout).text(),
-      new Response(proc.stderr).text(),
-      proc.exited,
-    ]);
+    const [stdout, stderr] = await Promise.race([finished, timedOut]);
     return { exitCode: proc.exitCode, stdout, stderr };
   } finally {
     clearTimeout(timer);
   }
+}
+
+function defaultRun(argv: string[], cwd: string): Promise<ProbeRunResult> {
+  return runProbeCommand(argv, cwd, PROBE_BUDGET_MS);
 }
 
 /** The first line of `text`, trimmed, for a reason string. */

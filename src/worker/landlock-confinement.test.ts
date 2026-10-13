@@ -30,6 +30,7 @@ import {
   removeCallTempDir,
   requireSpawnConfinement,
   resolveWriteConfinement,
+  runProbeCommand,
   type ProbeRunResult,
   type WriteConfinement,
 } from './landlock-confinement';
@@ -255,6 +256,29 @@ describe('detectWriteConfinement: each reason it is unavailable, with the depend
     }));
     expect(!result.available && result.reason).toBe('the write-confinement probe failed (spawn failed)');
   });
+});
+
+describe('runProbeCommand', () => {
+  it('returns the exit code and output of a command that finishes inside the budget', async () => {
+    const result = await runProbeCommand(['/bin/sh', '-c', 'echo out; echo err >&2; exit 3'], scratch, 5_000);
+    expect(result).toEqual({ exitCode: 3, stdout: 'out\n', stderr: 'err\n' });
+  });
+
+  it('rejects at the budget when a surviving descendant holds the output pipe open', async () => {
+    // sh exits at once, but the background sleep inherited stdout and stderr, so
+    // the pipes stay open. The result must not wait for the sleep.
+    const started = Date.now();
+    await expect(runProbeCommand(['/bin/sh', '-c', 'sleep 5 & exit 0'], scratch, 200)).rejects.toThrow(
+      /probe timed out after 200 ms/,
+    );
+    expect(Date.now() - started).toBeLessThan(3_000);
+  }, 4_000);
+
+  it('rejects at the budget for a command that never exits, and kills it', async () => {
+    await expect(runProbeCommand(['/bin/sh', '-c', 'exec sleep 30'], scratch, 200)).rejects.toThrow(
+      /probe timed out after 200 ms/,
+    );
+  }, 4_000);
 });
 
 describe('createWriteConfinementResolver', () => {
