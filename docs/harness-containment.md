@@ -96,12 +96,14 @@ What it does not cover:
   `curl -o`, `tee`, `sed -i`, `awk` (`system()`). Listing one of them allows what it can
   do, so the Bash allowlist constrains only what the flow author chooses to list.
 - A Bash write that bypasses the path check. Redirects are refused, but a write by an
-  allowlisted program to a path in its arguments is not. On the serial path the MARK_DONE
-  owned-paths integrity check stays mandatory as the backstop and holds the card after the
-  call. It sees files created, changed and deleted, so an `rm` outside the owned paths holds
-  the card too. An overlapped call (`overlap: true`) runs under Landlock write confinement, which
-  refuses such a write at the syscall when it targets anything outside the call's writable
-  set, including the owned paths of a card whose call overlapped this one (see
+  allowlisted program to a path in its arguments is not. The MARK_DONE owned-paths
+  integrity check stays mandatory as the backstop on both paths and holds the card after
+  the call. It sees files created, changed and deleted, so an `rm` outside the owned paths
+  holds the card too. An overlapped call (`overlap: true`) also runs under Landlock write
+  confinement, which refuses such a write at the syscall when it targets anything outside
+  the call's writable set, including the owned paths of a card whose call overlapped this
+  one. Metadata changes and writes an unconfined process makes on the call's behalf are not
+  refused (see the "Not covered" list under
   [Write confinement of overlapped calls](#write-confinement-of-overlapped-calls)).
 - Reads outside the project root, and a symlink swapped between the check and the write.
 - The input of `Agent` and of any other listed tool that is not a file tool.
