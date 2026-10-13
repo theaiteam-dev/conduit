@@ -219,6 +219,8 @@ export interface FakeClaudeSdkAnswer {
   postEvent: "PostToolUse" | "PostToolUseFailure" | null;
   /** Exit code of a Bash command that ran. */
   exitCode?: number;
+  /** Stderr of a Bash command that ran, so a journey can tell a denied write from another failure. */
+  stderr?: string;
 }
 
 export interface FakeClaudeSdkLogEntry {
@@ -486,9 +488,10 @@ async function main(): Promise<number> {
           const proc = Bun.spawnSync(["/bin/sh", "-c", String(executed.command ?? "")], {
             cwd,
             stdout: "pipe",
-            stderr: "ignore",
+            stderr: "pipe",
           });
           answer.exitCode = proc.exitCode;
+          answer.stderr = proc.stderr.toString();
           resultText = proc.stdout.toString();
           isError = proc.exitCode !== 0;
           if (isError) resultText = `Exit code ${proc.exitCode}`;

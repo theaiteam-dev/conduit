@@ -314,6 +314,8 @@ if (!hostConfines && process.env.CONDUIT_REQUIRE_LANDLOCK === "1") {
       ]);
       for (const a of c1.answers.filter((x) => ATTACK_LABELS.includes(x.label))) {
         expect({ label: a.label, failed: a.exitCode !== 0 }).toEqual({ label: a.label, failed: true });
+        // Landlock refuses with EACCES, so a missing binary or a usage error cannot pass for a denial.
+        expect({ label: a.label, stderr: a.stderr }).toMatchObject({ label: a.label, stderr: expect.stringMatching(/Permission denied/) });
       }
     });
 

@@ -26,8 +26,8 @@ export async function sinkPost(sinkUrl: string, path: string, body: string, time
 }
 
 /** The sink's call number for `role`. A malformed answer fails the call rather than running the default scenario. */
-export async function claimSinkCallNumber(sinkUrl: string, role: string): Promise<number> {
-  const claim = (await sinkPost(sinkUrl, "/call", JSON.stringify({ role }))).call;
+export async function claimSinkCallNumber(sinkUrl: string, role: string, timeoutMs?: number): Promise<number> {
+  const claim = (await sinkPost(sinkUrl, "/call", JSON.stringify({ role }), timeoutMs)).call;
   // Check the type before the value: Number() would coerce true, [3] and "3\n" into a valid-looking call number.
   if (typeof claim !== "number" || !Number.isInteger(claim) || claim < 1) {
     throw new Error(`stub sink /call returned a bad call number: ${JSON.stringify(claim)}`);
@@ -52,6 +52,6 @@ export async function awaitSinkBarrier(sinkUrl: string, barrier: SinkBarrier): P
 }
 
 /** Append one log entry through the sink. */
-export async function sinkLog(sinkUrl: string, entry: unknown): Promise<void> {
-  await sinkPost(sinkUrl, "/log", JSON.stringify(entry));
+export async function sinkLog(sinkUrl: string, entry: unknown, timeoutMs?: number): Promise<void> {
+  await sinkPost(sinkUrl, "/log", JSON.stringify(entry), timeoutMs);
 }

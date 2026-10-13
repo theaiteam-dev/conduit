@@ -52,8 +52,10 @@ let ownerTagMemo: string | undefined;
 
 /**
  * `<pid>-<start time>` of this kernel, or undefined when /proc/self/stat cannot
- * be read (non-Linux). Callers that name a resource with it fall back to an
- * untagged name, which no sweep ever removes.
+ * be read (non-Linux). The temp-dir callers (`taggedTempPrefix`) fall back to
+ * an untagged name, which no sweep ever removes; cgroup containment
+ * (`ownerTag` in cgroup-containment.ts) throws instead, so it never names a
+ * cgroup without a tag.
  */
 export function tryOwnerTag(): string | undefined {
   if (ownerTagMemo !== undefined) return ownerTagMemo;
