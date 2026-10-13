@@ -54,6 +54,11 @@ for name in TMPDIR CLAUDE_CONFIG_DIR CODEX_HOME HOME XDG_CONFIG_HOME XDG_DATA_HO
 done
 
 if command -v setsid >/dev/null 2>&1; then
+  # The child runs two redirected echos and exits, so a child the wait below
+  # gives up on is one the scheduler had not run yet, and it ends on its own
+  # once it runs. Its writes go to this project root, which the suite removes,
+  # so a late child writes nothing a retry reads. Under cgroup containment the
+  # adapter's cgroup.kill at the end of the call also kills it.
   setsid -f sh -c 'echo setsid > cards/b/setsid.txt 2>/dev/null; echo done > cards/a/setsid.done' </dev/null >/dev/null 2>&1
   i=0
   while [ ! -f cards/a/setsid.done ] && [ "$i" -lt 50 ]; do

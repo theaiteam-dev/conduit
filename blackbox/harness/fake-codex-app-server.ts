@@ -105,6 +105,8 @@ export interface FakeCodexDecision {
   method: string;
   /** The `decision` the kernel answered with, or `error:<message>` for a JSON-RPC error. */
   decision: string;
+  /** Whether the fake ran the command or wrote the file, recorded after it did so. */
+  performed: boolean;
   /** Exit code of an accepted command. */
   exitCode?: number;
 }
@@ -216,13 +218,14 @@ async function appServer(argv: string[]): Promise<number> {
           kind: "command", threadId: THREAD_ID, turnId: TURN_ID, itemId, command: display, cwd, commandActions: [],
         });
         const decision = answerOf(answer);
-        const entry: FakeCodexDecision = { label: step.label, method: "item/commandExecution/requestApproval", decision };
+        const entry: FakeCodexDecision = { label: step.label, method: "item/commandExecution/requestApproval", decision, performed: false };
         let status = "declined";
         let exitCode: number | null = null;
         if (decision === "accept") {
           const proc = Bun.spawnSync(["/bin/sh", "-c", step.command], { cwd, stdout: "ignore", stderr: "ignore" });
           exitCode = proc.exitCode;
           entry.exitCode = exitCode;
+          entry.performed = true;
           status = exitCode === 0 ? "completed" : "failed";
         }
         decisions.push(entry);
@@ -241,11 +244,13 @@ async function appServer(argv: string[]): Promise<number> {
           threadId: THREAD_ID, turnId: TURN_ID, itemId, startedAtMs: Date.now(), reason: null, grantRoot: null,
         });
         const decision = answerOf(answer);
-        decisions.push({ label: step.label, method: "item/fileChange/requestApproval", decision });
+        const entry: FakeCodexDecision = { label: step.label, method: "item/fileChange/requestApproval", decision, performed: false };
         if (decision === "accept") {
           mkdirSync(dirname(abs), { recursive: true });
           writeFileSync(abs, step.write.content);
+          entry.performed = true;
         }
+        decisions.push(entry);
         notify("item/completed", {
           threadId: THREAD_ID, turnId: TURN_ID,
           item: { type: "fileChange", id: itemId, changes, status: decision === "accept" ? "completed" : "declined" },

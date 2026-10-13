@@ -172,8 +172,8 @@ const CODEX: AdapterCase = {
           steps: e.decisions.map((d) => ({
             label: d.label,
             allowed: d.decision === "accept",
-            // The fake runs an accepted command or write, and records an exit code for a command.
-            performed: d.decision === "accept",
+            // Set by the fake after it ran the command or wrote the file, not derived from the answer.
+            performed: d.performed,
             exitCode: d.exitCode,
           })),
         },

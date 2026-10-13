@@ -128,9 +128,9 @@ describe("fake-codex-app-server", () => {
     });
     const log = readFileSync(logPath, "utf8").trim().split("\n").map((l) => JSON.parse(l) as FakeCodexLogEntry);
     expect(log).toHaveLength(1);
-    expect(log[0]!.decisions.map((d) => [d.label, d.decision])).toEqual([
-      ["yes", "accept"],
-      ["no", "decline"],
+    expect(log[0]!.decisions.map((d) => [d.label, d.decision, d.performed])).toEqual([
+      ["yes", "accept", true],
+      ["no", "decline", false],
     ]);
     expect(log[0]!.threadStart).toEqual({ model: "m" });
   });
@@ -169,9 +169,9 @@ describe("fake-codex-app-server", () => {
       expect(log.map((e) => e.barrierReleased)).toEqual([true, true]);
       for (const e of log) expect(e.endedAt).toBeGreaterThanOrEqual(e.startedAt);
       const first = log.find((e) => e.call === 1)!;
-      expect(first.decisions.map((d) => [d.label, d.decision, d.exitCode])).toEqual([
-        ["ok", "accept", 0],
-        ["fails", "accept", 3],
+      expect(first.decisions.map((d) => [d.label, d.decision, d.performed, d.exitCode])).toEqual([
+        ["ok", "accept", true, 0],
+        ["fails", "accept", true, 3],
       ]);
       expect(existsSync(join(sinkDir, "no-log"))).toBe(false);
       expect(existsSync(join(sinkDir, "no-counters"))).toBe(false);
