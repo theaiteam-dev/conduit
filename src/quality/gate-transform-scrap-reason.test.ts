@@ -145,3 +145,28 @@ describe('runGateCheck: named scrap reasons for a transform critic (issue #42)',
     expect(decision.criticUsage).toBeUndefined();
   });
 });
+
+describe('runGateCheck: a transform critic scrap reason carries no model output (issue #42)', () => {
+  // The reason is journaled and printed, so it must not quote what the critic
+  // model wrote. Each response below fails a different gateCriticSchema check
+  // and carries a marker in the value the check rejects.
+  const MARKER = 'SECRET-PROMPT-ECHO';
+  const shapes: Array<[string, string]> = [
+    ['a non-object JSON value', JSON.stringify(MARKER)],
+    ['an array', JSON.stringify([MARKER])],
+    ['an unknown verdict', JSON.stringify({ verdict: MARKER, findings: [] })],
+    ['a reject with findings under another key', JSON.stringify({ verdict: 'reject', reasons: [MARKER] })],
+    ['a pass with non-array findings', JSON.stringify({ verdict: 'pass', findings: MARKER })],
+  ];
+
+  for (const [label, text] of shapes) {
+    it(`does not quote the rejected value for ${label}`, async () => {
+      const { adapter } = queuedAdapter([resp(text), resp(text), resp(text)]);
+
+      const reason = scrapReason(await runGateCheck(config(adapter)));
+
+      expect(reason.startsWith('critic-')).toBe(true);
+      expect(reason).not.toContain(MARKER);
+    });
+  }
+});

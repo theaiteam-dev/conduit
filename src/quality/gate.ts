@@ -192,14 +192,21 @@ const gateCriticSchema: OutputSchema<GateCriticVerdict> = {
  *
  *   - `critic-reject-without-findings: <REJECT_WITHOUT_FINDINGS_ERROR>`: a
  *     reject verdict with missing or empty findings
- *   - `critic-verdict-invalid: <validator error>`: the verdict parsed but
- *     failed the schema on every attempt
+ *   - `critic-verdict-invalid: <validator error>`: no attempt passed the
+ *     schema and at least one parsed. The error is the one from the last
+ *     attempt that parsed, so a parsed-but-invalid attempt followed by an
+ *     unparseable one still reports this reason with the earlier error
  *   - `critic-verdict-unparseable`: no attempt produced parseable JSON
  *   - `critic-output-truncated`: finish_reason `length` with no valid verdict
  *   - `critic-vision-unsupported`: the adapter refused image input
  *
  * The `harness-critic-` prefix stays distinct, so the journal tells the two
  * critic kinds apart.
+ *
+ * The reason is journaled and printed by `conduit run` and `journal inspect`,
+ * so it must carry no model output. Every error gateCriticSchema returns is a
+ * fixed string that does not quote the value it rejected; keep it that way.
+ * gate-transform-scrap-reason.test.ts pins this.
  */
 function transformCriticScrapReason(
   result: Extract<TransformResult<GateCriticVerdict>, { status: 'scrapped' }>,

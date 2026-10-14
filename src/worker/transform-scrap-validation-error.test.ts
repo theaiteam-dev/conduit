@@ -72,4 +72,27 @@ describe('runTransformStation: validationError on a model-incompatible scrap (is
 
     expect(result).toEqual({ status: 'scrapped', reason: 'model-incompatible', attempts: 2 });
   });
+
+  it('keeps the error of the highest-priority candidate when one response holds several invalid objects', async () => {
+    // A test-local schema whose error names the rejected object's keys, so the
+    // test can tell which candidate's error was kept.
+    const keyed: OutputSchema<{ idea: string }> = {
+      validate(value) {
+        const v = value as Record<string, unknown>;
+        if (typeof v.idea === 'string') return { ok: true, value: { idea: v.idea } };
+        return { ok: false, error: `idea missing in {${Object.keys(v).join(',')}}` };
+      },
+    };
+    // coerciveParseCandidates orders embedded objects last-to-first, so the
+    // trailing {"second":2} is the first candidate validated.
+    const text = 'thinking {"first":1} then answering {"second":2}';
+    const result = await runTransformStation({ ...ctx(adapterReturning([text, text])), schema: keyed });
+
+    expect(result).toEqual({
+      status: 'scrapped',
+      reason: 'model-incompatible',
+      attempts: 2,
+      validationError: 'idea missing in {second}',
+    });
+  });
 });
