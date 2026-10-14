@@ -270,6 +270,21 @@ async function redriveRow(
     // Delegate the actual launch to the seam (does not touch ingress_events/log).
     launch = normalizeRedriveLaunch(await respawn(event));
 
+    // Hand the live child to its exit watcher BEFORE any bookkeeping that can
+    // throw (issue #47 review). Otherwise a storage error below would release
+    // the slot of a running child, letting the next sweep launch a second
+    // process for the same row, and would leave nothing to record its exit.
+    // The bookkeeping below is synchronous, so the watcher cannot act on the
+    // exit before this iteration has finished writing the row.
+    if (launch.result === 'spawned' && launch.exited !== undefined) {
+      slotHandedOff = true;
+      void watchRedrivenChildExit(
+        { db, source, now, ...(alerts !== undefined && { alerts }), ...(slots !== undefined && { slots }) },
+        event,
+        launch.exited,
+      );
+    }
+
     if (launch.result === 'spawned') {
       // 'spawned' means LAUNCHED (the original acknowledgement-on-accept work) — a child that later dies is
       // marked failed by the exit watcher below.
@@ -297,22 +312,13 @@ async function redriveRow(
 
     // Record every re-drive attempt in the ingress log, regardless of outcome.
     db.appendIngressLog({ source, eventId: event.event_id, outcome: 'redriven' });
-
-    if (launch.result === 'spawned' && launch.exited !== undefined) {
-      slotHandedOff = true;
-      void watchRedrivenChildExit(
-        { db, source, now, ...(alerts !== undefined && { alerts }), ...(slots !== undefined && { slots }) },
-        event,
-        launch.exited,
-      );
-    }
   } finally {
     // Release AFTER the row's terminal state is marked (never re-throws on a
     // seam throw path without freeing the slot). A handed-off slot stays held:
     // its child is still running.
     if (!slotHandedOff) slots?.release(event.event_id);
-    // Bookkeeping threw after a launch (issue #47): nothing awaits the child's
-    // exit, so a rejection there must not surface as an unhandled one.
+    // A failed launch that still reported an exit has no watcher, so a
+    // rejection there must not surface as an unhandled one.
     if (!slotHandedOff) launch?.exited?.catch(() => {});
   }
 
@@ -440,8 +446,20 @@ async function fireRedriveAlert(
  */
 export const REDRIVE_SWEEP_ALERT_EVENT_ID = 'redrive-sweep';
 
+/**
+ * Longest reason a sweep error stores in ingress_log or sends in an alert
+ * (issue #47 review). A storage error's message is written as thrown and can
+ * be long (a driver that appends a statement or a path list); the journal row
+ * and the alert carry a bounded prefix of it.
+ */
+export const SWEEP_ERROR_REASON_MAX = 500;
+
+const TRUNCATION_MARK = '… (truncated)';
+
 function errorMessage(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
+  const message = err instanceof Error ? err.message : String(err);
+  if (message.length <= SWEEP_ERROR_REASON_MAX) return message;
+  return message.slice(0, SWEEP_ERROR_REASON_MAX - TRUNCATION_MARK.length) + TRUNCATION_MARK;
 }
 
 /**

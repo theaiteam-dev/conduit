@@ -525,7 +525,11 @@ until a sweep succeeds. After a failed sweep, slot-release kicks are ignored
 until the next interval tick, which sweeps again, so a full disk is retried
 once per interval rather than on every child exit. The boot re-drive has the
 per-row boundary too, but a snapshot that cannot be read at boot still fails
-the boot.
+the boot. A `'sweep_error'` reason, in the log and in the alert, is cut to 500
+characters. Every launch path (the hot path, the sweep and a keyed pass) hands
+a launched child to its exit watcher before it writes `spawned` and the log
+row, so a storage error in those writes leaves the run slot held until the
+child exits, and the watcher still records a non-zero exit.
 
 **Parked runs are resumed, not re-driven.** A run that halted behind a provider
 rate limit exits 1, but its `runs` row reads `status='halted', outcome='parked'`

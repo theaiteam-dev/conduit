@@ -376,6 +376,16 @@ async function launchPass(
     }
 
     if (result.ok) {
+      // Hand the live pass to its exit watcher BEFORE the writes below, which
+      // can throw on a storage error (issue #47 review): a throw after the
+      // launch must not free the run slot of a running pass, or a sweep could
+      // launch a second pass beside it, and the pass's exit must still be
+      // recorded. The writes are synchronous, so the watcher cannot act on
+      // the exit before they are done.
+      if (result.exited !== undefined) {
+        slotHandedOff = true;
+        void watchPassExit(deps, keyed, event, result.exited);
+      }
       if (pendingRidesThisPass) db.setKeyedRunPending(keyed.run_id, null);
       db.markIngressSpawned(event.eventId);
       db.setKeyedRunBlockedAlerted(keyed.run_id, false);
@@ -385,10 +395,6 @@ async function launchPass(
         outcome: mode === 'sweep' ? 'redriven' : 'accepted',
         reason: `pass ${pass} of keyed run '${keyed.run_id}', covering ${covered.length} event(s)`,
       });
-      if (result.exited !== undefined) {
-        slotHandedOff = true;
-        void watchPassExit(deps, keyed, event, result.exited);
-      }
       return { outcome: 'accepted', runId: keyed.run_id, pass };
     }
 

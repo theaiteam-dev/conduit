@@ -127,7 +127,12 @@ historical context, not public releases or public repository history.
   when the journal allows, sends one alert per run of failed sweeps on the
   listener-global channel (`event=redrive-sweep`), and ignores slot-release
   kicks until the next interval tick, which sweeps again. A throwing `onSweep`
-  sink is caught too.
+  sink is caught too. A launched child is handed to its exit watcher before
+  the writes that follow the launch, on the sweep, the hot path and the keyed
+  pass launcher, so a storage error in those writes no longer frees the run
+  slot of a running child (which let the next sweep launch a second process
+  for the same row) or leaves its exit unrecorded. A `sweep_error` reason, in
+  the log and in the alert, is cut to 500 characters.
 - A gate critic on a child-entry station can see the child's inputs. The
   critic prompt was rendered with no card scope, so a critic that referenced
   `{{seed.json}}` threw at render and the card went to `hold`. `ownedPaths` and
