@@ -1,6 +1,6 @@
 # Why Conduit?
 
-**Conduit makes recurring AI work configurable, inspectable, and repeatable.**
+**Conduit runs LLM jobs from a YAML file, with safety, replay, and logging built in.**
 
 Define your production flow in YAML, with prompts and scripts alongside it.
 Conduit runs the steps, applies your checks, sends findings back for bounded
@@ -47,38 +47,52 @@ The aim is to reduce the custom orchestration code needed for an inspected
 production flow. Whether that is easier for your team depends on the flow and
 the infrastructure you already operate.
 
+## Why Not Temporal?" -->
+
 ## Why Not Temporal?
 
-[Temporal](https://docs.temporal.io/) provides durable execution for application
-workflows, with self-hosted and managed deployment options. It is also a viable
-platform for AI work: its [AI cookbook](https://docs.temporal.io/ai/cookbook)
-covers model calls, provider switching, agent loops, structured outputs, human
-approval, and guardrails.
+[Temporal](https://docs.temporal.io/) gives application code durable execution:
+a workflow's event history records every activity it scheduled and the result
+it returned, and when a worker dies the workflow replays that history and
+continues from the last recorded step. For a long-running business process that
+spans services, with timers, signals, and schedules, it is the mature answer and
+Conduit does not compete with it there.
 
-You can implement an inspection-and-revision process on Temporal. Choosing
-Conduit means adopting an existing configurable production model: stations,
-critic findings, bounded back-edges, checkpoint bindings, and recorded outcomes.
-The decision is how much of that application behavior you would otherwise build
-and maintain yourself.
+Run LLM work on Temporal and the history does one thing well: a crash never
+re-bills a completed activity. What the history does not hold is anything about
+the model call itself. It records that an activity returned a value, not which
+prompt version, model, or inputs produced it, so when you change a prompt
+Temporal has no way to say which steps are now stale. You reset the workflow to
+an event ID by hand, or you build the dependency tracking in your own code.
 
-For example, a marketing flow might draft an asset, reject it with specific
-findings, revise it twice at most, and ask a person to choose among candidates.
-Conduit exposes those policies in its flow configuration. The prompts and
-criteria remain yours.
+Conduit keys each checkpoint by a binding stamp:
+`hash(model, prompt version, input artifact hashes, flow version)`, where the
+prompt version includes the injected skills and the harness agent definition.
+On resume a station runs again only if its stamp changed, and the invalidation
+cascades to the stations that consume its output. Bump one `prompt_version` and
+only that station and its dependents re-run. The upstream model calls are
+reused. Change `flow_version` and `conduit resume --rebind` re-validates every
+stamp.
 
-If your team already runs Temporal and has suitable workflow components,
-staying with it may be simpler. Choose it when you need distributed execution
-or coordination across services beyond Conduit's single-host scope. Conduit's
-checkpoint-and-resume behavior does not establish equivalent durability
-guarantees.
+The second difference is what gets recorded. Temporal's history is activity
+inputs and outputs. Conduit's journal is the model call's model, tokens, cost,
+prompt version, and binding stamp; the card log is every lane change, every
+critic verdict with its findings, and the terminal reason. When a run ends you
+can answer "why was this accepted" and "what did this cost" from the database,
+not from your own logging.
 
-For a new deployment, Conduit's Bun/SQLite runtime and per-flow packaging may
-fit a smaller operational footprint. Evaluate that benefit against the
-integration work and operational familiarity you already have.
+The third is what you have to write. A critic with a rework cap, a token budget,
+a command allowlist for an agent's shell calls, and an intent log for a publish
+step are all workflow and activity code on Temporal. On Conduit they are keys
+in `flow.yaml` that the kernel enforces.
 
-Temporal could also own an outer business process that invokes a Conduit run.
-That is an integration you would build; Conduit does not ship a dedicated
-Temporal integration.
+Choose Temporal when the job is a durable business process and the model call
+is one activity among many. Choose Conduit when the job is mostly model calls
+and you need replay keyed to the prompt, a journal of verdicts and cost, and
+bounded loops without writing them. They compose: Temporal can own the outer
+process and start a Conduit run for the model-heavy stage. Conduit is one host
+on SQLite and a developer preview; Temporal is neither, and that is a reason to
+pick Temporal when the surrounding process needs its scale.
 
 ## Why Not n8n?
 

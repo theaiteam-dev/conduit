@@ -1,6 +1,6 @@
 # Conduit Roadmap
 
-**Conduit makes recurring AI work configurable, inspectable, and repeatable.**
+**Conduit runs LLM jobs from a YAML file, with safety, replay, and logging built in.**
 
 Define your production flow in YAML, with prompts and scripts alongside it.
 Conduit runs the steps, applies your checks, sends findings back for bounded

@@ -6,7 +6,7 @@ below.
 
 ## The Product Promise
 
-**Conduit makes recurring AI work configurable, inspectable, and repeatable.**
+**Conduit runs LLM jobs from a YAML file, with safety, replay, and logging built in.**
 
 The flow definition, prompts, and scripts capture how a piece of work should be
 produced and checked. The runtime executes that process, records its path, and
