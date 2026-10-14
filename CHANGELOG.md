@@ -117,6 +117,16 @@ historical context, not public releases or public repository history.
 
 ### Fixed
 
+- A duplicate webhook delivery names its run
+  ([#52](https://github.com/theaiteam-dev/conduit/issues/52)). The answer was
+  `200 {"outcome":"duplicate"}`, so a caller whose first `202` was lost in
+  transit had no way to find the run its event started. It is now
+  `200 {"outcome":"duplicate","run_id":"…"}`, read from the event's stored
+  row. On a `run_key` binding the id is present only once the event was
+  launched as a pass, folded into the pending pass or consumed by a pass; a
+  redelivery that arrives while the first is still being routed, or after the
+  run refused the event, carries no `run_id`. See `docs/ingress-listener.md`.
+
 - A gate critic on a child-entry station can see the child's inputs. The
   critic prompt was rendered with no card scope, so a critic that referenced
   `{{seed.json}}` threw at render and the card went to `hold`. `ownedPaths` and

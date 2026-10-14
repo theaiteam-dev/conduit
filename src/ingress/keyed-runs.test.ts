@@ -284,6 +284,81 @@ describe('run key resolution', () => {
   });
 });
 
+describe('a duplicate delivery of a keyed event (issue #52)', () => {
+  // The duplicate names the run only once the event is bound to it: launched
+  // as a pass, folded into the pending pass, or consumed by a pass. While the
+  // first delivery is still being routed, and after the run refused the
+  // event, it names none, since the event may never become part of the run.
+  const body = (res: { body?: string }) => JSON.parse(res.body!) as Record<string, unknown>;
+
+  it('names the keyed run for a redelivery of an event that launched a pass', async () => {
+    const listener = await boot(makeFlow(keyedIngress()));
+    const req = prEvent({ repo: 'acme/widgets', pr: 7 });
+
+    const first = await listener.handleWebhook(req);
+    const second = await listener.handleWebhook(req);
+
+    expect(body(first)).toEqual({ outcome: 'accepted', run_id: RUN });
+    expect(second.status).toBe(200);
+    expect(body(second)).toEqual({ outcome: 'duplicate', run_id: RUN });
+    expect(launches).toHaveLength(1);
+  });
+
+  it('names the keyed run for a redelivery of an event folded into the pending pass', async () => {
+    const listener = await boot(makeFlow(keyedIngress()));
+    await listener.handleWebhook(prEvent({ repo: 'acme/widgets', pr: 7, seq: 0 }));
+    const req = prEvent({ repo: 'acme/widgets', pr: 7, seq: 1 });
+
+    expect(body(await listener.handleWebhook(req))).toEqual({ outcome: 'coalesced', run_id: RUN });
+    expect(body(await listener.handleWebhook(req))).toEqual({ outcome: 'duplicate', run_id: RUN });
+  });
+
+  it('names the keyed run for a redelivery of an event a pass consumed', async () => {
+    const listener = await boot(makeFlow(keyedIngress()));
+    const req = prEvent({ repo: 'acme/widgets', pr: 7 });
+    await listener.handleWebhook(req);
+    await finishPass(0, 1);
+
+    expect(db.getPassForEvent(req.headers['x-delivery']!)).toEqual({ run_id: RUN, pass: 1 });
+    expect(body(await listener.handleWebhook(req))).toEqual({ outcome: 'duplicate', run_id: RUN });
+  });
+
+  it('names no run for a redelivery that arrives while the first is still being routed', async () => {
+    let releaseLaunch: () => void = () => {};
+    const launchGate = new Promise<void>((resolve) => {
+      releaseLaunch = resolve;
+    });
+    const gatedSpawn: SpawnSeam = async (invocation) => {
+      await launchGate;
+      return controlledSpawn(invocation);
+    };
+    const listener = await boot(makeFlow(keyedIngress()), { spawn: gatedSpawn });
+    const req = prEvent({ repo: 'acme/widgets', pr: 7 });
+
+    const first = listener.handleWebhook(req);
+    await settle();
+    expect(db.getIngressEvent(req.headers['x-delivery']!)!.spawn_state).toBe('accepted');
+    const second = await listener.handleWebhook(req);
+    releaseLaunch();
+
+    expect(second.status).toBe(200);
+    expect(body(second)).toEqual({ outcome: 'duplicate' });
+    expect(body(await first)).toEqual({ outcome: 'accepted', run_id: RUN });
+    expect(launches).toHaveLength(1);
+  });
+
+  it('names no run for a redelivery of an event the run refused', async () => {
+    const listener = await boot(makeFlow(keyedIngress({ max_passes: 1 })));
+    await listener.handleWebhook(prEvent({ repo: 'acme/widgets', pr: 7 }));
+    await finishPass(0, 1);
+    const req = prEvent({ repo: 'acme/widgets', pr: 7 });
+
+    expect(body(await listener.handleWebhook(req))).toEqual({ outcome: 'pass_limit' });
+    expect(db.getIngressEvent(req.headers['x-delivery']!)!.spawn_state).toBe('refused');
+    expect(body(await listener.handleWebhook(req))).toEqual({ outcome: 'duplicate' });
+  });
+});
+
 describe('passes of one run', () => {
   it('coalesces six events during a pass into one trailing pass on the latest event, listing all six', async () => {
     const listener = await boot(makeFlow(keyedIngress()));

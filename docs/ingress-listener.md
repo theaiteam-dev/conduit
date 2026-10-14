@@ -59,8 +59,27 @@ The webhook response is produced as soon as the event is accepted and its
 | --- | --- | --- |
 | `accepted` — a run is now executing | `202` | `{"outcome":"accepted","run_id":"…"}` |
 | `queued` — accepted, waiting on a free run slot | `202` | `{"outcome":"queued","run_id":"…"}` |
-| `duplicate` — already handled | `200` | `{"outcome":"duplicate"}` |
+| `duplicate` — already handled | `200` | `{"outcome":"duplicate","run_id":"…"}`, or `{"outcome":"duplicate"}` (see below) |
 | `spawn_failed` — the launch failed; the sweep owns the retry | `200` | `{"outcome":"spawn_failed"}` |
+
+A `duplicate` carries the `run_id` of the run the original delivery started or
+joined, so a caller whose first `202` was lost in transit can still find the
+run. The id is read from the event's stored row, never derived from the
+redelivery's body, and describes the event when the duplicate arrives:
+
+- Unkeyed binding: always present. The run id is written with the accept,
+  before the launch, so a redelivery that arrives while the first delivery is
+  still launching gets it too. The run may not appear in `conduit run status`
+  until that launch completes.
+- Keyed binding (`run_key`): present once the event was launched as a pass,
+  folded into the run's pending pass (`coalesced`), or consumed by a pass.
+  Absent while the first delivery is still being routed or is queued behind
+  busy run slots, since the keyed run may yet refuse it, and absent for an
+  event the run refused (`pass_limit`, `run_not_appendable`), which never
+  joined it. A folded event that is refused when its pass would launch names no
+  run on a later duplicate.
+- An event accepted before ingress attribution existed has no stored run id,
+  so its duplicate carries none.
 
 Before this, the response waited on the child's **exit**, so a multi-hour render
 held the HTTP socket open for hours: every real client timed out and marked
