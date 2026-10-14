@@ -574,6 +574,21 @@ describe('issue #35 — doctor probes a harness critic', () => {
     expect(io.lines).toContain("  harness 'codex-exec' (station 'draft' critic) at '/usr/local/bin/codex': FAIL");
   });
 
+  it("keeps the maker's usage-blind line unprefixed and adds none for a critic that reports usage", async () => {
+    const registry = createHarnessRegistry([
+      probingAdapter('claude-headless', { present: true, detail: '/usr/local/bin/claude' }, { reportsUsage: false }),
+      probingAdapter('codex-exec', { present: true, detail: '/usr/local/bin/codex' }),
+    ]);
+    const flowPath = writeCriticFlow('codex-exec', 'harness');
+    const io = makeIO();
+
+    const code = await main(['doctor', flowPath], makeDoctorDeps(io, registry));
+
+    expect(code).toBe(0);
+    expect(io.lines).toContain("  harness 'claude-headless' is usage-blind (cannot report token/cost usage)");
+    expect(io.lines.filter((line) => line.includes('usage-blind'))).toHaveLength(1);
+  });
+
   it('cmdRun fails at startup when only the critic binary is missing', async () => {
     const registry = createHarnessRegistry([
       probingAdapter('codex-exec', { present: false, detail: '/usr/local/bin/codex' }),
