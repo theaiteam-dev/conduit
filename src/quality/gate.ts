@@ -211,6 +211,8 @@ const gateCriticSchema: OutputSchema<GateCriticVerdict> = {
 function transformCriticScrapReason(
   result: Extract<TransformResult<GateCriticVerdict>, { status: 'scrapped' }>,
 ): string {
+  // No default branch on purpose: with a `string` return type, a reason added
+  // to TransformResult that has no case here fails tsc with TS2366.
   switch (result.reason) {
     case 'output-truncated':
       return 'critic-output-truncated';
