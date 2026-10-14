@@ -584,6 +584,18 @@ describe('runExecutor fan-out — owned_paths resolve against and stay inside th
     expect(existsSync(join(elsewhere, 'seed.json'))).toBe(false);
   });
 
+  it('holds the parent and names the child and path when a seeded child has no owned dir', async () => {
+    await runFanOut({
+      children: [{ id: 'c1', depends_on: [], owned_paths: ['evidence/missing'], seed: { n: 1 } }],
+    });
+
+    expect(childIds(db!, PARENT_ID)).toEqual([]);
+    expect(db!.getCard(DEFAULT_RUN_ID, PARENT_ID)?.status).toBe('held');
+    expect(holdReason()).toBe(
+      `fan-out station 'plan' proposal rejected: seed_path_out_of_bounds (child 'c1', path 'evidence/missing')`,
+    );
+  });
+
   it('holds the parent for a symlink inside the root that points outside it', async () => {
     symlinkSync(elsewhere, join(projectDir, 'escape'));
 

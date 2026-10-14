@@ -28,7 +28,9 @@
  * behavioral intent of AC1 (no partial children, clean reconcile, no duplicate
  * children) is fully covered.
  */
+import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, it, expect, beforeEach, afterEach, spyOn } from 'bun:test';
 import { openConduitDB, type ConduitDB, DEFAULT_RUN_ID } from '../persistence/db';
 import {
@@ -48,8 +50,12 @@ import {
   type SlackTransport,
 } from '../channels/slack';
 
-/** The project root commitFanOut confines owned_paths to; these proposals use relative paths. */
-const FANOUT_PROJECT_ROOT = tmpdir();
+/**
+ * The project root commitFanOut confines owned_paths to; these proposals use
+ * relative paths. A fresh dir per test, so nothing left in the shared temp
+ * root can change how a path canonicalizes.
+ */
+let FANOUT_PROJECT_ROOT: string;
 
 const FLOW_ID = 'reference-pipeline';
 const CHANNEL = '#content-pipeline';
@@ -112,10 +118,12 @@ let db: ConduitDB;
 beforeEach(() => {
   db = openConduitDB({ stateDbPath: ':memory:', journalDbPath: ':memory:' });
   ensureCheckpointSchema(db.getStateDb());
+  FANOUT_PROJECT_ROOT = mkdtempSync(join(tmpdir(), 'conduit-fanout-resume-'));
 });
 
 afterEach(() => {
   db.close();
+  rmSync(FANOUT_PROJECT_ROOT, { recursive: true, force: true });
 });
 
 // ===========================================================================
