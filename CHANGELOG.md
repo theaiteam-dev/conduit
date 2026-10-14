@@ -117,6 +117,24 @@ historical context, not public releases or public repository history.
 
 ### Fixed
 
+- The binding stamp covers prompt content and harness skills
+  ([#131](https://github.com/theaiteam-dev/conduit/issues/131),
+  [#93](https://github.com/theaiteam-dev/conduit/issues/93)). A transform or
+  harness station's `prompt_template_version` now folds the SHA-256 of the
+  template it renders (its `prompt_file`, or the `worker.uses` composition of
+  skills plus the local prompt), and a harness station folds its ordered
+  `worker.uses` skill hashes as a transform station already did. Editing a
+  prompt file or a skill without bumping `prompt_version` now re-runs the
+  station on resume and cascades downstream; a `prompt_version` bump still
+  forces a re-run. The journal's `prompt_template_version` column records the
+  new value. A gate critic is unchanged: it writes no checkpoint and already
+  renders its current prompt file on every check. Upgrade note: every
+  transform and harness checkpoint written before this change carries the old
+  stamp, so the first resume of such a run re-runs the station its card is at,
+  once, and invalidates the checkpoints downstream of it (SPEC §5 treats any
+  stamp mismatch this way). An effectful station whose outbox intent is
+  already committed is not re-run: it reuses its checkpoint as before.
+
 - A gate critic on a child-entry station can see the child's inputs. The
   critic prompt was rendered with no card scope, so a critic that referenced
   `{{seed.json}}` threw at render and the card went to `hold`. `ownedPaths` and
