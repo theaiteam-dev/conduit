@@ -9,7 +9,8 @@
  * absolute path elsewhere, a `..` escape, or a symlink that points out.
  * Nothing is written and no card is inserted on a rejection.
  */
-import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
+import { describe, it, expect, beforeEach, afterEach, spyOn } from 'bun:test';
+import * as fs from 'node:fs';
 import { mkdtempSync, mkdirSync, rmSync, existsSync, readFileSync, symlinkSync, realpathSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -315,6 +316,24 @@ describe('resolveSeedDir re-checks the seed dir realpath against the project roo
     expect(resolveSeedDir(projectRoot, 'escape')).toEqual({ ok: false, code: 'owned_path_out_of_bounds' });
   });
 
+  it('reports a dangling symlink as seed_path_out_of_bounds instead of throwing', () => {
+    symlinkSync(join(projectRoot, 'gone'), join(projectRoot, 'dangling'));
+    expect(resolveSeedDir(projectRoot, 'dangling')).toEqual({ ok: false, code: 'seed_path_out_of_bounds' });
+  });
+
+  it('reports a dir removed before realpathSync as seed_path_out_of_bounds instead of throwing', () => {
+    mkdirSync(join(projectRoot, 'racy'));
+    const spy = spyOn(fs, 'realpathSync').mockImplementation((() => {
+      throw Object.assign(new Error('ENOENT: no such file or directory'), { code: 'ENOENT' });
+    }) as unknown as typeof fs.realpathSync);
+    try {
+      expect(resolveSeedDir(projectRoot, 'racy')).toEqual({ ok: false, code: 'seed_path_out_of_bounds' });
+      expect(spy).toHaveBeenCalled();
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
   it('reports a missing dir and a file as seed_path_out_of_bounds', () => {
     expect(resolveSeedDir(projectRoot, 'missing')).toEqual({ ok: false, code: 'seed_path_out_of_bounds' });
     writeFileSync(join(projectRoot, 'file'), 'x');
@@ -351,6 +370,28 @@ describe('commitFanOut rejects two seeded children that share a seed dir', () =>
     expect(existsSync(join(projectRoot, 'a', 'seed.json'))).toBe(false);
     expect(db.getCard(DEFAULT_RUN_ID, 'c1')).toBeNull();
     expect(db.getCard(DEFAULT_RUN_ID, 'c2')).toBeNull();
+  });
+
+  it.each([
+    ['ordered by depends_on', ['c1']],
+    ['concurrent, so serialize adds the edge', []],
+  ])('rejects a shared seed dir under onPathConflict: serialize, %s', (_label, c2Deps) => {
+    const r = commitFanOut(
+      db,
+      DEFAULT_RUN_ID,
+      'epic',
+      {
+        children: [
+          { id: 'c1', depends_on: [], owned_paths: ['a'], seed: { n: 1 } },
+          { id: 'c2', depends_on: c2Deps as string[], owned_paths: ['./a'], seed: { n: 2 } },
+        ],
+      },
+      { onPathConflict: 'serialize', projectRoot },
+    );
+
+    expect(r).toEqual({ ok: false, error: { code: 'seed_path_conflict', children: ['c1', 'c2'], path: './a' } });
+    expect(existsSync(join(projectRoot, 'a', 'seed.json'))).toBe(false);
+    expect(db.getCard(DEFAULT_RUN_ID, 'c1')).toBeNull();
   });
 
   it('accepts a shared dir when only one of the two children is seeded', () => {

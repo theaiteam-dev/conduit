@@ -21,7 +21,7 @@
  * persisted.  commitFanOut only writes parent_id + owned_paths via insertCard.
  */
 
-import { writeFileSync, unlinkSync, existsSync, statSync, realpathSync } from 'node:fs';
+import { writeFileSync, unlinkSync, statSync, realpathSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import type { Status, Lane } from '../types/kernel';
 import type { ConduitDB } from '../persistence/db';
@@ -331,7 +331,19 @@ export function confineOwnedPaths(
  * validateExpansion has already confined the entry, but it read the
  * filesystem earlier: a symlink re-pointed between that read and this one
  * would send the seed outside the root. The containment check here runs on
- * the same realpath the write uses.
+ * the realpath string commitFanOut then writes `seed.json` under, so
+ * re-pointing `owned_paths[0]` itself after this call has no effect on the
+ * write.
+ *
+ * A race remains and is accepted: a directory on that realpath replaced by a
+ * symlink between this check and the write would still be followed, since
+ * Bun exposes no `openat2(RESOLVE_BENEATH)`-style write anchored to the
+ * checked inode. Exploiting it needs concurrent write access to the project
+ * root during the fan-out commit; the container (ADR-0003) is the boundary
+ * for that case, as it is for the integrity check's own reads (§7).
+ *
+ * Never throws: a path removed or re-pointed to a missing target between the
+ * existence check and `realpathSync` is reported as `seed_path_out_of_bounds`.
  */
 export function resolveSeedDir(
   projectRoot: string,
@@ -339,11 +351,15 @@ export function resolveSeedDir(
 ): { ok: true; dir: string } | { ok: false; code: 'seed_path_out_of_bounds' | 'owned_path_out_of_bounds' } {
   const absDir = resolve(projectRoot, rawDir);
   // The entry must exist AND be a directory: a file entry would cause ENOTDIR
-  // on write. Check existence BEFORE realpathSync, which throws on a missing path.
-  if (!existsSync(absDir) || !statSync(absDir).isDirectory()) {
+  // on write. statSync and realpathSync throw on a missing path, including one
+  // removed after an earlier check, so any throw is the same rejection.
+  let dir: string;
+  try {
+    if (!statSync(absDir).isDirectory()) return { ok: false, code: 'seed_path_out_of_bounds' };
+    dir = realpathSync(absDir);
+  } catch {
     return { ok: false, code: 'seed_path_out_of_bounds' };
   }
-  const dir = realpathSync(absDir);
   if (!isContainedIn(dir, resolveOwnedPath(resolve(projectRoot)))) {
     return { ok: false, code: 'owned_path_out_of_bounds' };
   }

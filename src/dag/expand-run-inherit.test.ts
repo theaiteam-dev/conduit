@@ -13,24 +13,32 @@
  *        by walking parent_id ancestry — parent row can be absent)
  * AC-4: back-compat regression — fan-out under DEFAULT_RUN_ID still works
  */
+import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import type { Card } from '../types/kernel';
 import { openConduitDB, DEFAULT_RUN_ID, type ConduitDB } from '../persistence/db';
 import { commitFanOut } from './expand';
 import type { ArchitectProposal } from './expand';
 
-/** The project root commitFanOut confines owned_paths to; these proposals use relative paths. */
-const FANOUT_PROJECT_ROOT = tmpdir();
+/**
+ * The project root commitFanOut confines owned_paths to; these proposals use
+ * relative paths. A fresh dir per test, so nothing left in the shared temp
+ * root can change how a path canonicalizes.
+ */
+let FANOUT_PROJECT_ROOT: string;
 
 let db: ConduitDB;
 
 beforeEach(() => {
   db = openConduitDB({ stateDbPath: ':memory:', journalDbPath: ':memory:' });
+  FANOUT_PROJECT_ROOT = mkdtempSync(join(tmpdir(), 'conduit-fanout-'));
 });
 
 afterEach(() => {
   db.close();
+  rmSync(FANOUT_PROJECT_ROOT, { recursive: true, force: true });
 });
 
 function makeParent(id: string, runId: string): Card {

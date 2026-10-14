@@ -32,7 +32,9 @@
  * byte-comparable.
  */
 
+import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { openConduitDB, DEFAULT_RUN_ID } from '../persistence/db';
 import type { ConduitDB } from '../persistence/db';
 import {
@@ -53,8 +55,6 @@ import type { ArchitectProposal } from '../dag/expand';
 import { egressSend } from '../channels/slack';
 import type { ModelAdapter, ModelResponse } from '../worker/adapter';
 
-/** The project root commitFanOut confines owned_paths to; these proposals use relative paths. */
-const FANOUT_PROJECT_ROOT = tmpdir();
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -900,6 +900,10 @@ async function crashAfterEffectfulCommit(): Promise<OracleTrial> {
 
 async function crashMidFanOut(): Promise<OracleTrial> {
   const db = openConduitDB({ stateDbPath: ':memory:', journalDbPath: ':memory:' });
+  // The project root commitFanOut confines owned_paths to; the proposal uses
+  // relative paths. A fresh dir per trial, so nothing left in the shared temp
+  // root can change how a path canonicalizes.
+  const fanOutProjectRoot = mkdtempSync(join(tmpdir(), 'conduit-crash-oracle-fanout-'));
   ensureCheckpointSchema(db.getStateDb());
   const stateDb = db.getStateDb();
 
@@ -948,7 +952,7 @@ async function crashMidFanOut(): Promise<OracleTrial> {
     const resumeFanOut = (): void => {
       const parent = db.getCard(DEFAULT_RUN_ID, 'parent');
       if (parent?.status === 'awaiting_children') return;
-      commitFanOut(db, DEFAULT_RUN_ID, 'parent', proposal, { onPathConflict: 'reject', projectRoot: FANOUT_PROJECT_ROOT });
+      commitFanOut(db, DEFAULT_RUN_ID, 'parent', proposal, { onPathConflict: 'reject', projectRoot: fanOutProjectRoot });
       stateDb
         .prepare("UPDATE cards SET status = 'awaiting_children' WHERE id = 'parent'")
         .run();
@@ -971,6 +975,7 @@ async function crashMidFanOut(): Promise<OracleTrial> {
     };
   } finally {
     db.close();
+    rmSync(fanOutProjectRoot, { recursive: true, force: true });
   }
 }
 

@@ -61,7 +61,9 @@
  * while commitFanOut persists parent_id + owned_paths via ConduitDB.insertCard.
  * REUSE findCycleNodes — do NOT reimplement a separate DFS.
  */
+import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import type { Card } from '../types/kernel';
 import { openConduitDB, type ConduitDB, DEFAULT_RUN_ID } from '../persistence/db';
@@ -82,8 +84,12 @@ import type {
   FanInPolicy,
 } from './expand';
 
-/** The project root commitFanOut confines owned_paths to; these proposals use relative paths. */
-const FANOUT_PROJECT_ROOT = tmpdir();
+/**
+ * The project root commitFanOut confines owned_paths to; these proposals use
+ * relative paths. A fresh dir per test, so nothing left in the shared temp
+ * root can change how a path canonicalizes.
+ */
+let FANOUT_PROJECT_ROOT: string;
 
 const TERMINAL = ['done', 'scrap', 'hold'] as const;
 
@@ -91,10 +97,12 @@ let db: ConduitDB;
 
 beforeEach(() => {
   db = openConduitDB({ stateDbPath: ':memory:', journalDbPath: ':memory:' });
+  FANOUT_PROJECT_ROOT = mkdtempSync(join(tmpdir(), 'conduit-fanout-'));
 });
 
 afterEach(() => {
   db.close();
+  rmSync(FANOUT_PROJECT_ROOT, { recursive: true, force: true });
 });
 
 function parentCard(id: string): Card {
