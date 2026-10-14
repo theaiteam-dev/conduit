@@ -434,6 +434,11 @@ async function launchPass(
  *                                 alerted; the run takes its next pass.
  *   - anything else               failed, alerted, logged 'spawn_failed',
  *                                 exactly as an unkeyed launch.
+ *
+ * Awaits `exited` before it reads or writes anything (issue #47 review): the
+ * launch path starts this watcher before it writes the row, and relies on
+ * that await to run the watcher after those writes. The already-exited child
+ * test in keyed-runs.test.ts pins the order.
  */
 async function watchPassExit(
   deps: KeyedRunDeps,

@@ -500,6 +500,11 @@ async function fireSpawnFailedAlert(alert: AlertSeam, notice: SpawnFailedAlert):
  * Never rejects — it runs detached, so an escaping throw would be an unhandled
  * rejection with no caller to report to (same discipline as the post-ack Slack
  * pipeline).
+ *
+ * Awaits `exited` before it reads or writes anything (issue #47 review): the
+ * launch path starts this watcher before it writes the row, and relies on
+ * that await to run the watcher after those writes. The already-exited child
+ * test in spawn.test.ts pins the order.
  */
 async function watchChildExit(
   deps: ChildExitDeps,

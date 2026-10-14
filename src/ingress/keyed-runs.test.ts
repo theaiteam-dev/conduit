@@ -917,7 +917,45 @@ describe('restart and re-drive', () => {
     await settle();
 
     expect(slots.inFlightCount()).toBe(0);
-    expect(db.getIngressLog().map((e) => e.outcome)).toContainAnyValues(['pass_failed', 'spawn_failed']);
+    // The run is still concluded and appendable, so the watcher reads the
+    // non-zero exit as a pass that ran and failed.
+    expect(db.getIngressLog().map((e) => e.outcome)).toEqual(['pass_failed']);
+  });
+
+  it('a pass whose child has already exited when the launch returns is recorded after the launch writes (issue #47 review)', async () => {
+    seedFinishedRun();
+    acceptRow('ev-a', NOW - 10, { round: 'a' });
+    const slots = createRunSlots({ capacity: 1 });
+    const deps: KeyedRunDeps = {
+      db,
+      // The child died before the seam returned: the exit promise is already settled.
+      spawn: async () => ({ ok: true, exited: Promise.resolve({ code: 9 }) }),
+      alerts: { alert: async (a) => void alerts.push(a), channels: {}, globalAlertChannel: '#ops' },
+      slots,
+      redriveCap: 3,
+      now: () => NOW,
+      launching: new Set<string>(),
+    };
+
+    const routed = await routeKeyedEvent(
+      deps,
+      {
+        eventId: 'ev-a',
+        runId: RUN,
+        flowId: FLOW_ID,
+        flowPath: FLOW_PATH,
+        substrateJson: db.getIngressEvent('ev-a')!.substrate_json!,
+        source: 'test',
+      },
+      'sweep',
+    );
+    await settle();
+
+    expect(routed).toEqual({ outcome: 'accepted', runId: RUN, pass: 2 });
+    // The launch's own writes land first; the watcher's record follows them.
+    expect(db.getIngressLog().map((e) => e.outcome)).toEqual(['redriven', 'pass_failed']);
+    expect(db.getIngressEvent('ev-a')).toMatchObject({ spawn_state: 'spawned' });
+    expect(slots.inFlightCount()).toBe(0);
   });
 });
 

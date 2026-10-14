@@ -1622,6 +1622,20 @@ describe('re-drive sweep error boundary (issue #47)', () => {
     expect(db.getIngressEvent('e-marked')).toMatchObject({ spawn_state: 'failed' });
   });
 
+  it('a child that has already exited when the seam returns is recorded after the launch writes', async () => {
+    seedFailed('e-dead', 1);
+    const slots = createRunSlots({ capacity: 1 });
+    const respawn: RespawnSeam = async () => ({ result: 'spawned', exited: Promise.resolve({ code: 9 }) });
+
+    const report = await redriveOnBoot({ db, respawn, cap: CAP, slots });
+    await settle();
+
+    expect(report.spawned).toEqual(['e-dead']);
+    expect(db.getIngressEvent('e-dead')).toMatchObject({ spawn_state: 'failed', spawn_attempts: 2 });
+    expect(db.getIngressLog().map((e) => e.outcome)).toEqual(['redriven', 'spawn_failed']);
+    expect(slots.inFlightCount()).toBe(0);
+  });
+
   it('bounds the stored reason of a sweep error', async () => {
     seedFailed('e-long', 1);
     const huge = 'x'.repeat(10_000);

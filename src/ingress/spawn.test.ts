@@ -977,4 +977,22 @@ describe('a storage error after the child is launched', () => {
     expect(db.getIngressEvent('evt-1')).toMatchObject({ spawn_state: 'failed' });
     expect(db.getIngressLog().map((e) => e.outcome)).toContain('spawn_failed');
   });
+
+  it('a child that has already exited when the seam returns is recorded after the launch writes', async () => {
+    const slots = createRunSlots({ capacity: 1 });
+    const spawn: SpawnSeam = async () => ({ ok: true, exited: Promise.resolve({ code: 9 }) });
+
+    const result = await runSpawnPath(
+      { db, spawn, alert: recordingAlert().seam, globalAlertChannel: '#l', redriveCap: 3, slots },
+      baseInput(),
+    );
+    await settleExitWatcher();
+
+    expect(result).toEqual({ outcome: 'accepted', runId: deriveIngressRunId('evt-1') });
+    // Had the watcher written before the launch path, 'spawned' would have
+    // overwritten 'failed' and the log would start with 'spawn_failed'.
+    expect(db.getIngressEvent('evt-1')).toMatchObject({ spawn_state: 'failed' });
+    expect(db.getIngressLog().map((e) => e.outcome)).toEqual(['accepted', 'spawn_failed']);
+    expect(slots.inFlightCount()).toBe(0);
+  });
 });

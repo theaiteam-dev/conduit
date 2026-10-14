@@ -359,6 +359,11 @@ function normalizeRedriveLaunch(value: RedriveResult | RedriveLaunch): RedriveLa
  * stays 'spawned', the log records 'parked', and the sweep resumes it once
  * its gate passes (ingress/parked.ts). A pre-v9 row carries no run_id, so it
  * cannot be recognised as parked and keeps the failure path.
+ *
+ * Awaits `exited` before it reads or writes anything (issue #47 review): the
+ * launch path starts this watcher before it writes the row, and relies on
+ * that await to run the watcher after those writes. The already-exited child
+ * test in recovery.test.ts pins the order.
  */
 async function watchRedrivenChildExit(
   deps: { db: ConduitDB; source: string; now: () => number; alerts?: RedriveAlerting; slots?: RunSlots },
