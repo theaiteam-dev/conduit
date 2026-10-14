@@ -1611,6 +1611,8 @@ describe('re-drive sweep error boundary (issue #47)', () => {
     const report = await redriveOnBoot({ db: flaky, respawn: respawn.seam, cap: CAP, slots });
 
     expect(report.errored).toHaveLength(1);
+    // Each row lands in one bucket: the errored row is not also reported spawned.
+    expect(report.spawned).toEqual([]);
     expect(db.getIngressEvent('e-marked')).toMatchObject({ spawn_state: 'spawned' });
     expect(slots.inFlight('e-marked')).toBe(true);
 

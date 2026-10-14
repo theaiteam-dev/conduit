@@ -145,7 +145,9 @@ export interface RedriveReport {
   /**
    * Rows whose processing threw (issue #47), most likely a storage error in
    * the row's bookkeeping. The sweep moved on to the next row; each one is
-   * logged 'sweep_error' when the journal accepts the write.
+   * logged 'sweep_error' when the journal accepts the write. A row here is in
+   * no other bucket. Its child may still have launched: if so, its exit
+   * watcher holds the run slot and records the exit.
    */
   errored: Array<{ eventId: string; reason: string }>;
 }
@@ -289,7 +291,6 @@ async function redriveRow(
       // 'spawned' means LAUNCHED (the original acknowledgement-on-accept work) — a child that later dies is
       // marked failed by the exit watcher below.
       db.markIngressSpawned(event.event_id);
-      report.spawned.push(event.event_id);
     } else if (launch.result === 'transient_failure') {
       db.markIngressFailed(event.event_id);
       // Alert on a transient launch failure too (#8). The hot path alerts on
@@ -298,7 +299,6 @@ async function redriveRow(
       // either way until a later sweep succeeds. Mirroring it keeps one
       // failure story across both paths; the reason text carries the nuance.
       void fireRedriveAlert(alerts, event, 're-drive launch failed — will retry while under the attempt cap');
-      report.failed.push(event.event_id);
     } else {
       // permanent_failure: mark failed and exhaust the remaining cap headroom so
       // listRedrivable skips this row on future boots (spawn_attempts reaches >= cap).
@@ -307,11 +307,16 @@ async function redriveRow(
       // The loudest case (#8): the row is now excluded from listRedrivable, so
       // this alert is the ONLY thing that will ever surface the event again.
       void fireRedriveAlert(alerts, event, 're-drive launch failed permanently — the event will not be retried');
-      report.permanentlyFailed.push(event.event_id);
     }
 
     // Record every re-drive attempt in the ingress log, regardless of outcome.
     db.appendIngressLog({ source, eventId: event.event_id, outcome: 'redriven' });
+
+    // Report the row only once all of its writes have landed, so a row whose
+    // bookkeeping threw is reported in `errored` alone (issue #47 review).
+    if (launch.result === 'spawned') report.spawned.push(event.event_id);
+    else if (launch.result === 'transient_failure') report.failed.push(event.event_id);
+    else report.permanentlyFailed.push(event.event_id);
   } finally {
     // Release AFTER the row's terminal state is marked (never re-throws on a
     // seam throw path without freeing the slot). A handed-off slot stays held:
