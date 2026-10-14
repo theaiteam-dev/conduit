@@ -420,6 +420,30 @@ for (const kind of ['harness', 'transform'] as const) {
         .flatMap((e) => (e.kind === 'terminal' ? [e.reason] : []));
       expect(holdReasons.some((r) => r.includes('could not read its prompt template'))).toBe(true);
     });
+
+    it('an effectful station with an unreadable prompt file holds before writing an outbox intent', async () => {
+      writePrompt('a.md', 'ROLE:A original prompt.');
+      const rig = makeRig();
+      db = openDb();
+      const flow = writeFlow(rig.registry, { kind, effectful: true });
+      rmSync(join(projectDir, 'prompts', 'a.md'));
+      let clock = 1000;
+      await runExecutor({
+        db,
+        flow,
+        now: () => clock,
+        sleep: async (ms: number) => {
+          clock += Math.max(1, Math.ceil(ms / 1000));
+        },
+        adapter: rig.model.adapter,
+        io,
+        harnessRegistry: rig.registry,
+      } as unknown as RunEngineArgs);
+      expect(db.getCard(DEFAULT_RUN_ID, 'c')?.status).toBe('held');
+      expect(aCalls(rig, kind)).toBe(0);
+      const outbox = db.getStateDb().prepare('SELECT COUNT(*) AS n FROM outbox').get() as { n: number };
+      expect(outbox.n).toBe(0);
+    });
   });
 }
 
@@ -451,6 +475,21 @@ describe('harness station with a named agent', () => {
     resetToA(db);
     await run(rig, writeFlow(rig.registry, { kind: 'harness', uses: ['house-style'], agent: 'team:coder' }), 2000);
     expect(rig.harness.calls).toHaveLength(2);
+  });
+
+  it('editing the agent definition with the prompt and skills unchanged re-runs the station and cascades downstream', async () => {
+    writePrompt('a.md', 'ROLE:A local prompt.');
+    writeAgent('coder', 'Agent body one.');
+    const rig = await runEditResume({ kind: 'harness', agent: 'team:coder' }, () => writeAgent('coder', 'Agent body two.'));
+    expect(rig.harness.calls).toHaveLength(2);
+    expect(bCalls(rig)).toBe(2);
+  });
+
+  it('an unchanged agent definition still skips on resume', async () => {
+    writePrompt('a.md', 'ROLE:A local prompt.');
+    writeAgent('coder', 'Agent body.');
+    const rig = await runEditResume({ kind: 'harness', agent: 'team:coder' }, () => writeAgent('coder', 'Agent body.'));
+    expect(rig.harness.calls).toHaveLength(1);
   });
 });
 
