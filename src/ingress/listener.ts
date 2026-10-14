@@ -148,6 +148,13 @@ export interface Listener {
    * errors that quarantined each. Always empty when config.quarantine is off.
    */
   quarantined: Record<string, ListenerBootError[]>;
+  /**
+   * True when a served flow has a binding that receives events over inbound
+   * HTTP: a webhook route, or a slack binding on the Events API transport.
+   * False when every served binding is Socket Mode, which is outbound-only, so
+   * `conduit listen` starts no HTTP server (#44). Quarantined flows do not count.
+   */
+  needsHttp: boolean;
 }
 
 export type StartListenerResult =
@@ -533,6 +540,8 @@ export async function startListener(
   // flows sharing a Slack app share a connection; routing stays per-channel via
   // slackChannelMap, exactly like the webhook transport.
   const socketAppTokens = new Set<string>(socketFlowTokens.values());
+  // Whether any surviving binding receives events over inbound HTTP (#44).
+  let needsHttp = false;
 
   for (const { flowName, flowPath, flow, rawIngress } of loadedFlows) {
     const parseResult = parseIngressBinding(rawIngress);
@@ -548,7 +557,9 @@ export async function startListener(
       const secret = secretEnv !== undefined ? (config.secrets?.[secretEnv] ?? '') : '';
 
       webhookRouteMap.set(binding.route, { flowId: flowName, flowPath, flow, binding, secret });
+      needsHttp = true;
     } else if (binding.type === 'slack') {
+      if (binding.transport !== 'socket') needsHttp = true;
       // `channel` is not part of the typed IngressBinding — extract from the raw value.
       const rawRecord =
         rawIngress !== null && typeof rawIngress === 'object' && !Array.isArray(rawIngress)
@@ -680,6 +691,7 @@ export async function startListener(
       },
     },
     quarantined,
+    needsHttp,
     redrive: {
       start: () => {
         if (periodicRedrive !== null) return; // idempotent — one schedule per listener

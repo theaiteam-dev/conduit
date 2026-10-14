@@ -207,7 +207,7 @@ async function waitForCondition(
 }
 
 /** Binds an ephemeral port by opening then immediately closing a throwaway server. */
-function reserveEphemeralPort(): number {
+export function reserveEphemeralPort(): number {
   const probe = Bun.serve({ port: 0, fetch: () => new Response("ok") });
   const port = Number(probe.url.port);
   probe.stop(true);
@@ -513,6 +513,56 @@ function startFakeModelGateway(opts: { projectRoot?: string; overlap?: boolean }
 // ---------------------------------------------------------------------------
 
 const HARNESS_CHANNEL = "C_HARNESS";
+
+/**
+ * A second allowlisted flow whose only job is to declare a webhook route, so
+ * the listener starts its HTTP server (#44: a listener whose bindings are all
+ * Socket Mode opens no port). The journeys POST Slack events to that server's
+ * /slack/events route, which routes by channel to the socket-transport journey
+ * flow. Nothing ever posts to the anchor's own route.
+ */
+function writeHttpAnchorFlow(root: string): string {
+  const path = join(root, "http-anchor.yaml");
+  writeFileSync(
+    path,
+    `flow: blackbox-http-anchor
+project_root: ./workspace
+flow_version: 1
+
+terminal_lanes: [done, scrap, hold]
+
+stations:
+  - id: noop
+    next: done
+    worker:
+      kind: deterministic
+      role: noop
+      command: cp
+      args: ["seed/delivery.txt", "anchor.txt"]
+    wip: 1
+    inputs: []
+    outputs: [anchor.txt]
+
+channels:
+  ingress:
+    type: webhook
+    route: /hooks/http-anchor
+    auth: { type: hmac, secret_env: HTTP_ANCHOR_SECRET }
+    event_id: { from: json_path, path: "$.id" }
+  egress:
+    - type: slack
+      target: "${HARNESS_CHANNEL}"
+      uses: [alerts]
+
+security:
+  bash:
+    allow: ["cp"]
+    deny_shell_metachars: true
+  network_egress: deny
+`,
+  );
+  return path;
+}
 
 interface Workspace {
   root: string;
@@ -878,6 +928,7 @@ export async function startJourneyHarness(opts?: {
   const ws = opts?.concurrentFanOut
     ? scaffoldConcurrentFanoutWorkspace(opts)
     : scaffoldWorkspace(opts);
+  const listenFlows = `journey=${ws.flowPath},httpanchor=${writeHttpAnchorFlow(ws.root)}`;
   const fakeModel = startFakeModelGateway({
     projectRoot: ws.projectRoot,
     overlap: opts?.concurrentFanOut === true,
@@ -906,7 +957,7 @@ export async function startJourneyHarness(opts?: {
       CONDUIT_ENTRY,
       "listen",
       "--flows",
-      `journey=${ws.flowPath}`,
+      listenFlows,
       "--port",
       String(listenerPort),
     ],
@@ -1063,7 +1114,7 @@ export async function startJourneyHarness(opts?: {
           CONDUIT_ENTRY,
           "listen",
           "--flows",
-          `journey=${ws.flowPath}`,
+          listenFlows,
           "--port",
           String(listenerPort),
         ],

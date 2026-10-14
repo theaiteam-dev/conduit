@@ -126,15 +126,18 @@ from, since the build cannot be reproduced from the Dockerfile alone.
 ### 5. Publish no ports you don't serve
 
 Socket-Mode ingress is outbound-only: the listener needs **zero** inbound ports, so a
-Socket-Mode deployment should publish none (`PublishPort=`/`-p` absent entirely). Anything
-the engine binds on `0.0.0.0` then stays inside the container network, unreachable from
-the LAN. If you do run webhook ingress, publish exactly that one port and terminate it
-behind a reverse proxy you already trust — nothing else.
+Socket-Mode deployment should publish none (`PublishPort=`/`-p` absent entirely). If you
+do run webhook ingress, publish exactly that one port and terminate it behind a reverse
+proxy you already trust — nothing else.
 
-`conduit listen` currently starts its HTTP ingress server on `0.0.0.0:3000` even when
-every binding uses Socket Mode ([#44](https://github.com/theaiteam-dev/conduit/issues/44)).
-In a container that port is harmless as long as it is not published. On a bare-metal
-install it is reachable from the host's network, so block it with the host firewall.
+`conduit listen` starts its HTTP ingress server only when a served binding needs one (a
+webhook route or a Slack Events API binding), so a Socket-Mode-only listener opens no port
+([#44](https://github.com/theaiteam-dev/conduit/issues/44)). When it does start, it binds
+`127.0.0.1` unless `--bind` names another address. On a bare-metal install behind a local
+reverse proxy, keep the default. In a container, pass `--bind 0.0.0.0`, because a published
+port does not reach the container's loopback, and restrict exposure on the host side of
+the mapping instead (`-p 127.0.0.1:8080:8080` for a proxy on the same host). See
+[`ingress-listener.md`](ingress-listener.md#http-server-when-it-starts-and-where-it-binds---port---bind).
 
 ### 6. Secrets are a runtime seam, not a file in the repo
 

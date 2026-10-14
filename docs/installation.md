@@ -273,7 +273,7 @@ override the image with `CONDUIT_FLOW_IMAGE`.
 
 | Service | Image | Command | Purpose |
 |---------|-------|---------|---------|
-| `listener` | `${CONDUIT_FLOW_IMAGE:-branching-flow}` | `listen --flows branching=/flow/flow.yaml --port 8080` | Long-lived process; receives webhook events on port `8080`, enqueues cards into the shared state DB |
+| `listener` | `${CONDUIT_FLOW_IMAGE:-branching-flow}` | `listen --flows branching=/flow/flow.yaml --port 8080 --bind 0.0.0.0` | Long-lived process; receives webhook events on port `8080`, enqueues cards into the shared state DB |
 | `kernel` | `${CONDUIT_FLOW_IMAGE:-branching-flow}` | `run /flow/flow.yaml` | Per-run process; executes the baked flow against the shared state DB and exits when the flow completes |
 | `model` | `ollama/ollama` | — | Local model sidecar; both engine services reach it via `CONDUIT_BASE_URL: http://model:11434/v1` |
 
@@ -305,6 +305,15 @@ docker compose -f docker-compose.operator.yml run --rm kernel
 > **Port mapping** — the `listener` service binds `8080:8080`. Put a reverse
 > proxy or cloud load-balancer in front for TLS termination; the container
 > serves plain HTTP.
+>
+> **`--bind 0.0.0.0` is required in a container.** `conduit listen` binds its
+> HTTP server to `127.0.0.1` unless `--bind` names another address, and a
+> published port does not reach a container's loopback. Without the flag the
+> listener starts but `8080:8080` connects to nothing. To keep the port off the
+> network, restrict the host side instead: `"127.0.0.1:8080:8080"`. A flow whose
+> ingress is Slack Socket Mode only starts no HTTP server, so it needs neither
+> `--bind` nor a `ports:` entry. See
+> [HTTP server: when it starts and where it binds](./ingress-listener.md#http-server-when-it-starts-and-where-it-binds---port---bind).
 
 ---
 
