@@ -1667,7 +1667,40 @@ describe('re-drive sweep error boundary (issue #47)', () => {
     expect(reason.length).toBeLessThanOrEqual(SWEEP_ERROR_REASON_MAX);
     expect(reason.endsWith('… (truncated)')).toBe(true);
     expect(calls).toHaveLength(1);
-    expect(calls[0]!.reason.length).toBeLessThan(SWEEP_ERROR_REASON_MAX + 400);
+    expect(calls[0]!.reason.length).toBeLessThanOrEqual(SWEEP_ERROR_REASON_MAX);
+  });
+
+  it('bounds the reason of a failed snapshot, prefix included', async () => {
+    const huge = 'y'.repeat(10_000);
+    const longFail = new Proxy(db, {
+      get(target, prop, receiver) {
+        if (prop === 'listRedrivable') {
+          return () => {
+            throw new Error(huge);
+          };
+        }
+        return forward(target, prop, receiver);
+      },
+    });
+    const { alerts, calls } = recordingAlert();
+    const handle = startPeriodicRedrive({
+      db: longFail,
+      respawn: recordingRespawn(allSpawn).seam,
+      cap: CAP,
+      intervalMs: 60_000,
+      schedule: manualSchedule().schedule,
+      alerts,
+    });
+    handle.kick();
+    await settle();
+    await settle();
+    handle.stop();
+
+    const reason = db.getIngressLog()[0]!.reason!;
+    expect(reason.startsWith('re-drive sweep failed: ')).toBe(true);
+    expect(reason.length).toBeLessThanOrEqual(SWEEP_ERROR_REASON_MAX);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.reason.length).toBeLessThanOrEqual(SWEEP_ERROR_REASON_MAX);
   });
 
   it('backs off: after a failed sweep, a kick does not sweep until the next tick', async () => {

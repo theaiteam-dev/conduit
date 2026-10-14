@@ -455,16 +455,20 @@ export const REDRIVE_SWEEP_ALERT_EVENT_ID = 'redrive-sweep';
  * Longest reason a sweep error stores in ingress_log or sends in an alert
  * (issue #47 review). A storage error's message is written as thrown and can
  * be long (a driver that appends a statement or a path list); the journal row
- * and the alert carry a bounded prefix of it.
+ * and the alert carry a bounded prefix of it. The bound is applied where the
+ * reason is written, after any prefix or suffix is added.
  */
 export const SWEEP_ERROR_REASON_MAX = 500;
 
 const TRUNCATION_MARK = '… (truncated)';
 
+function boundReason(reason: string, max: number = SWEEP_ERROR_REASON_MAX): string {
+  if (reason.length <= max) return reason;
+  return reason.slice(0, max - TRUNCATION_MARK.length) + TRUNCATION_MARK;
+}
+
 function errorMessage(err: unknown): string {
-  const message = err instanceof Error ? err.message : String(err);
-  if (message.length <= SWEEP_ERROR_REASON_MAX) return message;
-  return message.slice(0, SWEEP_ERROR_REASON_MAX - TRUNCATION_MARK.length) + TRUNCATION_MARK;
+  return boundReason(err instanceof Error ? err.message : String(err));
 }
 
 /**
@@ -474,7 +478,7 @@ function errorMessage(err: unknown): string {
  */
 function appendSweepError(db: ConduitDB, source: string, eventId: string | null, reason: string): void {
   try {
-    db.appendIngressLog({ source, eventId, outcome: 'sweep_error', reason });
+    db.appendIngressLog({ source, eventId, outcome: 'sweep_error', reason: boundReason(reason) });
   } catch {
     // The alert and the next tick's retry are what is left.
   }
@@ -612,7 +616,8 @@ export function startPeriodicRedrive(deps: PeriodicRedriveDeps): PeriodicRedrive
   /** Best effort and not awaited, like fireRedriveAlert. */
   const alertSweepFailure = (failure: string): void => {
     if (alerts === undefined) return;
-    const reason = `${failure}; the listener keeps running and retries on the next interval tick`;
+    const suffix = '; the listener keeps running and retries on the next interval tick';
+    const reason = boundReason(failure, SWEEP_ERROR_REASON_MAX - suffix.length) + suffix;
     void Promise.resolve()
       .then(() =>
         alerts.alert({
