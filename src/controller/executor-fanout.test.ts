@@ -44,8 +44,8 @@
  *     route the parent to its happyPathNext successor with status 'waiting'/'complete')
  */
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
-import { join } from 'node:path';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { basename, join } from 'node:path';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync, existsSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 
 import type { ModelAdapter, ModelCall, ModelResponse } from '../worker/adapter';
@@ -166,7 +166,7 @@ afterEach(() => {
 // ---------------------------------------------------------------------------
 
 /** Drive the real runExecutor over the fan-out flow with the given proposal. */
-async function runFanOut(proposal: unknown): Promise<{ lines: string[] }> {
+async function runFanOut(proposal: unknown, extra: { projectRoot?: string } = {}): Promise<{ lines: string[] }> {
   const flow = setupFanOutFlow(projectDir);
   db = openConduitDB({ stateDbPath: ':memory:', journalDbPath: ':memory:' });
   ensureCheckpointSchema(db.getStateDb());
@@ -188,6 +188,7 @@ async function runFanOut(proposal: unknown): Promise<{ lines: string[] }> {
     now: SECONDS(1000),
     adapter: makeProposalAdapter(proposal),
     io,
+    ...extra,
   } as RunEngineArgs);
   return { lines };
 }
@@ -516,5 +517,82 @@ describe('runExecutor fan-out — gate pass still routes via FAN_OUT, not statio
       expect(departedFromLane(db!, kid, CHILD_ENTRY)).toBe(true);
       expect(departedFromLane(db!, kid, 'merge')).toBe(false);
     }
+  });
+});
+
+// ===========================================================================
+// Issues #73 and #124 — owned_paths resolve against the run's project root,
+// not the kernel's cwd, and must stay inside it.
+// ===========================================================================
+
+describe('runExecutor fan-out — owned_paths resolve against and stay inside the project root (#73, #124)', () => {
+  let elsewhere: string;
+
+  beforeEach(() => {
+    elsewhere = mkdtempSync(join(tmpdir(), 'conduit-fanout-cwd-'));
+  });
+
+  afterEach(() => {
+    rmSync(elsewhere, { recursive: true, force: true });
+  });
+
+  /** The terminal reason the parent was held with. */
+  function holdReason(): string | undefined {
+    return db!
+      .getCardLog(PARENT_ID)
+      .filter((e) => e.kind === 'terminal')
+      .map((e) => e.reason ?? '')
+      .at(-1);
+  }
+
+  it('seeds relative child dirs under the project root when the kernel runs from another cwd', async () => {
+    mkdirSync(join(projectDir, 'evidence', 'c1'), { recursive: true });
+    mkdirSync(join(projectDir, 'evidence', 'c2'), { recursive: true });
+    const flowRoot = projectDir;
+    process.chdir(elsewhere);
+
+    await runFanOut(
+      {
+        children: [
+          { id: 'c1', depends_on: [], owned_paths: ['evidence/c1'], seed: { n: 1 } },
+          { id: 'c2', depends_on: [], owned_paths: ['evidence/c2'], seed: { n: 2 } },
+        ],
+      },
+      { projectRoot: flowRoot },
+    );
+
+    expect(childIds(db!, PARENT_ID)).toEqual(['c1', 'c2']);
+    expect(JSON.parse(readFileSync(join(flowRoot, 'evidence', 'c2', 'seed.json'), 'utf8'))).toEqual({ n: 2 });
+    expect(existsSync(join(elsewhere, 'evidence'))).toBe(false);
+  });
+
+  it.each([
+    ['a `..` escape', (outside: string) => join('..', basename(outside))],
+    ['an absolute path outside the root', (outside: string) => outside],
+  ])('holds the parent, seeds nothing and names the path for %s', async (_label, pathFor) => {
+    const target = pathFor(elsewhere);
+
+    await runFanOut({
+      children: [{ id: 'c1', depends_on: [], owned_paths: [target], seed: { evil: true } }],
+    });
+
+    expect(childIds(db!, PARENT_ID)).toEqual([]);
+    expect(db!.getCard(DEFAULT_RUN_ID, PARENT_ID)?.status).toBe('held');
+    expect(holdReason()).toBe(
+      `fan-out station 'plan' proposal rejected: owned_path_out_of_bounds (child 'c1', path '${target}')`,
+    );
+    expect(existsSync(join(elsewhere, 'seed.json'))).toBe(false);
+  });
+
+  it('holds the parent for a symlink inside the root that points outside it', async () => {
+    symlinkSync(elsewhere, join(projectDir, 'escape'));
+
+    await runFanOut({
+      children: [{ id: 'c1', depends_on: [], owned_paths: ['escape'], seed: { evil: true } }],
+    });
+
+    expect(childIds(db!, PARENT_ID)).toEqual([]);
+    expect(holdReason()).toContain('owned_path_out_of_bounds');
+    expect(existsSync(join(elsewhere, 'seed.json'))).toBe(false);
   });
 });

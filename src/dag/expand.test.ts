@@ -61,6 +61,7 @@
  * while commitFanOut persists parent_id + owned_paths via ConduitDB.insertCard.
  * REUSE findCycleNodes — do NOT reimplement a separate DFS.
  */
+import { tmpdir } from 'node:os';
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import type { Card } from '../types/kernel';
 import { openConduitDB, type ConduitDB, DEFAULT_RUN_ID } from '../persistence/db';
@@ -80,6 +81,9 @@ import type {
   ExpansionResult,
   FanInPolicy,
 } from './expand';
+
+/** The project root commitFanOut confines owned_paths to; these proposals use relative paths. */
+const FANOUT_PROJECT_ROOT = tmpdir();
 
 const TERMINAL = ['done', 'scrap', 'hold'] as const;
 
@@ -123,7 +127,7 @@ describe('commitFanOut (AC1)', () => {
   it('persists N child cards with parent_id set and surfaces their depends_on edges', () => {
     db.insertCard(parentCard('epic'));
 
-    const result = expectOk(commitFanOut(db, DEFAULT_RUN_ID, 'epic', proposal, { onPathConflict: 'reject' }));
+    const result = expectOk(commitFanOut(db, DEFAULT_RUN_ID, 'epic', proposal, { onPathConflict: 'reject', projectRoot: FANOUT_PROJECT_ROOT }));
 
     // The returned child set carries the proposed depends_on edges.
     expect(result.children.map((c) => c.id)).toEqual(['c1', 'c2', 'c3']);
@@ -150,7 +154,7 @@ describe('commitFanOut child-id collision', () => {
     expectOk(
       commitFanOut(db, DEFAULT_RUN_ID, 'entry-pass1', {
         children: [{ id: 'c1', depends_on: [], owned_paths: ['out/c1.json'] }],
-      }, { onPathConflict: 'reject' }),
+      }, { onPathConflict: 'reject', projectRoot: FANOUT_PROJECT_ROOT }),
     );
     db.insertCard(parentCard('entry-pass2'));
 
@@ -160,7 +164,7 @@ describe('commitFanOut child-id collision', () => {
           { id: 'c0', depends_on: [], owned_paths: ['out/c0.json'] },
           { id: 'c1', depends_on: [], owned_paths: ['out/c1.json'] },
         ],
-      }, { onPathConflict: 'reject' }),
+      }, { onPathConflict: 'reject', projectRoot: FANOUT_PROJECT_ROOT }),
     );
 
     expect(err.error).toEqual({ code: 'child_id_collision', child: 'c1', owner: 'entry-pass1' });
@@ -174,7 +178,7 @@ describe('commitFanOut child-id collision', () => {
     const err = expectErr(
       commitFanOut(db, DEFAULT_RUN_ID, 'entry-pass2', {
         children: [{ id: 'entry-pass1', depends_on: [], owned_paths: ['out/x.json'] }],
-      }, { onPathConflict: 'reject' }),
+      }, { onPathConflict: 'reject', projectRoot: FANOUT_PROJECT_ROOT }),
     );
     expect(err.error.code).toBe('child_id_collision');
   });
@@ -183,8 +187,8 @@ describe('commitFanOut child-id collision', () => {
     db.insertCard({ ...parentCard('p'), run_id: 'run-a' });
     db.insertCard({ ...parentCard('p'), run_id: 'run-b' });
     const proposal = { children: [{ id: 'c1', depends_on: [], owned_paths: ['out/c1.json'] }] };
-    expectOk(commitFanOut(db, 'run-a', 'p', proposal, { onPathConflict: 'reject' }));
-    expectOk(commitFanOut(db, 'run-b', 'p', proposal, { onPathConflict: 'reject' }));
+    expectOk(commitFanOut(db, 'run-a', 'p', proposal, { onPathConflict: 'reject', projectRoot: FANOUT_PROJECT_ROOT }));
+    expectOk(commitFanOut(db, 'run-b', 'p', proposal, { onPathConflict: 'reject', projectRoot: FANOUT_PROJECT_ROOT }));
   });
 
   // Two children in the same proposal sharing an id both
@@ -217,7 +221,7 @@ describe('commitFanOut child-id collision', () => {
           { id: 'c1', depends_on: [], owned_paths: ['out/c1.json'] },
           { id: 'c1', depends_on: [], owned_paths: ['out/c1-dup.json'] },
         ],
-      }, { onPathConflict: 'reject' }),
+      }, { onPathConflict: 'reject', projectRoot: FANOUT_PROJECT_ROOT }),
     );
 
     expect(err.error).toEqual({ code: 'child_id_collision', child: 'c1', owner: null });
@@ -246,7 +250,7 @@ describe('cycle detection (AC2)', () => {
 
   it('commits NO child cards when the proposal is cyclic', () => {
     db.insertCard(parentCard('epic'));
-    expectErr(commitFanOut(db, DEFAULT_RUN_ID, 'epic', cyclic, { onPathConflict: 'reject' }));
+    expectErr(commitFanOut(db, DEFAULT_RUN_ID, 'epic', cyclic, { onPathConflict: 'reject', projectRoot: FANOUT_PROJECT_ROOT }));
 
     expect(db.getCard(DEFAULT_RUN_ID, 'a')).toBeNull();
     expect(db.getCard(DEFAULT_RUN_ID, 'b')).toBeNull();
@@ -279,7 +283,7 @@ describe('dangling depends_on detection (#13)', () => {
         { id: 'c1', depends_on: ['ghost'], owned_paths: ['out/c1'] },
       ],
     };
-    expectErr(commitFanOut(db, DEFAULT_RUN_ID, 'epic', proposal, { onPathConflict: 'reject' }));
+    expectErr(commitFanOut(db, DEFAULT_RUN_ID, 'epic', proposal, { onPathConflict: 'reject', projectRoot: FANOUT_PROJECT_ROOT }));
     expect(db.getCard(DEFAULT_RUN_ID, 'c1')).toBeNull();
   });
 

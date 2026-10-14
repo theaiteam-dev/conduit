@@ -8,7 +8,7 @@ sig = "c589b70ef7bb72cd"
 [[bindings]]
 doc = "CLAUDE.md"
 target = "src/controller/executor.ts#runExecutor"
-sig = "3db2b6e7929c2d22"
+sig = "b44655b281bc86d4"
 
 [[bindings]]
 doc = "CLAUDE.md"

@@ -32,6 +32,7 @@
  * byte-comparable.
  */
 
+import { tmpdir } from 'node:os';
 import { openConduitDB, DEFAULT_RUN_ID } from '../persistence/db';
 import type { ConduitDB } from '../persistence/db';
 import {
@@ -51,6 +52,9 @@ import { evaluateFanIn, commitFanOut } from '../dag/expand';
 import type { ArchitectProposal } from '../dag/expand';
 import { egressSend } from '../channels/slack';
 import type { ModelAdapter, ModelResponse } from '../worker/adapter';
+
+/** The project root commitFanOut confines owned_paths to; these proposals use relative paths. */
+const FANOUT_PROJECT_ROOT = tmpdir();
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -944,7 +948,7 @@ async function crashMidFanOut(): Promise<OracleTrial> {
     const resumeFanOut = (): void => {
       const parent = db.getCard(DEFAULT_RUN_ID, 'parent');
       if (parent?.status === 'awaiting_children') return;
-      commitFanOut(db, DEFAULT_RUN_ID, 'parent', proposal, { onPathConflict: 'reject' });
+      commitFanOut(db, DEFAULT_RUN_ID, 'parent', proposal, { onPathConflict: 'reject', projectRoot: FANOUT_PROJECT_ROOT });
       stateDb
         .prepare("UPDATE cards SET status = 'awaiting_children' WHERE id = 'parent'")
         .run();

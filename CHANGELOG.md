@@ -117,6 +117,18 @@ historical context, not public releases or public repository history.
 
 ### Fixed
 
+- Fan-out owned paths resolve against the project root and stay inside it
+  ([#124](https://github.com/theaiteam-dev/conduit/issues/124),
+  [#73](https://github.com/theaiteam-dev/conduit/issues/73)). `commitFanOut`
+  resolved a child's relative `owned_paths[0]` against the kernel's cwd, so a
+  run whose cwd was not the project root (Docker, `--project-root`) rejected a
+  valid proposal with `seed_path_out_of_bounds`; `skip_when` `source: seed`
+  read `seed.json` from the cwd the same way. Both now resolve against the
+  run's project root. A proposal whose `owned_paths` entry resolves outside the
+  root (an absolute path elsewhere, a `..` escape, or a symlink pointing out)
+  is rejected with the new `owned_path_out_of_bounds` code: nothing is seeded,
+  and the parent is held with the child and path in its reason.
+  `commitFanOut` now requires `projectRoot` in its options.
 - A gate critic on a child-entry station can see the child's inputs. The
   critic prompt was rendered with no card scope, so a critic that referenced
   `{{seed.json}}` threw at render and the card went to `hold`. `ownedPaths` and

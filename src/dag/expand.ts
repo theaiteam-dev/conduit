@@ -11,6 +11,9 @@
  *      must not share owned_paths; conflicts are rejected or serialised.
  *   3. Categorisation into ready (all deps terminal) vs waiting (emergent waves).
  *   4. Fan-in policy: all | quorum(k ratio) | best_effort.
+ *   5. Owned-path confinement (commitFanOut, issues #73 and #124): every
+ *      proposed owned_paths entry resolves against the run's project root and
+ *      must stay inside it, symlinks resolved.
  *
  * NOTE: the cards table (WI-290) has no depends_on column, so the depends_on
  * graph lives in ExpansionResult.children (in-process wave state) and is NOT
@@ -23,6 +26,8 @@ import type { Status, Lane } from '../types/kernel';
 import type { ConduitDB } from '../persistence/db';
 import { DEFAULT_RUN_ID } from '../persistence/db';
 import { findCycleNodes } from '../flow/dag-utils';
+import { canonicalOwnedPaths } from '../controller/harness-overlap';
+import { isContainedIn, resolveOwnedPath } from '../worker/integrity';
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -53,11 +58,26 @@ export interface ExpandOptions {
   onPathConflict: 'reject' | 'serialize';
 }
 
+/**
+ * commitFanOut also needs the run's project root (issues #73, #124): every
+ * owned path is resolved against it, not against the kernel's cwd, and must
+ * stay inside it.
+ */
+export interface CommitFanOutOptions extends ExpandOptions {
+  projectRoot: string;
+}
+
 export type ExpansionError =
   | { code: 'dependency_cycle'; cycle: string[] }
   | { code: 'overlapping_owned_paths'; stations: [string, string]; path: string }
   | { code: 'unknown_dependency'; child: string; dependency: string }
   | { code: 'seed_path_out_of_bounds'; child: string; path: string }
+  /**
+   * A proposed owned_paths entry resolves outside the run's project root:
+   * an absolute path elsewhere, a `..` escape, or a symlink that points out
+   * (issue #73). `path` is the entry as proposed.
+   */
+  | { code: 'owned_path_out_of_bounds'; child: string; path: string }
   /**
    * A proposed child id is already a card in this run under another parent
    * (issue #36). Card ids are unique per run, and a keyed run's later pass may
@@ -216,6 +236,48 @@ export function validateExpansion(
 }
 
 // ---------------------------------------------------------------------------
+// findOwnedPathEscape — confine proposed owned_paths to the project root
+// ---------------------------------------------------------------------------
+
+/**
+ * The first proposed owned_paths entry that resolves outside `projectRoot`, as
+ * an `owned_path_out_of_bounds` error, or null when every entry is inside it
+ * (issue #73, SPEC §7 path ownership).
+ *
+ * A proposal is model output, and the kernel writes seed.json to a child's
+ * owned_paths[0], reads it back from there (card-scoped inputs, `skip_when`
+ * `source: seed`), and lets the child write anywhere inside its owned paths.
+ * So every entry of every child is checked, seeded or not.
+ *
+ * Entries go through `canonicalOwnedPaths`, the resolver the overlap
+ * disjointness check and `checkIntegrity` use: relative entries resolve against
+ * the project root, and symlinks in the longest existing prefix are resolved,
+ * so an entry that does not exist yet is still checked through any symlinked
+ * ancestor. The result is compared against the canonical project root.
+ *
+ * Never throws: a non-string entry (the proposal shape check accepts any array)
+ * is reported as out of bounds rather than surfacing a TypeError.
+ */
+export function findOwnedPathEscape(
+  projectRoot: string,
+  children: readonly ProposedChild[],
+): ExpansionError | null {
+  const canonicalRoot = resolveOwnedPath(resolve(projectRoot));
+  for (const child of children) {
+    for (const entry of child.owned_paths) {
+      if (typeof entry !== 'string') {
+        return { code: 'owned_path_out_of_bounds', child: child.id, path: String(entry) };
+      }
+      const [canonical] = canonicalOwnedPaths(canonicalRoot, [entry]);
+      if (canonical === undefined || !isContainedIn(canonical, canonicalRoot)) {
+        return { code: 'owned_path_out_of_bounds', child: child.id, path: entry };
+      }
+    }
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
 // commitFanOut — validate then persist
 // ---------------------------------------------------------------------------
 
@@ -236,20 +298,20 @@ export function validateExpansion(
  * duplicates; this guard makes re-dispatch safe without a UNIQUE violation.
  */
 // Overload 1 (new, 5-arg): explicit parentRunId for multi-run isolation.
-export function commitFanOut(db: ConduitDB, parentRunId: string, parentId: string, proposal: ArchitectProposal, opts: ExpandOptions): ExpansionResult;
+export function commitFanOut(db: ConduitDB, parentRunId: string, parentId: string, proposal: ArchitectProposal, opts: CommitFanOutOptions): ExpansionResult;
 // Overload 2 (legacy, 4-arg): omitted parentRunId defaults to DEFAULT_RUN_ID.
-export function commitFanOut(db: ConduitDB, parentId: string, proposal: ArchitectProposal, opts: ExpandOptions): ExpansionResult;
+export function commitFanOut(db: ConduitDB, parentId: string, proposal: ArchitectProposal, opts: CommitFanOutOptions): ExpansionResult;
 export function commitFanOut(
   db: ConduitDB,
   runIdOrParentId: string,
   parentIdOrProposal: string | ArchitectProposal,
-  proposalOrOpts: ArchitectProposal | ExpandOptions,
-  opts?: ExpandOptions,
+  proposalOrOpts: ArchitectProposal | CommitFanOutOptions,
+  opts?: CommitFanOutOptions,
 ): ExpansionResult {
   let parentRunId: string;
   let parentId: string;
   let proposal: ArchitectProposal;
-  let expandOpts: ExpandOptions;
+  let expandOpts: CommitFanOutOptions;
 
   if (opts !== undefined) {
     // 5-arg form: (db, parentRunId, parentId, proposal, opts)
@@ -262,10 +324,14 @@ export function commitFanOut(
     parentRunId = DEFAULT_RUN_ID;
     parentId = runIdOrParentId;
     proposal = parentIdOrProposal as ArchitectProposal;
-    expandOpts = proposalOrOpts as ExpandOptions;
+    expandOpts = proposalOrOpts as CommitFanOutOptions;
   }
   const result = validateExpansion(proposal, expandOpts);
   if (!result.ok) return result;
+
+  const { projectRoot } = expandOpts;
+  const escape = findOwnedPathEscape(projectRoot, proposal.children);
+  if (escape !== null) return { ok: false, error: escape };
 
   const stateDb = db.getStateDb();
 
@@ -293,12 +359,13 @@ export function commitFanOut(
   }
 
   // Build a map from child id → seed file path for each seeded child.
-  // Validate out-of-bounds seed paths before touching the filesystem or DB:
+  // Validate seed paths before touching the filesystem or DB:
   //   1. A seeded child with empty owned_paths has no directory to write into.
-  //   2. The raw owned_paths[0] entry must exist and be a directory — check
-  //      existence BEFORE calling realpathSync (which throws on missing paths).
-  //   3. realpathSync resolves symlinks so a symlink escaping the sandbox is
-  //      caught at write time by the integrity gate rather than silently allowed.
+  //   2. owned_paths[0], resolved against the project root (never the kernel's
+  //      cwd, issue #124), must exist and be a directory. Check existence
+  //      BEFORE calling realpathSync, which throws on missing paths.
+  //   3. findOwnedPathEscape above already confined it to the project root,
+  //      symlinks resolved, so the realpath here stays inside the root.
   const seedPaths = new Map<string, string>();
   for (const child of proposal.children) {
     // null is treated as "no seed" — only undefined and null are skipped.
@@ -310,21 +377,16 @@ export function commitFanOut(
       };
     }
     const rawDir = child.owned_paths[0]!;
-    // The entry must exist AND be a directory — a non-existent path indicates
-    // traversal outside the sandbox; a file entry would cause ENOTDIR on write.
-    if (!existsSync(rawDir)) {
+    const absDir = resolve(projectRoot, rawDir);
+    // The entry must exist AND be a directory: a file entry would cause
+    // ENOTDIR on write.
+    if (!existsSync(absDir) || !statSync(absDir).isDirectory()) {
       return {
         ok: false,
         error: { code: 'seed_path_out_of_bounds', child: child.id, path: rawDir },
       };
     }
-    if (!statSync(rawDir).isDirectory()) {
-      return {
-        ok: false,
-        error: { code: 'seed_path_out_of_bounds', child: child.id, path: rawDir },
-      };
-    }
-    const firstDir = realpathSync(rawDir); // symlink-resolved
+    const firstDir = realpathSync(absDir); // symlink-resolved
     const seedPath = join(firstDir, 'seed.json');
     seedPaths.set(child.id, seedPath);
   }

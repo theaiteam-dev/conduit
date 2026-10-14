@@ -494,7 +494,9 @@ declare a predicate that lets the kernel pass a card straight through to the sta
 ```
 
 - **`source: seed`** reads a top-level field of the card's `seed.json` (in
-  `owned_paths[0]`, written at fan-out, §9).
+  `owned_paths[0]`, written at fan-out, §9). A relative `owned_paths[0]` resolves against
+  the project root, not the kernel's working directory, and a `seed.json` that resolves
+  outside the owned directory (through a symlink) holds the card.
 - **`source: output`** (with `station: <id>`) reads a top-level field of the payload that
   an upstream `transform` station produced for the same card, from that station's latest
   checkpoint (§5). The station must declare the field in its `output_schema`, must reach
@@ -1111,6 +1113,15 @@ Conduit unfurls the plan at runtime rather than following a static script.
   `config.ts`" race that path-ownership alone misses. The overlap integrity rule for
   harness calls (§7) depends on this invariant: it attributes a touched path to the one
   in-flight card that owns it.
+- **Owned paths confined to the project root.** A child's `owned_paths` are model output.
+  The Kernel resolves every entry against the run's project root, never against its own
+  working directory, canonicalizes it with symlinks resolved in its longest existing
+  prefix (the resolver the integrity check uses, §7), and rejects the whole proposal with
+  `owned_path_out_of_bounds` when an entry lands outside the canonical root: an absolute
+  path elsewhere, a `..` escape, or a symlink pointing out. The rejection writes no
+  `seed.json` and seeds no child, and holds the parent with the child and the path in its
+  reason. This one check covers every later use of the path: the `seed.json` write, the
+  card-scoped input reads, `skip_when` `source: seed`, and the child's own writes.
 - **Two axes of motion, deliberately different:**
   - **Forward-only across waves.** An implementation failure → **hard pause for a human**
     (`hold`), never an automatic "nuclear reversal" to Wave 1 (state rot).

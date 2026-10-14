@@ -151,7 +151,25 @@ export interface Harness {
   };
   waitFor(cond: () => boolean | Promise<boolean>, opts?: { timeoutMs?: number; intervalMs?: number }): Promise<void>;
   cleanup(): Promise<void>;
+  /** The run's project root (CONDUIT_PROJECT_ROOT). */
+  projectRoot: string;
+  /**
+   * A directory beside the project root, outside it. With
+   * `fanOutOwnedPaths: "outside"`, each child's proposed owned dir is
+   * `<outsideRoot>/<child dir>`, pre-created so only confinement can reject it.
+   */
+  outsideRoot: string;
 }
+
+/**
+ * How the concurrent fan-out gateway spells each child's owned dir:
+ *   - absolute: `<projectRoot>/<dir>` (the default);
+ *   - relative: `<dir>`, which the kernel must resolve against the project
+ *     root, not its cwd (issue #124);
+ *   - outside:  `<outsideRoot>/<dir>`, an existing directory outside the
+ *     project root, which the kernel must reject (issue #73).
+ */
+export type FanOutOwnedPaths = "absolute" | "relative" | "outside";
 
 // ---------------------------------------------------------------------------
 // Slack v0 signature scheme — mirrors src/ingress/adapters/slack-events.ts
@@ -430,9 +448,10 @@ export const CONCURRENT_FANOUT_CHILDREN: ReadonlyArray<{ id: string; dir: string
 /**
  * OpenAI-compatible /chat/completions fake (CONDUIT_BASE_URL). Routes by prompt:
  *   • "Propose …"      → a fan-out proposal (the N homogeneous children above),
- *                        each owning an ABSOLUTE dir under projectRoot (the run
- *                        does not chdir, so commitFanOut's cwd-relative existsSync
- *                        needs an absolute owned path).
+ *                        each owning a dir spelled as `fanOutOwnedPaths` says
+ *                        (absolute under projectRoot by default). With
+ *                        `skipChild`, every seed carries `skip`, true only for
+ *                        that child, for the flow's `skip_when` predicate.
  *   • "…findings for…" → a review child; echoes THIS child's lens (rendered into
  *                        the prompt from its per-child seed.json) so each written
  *                        findings.json is distinguishable — proof of no-clobber.
@@ -443,7 +462,15 @@ export const CONCURRENT_FANOUT_CHILDREN: ReadonlyArray<{ id: string; dir: string
  * can prove real parallelism. `overlap` is off for the serial journeys, so their
  * timing and the default verdict path are byte-for-byte unchanged.
  */
-function startFakeModelGateway(opts: { projectRoot?: string; overlap?: boolean } = {}): FakeModelGateway {
+function startFakeModelGateway(
+  opts: {
+    projectRoot?: string;
+    outsideRoot?: string;
+    overlap?: boolean;
+    fanOutOwnedPaths?: FanOutOwnedPaths;
+    skipChild?: string;
+  } = {},
+): FakeModelGateway {
   const holdOpenMs = opts.overlap ? 40 : 0;
   let inFlight = 0;
   let peak = 0;
@@ -477,11 +504,21 @@ function startFakeModelGateway(opts: { projectRoot?: string; overlap?: boolean }
         if (holdOpenMs > 0) await sleep(holdOpenMs);
 
         if (prompt.includes("Propose")) {
+          const ownedDir = (dir: string): string => {
+            switch (opts.fanOutOwnedPaths ?? "absolute") {
+              case "relative":
+                return dir;
+              case "outside":
+                return join(opts.outsideRoot!, dir);
+              default:
+                return opts.projectRoot ? join(opts.projectRoot, dir) : dir;
+            }
+          };
           const children = CONCURRENT_FANOUT_CHILDREN.map((c) => ({
             id: c.id,
             depends_on: [] as string[],
-            owned_paths: [opts.projectRoot ? join(opts.projectRoot, c.dir) : c.dir],
-            seed: { lens: c.lens },
+            owned_paths: [ownedDir(c.dir)],
+            seed: opts.skipChild === undefined ? { lens: c.lens } : { lens: c.lens, skip: c.id === opts.skipChild },
           }));
           return respond(JSON.stringify({ children }));
         }
@@ -513,6 +550,11 @@ function startFakeModelGateway(opts: { projectRoot?: string; overlap?: boolean }
 // ---------------------------------------------------------------------------
 
 const HARNESS_CHANNEL = "C_HARNESS";
+
+/** The directory beside the project root used as an out-of-project target. */
+function outsideRootOf(root: string): string {
+  return join(root, "outside");
+}
 
 interface Workspace {
   root: string;
@@ -619,7 +661,9 @@ security:
  * resolves concurrency as flag > flow default > 1). Each child's owned dir is
  * pre-created here so commitFanOut can seed it and the scoped output can land.
  */
-function scaffoldConcurrentFanoutWorkspace(opts: { childStaggerSeconds?: number } = {}): Workspace {
+function scaffoldConcurrentFanoutWorkspace(
+  opts: { childStaggerSeconds?: number; skipChild?: string } = {},
+): Workspace {
   const root = mkdtempSync(join(tmpdir(), "conduit-blackbox-"));
   const projectRoot = join(root, "workspace");
   mkdirSync(projectRoot, { recursive: true });
@@ -628,6 +672,8 @@ function scaffoldConcurrentFanoutWorkspace(opts: { childStaggerSeconds?: number 
   // dirs must EXIST before fan-out (same rule as the per-child seed).
   for (const c of CONCURRENT_FANOUT_CHILDREN) {
     mkdirSync(join(projectRoot, c.dir), { recursive: true });
+    // The same dirs outside the project root, for the confinement journey.
+    mkdirSync(join(outsideRootOf(root), c.dir), { recursive: true });
   }
 
   const promptsDir = join(root, "prompts");
@@ -639,6 +685,8 @@ function scaffoldConcurrentFanoutWorkspace(opts: { childStaggerSeconds?: number 
     opts.childStaggerSeconds && opts.childStaggerSeconds > 0
       ? `    child_stagger_seconds: ${opts.childStaggerSeconds}\n`
       : "";
+  const skipLine =
+    opts.skipChild !== undefined ? `    skip_when: { source: seed, field: skip, equals: true }\n` : "";
 
   const flowPath = join(root, "flow.yaml");
   writeFileSync(
@@ -682,7 +730,7 @@ ${staggerLine}
     outputs: [findings.json]
     output_scope: owned_dir
     wip: 3
-
+${skipLine}
   - id: gather
     next: done
     worker:
@@ -861,6 +909,10 @@ export async function startJourneyHarness(opts?: {
   concurrentFanOut?: boolean;
   /** concurrent fan-out journey: fan-out cache-warming stagger (seconds) on the plan station; concurrentFanOut only. */
   childStaggerSeconds?: number;
+  /** concurrentFanOut only: how the proposal spells each child's owned dir (issues #73, #124). */
+  fanOutOwnedPaths?: FanOutOwnedPaths;
+  /** concurrentFanOut only: add `skip_when: { source: seed, field: skip, equals: true }` to the review station; this child's seed has skip: true. */
+  skipChild?: string;
 }): Promise<Harness> {
   // Spawn observation (SpawnObserver / descendantPids) reads /proc, which only
   // exists on Linux. On any other platform readdirSync('/proc') throws, is
@@ -880,7 +932,10 @@ export async function startJourneyHarness(opts?: {
     : scaffoldWorkspace(opts);
   const fakeModel = startFakeModelGateway({
     projectRoot: ws.projectRoot,
+    outsideRoot: outsideRootOf(ws.root),
     overlap: opts?.concurrentFanOut === true,
+    fanOutOwnedPaths: opts?.fanOutOwnedPaths,
+    skipChild: opts?.skipChild,
   });
   const signingSecret = randomUUID();
   const appToken = `xapp-test-${randomUUID()}`;
@@ -968,6 +1023,8 @@ export async function startJourneyHarness(opts?: {
   const harness: Harness = {
     slackBaseUrl: fakeSlack.baseUrl,
     signingSecret,
+    projectRoot: ws.projectRoot,
+    outsideRoot: outsideRootOf(ws.root),
 
     signSlackRequest(rawBody: string, timestampSec = Math.floor(Date.now() / 1000)): SignedRequest {
       const signature = computeV0Signature(signingSecret, timestampSec, rawBody);
