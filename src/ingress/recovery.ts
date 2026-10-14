@@ -540,9 +540,11 @@ export function startPeriodicRedrive(deps: PeriodicRedriveDeps): PeriodicRedrive
   let sweepInFlight = false;
   let kickPending = false;
   let stopped = false;
-  // Issue #47. backingOff: the last sweep failed, so kicks wait for the next
-  // interval tick instead of retrying on every child exit. failing: the
-  // current run of failed sweeps has already alerted.
+  // Issue #47. backingOff: the last sweep failed and made no progress (its
+  // snapshot threw, or every row it reached threw), so kicks wait for the
+  // next interval tick instead of retrying on every child exit. A sweep that
+  // launched or recorded some row is working, so kicks keep running after it.
+  // failing: the current run of failed sweeps has already alerted.
   let backingOff = false;
   let failing = false;
 
@@ -553,6 +555,7 @@ export function startPeriodicRedrive(deps: PeriodicRedriveDeps): PeriodicRedrive
    */
   const sweepOnce = async (): Promise<void> => {
     let failure: string | null = null;
+    let progressed = false;
     let report: RedriveReport | null = null;
     try {
       report = await redriveOnBoot({
@@ -565,6 +568,8 @@ export function startPeriodicRedrive(deps: PeriodicRedriveDeps): PeriodicRedrive
         ...(now !== undefined && { now }),
         ...(keyed !== undefined && { keyed }),
       });
+      progressed =
+        report.spawned.length + report.failed.length + report.permanentlyFailed.length > 0;
       const firstError = report.errored[0];
       if (firstError !== undefined) {
         failure =
@@ -581,7 +586,7 @@ export function startPeriodicRedrive(deps: PeriodicRedriveDeps): PeriodicRedrive
     if (failure === null) {
       failing = false;
     } else {
-      backingOff = true;
+      if (!progressed) backingOff = true;
       if (!failing) {
         failing = true;
         alertSweepFailure(failure);

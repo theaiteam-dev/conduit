@@ -125,8 +125,9 @@ historical context, not public releases or public repository history.
   `sweep_error`, and the sweep goes on to the next row. The periodic runner
   catches a sweep that fails as a whole, logs `sweep_error` with no event id
   when the journal allows, sends one alert per run of failed sweeps on the
-  listener-global channel (`event=redrive-sweep`), and ignores slot-release
-  kicks until the next interval tick, which sweeps again. A throwing `onSweep`
+  listener-global channel (`event=redrive-sweep`), and, when the failed sweep
+  made no progress, ignores slot-release kicks until the next interval tick,
+  which sweeps again. A throwing `onSweep`
   sink is caught too. A launched child is handed to its exit watcher before
   the writes that follow the launch, on the sweep, the hot path and the keyed
   pass launcher, so a storage error in those writes no longer frees the run

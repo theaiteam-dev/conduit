@@ -521,9 +521,11 @@ the sweep goes on to the next row; a snapshot that cannot be read is logged
 `'sweep_error'` with no event id. Both log writes are best effort. The first
 failed sweep of a run of failures fires one alert on the listener-global
 channel (`flow=unknown event=redrive-sweep`); later failures do not alert again
-until a sweep succeeds. After a failed sweep, slot-release kicks are ignored
-until the next interval tick, which sweeps again, so a full disk is retried
-once per interval rather than on every child exit. The boot re-drive has the
+until a sweep succeeds. After a failed sweep that made no progress (its
+snapshot could not be read, or every row it reached threw), slot-release kicks
+are ignored until the next interval tick, which sweeps again, so a full disk is
+retried once per interval rather than on every child exit. A sweep that
+launched or recorded some row despite an errored row does not back off. The boot re-drive has the
 per-row boundary too, but a snapshot that cannot be read at boot still fails
 the boot. A `'sweep_error'` reason, in the log and in the alert, is cut to 500
 characters. Every launch path (the hot path, the sweep and a keyed pass) hands

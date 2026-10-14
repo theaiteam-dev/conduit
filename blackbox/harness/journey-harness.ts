@@ -1225,6 +1225,8 @@ export async function startJourneyHarness(opts?: {
     ingressEvent(eventId) {
       const db = new Database(ws.stateDbPath, { readonly: true });
       try {
+        // The listener may hold the write lock: wait rather than fail SQLITE_BUSY.
+        db.exec("PRAGMA busy_timeout = 5000");
         const row = db
           .query(`SELECT spawn_state, spawn_attempts FROM ingress_events WHERE event_id = ?`)
           .get(eventId) as { spawn_state: string; spawn_attempts: number } | null;
@@ -1237,6 +1239,8 @@ export async function startJourneyHarness(opts?: {
     ingressLog() {
       const db = new Database(ws.journalDbPath, { readonly: true });
       try {
+        // The listener may hold the write lock: wait rather than fail SQLITE_BUSY.
+        db.exec("PRAGMA busy_timeout = 5000");
         return db
           .query(`SELECT source, event_id, outcome, reason FROM ingress_log ORDER BY id`)
           .all() as Array<{ source: string; event_id: string | null; outcome: string; reason: string | null }>;

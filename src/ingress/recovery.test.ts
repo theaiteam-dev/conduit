@@ -1707,6 +1707,48 @@ describe('re-drive sweep error boundary (issue #47)', () => {
     expect(reports).toHaveLength(4);
   });
 
+  it('does not back off when the sweep made progress past an errored row', async () => {
+    seedFailed('e-bad', 1);
+    db.acceptIngressEvent('e-good', 2000);
+    db.incrementSpawnAttempts('e-good');
+    db.markIngressFailed('e-good');
+    const flaky = new Proxy(db, {
+      get(target, prop, receiver) {
+        if (prop === 'incrementSpawnAttempts') {
+          return (eventId: string) => {
+            if (eventId === 'e-bad') throw diskFull();
+            target.incrementSpawnAttempts(eventId);
+          };
+        }
+        return forward(target, prop, receiver);
+      },
+    });
+    const reports: RedriveReport[] = [];
+    const { alerts, calls } = recordingAlert();
+    const handle = startPeriodicRedrive({
+      db: flaky,
+      respawn: recordingRespawn(allSpawn).seam,
+      cap: CAP,
+      intervalMs: 60_000,
+      schedule: manualSchedule().schedule,
+      onSweep: (r) => reports.push(r),
+      alerts,
+    });
+
+    handle.kick();
+    await settle();
+    expect(reports[0]!.spawned).toEqual(['e-good']);
+    expect(reports[0]!.errored).toHaveLength(1);
+    // The row error is still reported once.
+    expect(calls).toHaveLength(1);
+
+    // The sweep launched a row, so a slot-release kick sweeps at once.
+    handle.kick();
+    await settle();
+    handle.stop();
+    expect(reports).toHaveLength(2);
+  });
+
   it('alerts once per run of failed sweeps, and again after a recovery', async () => {
     const failing = new Set<keyof ConduitDB>(['listRedrivable']);
     const { alerts, calls } = recordingAlert();
