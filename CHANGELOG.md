@@ -117,6 +117,16 @@ historical context, not public releases or public repository history.
 
 ### Fixed
 
+- A transform gate critic that fails now scraps the card under a reason naming
+  the failure ([#42](https://github.com/theaiteam-dev/conduit/issues/42)),
+  where every failure used to scrap as `model-incompatible`:
+  `critic-verdict-invalid: <validator error>` for a verdict that parsed but
+  has the wrong shape, `critic-reject-without-findings`,
+  `critic-verdict-unparseable`, `critic-output-truncated` and
+  `critic-vision-unsupported`. `conduit run` and `conduit journal inspect`
+  print the reason. A `model-incompatible` scrap from `runTransformStation`
+  carries the last validator error as `validationError`. Transform makers
+  and harness critics keep their reasons.
 - A gate critic on a child-entry station can see the child's inputs. The
   critic prompt was rendered with no card scope, so a critic that referenced
   `{{seed.json}}` threw at render and the card went to `hold`. `ownedPaths` and

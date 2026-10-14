@@ -3,7 +3,7 @@ version = 1
 [[bindings]]
 doc = "CLAUDE.md"
 target = "SPEC.md#the-rework-loop-and-its-four-bounding-guards"
-sig = "c589b70ef7bb72cd"
+sig = "ad4136a22b151a97"
 
 [[bindings]]
 doc = "CLAUDE.md"
