@@ -336,6 +336,7 @@ These probes run whether or not a flow argument is given:
 |------------|---------------|
 | `flow-prereqs-present` | Every package in `flow.prerequisites` is present on PATH; reports all missing packages, not just the first |
 | `model-endpoint-reachable` | HTTP HEAD/GET to `${CONDUIT_BASE_URL}/models` succeeds; FAIL names the configured endpoint |
+| `harness '<adapter>' (station '<id>')` | One line per harness the flow uses: a `kind: harness` maker, and a `check.critic.harness` gate critic on a station of any kind, marked `(station '<id>' critic)`. The adapter's binary is present and executable; FAIL names the probed path. See [Verifying with `conduit doctor`](harness-adapter-registration.md#verifying-with-conduit-doctor) |
 
 ### Example: passing run (no flow arg)
 

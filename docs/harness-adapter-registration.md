@@ -347,6 +347,23 @@ $ conduit doctor examples/research-flow.yaml
   harness 'claude-headless' (station 'research') at '/usr/local/bin/claude': ok
 ```
 
+A gate critic that runs on a harness (`check.critic.harness`) gets its own
+line, marked `critic`, whatever the station's own `kind`. A station with a
+harness maker and a harness critic gets one line for each:
+
+```
+  harness 'claude-headless' (station 'research') at '/usr/local/bin/claude': ok
+  harness 'codex-exec' (station 'research' critic) at '/usr/local/bin/codex': ok
+```
+
+A missing critic binary fails `doctor`, and `conduit run`/`resume` refuse to
+start with `HARNESS_BINARY_NOT_FOUND` naming the station and the critic. A
+usage-blind critic adapter prints
+`harness '<name>' (station '<id>' critic) is usage-blind (cannot report token/cost usage)`.
+`conduit explain` lists the critic's adapter, model, agent, tools and
+usage-blind flag with a `critic ` prefix (`critic harness=codex-exec`), next to
+the maker's unprefixed `harness=`.
+
 The allowlist/`_COMMAND` warnings, however, fire in **both** modes — a broken
 allowlist is broken regardless of which flow is probed, so `doctor
 <flow.yaml>` surfaces the same `HOME`/`PATH`-floor and relative-`_COMMAND`

@@ -117,6 +117,20 @@ historical context, not public releases or public repository history.
 
 ### Fixed
 
+- A gate critic that runs on a harness adapter (`check.critic.harness`) is
+  now probed and reported like a harness maker
+  ([#35](https://github.com/theaiteam-dev/conduit/issues/35)). The binary
+  probe behind `conduit run`/`resume`, `conduit doctor` and `conduit explain`
+  all keyed on `station.kind === 'harness'`, so a critic on a `kind: transform`
+  station was skipped: doctor passed with the critic's binary missing and the
+  run scrapped the card at the first gate. All three now read one collector,
+  `src/flow/station-harnesses.ts`. A missing critic binary fails with
+  `HARNESS_BINARY_NOT_FOUND` naming `Station '<id>' critic harness adapter`;
+  doctor prints `harness '<name>' (station '<id>' critic)` lines, including the
+  usage-blind notice; explain shows `critic harness=`, `critic model=`,
+  `critic agent=`, `critic tools=` and `critic usage-blind`, and now also shows
+  a harness maker's `agent=`.
+
 - A gate critic on a child-entry station can see the child's inputs. The
   critic prompt was rendered with no card scope, so a critic that referenced
   `{{seed.json}}` threw at render and the card went to `hold`. `ownedPaths` and
