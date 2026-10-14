@@ -153,9 +153,13 @@ describe("fan-out owned_paths outside the project root are rejected (#73, shippe
         expect(() => h.assert.artifactContent(`${c.dir}/seed.json`)).toThrow();
       }
 
-      // No child card was seeded.
-      const child = await h.runConduit(["journal", "inspect", first.id, "--run", runId]);
-      expect(child.stdout).not.toContain("review");
+      // No child card was seeded: `journal inspect` exits 0 and prints no
+      // span or card_log line for a card id the run never created.
+      for (const c of CONCURRENT_FANOUT_CHILDREN) {
+        const child = await h.runConduit(["journal", "inspect", c.id, "--run", runId]);
+        expect(child.exitCode).toBe(0);
+        expect(child.stdout.trim()).toBe("");
+      }
     },
     JOURNEY_TIMEOUT_MS,
   );

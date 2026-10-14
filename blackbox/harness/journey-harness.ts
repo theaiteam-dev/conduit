@@ -926,6 +926,15 @@ export async function startJourneyHarness(opts?: {
     );
   }
 
+  // A skipChild that names no child would skip nothing, and the journey
+  // would pass on the non-skip path. Fail before starting any server.
+  if (opts?.skipChild !== undefined && !CONCURRENT_FANOUT_CHILDREN.some((c) => c.id === opts.skipChild)) {
+    throw new Error(
+      `startJourneyHarness: skipChild '${opts.skipChild}' is not a CONCURRENT_FANOUT_CHILDREN id ` +
+        `(${CONCURRENT_FANOUT_CHILDREN.map((c) => c.id).join(", ")})`,
+    );
+  }
+
   const fakeSlack = startFakeSlackServer();
   const ws = opts?.concurrentFanOut
     ? scaffoldConcurrentFanoutWorkspace(opts)

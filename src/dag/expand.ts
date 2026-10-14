@@ -69,6 +69,14 @@ export type ExpansionError =
   | { code: 'dependency_cycle'; cycle: string[] }
   | { code: 'overlapping_owned_paths'; stations: [string, string]; path: string }
   | { code: 'unknown_dependency'; child: string; dependency: string }
+  /**
+   * A seeded child has no usable directory to write `seed.json` into: its
+   * `owned_paths` is empty (`path` is `''`), or `owned_paths[0]` does not
+   * exist or is not a directory. The name predates issue #73 and is kept
+   * because hold reasons and callers already match on it; a path outside the
+   * project root is reported as `owned_path_out_of_bounds`, which
+   * `validateExpansion` raises before this check runs.
+   */
   | { code: 'seed_path_out_of_bounds'; child: string; path: string }
   /**
    * A proposed owned_paths entry resolves outside the run's project root:
@@ -378,7 +386,8 @@ export function commitFanOut(
   }
 
   // Build a map from child id → seed file path for each seeded child.
-  // Validate seed paths before touching the filesystem or DB:
+  // Validate seed paths before touching the filesystem or DB. Every failure
+  // here is `seed_path_out_of_bounds` (see its doc on ExpansionError):
   //   1. A seeded child with empty owned_paths has no directory to write into.
   //   2. owned_paths[0], resolved against the project root (never the kernel's
   //      cwd, issue #124), must exist and be a directory. Check existence
