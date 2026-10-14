@@ -117,6 +117,15 @@ historical context, not public releases or public repository history.
 
 ### Fixed
 
+- Two `conduit run` launches of the same run id at the same moment no longer
+  risk `fatal: UNIQUE constraint failed: runs.run_id`
+  ([#48](https://github.com/theaiteam-dev/conduit/issues/48)). `registerRun`
+  inserts the row with `ON CONFLICT(run_id) DO NOTHING` inside its existing
+  `BEGIN IMMEDIATE` transaction, and a launch whose insert finds a row answers
+  from that row as `existing` or `conflict`. The losing launch exits 1 with the
+  lease-conflict message while the winner runs, or reports the run's state
+  once it has finished. `blackbox/fault-concurrent-same-run-id.test.ts` starts
+  two launches of one run id and checks that exactly one drives it.
 - A gate critic on a child-entry station can see the child's inputs. The
   critic prompt was rendered with no card scope, so a critic that referenced
   `{{seed.json}}` threw at render and the card went to `hold`. `ownedPaths` and

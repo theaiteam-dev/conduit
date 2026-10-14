@@ -47,6 +47,12 @@ user or CI consumer actually sees, not internal implementation details.
 - `harness-happy-path.test.ts`: one harness maker writes its declared output
   and the card reaches `done`; checks exit code, `run status` occupancy, the
   `<station>.harness` span and its usage, and the argv the kernel passed.
+- `fault-concurrent-same-run-id.test.ts`: two `conduit run` launches of one
+  run id start at the same moment (issue #48), over five fresh workspaces.
+  Neither prints a constraint error, the stub is called once, and the card
+  reaches `done` with one `research.harness` span. The other launch exits 1
+  with the lease-conflict message naming the run, or, if the winner already
+  finished, exits 0 after reporting the run's state.
 - `harness-gate-critic.test.ts`: a harness maker gated by an agentic
   (`check.critic.harness`) critic. The critic rejects then passes, and the
   card goes back through the maker to `done`; a second case always rejects
