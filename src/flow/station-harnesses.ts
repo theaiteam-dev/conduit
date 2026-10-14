@@ -47,7 +47,8 @@ export function stationHarnesses(station: StationConfig): StationHarnessUse[] {
     uses.push({
       role: 'critic',
       adapter: gate.criticHarness,
-      // The loader stores an undeclared critic model as '' (StationGateConfig.criticHarness).
+      // The loader stores an undeclared critic model as '' in criticModel
+      // (documented on StationGateConfig.criticHarness).
       ...(gate.criticModel !== '' ? { model: gate.criticModel } : {}),
       ...(gate.criticAgent !== undefined ? { agent: gate.criticAgent } : {}),
       ...(gate.criticTools !== undefined ? { tools: gate.criticTools } : {}),
