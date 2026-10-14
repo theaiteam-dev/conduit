@@ -8,10 +8,11 @@
  *   1. Cycle detection via findCycleNodes (REUSED from WI-292 dag-utils) — a
  *      cyclic depends_on graph is rejected before any child is committed.
  *   2. Disjoint-ownership invariant (rev-1 H4) — concurrently-eligible children
- *      must not share owned_paths; conflicts are rejected or serialised.
+ *      must not own overlapping paths (equal after canonicalization, or one
+ *      inside the other); conflicts are rejected or serialised.
  *   3. Categorisation into ready (all deps terminal) vs waiting (emergent waves).
  *   4. Fan-in policy: all | quorum(k ratio) | best_effort.
- *   5. Owned-path confinement (commitFanOut, issues #73 and #124): every
+ *   5. Owned-path confinement (validateExpansion, issues #73 and #124): every
  *      proposed owned_paths entry resolves against the run's project root and
  *      must stay inside it, symlinks resolved.
  *
@@ -26,7 +27,7 @@ import type { Status, Lane } from '../types/kernel';
 import type { ConduitDB } from '../persistence/db';
 import { DEFAULT_RUN_ID } from '../persistence/db';
 import { findCycleNodes } from '../flow/dag-utils';
-import { canonicalOwnedPaths } from '../controller/harness-overlap';
+import { canonicalOwnedPaths, ownedPathSetsIntersect } from '../controller/harness-overlap';
 import { isContainedIn, resolveOwnedPath } from '../worker/integrity';
 
 // ---------------------------------------------------------------------------
@@ -53,17 +54,14 @@ export interface ValidatedChild {
   owned_paths: string[];
 }
 
-/** What to do when two concurrent children claim the same owned_path. */
 export interface ExpandOptions {
+  /** What to do when two concurrent children claim overlapping owned paths. */
   onPathConflict: 'reject' | 'serialize';
-}
-
-/**
- * commitFanOut also needs the run's project root (issues #73, #124): every
- * owned path is resolved against it, not against the kernel's cwd, and must
- * stay inside it.
- */
-export interface CommitFanOutOptions extends ExpandOptions {
+  /**
+   * The run's project root (issues #73, #124). Every owned path is resolved
+   * against it, not against the kernel's cwd, must stay inside it, and is
+   * compared with its siblings' in canonical form.
+   */
   projectRoot: string;
 }
 
@@ -121,11 +119,20 @@ function computeTransitiveDeps(
 // ---------------------------------------------------------------------------
 
 /**
- * Validate an Architect proposal: cycle detection then disjoint-ownership.
+ * Validate an Architect proposal: cycle detection, owned-path confinement,
+ * then disjoint ownership.
  *
  * - Cycle detection REUSES findCycleNodes from src/flow/dag-utils (WI-292).
+ * - Confinement (findOwnedPathEscape) rejects an owned path outside the
+ *   project root before any two paths are compared.
+ * - Disjointness compares canonical paths (canonicalOwnedPaths, the resolver
+ *   the integrity check uses) with ownedPathSetsIntersect, the overlap batch's
+ *   comparator, so `./a` and `a`, a relative and an absolute spelling, or two
+ *   symlinks to one dir are the same path, and a dir overlaps every path
+ *   inside it.
  * - Path conflict resolution is controlled by opts.onPathConflict:
- *     'reject'    → return error naming both stations and the shared path.
+ *     'reject'    → return error naming both stations and the overlapping
+ *                   entry as proposed by the second.
  *     'serialize' → inject a forced depends_on edge so the two are no longer
  *                   concurrent; the forced edge is recorded in forcedEdges.
  *
@@ -178,7 +185,17 @@ export function validateExpansion(
     return { ok: false, error: { code: 'dependency_cycle', cycle: Array.from(cycleNodes) } };
   }
 
-  // ── 2. Disjoint-ownership invariant ───────────────────────────────────────
+  // ── 2. Owned-path confinement (issue #73) ─────────────────────────────────
+  // Before disjointness: an escaping or non-string entry cannot be compared.
+  const escape = findOwnedPathEscape(opts.projectRoot, children);
+  if (escape !== null) return { ok: false, error: escape };
+
+  // ── 3. Disjoint-ownership invariant, on canonical paths ───────────────────
+  const canonicalRoot = resolveOwnedPath(resolve(opts.projectRoot));
+  const canonical = new Map<string, string[]>(
+    children.map((c) => [c.id, canonicalOwnedPaths(canonicalRoot, c.owned_paths)]),
+  );
+
   // Build a mutable transitive-deps map so serialization updates propagate.
   const transitiveDeps = new Map<string, Set<string>>(
     children.map((c) => [c.id, computeTransitiveDeps(c.id, depsMap)]),
@@ -198,10 +215,13 @@ export function validateExpansion(
       const bDepA = transitiveDeps.get(b.id)?.has(a.id) ?? false;
       if (aDepB || bDepA) continue;
 
-      // Check for shared owned paths between concurrent children.
-      const aPathSet = new Set(a.owned_paths);
-      const sharedPath = b.owned_paths.find((p) => aPathSet.has(p));
-      if (sharedPath === undefined) continue;
+      // Check for overlapping owned paths between concurrent children: equal
+      // after canonicalization, or one inside the other.
+      const aCanonical = canonical.get(a.id)!;
+      const bCanonical = canonical.get(b.id)!;
+      const overlapIndex = bCanonical.findIndex((p) => ownedPathSetsIntersect(aCanonical, [p]));
+      if (overlapIndex === -1) continue;
+      const sharedPath = b.owned_paths[overlapIndex]!;
 
       if (opts.onPathConflict === 'reject') {
         return {
@@ -298,20 +318,20 @@ export function findOwnedPathEscape(
  * duplicates; this guard makes re-dispatch safe without a UNIQUE violation.
  */
 // Overload 1 (new, 5-arg): explicit parentRunId for multi-run isolation.
-export function commitFanOut(db: ConduitDB, parentRunId: string, parentId: string, proposal: ArchitectProposal, opts: CommitFanOutOptions): ExpansionResult;
+export function commitFanOut(db: ConduitDB, parentRunId: string, parentId: string, proposal: ArchitectProposal, opts: ExpandOptions): ExpansionResult;
 // Overload 2 (legacy, 4-arg): omitted parentRunId defaults to DEFAULT_RUN_ID.
-export function commitFanOut(db: ConduitDB, parentId: string, proposal: ArchitectProposal, opts: CommitFanOutOptions): ExpansionResult;
+export function commitFanOut(db: ConduitDB, parentId: string, proposal: ArchitectProposal, opts: ExpandOptions): ExpansionResult;
 export function commitFanOut(
   db: ConduitDB,
   runIdOrParentId: string,
   parentIdOrProposal: string | ArchitectProposal,
-  proposalOrOpts: ArchitectProposal | CommitFanOutOptions,
-  opts?: CommitFanOutOptions,
+  proposalOrOpts: ArchitectProposal | ExpandOptions,
+  opts?: ExpandOptions,
 ): ExpansionResult {
   let parentRunId: string;
   let parentId: string;
   let proposal: ArchitectProposal;
-  let expandOpts: CommitFanOutOptions;
+  let expandOpts: ExpandOptions;
 
   if (opts !== undefined) {
     // 5-arg form: (db, parentRunId, parentId, proposal, opts)
@@ -324,14 +344,13 @@ export function commitFanOut(
     parentRunId = DEFAULT_RUN_ID;
     parentId = runIdOrParentId;
     proposal = parentIdOrProposal as ArchitectProposal;
-    expandOpts = proposalOrOpts as CommitFanOutOptions;
+    expandOpts = proposalOrOpts as ExpandOptions;
   }
+  // validateExpansion also confines every owned path to the project root.
   const result = validateExpansion(proposal, expandOpts);
   if (!result.ok) return result;
 
   const { projectRoot } = expandOpts;
-  const escape = findOwnedPathEscape(projectRoot, proposal.children);
-  if (escape !== null) return { ok: false, error: escape };
 
   const stateDb = db.getStateDb();
 
@@ -364,7 +383,7 @@ export function commitFanOut(
   //   2. owned_paths[0], resolved against the project root (never the kernel's
   //      cwd, issue #124), must exist and be a directory. Check existence
   //      BEFORE calling realpathSync, which throws on missing paths.
-  //   3. findOwnedPathEscape above already confined it to the project root,
+  //   3. validateExpansion already confined it to the project root,
   //      symlinks resolved, so the realpath here stays inside the root.
   const seedPaths = new Map<string, string>();
   for (const child of proposal.children) {

@@ -15,7 +15,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Card } from '../types/kernel';
 import { openConduitDB, type ConduitDB, DEFAULT_RUN_ID } from '../persistence/db';
-import { commitFanOut } from './expand';
+import { commitFanOut, validateExpansion } from './expand';
 import type { ArchitectProposal, ExpansionResult } from './expand';
 
 let db: ConduitDB;
@@ -217,5 +217,83 @@ describe('commitFanOut confines owned_paths to the project root (issue #73)', ()
       children: [{ id: 'c2', depends_on: [], owned_paths: [outside] }],
     }, { onPathConflict: 'reject', projectRoot: linkedRoot });
     expectOutOfBounds(escaped, 'c2', outside);
+  });
+});
+
+// ===========================================================================
+// Disjoint ownership on canonical paths (SPEC §9). Two concurrent children
+// that own the same directory, or one inside the other, overlap however the
+// proposal spells the paths.
+// ===========================================================================
+
+describe('validateExpansion compares owned paths canonically (SPEC §9)', () => {
+  function pair(a: string, b: string): ArchitectProposal {
+    return {
+      children: [
+        { id: 'c1', depends_on: [], owned_paths: [a] },
+        { id: 'c2', depends_on: [], owned_paths: [b] },
+      ],
+    };
+  }
+
+  function reject(p: ArchitectProposal): ExpansionResult {
+    return validateExpansion(p, { onPathConflict: 'reject', projectRoot });
+  }
+
+  it('rejects a relative and an absolute spelling of the same dir, naming the proposed entry', () => {
+    mkdirSync(join(projectRoot, 'evidence', 'c1'), { recursive: true });
+    const abs = join(projectRoot, 'evidence', 'c1');
+
+    expect(reject(pair('evidence/c1', abs))).toEqual({
+      ok: false,
+      error: { code: 'overlapping_owned_paths', stations: ['c1', 'c2'], path: abs },
+    });
+  });
+
+  it('rejects `./a` against `a`', () => {
+    const r = reject(pair('./a', 'a'));
+    expect(!r.ok && r.error.code).toBe('overlapping_owned_paths');
+  });
+
+  it('rejects a parent against a nested child, `a` vs `a/b`, in either order', () => {
+    expect(reject(pair('a', 'a/b'))).toEqual({
+      ok: false,
+      error: { code: 'overlapping_owned_paths', stations: ['c1', 'c2'], path: 'a/b' },
+    });
+    expect(reject(pair('a/b', 'a')).ok).toBe(false);
+  });
+
+  it('serializes a parent and a nested child under onPathConflict: serialize', () => {
+    const r = validateExpansion(pair('a', 'a/b'), { onPathConflict: 'serialize', projectRoot });
+    expect(r.ok && r.forcedEdges).toEqual([{ from: 'c2', to: 'c1' }]);
+    expect(r.ok && r.children.find((c) => c.id === 'c2')?.depends_on).toEqual(['c1']);
+  });
+
+  it('rejects two different symlinks to the same dir', () => {
+    mkdirSync(join(projectRoot, 'real'));
+    symlinkSync(join(projectRoot, 'real'), join(projectRoot, 'one'));
+    symlinkSync(join(projectRoot, 'real'), join(projectRoot, 'two'));
+
+    const r = reject(pair('one', 'two'));
+    expect(!r.ok && r.error.code).toBe('overlapping_owned_paths');
+  });
+
+  it('accepts disjoint siblings `a/x` and `a/y`', () => {
+    expect(reject(pair('a/x', 'a/y')).ok).toBe(true);
+  });
+
+  it('commitFanOut rejects the relative/absolute overlap and seeds nothing', () => {
+    mkdirSync(join(projectRoot, 'evidence', 'c1'), { recursive: true });
+
+    const r = commit({
+      children: [
+        { id: 'c1', depends_on: [], owned_paths: ['evidence/c1'], seed: { n: 1 } },
+        { id: 'c2', depends_on: [], owned_paths: [join(projectRoot, 'evidence', 'c1')], seed: { n: 2 } },
+      ],
+    });
+
+    expect(!r.ok && r.error.code).toBe('overlapping_owned_paths');
+    expect(existsSync(join(projectRoot, 'evidence', 'c1', 'seed.json'))).toBe(false);
+    expect(db.getCard(DEFAULT_RUN_ID, 'c1')).toBeNull();
   });
 });

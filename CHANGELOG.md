@@ -128,7 +128,12 @@ historical context, not public releases or public repository history.
   root (an absolute path elsewhere, a `..` escape, or a symlink pointing out)
   is rejected with the new `owned_path_out_of_bounds` code: nothing is seeded,
   and the parent is held with the child and path in its reason.
-  `commitFanOut` now requires `projectRoot` in its options.
+  The disjoint-ownership check compared raw strings, so `./a` and `a`, a
+  relative and an absolute spelling of one dir, two symlinks to one dir, or
+  `a` and `a/b` passed as disjoint; it now compares canonical paths, and a dir
+  overlaps every path inside it, under both `reject` and `serialize`.
+  `validateExpansion` and `commitFanOut` now require `projectRoot` in their
+  options.
 - A gate critic on a child-entry station can see the child's inputs. The
   critic prompt was rendered with no card scope, so a critic that referenced
   `{{seed.json}}` threw at render and the card went to `hold`. `ownedPaths` and
