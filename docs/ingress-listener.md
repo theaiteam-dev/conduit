@@ -76,8 +76,9 @@ redelivery's body, and describes the event when the duplicate arrives:
   Absent while the first delivery is still being routed or is queued behind
   busy run slots, since the keyed run may yet refuse it, and absent for an
   event the run refused (`pass_limit`, `run_not_appendable`), which never
-  joined it. A folded event that is refused when its pass would launch names no
-  run on a later duplicate.
+  joined it. When the run refuses a pending pass (`max_passes` reached, or the
+  run cannot take it), every event folded into that pass is refused with it, so
+  a later duplicate of any of them names no run.
 - An event accepted before ingress attribution existed has no stored run id,
   so its duplicate carries none.
 

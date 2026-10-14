@@ -212,9 +212,10 @@ export type SpawnPathResult =
  *     yet refuse it, and a 'refused' event never joined the run, so neither
  *     names one.
  *
- * The answer describes the event at the moment of the duplicate. A folded
- * event the run later refuses (max_passes reached when its pass would launch)
- * names no run on a later duplicate.
+ * The answer describes the event at the moment of the duplicate. When the run
+ * later refuses the pending pass an event was folded into, every event of that
+ * pass is refused (keyed-runs.ts refusePass), so a later duplicate of any of
+ * them names no run.
  */
 function duplicateRunId(db: ConduitDB, eventId: string): string | undefined {
   const row = db.getIngressEvent(eventId);

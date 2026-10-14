@@ -34,7 +34,7 @@ import type { FlowConfig, FlowChannels, FlowEgressChannel } from '../types/kerne
 import type { LoadFlowResult } from '../flow/load';
 import { buildEnvelope } from './envelope';
 import { deriveIngressRunId, deriveKeyedIngressRunId } from './run-id';
-import { EXIT_RUN_LEASE_CONFLICT } from '../run/run-passes';
+import { EXIT_PASS_REFUSED, EXIT_RUN_LEASE_CONFLICT } from '../run/run-passes';
 import type { SpawnExit, SpawnFailedAlert, SpawnInvocation, SpawnSeam } from './spawn';
 import { startListener, type ListenerDeps, type ListenerConfig } from './listener';
 import { drainKeyedRun, routeKeyedEvent, type KeyedRunDeps } from './keyed-runs';
@@ -356,6 +356,47 @@ describe('a duplicate delivery of a keyed event (issue #52)', () => {
     expect(body(await listener.handleWebhook(req))).toEqual({ outcome: 'pass_limit' });
     expect(db.getIngressEvent(req.headers['x-delivery']!)!.spawn_state).toBe('refused');
     expect(body(await listener.handleWebhook(req))).toEqual({ outcome: 'duplicate' });
+  });
+
+  it('names no run for any folded event once its pending pass is refused at max_passes', async () => {
+    const listener = await boot(makeFlow(keyedIngress({ max_passes: 1 })));
+    await listener.handleWebhook(prEvent({ repo: 'acme/widgets', pr: 7, seq: 0 }));
+    const older = prEvent({ repo: 'acme/widgets', pr: 7, seq: 1 });
+    const latest = prEvent({ repo: 'acme/widgets', pr: 7, seq: 2 });
+    expect(body(await listener.handleWebhook(older))).toEqual({ outcome: 'coalesced', run_id: RUN });
+    expect(body(await listener.handleWebhook(latest))).toEqual({ outcome: 'coalesced', run_id: RUN });
+
+    await finishPass(0, 1);
+
+    expect(launches).toHaveLength(1);
+    for (const req of [older, latest]) {
+      const id = req.headers['x-delivery']!;
+      expect(db.getIngressEvent(id)!.spawn_state).toBe('refused');
+      expect(db.getIngressLog({ outcome: 'pass_limit', eventId: id })).toHaveLength(1);
+      expect(body(await listener.handleWebhook(req))).toEqual({ outcome: 'duplicate' });
+    }
+  });
+
+  it('names no run for any folded event once the kernel refuses the pass that covered it', async () => {
+    const listener = await boot(makeFlow(keyedIngress()));
+    await listener.handleWebhook(prEvent({ repo: 'acme/widgets', pr: 7, seq: 0 }));
+    const older = prEvent({ repo: 'acme/widgets', pr: 7, seq: 1 });
+    const latest = prEvent({ repo: 'acme/widgets', pr: 7, seq: 2 });
+    await listener.handleWebhook(older);
+    await listener.handleWebhook(latest);
+    await finishPass(0, 1);
+    expect(launches).toHaveLength(2);
+    expect(launches[1]!.passEvents).toEqual([older.headers['x-delivery']!, latest.headers['x-delivery']!]);
+
+    launches[1]!.exit(EXIT_PASS_REFUSED);
+    await settle();
+
+    for (const req of [older, latest]) {
+      const id = req.headers['x-delivery']!;
+      expect(db.getIngressEvent(id)!.spawn_state).toBe('refused');
+      expect(db.getIngressLog({ outcome: 'run_not_appendable', eventId: id })).toHaveLength(1);
+      expect(body(await listener.handleWebhook(req))).toEqual({ outcome: 'duplicate' });
+    }
   });
 });
 

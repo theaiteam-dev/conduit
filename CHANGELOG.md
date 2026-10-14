@@ -125,7 +125,10 @@ historical context, not public releases or public repository history.
   row. On a `run_key` binding the id is present only once the event was
   launched as a pass, folded into the pending pass or consumed by a pass; a
   redelivery that arrives while the first is still being routed, or after the
-  run refused the event, carries no `run_id`. See `docs/ingress-listener.md`.
+  run refused the event, carries no `run_id`. A refused pending pass now
+  refuses every event folded into it, not only its latest: the older ones had
+  stayed `coalesced` with no pending pass, so their duplicates named a run they
+  never joined. See `docs/ingress-listener.md`.
 
 - A gate critic on a child-entry station can see the child's inputs. The
   critic prompt was rendered with no card scope, so a critic that referenced
