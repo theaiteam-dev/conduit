@@ -388,6 +388,38 @@ for (const kind of ['harness', 'transform'] as const) {
       const spans = spansNamed(kind === 'harness' ? 'a.harness' : 'a.transform');
       expect(spans[0]!.promptTemplateVersion).toBe(expected);
     });
+
+    it('a prompt file that became unreadable holds the card on resume instead of reusing the checkpoint or throwing', async () => {
+      writePrompt('a.md', 'ROLE:A original prompt.');
+      const rig = makeRig();
+      db = openDb();
+      await run(rig, writeFlow(rig.registry, { kind }), 1000);
+      expect(aCalls(rig, kind)).toBe(1);
+      // The stamp cannot be computed without the template, so a valid
+      // checkpoint from the first run cannot be confirmed either.
+      const flow = writeFlow(rig.registry, { kind });
+      rmSync(join(projectDir, 'prompts', 'a.md'));
+      resetToA(db);
+      let clock = 2000;
+      await runExecutor({
+        db,
+        flow,
+        now: () => clock,
+        sleep: async (ms: number) => {
+          clock += Math.max(1, Math.ceil(ms / 1000));
+        },
+        adapter: rig.model.adapter,
+        io,
+        harnessRegistry: rig.registry,
+      } as unknown as RunEngineArgs);
+      expect(db.getCard(DEFAULT_RUN_ID, 'c')?.status).toBe('held');
+      expect(aCalls(rig, kind)).toBe(1);
+      expect(bCalls(rig)).toBe(1);
+      const holdReasons = db
+        .getCardLogForRun(DEFAULT_RUN_ID, 'c')
+        .flatMap((e) => (e.kind === 'terminal' ? [e.reason] : []));
+      expect(holdReasons.some((r) => r.includes('could not read its prompt template'))).toBe(true);
+    });
   });
 }
 

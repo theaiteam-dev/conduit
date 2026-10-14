@@ -134,6 +134,9 @@ historical context, not public releases or public repository history.
   once, and invalidates the checkpoints downstream of it (SPEC §5 treats any
   stamp mismatch this way). An effectful station whose outbox intent is
   already committed is not re-run: it reuses its checkpoint as before.
+  Because the stamp now needs the template, a station whose prompt file
+  cannot be read holds its card on resume even when a checkpoint exists for
+  it; before this change a checkpoint hit never read the prompt file.
 
 - A gate critic on a child-entry station can see the child's inputs. The
   critic prompt was rendered with no card scope, so a critic that referenced

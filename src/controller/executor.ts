@@ -3709,8 +3709,22 @@ async function executeTransformStation(args: TransformArgs): Promise<boolean> {
   // content hash in order (WI-557) and the template's own content (issue #131),
   // so editing a skill or the prompt file invalidates this station's
   // checkpoint (and cascades) on resume. The template read here is the one
-  // rendered below.
-  const promptTemplate = readStationPromptTemplate(stationConfig);
+  // rendered below. The read runs before the checkpoint check, because the
+  // stamp cannot be computed without it, so a template that cannot be read
+  // holds the card, as on the harness path, even when a checkpoint exists:
+  // without the template that checkpoint cannot be confirmed as current. It
+  // runs before any outbox intent is written, so the hold leaves none behind.
+  let promptTemplate: string;
+  try {
+    promptTemplate = readStationPromptTemplate(stationConfig);
+  } catch (readErr) {
+    escalateToHold(
+      stateDb, db, cardId, stationId, card,
+      `transform station '${stationId}' could not read its prompt template: ${(readErr as Error).message}`,
+      err, runId,
+    );
+    return false;
+  }
   const promptTemplateVersion = stationPromptTemplateVersion(stationConfig, promptTemplate);
 
   const bindingStamp = computeBindingStamp({
