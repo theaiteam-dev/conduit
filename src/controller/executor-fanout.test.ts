@@ -605,6 +605,27 @@ describe('runExecutor fan-out — owned_paths resolve against and stay inside th
     );
   });
 
+  it('holds the parent and names both children when two seeded children share a seed dir', async () => {
+    mkdirSync(join(projectDir, 'evidence', 'shared'), { recursive: true });
+
+    await runFanOut(
+      {
+        children: [
+          { id: 'c1', depends_on: [], owned_paths: ['evidence/shared'], seed: { n: 1 } },
+          { id: 'c2', depends_on: ['c1'], owned_paths: ['./evidence/shared'], seed: { n: 2 } },
+        ],
+      },
+      { projectRoot: projectDir },
+    );
+
+    expect(childIds(db!, PARENT_ID)).toEqual([]);
+    expect(db!.getCard(DEFAULT_RUN_ID, PARENT_ID)?.status).toBe('held');
+    expect(holdReason()).toBe(
+      `fan-out station 'plan' proposal rejected: seed_path_conflict (children 'c1' and 'c2', path './evidence/shared')`,
+    );
+    expect(existsSync(join(projectDir, 'evidence', 'shared', 'seed.json'))).toBe(false);
+  });
+
   it('holds the parent for a symlink inside the root that points outside it', async () => {
     symlinkSync(elsewhere, join(projectDir, 'escape'));
 

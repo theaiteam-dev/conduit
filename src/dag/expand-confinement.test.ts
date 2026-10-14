@@ -321,3 +321,58 @@ describe('resolveSeedDir re-checks the seed dir realpath against the project roo
     expect(resolveSeedDir(projectRoot, 'file')).toEqual({ ok: false, code: 'seed_path_out_of_bounds' });
   });
 });
+
+describe('commitFanOut rejects two seeded children that share a seed dir', () => {
+  // commitFanOut writes every child's seed.json before any child runs, so two
+  // seeded children whose owned_paths[0] is one directory would leave the
+  // second seed in place of the first. depends_on ordering does not help: the
+  // disjointness check skips ordered pairs, and the writes happen up front.
+  beforeEach(() => {
+    mkdirSync(join(projectRoot, 'a', 'b'), { recursive: true });
+  });
+
+  it.each([
+    ['the same spelling', 'a', 'a'],
+    ['`./a` and `a`', './a', 'a'],
+    ['a relative and an absolute spelling', 'a', '<abs>'],
+  ])('rejects %s on children ordered by depends_on', (_label, first, second) => {
+    const spell = (p: string): string => (p === '<abs>' ? join(projectRoot, 'a') : p);
+    const r = commit({
+      children: [
+        { id: 'c1', depends_on: [], owned_paths: [spell(first)], seed: { n: 1 } },
+        { id: 'c2', depends_on: ['c1'], owned_paths: [spell(second)], seed: { n: 2 } },
+      ],
+    });
+
+    expect(r).toEqual({
+      ok: false,
+      error: { code: 'seed_path_conflict', children: ['c1', 'c2'], path: spell(second) },
+    });
+    expect(existsSync(join(projectRoot, 'a', 'seed.json'))).toBe(false);
+    expect(db.getCard(DEFAULT_RUN_ID, 'c1')).toBeNull();
+    expect(db.getCard(DEFAULT_RUN_ID, 'c2')).toBeNull();
+  });
+
+  it('accepts a shared dir when only one of the two children is seeded', () => {
+    const r = commit({
+      children: [
+        { id: 'c1', depends_on: [], owned_paths: ['a'], seed: { n: 1 } },
+        { id: 'c2', depends_on: ['c1'], owned_paths: ['a'] },
+      ],
+    });
+    expect(r.ok).toBe(true);
+    expect(JSON.parse(readFileSync(join(projectRoot, 'a', 'seed.json'), 'utf8'))).toEqual({ n: 1 });
+  });
+
+  it('accepts nested seed dirs, which hold separate seed.json files', () => {
+    const r = commit({
+      children: [
+        { id: 'c1', depends_on: [], owned_paths: ['a'], seed: { n: 1 } },
+        { id: 'c2', depends_on: ['c1'], owned_paths: ['a/b'], seed: { n: 2 } },
+      ],
+    });
+    expect(r.ok).toBe(true);
+    expect(JSON.parse(readFileSync(join(projectRoot, 'a', 'seed.json'), 'utf8'))).toEqual({ n: 1 });
+    expect(JSON.parse(readFileSync(join(projectRoot, 'a', 'b', 'seed.json'), 'utf8'))).toEqual({ n: 2 });
+  });
+});

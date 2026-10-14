@@ -6412,7 +6412,7 @@ interface FanOutCompleteArgs {
  *   - Structurally non-conforming payload (children not array / child not object)
  *   - commitFanOut ExpansionError (dependency_cycle / overlapping_owned_paths /
  *     unknown_dependency / child_id_collision / seed_path_out_of_bounds /
- *     owned_path_out_of_bounds) — the whole proposal is rejected, never partially applied
+ *     seed_path_conflict / owned_path_out_of_bounds) — the whole proposal is rejected, never partially applied
  *   - FSM illegal_transition on FAN_OUT (contradictory card state)
  *
  * Extension seams:
@@ -6483,7 +6483,9 @@ function handleFanOutComplete(args: FanOutCompleteArgs): boolean {
     const where =
       e.code === 'owned_path_out_of_bounds' || e.code === 'seed_path_out_of_bounds'
         ? ` (child '${e.child}', path '${e.path}')`
-        : '';
+        : e.code === 'seed_path_conflict'
+          ? ` (children '${e.children[0]}' and '${e.children[1]}', path '${e.path}')`
+          : '';
     escalateToHold(
       stateDb,
       db,

@@ -1127,6 +1127,15 @@ Conduit unfurls the plan at runtime rather than following a static script.
   `seed.json` and seeds no child, and holds the parent with the child and the path in its
   reason. This one check covers every later use of the path: the `seed.json` write, the
   card-scoped input reads, `skip_when` `source: seed`, and the child's own writes.
+- **One seed per directory.** The Kernel writes every child's `seed.json` into its
+  `owned_paths[0]` before any child runs, so two seeded children whose first owned path
+  resolves to the same directory (compared by the realpath the write uses, so `./a` and
+  `a` are one directory) would leave only the second seed. Such a proposal is rejected
+  with `seed_path_conflict` whether or not `depends_on` orders the two children: the
+  disjointness check above serializes overlapping children, and serialization does not
+  delay the seed writes. The parent is held with both child ids and the path in its
+  reason. Nested directories (`a` and `a/b`) hold separate `seed.json` files and do not
+  conflict here.
 - **Two axes of motion, deliberately different:**
   - **Forward-only across waves.** An implementation failure → **hard pause for a human**
     (`hold`), never an automatic "nuclear reversal" to Wave 1 (state rot).

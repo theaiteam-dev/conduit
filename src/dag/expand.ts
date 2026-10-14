@@ -86,6 +86,14 @@ export type ExpansionError =
    */
   | { code: 'owned_path_out_of_bounds'; child: string; path: string }
   /**
+   * Two seeded children's `owned_paths[0]` resolve to the same directory.
+   * commitFanOut writes every seed.json before any child runs, so the second
+   * would replace the first; `depends_on` ordering does not prevent it.
+   * `children` is [first, second] in proposal order, and `path` is the second
+   * child's entry as proposed.
+   */
+  | { code: 'seed_path_conflict'; children: [string, string]; path: string }
+  /**
    * A proposed child id is already a card in this run under another parent
    * (issue #36). Card ids are unique per run, and a keyed run's later pass may
    * propose the ids an earlier pass used; rejecting holds the parent instead
@@ -430,7 +438,10 @@ export function commitFanOut(
   //      the kernel's cwd, issue #124), requires an existing directory, and
   //      re-checks its realpath against the root, since validateExpansion's
   //      confinement read the filesystem earlier.
+  //   3. No two seeded children share that realpath (`seed_path_conflict`).
   const seedPaths = new Map<string, string>();
+  /** Seed dir realpath → the seeded child that writes into it. */
+  const seedDirOwner = new Map<string, string>();
   for (const child of proposal.children) {
     // null is treated as "no seed" — only undefined and null are skipped.
     if (child.seed === undefined || child.seed === null) continue;
@@ -445,6 +456,13 @@ export function commitFanOut(
     if (!seedDir.ok) {
       return { ok: false, error: { code: seedDir.code, child: child.id, path: rawDir } };
     }
+    // Compare the realpath the write uses: two spellings of one dir, or two
+    // symlinks to it, land on the same seed.json.
+    const sharer = seedDirOwner.get(seedDir.dir);
+    if (sharer !== undefined) {
+      return { ok: false, error: { code: 'seed_path_conflict', children: [sharer, child.id], path: rawDir } };
+    }
+    seedDirOwner.set(seedDir.dir, child.id);
     const seedPath = join(seedDir.dir, 'seed.json');
     seedPaths.set(child.id, seedPath);
   }

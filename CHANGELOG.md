@@ -133,7 +133,11 @@ historical context, not public releases or public repository history.
   `a` and `a/b` passed as disjoint; it now compares canonical paths, and a dir
   overlaps every path inside it, under both `reject` and `serialize`.
   `validateExpansion` and `commitFanOut` now require `projectRoot` in their
-  options.
+  options. Two seeded children whose `owned_paths[0]` resolve to one directory
+  are rejected with the new `seed_path_conflict` code, with both child ids and
+  the path in the hold reason: every `seed.json` is written before any child
+  runs, so the second seed replaced the first even when `depends_on` ordered
+  the two.
 - A gate critic on a child-entry station can see the child's inputs. The
   critic prompt was rendered with no card scope, so a critic that referenced
   `{{seed.json}}` threw at render and the card went to `hold`. `ownedPaths` and
