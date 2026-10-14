@@ -100,6 +100,8 @@ describe("fan-out owned_paths resolve against the project root (#124, shipped bi
       expect(skipped.exitCode).toBe(0);
       expect(skipped.stdout).toContain("seed.skip == true");
       const ran = await h.runConduit(["journal", "inspect", "review-security", "--run", runId]);
+      expect(ran.exitCode).toBe(0);
+      expect(ran.stdout).toContain("[review-security]");
       expect(ran.stdout).not.toContain("seed.skip == true");
     },
     JOURNEY_TIMEOUT_MS,

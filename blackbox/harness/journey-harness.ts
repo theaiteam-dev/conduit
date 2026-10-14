@@ -471,6 +471,9 @@ function startFakeModelGateway(
     skipChild?: string;
   } = {},
 ): FakeModelGateway {
+  if (opts.fanOutOwnedPaths === "outside" && opts.outsideRoot === undefined) {
+    throw new Error('startFakeModelGateway: fanOutOwnedPaths "outside" requires outsideRoot');
+  }
   const holdOpenMs = opts.overlap ? 40 : 0;
   let inFlight = 0;
   let peak = 0;
@@ -926,8 +929,12 @@ export async function startJourneyHarness(opts?: {
     );
   }
 
-  // A skipChild that names no child would skip nothing, and the journey
-  // would pass on the non-skip path. Fail before starting any server.
+  // A skipChild that names no child, or one set without concurrentFanOut
+  // (the serial workspace has no skip_when), would skip nothing, and the
+  // journey would pass on the non-skip path. Fail before starting any server.
+  if (opts?.skipChild !== undefined && opts.concurrentFanOut !== true) {
+    throw new Error("startJourneyHarness: skipChild requires concurrentFanOut: true");
+  }
   if (opts?.skipChild !== undefined && !CONCURRENT_FANOUT_CHILDREN.some((c) => c.id === opts.skipChild)) {
     throw new Error(
       `startJourneyHarness: skipChild '${opts.skipChild}' is not a CONCURRENT_FANOUT_CHILDREN id ` +

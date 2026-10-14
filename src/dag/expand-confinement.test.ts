@@ -10,12 +10,12 @@
  * Nothing is written and no card is inserted on a rejection.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
-import { mkdtempSync, mkdirSync, rmSync, existsSync, readFileSync, symlinkSync, realpathSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, existsSync, readFileSync, symlinkSync, realpathSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Card } from '../types/kernel';
 import { openConduitDB, type ConduitDB, DEFAULT_RUN_ID } from '../persistence/db';
-import { commitFanOut, validateExpansion } from './expand';
+import { commitFanOut, resolveSeedDir, validateExpansion } from './expand';
 import type { ArchitectProposal, ExpansionResult } from './expand';
 
 let db: ConduitDB;
@@ -295,5 +295,29 @@ describe('validateExpansion compares owned paths canonically (SPEC §9)', () => 
     expect(!r.ok && r.error.code).toBe('overlapping_owned_paths');
     expect(existsSync(join(projectRoot, 'evidence', 'c1', 'seed.json'))).toBe(false);
     expect(db.getCard(DEFAULT_RUN_ID, 'c1')).toBeNull();
+  });
+});
+
+describe('resolveSeedDir re-checks the seed dir realpath against the project root', () => {
+  // validateExpansion confines every entry first, but a symlink can be
+  // re-pointed between that check and commitFanOut's realpathSync. These call
+  // resolveSeedDir directly with an entry validation never saw.
+  it('returns the realpath for a dir inside the root', () => {
+    mkdirSync(join(projectRoot, 'evidence', 'c1'), { recursive: true });
+    expect(resolveSeedDir(projectRoot, 'evidence/c1')).toEqual({
+      ok: true,
+      dir: realpathSync(join(projectRoot, 'evidence', 'c1')),
+    });
+  });
+
+  it('rejects a symlink inside the root that points outside it', () => {
+    symlinkSync(outside, join(projectRoot, 'escape'));
+    expect(resolveSeedDir(projectRoot, 'escape')).toEqual({ ok: false, code: 'owned_path_out_of_bounds' });
+  });
+
+  it('reports a missing dir and a file as seed_path_out_of_bounds', () => {
+    expect(resolveSeedDir(projectRoot, 'missing')).toEqual({ ok: false, code: 'seed_path_out_of_bounds' });
+    writeFileSync(join(projectRoot, 'file'), 'x');
+    expect(resolveSeedDir(projectRoot, 'file')).toEqual({ ok: false, code: 'seed_path_out_of_bounds' });
   });
 });
