@@ -1091,6 +1091,12 @@ export interface ConduitDB {
   getCard(runId: string, id: string): Card | null;
   /** Insert a run record. Throws on duplicate run_id. */
   insertRun(run: RunInput): void;
+  /**
+   * Insert a run record unless a row with its run_id exists. Returns true when
+   * a row was inserted, false when one was already recorded, which is left
+   * unchanged. Same columns as insertRun (issue #48).
+   */
+  insertRunIfAbsent(run: RunInput): boolean;
   /** Return the run record for runId, or null if not found. */
   getRun(runId: string): RunRecord | null;
   /**
@@ -1398,12 +1404,21 @@ class ConduitDBImpl implements ConduitDB {
   }
 
   insertRun(run: RunInput): void {
-    this.stateDb
+    this.runInsert(run, '');
+  }
+
+  insertRunIfAbsent(run: RunInput): boolean {
+    return this.runInsert(run, ' ON CONFLICT(run_id) DO NOTHING') === 1;
+  }
+
+  /** The one runs INSERT, shared by insertRun and insertRunIfAbsent. Returns the rows changed. */
+  private runInsert(run: RunInput, conflictClause: '' | ' ON CONFLICT(run_id) DO NOTHING'): number {
+    return this.stateDb
       .prepare(
         `INSERT INTO runs (run_id, flow, project_root, input_fingerprint, status, outcome,
                            holder_pid, lease_acquired_at, holder_start_time)
          VALUES ($run_id, $flow, $project_root, $input_fingerprint, $status, $outcome,
-                 $holder_pid, $lease_acquired_at, $holder_start_time)`,
+                 $holder_pid, $lease_acquired_at, $holder_start_time)${conflictClause}`,
       )
       .run({
         $run_id: run.run_id,
@@ -1415,7 +1430,7 @@ class ConduitDBImpl implements ConduitDB {
         $holder_pid: run.holder_pid ?? null,
         $lease_acquired_at: run.lease_acquired_at ?? null,
         $holder_start_time: run.holder_start_time ?? null,
-      });
+      }).changes;
   }
 
   getRun(runId: string): RunRecord | null {

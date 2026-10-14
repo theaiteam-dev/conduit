@@ -68,28 +68,23 @@ export function registerRun(
       .transaction((): RegisterRunResult => {
         let recorded = db.getRun(runId);
         if (recorded === null) {
-          // DO NOTHING rather than a bare insert (issue #48): a row recorded
-          // after the read above is another launch's registration, and this
-          // call answers from that row below instead of throwing on the
-          // primary key.
-          const inserted = stateDb
-            .prepare(
-              `INSERT INTO runs (run_id, flow, project_root, input_fingerprint, status,
-                                 holder_pid, lease_acquired_at, holder_start_time)
-               VALUES ($run_id, $flow, $project_root, $fingerprint, 'running',
-                       $pid, $acquired_at, $start_time)
-               ON CONFLICT(run_id) DO NOTHING`,
-            )
-            .run({
-              $run_id: runId,
-              $flow: flow,
-              $project_root: normalizedProjectRoot,
-              $fingerprint: inputFingerprint,
-              $pid: holder?.pid ?? null,
-              $acquired_at: holder?.acquiredAt ?? null,
-              $start_time: holder?.startTime ?? null,
-            });
-          if (inserted.changes === 1) {
+          // insertRunIfAbsent rather than insertRun (issue #48): a row
+          // recorded after the read above is another launch's registration,
+          // and this call answers from that row below instead of throwing on
+          // the primary key.
+          const inserted = db.insertRunIfAbsent({
+            run_id: runId,
+            flow,
+            project_root: normalizedProjectRoot,
+            input_fingerprint: inputFingerprint,
+            status: 'running',
+            ...(holder !== undefined && {
+              holder_pid: holder.pid,
+              lease_acquired_at: holder.acquiredAt,
+              holder_start_time: holder.startTime,
+            }),
+          });
+          if (inserted) {
             return { kind: 'created', run: db.getRun(runId)!, retried: false };
           }
           recorded = db.getRun(runId)!;

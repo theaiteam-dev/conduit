@@ -1624,6 +1624,36 @@ describe('WI-474 AC-5: insertRun / getRun raw accessors', () => {
     ).toThrow();
   });
 
+  it('insertRunIfAbsent inserts once, then returns false and leaves the first row unchanged (issue #48)', () => {
+    const first = {
+      run_id: 'run-once',
+      flow: 'studio',
+      project_root: '/tmp/first',
+      input_fingerprint: 'fp-first',
+      status: 'running',
+      holder_pid: 4242,
+      lease_acquired_at: 1_000,
+      holder_start_time: 5_000,
+    };
+    expect(db!.insertRunIfAbsent(first)).toBe(true);
+    const recorded = db!.getRun('run-once');
+
+    expect(
+      db!.insertRunIfAbsent({
+        run_id: 'run-once',
+        flow: 'autocut',
+        project_root: '/tmp/second',
+        input_fingerprint: 'fp-second',
+        status: 'halted',
+        holder_pid: 7777,
+        lease_acquired_at: 2_000,
+        holder_start_time: 8_000,
+      }),
+    ).toBe(false);
+    expect(db!.getRun('run-once')).toEqual(recorded);
+    expect(recorded).toMatchObject(first);
+  });
+
   it('getRun returns outcome and created_at when present', () => {
     db!.insertRun({
       run_id: 'run-with-outcome',
