@@ -550,16 +550,21 @@ describe('runExecutor fan-out — owned_paths resolve against and stay inside th
     mkdirSync(join(projectDir, 'evidence', 'c2'), { recursive: true });
     const flowRoot = projectDir;
     process.chdir(elsewhere);
-
-    await runFanOut(
-      {
-        children: [
-          { id: 'c1', depends_on: [], owned_paths: ['evidence/c1'], seed: { n: 1 } },
-          { id: 'c2', depends_on: [], owned_paths: ['evidence/c2'], seed: { n: 2 } },
-        ],
-      },
-      { projectRoot: flowRoot },
-    );
+    try {
+      await runFanOut(
+        {
+          children: [
+            { id: 'c1', depends_on: [], owned_paths: ['evidence/c1'], seed: { n: 1 } },
+            { id: 'c2', depends_on: [], owned_paths: ['evidence/c2'], seed: { n: 2 } },
+          ],
+        },
+        { projectRoot: flowRoot },
+      );
+    } finally {
+      // Back to the per-test project dir before this describe's afterEach
+      // removes `elsewhere`; the file-level afterEach then restores originalCwd.
+      process.chdir(projectDir);
+    }
 
     expect(childIds(db!, PARENT_ID)).toEqual(['c1', 'c2']);
     expect(JSON.parse(readFileSync(join(flowRoot, 'evidence', 'c2', 'seed.json'), 'utf8'))).toEqual({ n: 2 });
@@ -572,9 +577,12 @@ describe('runExecutor fan-out — owned_paths resolve against and stay inside th
   ])('holds the parent, seeds nothing and names the path for %s', async (_label, pathFor) => {
     const target = pathFor(elsewhere);
 
-    await runFanOut({
-      children: [{ id: 'c1', depends_on: [], owned_paths: [target], seed: { evil: true } }],
-    });
+    // An explicit project root, so the `..` spelling escapes projectDir
+    // whatever the cwd is (the executor defaults projectRoot to resolve('.')).
+    await runFanOut(
+      { children: [{ id: 'c1', depends_on: [], owned_paths: [target], seed: { evil: true } }] },
+      { projectRoot: projectDir },
+    );
 
     expect(childIds(db!, PARENT_ID)).toEqual([]);
     expect(db!.getCard(DEFAULT_RUN_ID, PARENT_ID)?.status).toBe('held');
@@ -585,9 +593,10 @@ describe('runExecutor fan-out — owned_paths resolve against and stay inside th
   });
 
   it('holds the parent and names the child and path when a seeded child has no owned dir', async () => {
-    await runFanOut({
-      children: [{ id: 'c1', depends_on: [], owned_paths: ['evidence/missing'], seed: { n: 1 } }],
-    });
+    await runFanOut(
+      { children: [{ id: 'c1', depends_on: [], owned_paths: ['evidence/missing'], seed: { n: 1 } }] },
+      { projectRoot: projectDir },
+    );
 
     expect(childIds(db!, PARENT_ID)).toEqual([]);
     expect(db!.getCard(DEFAULT_RUN_ID, PARENT_ID)?.status).toBe('held');
@@ -599,9 +608,10 @@ describe('runExecutor fan-out — owned_paths resolve against and stay inside th
   it('holds the parent for a symlink inside the root that points outside it', async () => {
     symlinkSync(elsewhere, join(projectDir, 'escape'));
 
-    await runFanOut({
-      children: [{ id: 'c1', depends_on: [], owned_paths: ['escape'], seed: { evil: true } }],
-    });
+    await runFanOut(
+      { children: [{ id: 'c1', depends_on: [], owned_paths: ['escape'], seed: { evil: true } }] },
+      { projectRoot: projectDir },
+    );
 
     expect(childIds(db!, PARENT_ID)).toEqual([]);
     expect(holdReason()).toContain('owned_path_out_of_bounds');

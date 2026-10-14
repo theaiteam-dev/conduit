@@ -929,11 +929,15 @@ export async function startJourneyHarness(opts?: {
     );
   }
 
-  // A skipChild that names no child, or one set without concurrentFanOut
-  // (the serial workspace has no skip_when), would skip nothing, and the
-  // journey would pass on the non-skip path. Fail before starting any server.
+  // A skipChild that names no child, or either fan-out option set without
+  // concurrentFanOut (the serial workspace has no fan-out station and no
+  // skip_when), would change nothing, and the journey would pass on a path it
+  // did not mean to exercise. Fail before starting any server.
   if (opts?.skipChild !== undefined && opts.concurrentFanOut !== true) {
     throw new Error("startJourneyHarness: skipChild requires concurrentFanOut: true");
+  }
+  if (opts?.fanOutOwnedPaths !== undefined && opts.concurrentFanOut !== true) {
+    throw new Error("startJourneyHarness: fanOutOwnedPaths requires concurrentFanOut: true");
   }
   if (opts?.skipChild !== undefined && !CONCURRENT_FANOUT_CHILDREN.some((c) => c.id === opts.skipChild)) {
     throw new Error(

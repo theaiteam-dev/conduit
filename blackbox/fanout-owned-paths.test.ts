@@ -71,18 +71,28 @@ describe("fan-out owned_paths resolve against the project root (#124, shipped bi
       // reports 0 as soon as any card reaches 'done', which the skipped child
       // does before its siblings finish.
       const reviewed = CONCURRENT_FANOUT_CHILDREN.filter((c) => c.id !== SKIPPED);
-      await h.waitFor(
-        () => {
-          try {
-            for (const c of reviewed) h.assert.artifactContent(`${c.dir}/findings.json`);
-            h.assert.exitCode(run, 0);
-            return true;
-          } catch {
-            return false;
-          }
-        },
-        { timeoutMs: 60_000 },
-      );
+      // Keep the last failed check so a timeout reports which condition never
+      // held (a missing findings.json, or the run's exit code) instead of a
+      // bare timeout.
+      let lastError: unknown;
+      try {
+        await h.waitFor(
+          () => {
+            try {
+              for (const c of reviewed) h.assert.artifactContent(`${c.dir}/findings.json`);
+              h.assert.exitCode(run, 0);
+              return true;
+            } catch (err) {
+              lastError = err;
+              return false;
+            }
+          },
+          { timeoutMs: 60_000 },
+        );
+      } catch (timeout) {
+        throw new Error(`${(timeout as Error).message}; last check failed with: ${String(lastError)}`);
+      }
+
 
       for (const c of CONCURRENT_FANOUT_CHILDREN) {
         // Every seed landed in the child's dir under the project root.
