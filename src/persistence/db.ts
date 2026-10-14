@@ -2500,16 +2500,46 @@ const COLD_START_RETRY: Parameters<typeof withBusyRetry>[1] = {
   maxDelayMs: 150,
 };
 
+/** The oldest state DB version the migration ladder in openConduitDB accepts. */
+const OLDEST_MIGRATABLE_SCHEMA_VERSION = 2;
+
+/**
+ * The error for a state DB this binary cannot open (issue #50). It names which
+ * side is newer and what to do. The path is deliberately unquoted: the CLI's
+ * buildProductionDeps appends a bare-metal CONDUIT_STATE_DB hint to any open
+ * error containing the path in single quotes, which is wrong for this case.
+ */
+function stateSchemaMismatchMessage(stateDbPath: string, found: number): string {
+  const head = `conduit state DB schema mismatch: the state DB at ${stateDbPath} is at schema version ${found}, `;
+  if (found > SCHEMA_VERSION) {
+    return (
+      head +
+      `and this conduit binary supports up to version ${SCHEMA_VERSION}. ` +
+      `The DB was written by a newer Conduit: upgrade the conduit binary or engine image ` +
+      `to that version or later. Migrations run forward only, so rolling back past a ` +
+      `schema migration is not supported. The DB's version was left unchanged.`
+    );
+  }
+  return (
+    head +
+    `and this conduit binary migrates versions ${OLDEST_MIGRATABLE_SCHEMA_VERSION} through ` +
+    `${SCHEMA_VERSION - 1} to ${SCHEMA_VERSION} automatically on open. Version ${found} is ` +
+    `older than the oldest version this binary can migrate, so no migration ran. ` +
+    `Point conduit at a new file to start a new state DB; the old DB's version was left unchanged.`
+  );
+}
+
 /**
  * Open (or create) the split Conduit persistence layer.
  *
  * Fresh state DB (user_version = 0): initialise schema and stamp SCHEMA_VERSION.
  * Existing state DB (user_version = SCHEMA_VERSION): connect as-is.
- * Migratable state DBs (user_version = 2..6): apply the migration ladder and
- * stamp SCHEMA_VERSION. Additive ALTER TABLE steps are safe to re-run when
- * guarded against "duplicate column" errors.
- * Incompatible state DB (user_version < 2 or > SCHEMA_VERSION): throw —
- *   version left untouched so the caller can inspect and recover manually.
+ * Migratable state DBs (user_version = 2..SCHEMA_VERSION - 1): apply the
+ * migration ladder and stamp SCHEMA_VERSION. Additive ALTER TABLE steps are
+ * safe to re-run when guarded against "duplicate column" errors.
+ * Incompatible state DB (user_version < 2 or > SCHEMA_VERSION): throw the
+ *   stateSchemaMismatchMessage error, which says which side is newer; the
+ *   version is left untouched.
  *
  * Journal DB: JOURNAL_DDL is always executed — every statement uses
  * CREATE TABLE/INDEX IF NOT EXISTS so it is fully idempotent and self-heals
@@ -2655,10 +2685,7 @@ export function openConduitDB({
     needsV11ToV12Migration = true;
   } else if (user_version !== SCHEMA_VERSION) {
     stateDb.close();
-    throw new Error(
-      `conduit state DB schema mismatch: found version ${user_version}, ` +
-        `expected ${SCHEMA_VERSION}. Manual migration required.`,
-    );
+    throw new Error(stateSchemaMismatchMessage(stateDbPath, user_version));
   }
 
   if (needsV3ToV4Migration) {

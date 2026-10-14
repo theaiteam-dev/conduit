@@ -310,6 +310,69 @@ describe('schema version guard (AC5)', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Issue #50 — the schema-mismatch error says which side is newer and what to do.
+// ---------------------------------------------------------------------------
+
+describe('schema mismatch message names the newer side and the remedy (issue #50)', () => {
+  function stampVersion(version: number): void {
+    closeConduit();
+    const raw = new Database(stateDbPath);
+    raw.exec(`PRAGMA user_version = ${version}`);
+    raw.close();
+  }
+
+  function openError(): string {
+    try {
+      db = openConduitDB({ stateDbPath, journalDbPath });
+    } catch (err) {
+      db = null;
+      return err instanceof Error ? err.message : String(err);
+    }
+    throw new Error('expected openConduitDB to throw');
+  }
+
+  it('a DB newer than the binary: names both versions, says the DB is newer, and says to upgrade', () => {
+    stampVersion(SCHEMA_VERSION + 1);
+    const msg = openError();
+    expect(msg).toContain('schema mismatch');
+    expect(msg).toContain(stateDbPath);
+    expect(msg).toContain(`schema version ${SCHEMA_VERSION + 1},`);
+    expect(msg).toContain(`supports up to version ${SCHEMA_VERSION}`);
+    expect(msg).toContain('written by a newer Conduit');
+    expect(msg).toContain('upgrade the conduit binary or engine image');
+    expect(msg).toContain('rolling back past a schema migration is not supported');
+    expect(msg).not.toContain('Manual migration required');
+  });
+
+  it('a DB older than the oldest migration: says the binary is newer and why no migration ran', () => {
+    stampVersion(1);
+    const msg = openError();
+    expect(msg).toContain('schema mismatch');
+    expect(msg).toContain(stateDbPath);
+    expect(msg).toContain('schema version 1,');
+    expect(msg).toContain(`migrates versions 2 through ${SCHEMA_VERSION - 1} to ${SCHEMA_VERSION}`);
+    expect(msg).toContain('older than the oldest version this binary can migrate');
+    expect(msg).toContain('no migration ran');
+    expect(msg).toContain('start a new state DB');
+    expect(msg).not.toContain('Manual migration required');
+  });
+
+  it('a negative user_version takes the older-DB message', () => {
+    stampVersion(-1);
+    const msg = openError();
+    expect(msg).toContain('schema version -1,');
+    expect(msg).toContain('no migration ran');
+  });
+
+  it('does not quote the state DB path, so the CLI does not append its bare-metal open hint', () => {
+    // buildProductionDeps appends a CONDUIT_STATE_DB hint to any error that
+    // contains the path in single quotes, meant for a file that cannot be opened.
+    stampVersion(SCHEMA_VERSION + 1);
+    expect(openError()).not.toContain(`'${stateDbPath}'`);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // AC6 — ingress_events.event_id is a PRIMARY KEY; duplicate insert is rejected.
 // ---------------------------------------------------------------------------
 
