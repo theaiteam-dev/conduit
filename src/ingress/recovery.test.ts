@@ -161,7 +161,7 @@ describe('redriveOnBoot core re-drive (AC1)', () => {
     const respawn = recordingRespawn(allSpawn);
     const report = await redriveOnBoot({ db, respawn: respawn.seam, cap: CAP });
     expect(respawn.calls).toHaveLength(0);
-    expect(report).toEqual({ spawned: [], failed: [], permanentlyFailed: [], deferred: [] });
+    expect(report).toEqual({ spawned: [], failed: [], permanentlyFailed: [], deferred: [], errored: [] });
   });
 });
 
@@ -550,7 +550,9 @@ describe('run-slot-aware re-drive (the original listener-backpressure work)', ()
       throw new Error('seam exploded');
     };
 
-    await expect(redriveOnBoot({ db, respawn: throwing, cap: CAP, slots })).rejects.toThrow('seam exploded');
+    // Issue #47: the throw is recorded against the row instead of ending the sweep.
+    const report = await redriveOnBoot({ db, respawn: throwing, cap: CAP, slots });
+    expect(report.errored).toEqual([{ eventId: 'e-throw', reason: 'seam exploded' }]);
     expect(slots.inFlightCount()).toBe(0);
   });
 });
@@ -1344,5 +1346,291 @@ describe('re-driven exit watcher × parked run (issue #7)', () => {
     expect(db.getIngressEvent('e-dies')).toMatchObject({ spawn_state: 'failed', spawn_attempts: 2 });
     expect(db.getIngressLog().map((e) => e.outcome)).toEqual(['redriven', 'spawn_failed']);
     expect(seen[0]!.reason).toBe('re-driven run exited with code 1');
+  });
+});
+
+// ===========================================================================
+// Issue #47: a storage error in a sweep must not kill the listener
+// ===========================================================================
+
+describe('re-drive sweep error boundary (issue #47)', () => {
+  const settle = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
+
+  /** The SQLite error the issue observed when the host disk filled. */
+  const diskFull = (): Error =>
+    Object.assign(new Error('database or disk is full'), { code: 'SQLITE_FULL' });
+
+  /** Forward every other property of the real DB, bound to it. */
+  function forward(target: ConduitDB, prop: string | symbol, receiver: unknown): unknown {
+    const value = Reflect.get(target, prop, receiver);
+    return typeof value === 'function' ? value.bind(target) : value;
+  }
+
+  /**
+   * A fake DB: the real one, except that each method named in `failing`
+   * throws while it is listed. Tests clear the set to let a later tick
+   * succeed.
+   */
+  function faultyDb(failing: Set<keyof ConduitDB>): ConduitDB {
+    return new Proxy(db, {
+      get(target, prop, receiver) {
+        if (failing.has(prop as keyof ConduitDB)) {
+          return () => {
+            throw diskFull();
+          };
+        }
+        return forward(target, prop, receiver);
+      },
+    });
+  }
+
+  function recordingAlert() {
+    const calls: SpawnFailedAlert[] = [];
+    const alert: AlertSeam = async (a) => {
+      calls.push(a);
+    };
+    const alerts: RedriveAlerting = {
+      alert,
+      channels: { flowA: '#flow-a-alerts' },
+      globalAlertChannel: '#listener-global',
+    };
+    return { alerts, calls };
+  }
+
+  function manualSchedule() {
+    let tick: (() => void) | null = null;
+    const schedule = (fn: () => void, _ms: number) => {
+      tick = fn;
+      return { cancel: () => {} };
+    };
+    return { schedule, fire: () => tick?.() };
+  }
+
+  // Capture unhandled rejections for the duration of each test. Registering a
+  // listener also stops the runtime from exiting on one, so a regression is a
+  // failed assertion rather than a dead test process.
+  let unhandled: unknown[] = [];
+  const onUnhandled = (reason: unknown) => {
+    unhandled.push(reason);
+  };
+  beforeEach(() => {
+    unhandled = [];
+    process.on('unhandledRejection', onUnhandled);
+  });
+  afterEach(() => {
+    process.off('unhandledRejection', onUnhandled);
+  });
+
+  for (const method of ['incrementSpawnAttempts', 'listRedrivable'] as const) {
+    it(`a kicked sweep whose ${method} throws: no unhandled rejection, one alert, the next tick sweeps again`, async () => {
+      seedFailed('e-full', 1);
+      const failing = new Set<keyof ConduitDB>([method]);
+      const respawn = recordingRespawn(allSpawn);
+      const { alerts, calls } = recordingAlert();
+      const clock = manualSchedule();
+
+      const handle = startPeriodicRedrive({
+        db: faultyDb(failing),
+        respawn: respawn.seam,
+        cap: CAP,
+        intervalMs: 60_000,
+        schedule: clock.schedule,
+        alerts,
+      });
+
+      handle.kick(); // the run-slot release path (listener.ts onRelease)
+      await settle();
+      await settle();
+
+      expect(unhandled).toEqual([]);
+      expect(respawn.calls).toEqual([]); // nothing launched without a counted attempt
+      expect(calls).toHaveLength(1);
+      expect(calls[0]).toMatchObject({ channel: '#listener-global' });
+      expect(calls[0]!.reason).toContain('database or disk is full');
+
+      // The disk is freed; the next interval tick sweeps again and recovers the row.
+      failing.clear();
+      clock.fire();
+      await settle();
+      handle.stop();
+
+      expect(unhandled).toEqual([]);
+      expect(respawn.calls).toEqual(['e-full']);
+      expect(db.getIngressEvent('e-full')).toMatchObject({ spawn_state: 'spawned', spawn_attempts: 2 });
+    });
+  }
+
+  it('records a failed row in ingress_log when the journal still accepts writes', async () => {
+    seedFailed('e-row', 1);
+    const handle = startPeriodicRedrive({
+      db: faultyDb(new Set(['incrementSpawnAttempts'])),
+      respawn: recordingRespawn(allSpawn).seam,
+      cap: CAP,
+      intervalMs: 60_000,
+      schedule: manualSchedule().schedule,
+    });
+    handle.kick();
+    await settle();
+    handle.stop();
+
+    const log = db.getIngressLog();
+    expect(log).toHaveLength(1);
+    expect(log[0]).toMatchObject({ source: 'periodic-recovery', eventId: 'e-row', outcome: 'sweep_error' });
+    expect(log[0]!.reason).toContain('database or disk is full');
+  });
+
+  it('records a failed snapshot in ingress_log with no event id', async () => {
+    const handle = startPeriodicRedrive({
+      db: faultyDb(new Set(['listRedrivable'])),
+      respawn: recordingRespawn(allSpawn).seam,
+      cap: CAP,
+      intervalMs: 60_000,
+      schedule: manualSchedule().schedule,
+    });
+    handle.kick();
+    await settle();
+    handle.stop();
+
+    expect(db.getIngressLog()).toEqual([
+      expect.objectContaining({ source: 'periodic-recovery', eventId: null, outcome: 'sweep_error' }),
+    ]);
+  });
+
+  it('survives a sweep whose ingress_log write fails too, and alerts anyway', async () => {
+    seedFailed('e-both', 1);
+    const { alerts, calls } = recordingAlert();
+    const handle = startPeriodicRedrive({
+      db: faultyDb(new Set(['incrementSpawnAttempts', 'appendIngressLog'])),
+      respawn: recordingRespawn(allSpawn).seam,
+      cap: CAP,
+      intervalMs: 60_000,
+      schedule: manualSchedule().schedule,
+      alerts,
+    });
+    handle.kick();
+    await settle();
+    await settle();
+    handle.stop();
+
+    expect(unhandled).toEqual([]);
+    expect(calls).toHaveLength(1);
+  });
+
+  it('one bad row does not abort the rest of the snapshot', async () => {
+    seedFailed('e-bad', 1);
+    db.acceptIngressEvent('e-good', 2000);
+    db.incrementSpawnAttempts('e-good');
+    db.markIngressFailed('e-good');
+
+    const flaky = new Proxy(db, {
+      get(target, prop, receiver) {
+        if (prop === 'incrementSpawnAttempts') {
+          return (eventId: string) => {
+            if (eventId === 'e-bad') throw diskFull();
+            target.incrementSpawnAttempts(eventId);
+          };
+        }
+        return forward(target, prop, receiver);
+      },
+    });
+    const respawn = recordingRespawn(allSpawn);
+    const slots = createRunSlots({ capacity: 2 });
+
+    const report = await redriveOnBoot({ db: flaky, respawn: respawn.seam, cap: CAP, slots });
+
+    expect(respawn.calls).toEqual(['e-good']);
+    expect(report.spawned).toEqual(['e-good']);
+    expect(report.errored).toEqual([{ eventId: 'e-bad', reason: 'database or disk is full' }]);
+    expect(db.getIngressEvent('e-bad')).toMatchObject({ spawn_state: 'failed', spawn_attempts: 1 });
+    expect(slots.inFlightCount()).toBe(0); // the bad row's slot is released
+  });
+
+  it('backs off: after a failed sweep, a kick does not sweep until the next tick', async () => {
+    seedFailed('e-backoff', 1);
+    const failing = new Set<keyof ConduitDB>(['incrementSpawnAttempts']);
+    const reports: RedriveReport[] = [];
+    const clock = manualSchedule();
+    const handle = startPeriodicRedrive({
+      db: faultyDb(failing),
+      respawn: recordingRespawn(allSpawn).seam,
+      cap: CAP,
+      intervalMs: 60_000,
+      schedule: clock.schedule,
+      onSweep: (r) => reports.push(r),
+    });
+
+    handle.kick();
+    await settle();
+    expect(reports).toHaveLength(1);
+
+    // A child exit kicks again while the disk is still full: no retry loop on kicks.
+    handle.kick();
+    await settle();
+    expect(reports).toHaveLength(1);
+
+    clock.fire();
+    await settle();
+    expect(reports).toHaveLength(2);
+
+    // Healthy again: once a tick's sweep succeeds, kicks sweep immediately.
+    failing.clear();
+    clock.fire();
+    await settle();
+    handle.kick();
+    await settle();
+    handle.stop();
+    expect(reports).toHaveLength(4);
+  });
+
+  it('alerts once per run of failed sweeps, and again after a recovery', async () => {
+    const failing = new Set<keyof ConduitDB>(['listRedrivable']);
+    const { alerts, calls } = recordingAlert();
+    const clock = manualSchedule();
+    const handle = startPeriodicRedrive({
+      db: faultyDb(failing),
+      respawn: recordingRespawn(allSpawn).seam,
+      cap: CAP,
+      intervalMs: 60_000,
+      schedule: clock.schedule,
+      alerts,
+    });
+
+    clock.fire();
+    await settle();
+    clock.fire();
+    await settle();
+    clock.fire();
+    await settle();
+    expect(calls).toHaveLength(1);
+
+    failing.clear();
+    clock.fire();
+    await settle();
+    expect(calls).toHaveLength(1);
+
+    failing.add('listRedrivable');
+    clock.fire();
+    await settle();
+    handle.stop();
+    expect(calls).toHaveLength(2);
+    expect(calls[1]!.reason).toContain('database or disk is full');
+  });
+
+  it('a throwing onSweep does not become an unhandled rejection', async () => {
+    const clock = manualSchedule();
+    const handle = startPeriodicRedrive({
+      db,
+      respawn: recordingRespawn(allSpawn).seam,
+      cap: CAP,
+      intervalMs: 60_000,
+      schedule: clock.schedule,
+      onSweep: () => {
+        throw new Error('stdout closed');
+      },
+    });
+    clock.fire();
+    await settle();
+    handle.stop();
+    expect(unhandled).toEqual([]);
   });
 });

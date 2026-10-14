@@ -810,7 +810,11 @@ export type IngressOutcome =
   // 'already_applied': a re-drive found that a pass had already consumed the
   // event (run_pass_events), so it was marked spawned rather than launched a
   // second time.
-  | 'already_applied';
+  | 'already_applied'
+  // Issue #47: a re-drive sweep hit an error, a storage error in practice.
+  // With an event id, that row threw and the sweep moved on; without one, the sweep
+  // could not read its snapshot. Written only when the journal accepts it.
+  | 'sweep_error';
 
 export interface IngressLogInput {
   source: string;
@@ -868,6 +872,7 @@ const VALID_INGRESS_OUTCOMES: ReadonlySet<string> = new Set<IngressOutcome>([
   'run_not_appendable',
   'pass_failed',
   'already_applied',
+  'sweep_error',
 ]);
 
 // ---------------------------------------------------------------------------

@@ -513,6 +513,20 @@ On listener startup, `redriveOnBoot`:
    failure is the loudest case: the row is excluded from every future sweep, so
    its alert is the only thing that will surface the event again.
 
+**A sweep error does not stop the listener.** The periodic sweep and the sweep
+a freed run slot kicks run detached from any request, so each has an error
+boundary. A row that throws (for example `incrementSpawnAttempts` failing with
+`database or disk is full`) is logged `'sweep_error'` with its event id, and
+the sweep goes on to the next row; a snapshot that cannot be read is logged
+`'sweep_error'` with no event id. Both log writes are best effort. The first
+failed sweep of a run of failures fires one alert on the listener-global
+channel (`flow=unknown event=redrive-sweep`); later failures do not alert again
+until a sweep succeeds. After a failed sweep, slot-release kicks are ignored
+until the next interval tick, which sweeps again, so a full disk is retried
+once per interval rather than on every child exit. The boot re-drive has the
+per-row boundary too, but a snapshot that cannot be read at boot still fails
+the boot.
+
 **Parked runs are resumed, not re-driven.** A run that halted behind a provider
 rate limit exits 1, but its `runs` row reads `status='halted', outcome='parked'`
 and its cards are `ready` behind a future `release_at`. Both exit watchers
@@ -598,6 +612,7 @@ Append-only journal of all event outcomes. Columns:
   - `'run_not_appendable'`: A keyed run stopped with unfinished cards, or crashed mid-pass
   - `'pass_failed'`: A keyed pass ran and concluded unsuccessfully (its cards are in `done` or `scrap`); the event stays `spawned` and the run takes its next pass
   - `'already_applied'`: A re-drive found that a pass already consumed the event (`run_pass_events`); the event is marked `spawned` and not launched again
+  - `'sweep_error'`: A re-drive sweep hit an error, usually a storage error such as `SQLITE_FULL`. With an event id, that row threw and the sweep went on to the next row; with a null event id, the sweep could not read its snapshot. Written only when the journal still accepts the write
 - `reason` (TEXT, nullable): Human-readable reason
 - `attributes_json` (TEXT, nullable): Event attributes (secret-filtered)
 

@@ -117,6 +117,17 @@ historical context, not public releases or public repository history.
 
 ### Fixed
 
+- A storage error in the ingress re-drive sweep no longer escapes as an
+  unhandled rejection ([#47](https://github.com/theaiteam-dev/conduit/issues/47)).
+  `redriveOnBoot` catches per row, so one row whose bookkeeping throws (for
+  example `SQLITE_FULL` from `incrementSpawnAttempts`) is reported in the new
+  `RedriveReport.errored` and logged with the new `ingress_log` outcome
+  `sweep_error`, and the sweep goes on to the next row. The periodic runner
+  catches a sweep that fails as a whole, logs `sweep_error` with no event id
+  when the journal allows, sends one alert per run of failed sweeps on the
+  listener-global channel (`event=redrive-sweep`), and ignores slot-release
+  kicks until the next interval tick, which sweeps again. A throwing `onSweep`
+  sink is caught too.
 - A gate critic on a child-entry station can see the child's inputs. The
   critic prompt was rendered with no card scope, so a critic that referenced
   `{{seed.json}}` threw at render and the card went to `hold`. `ownedPaths` and
