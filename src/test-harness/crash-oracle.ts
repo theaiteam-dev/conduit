@@ -903,6 +903,9 @@ async function crashMidFanOut(): Promise<OracleTrial> {
   // relative paths. A fresh dir per trial, so nothing left in the shared temp
   // root can change how a path canonicalizes. Created before the db, so a
   // failure here leaves nothing to clean up, and a failed db open removes it.
+  // A plain prefix, not the owner-tagged run-scoped naming: no kernel creates
+  // this dir, so no kernel sweep would look for it; it lives in the test
+  // process like every other test mkdtemp.
   const fanOutProjectRoot = mkdtempSync(join(tmpdir(), 'conduit-crash-oracle-fanout-'));
   let db: ConduitDB;
   try {
