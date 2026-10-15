@@ -18,6 +18,14 @@ user or CI consumer actually sees, not internal implementation details.
 - `fault-*.test.ts` — fault variants of the golden journey (see "The standing
   rule" below). `fault-stalled-slack.test.ts` (WI-680) is the first shipped
   example.
+- `fanout-owned-paths.test.ts`: fan-out owned paths (issues #73 and #124),
+  with the kernel's cwd different from the project root. A proposal of
+  relative child dirs seeds each `seed.json` under the project root, and a
+  `skip_when: { source: seed }` predicate reads it from there. A proposal of
+  existing dirs outside the project root is rejected: no child is seeded,
+  nothing is written, and the parent is held with `owned_path_out_of_bounds`,
+  the child and the path in its reason. Driven through
+  `startJourneyHarness({ concurrentFanOut: true, fanOutOwnedPaths, skipChild })`.
 - `harness/fake-claude.ts`: a scenario-driven stand-in for the headless
   Claude Code CLI. The harness-flow journeys point the shipped
   `claude-headless` adapter at it through engine config
@@ -39,7 +47,8 @@ user or CI consumer actually sees, not internal implementation details.
   scrubs the child env, so `bun` may not be on its PATH). It runs the real
   `conduit run`, `conduit run status`, `conduit journal inspect` and
   `conduit doctor` as subprocesses. No Slack or listener. `journalSpans()` is
-  a read-only journal DB read for span usage columns, which no CLI prints.
+  a read-only journal DB read for span usage and binding-stamp columns
+  (`binding_stamp`, `prompt_template_version`), which no CLI prints.
   With `stubSink`, it also serves the stub's call counter, log and barriers
   over HTTP on 127.0.0.1 (`startStubSink`), for a stub that runs
   write-confined and so cannot write the stub dir; the server appends to the
@@ -47,15 +56,37 @@ user or CI consumer actually sees, not internal implementation details.
 - `harness-happy-path.test.ts`: one harness maker writes its declared output
   and the card reaches `done`; checks exit code, `run status` occupancy, the
   `<station>.harness` span and its usage, and the argv the kernel passed.
+- `fault-concurrent-same-run-id.test.ts`: two `conduit run` launches of one
+  run id start at the same moment (issue #48), over five fresh workspaces.
+  Neither prints a constraint error, the stub is called once, and the card
+  reaches `done` with one `research.harness` span. The other launch exits 1
+  with the lease-conflict message naming the run, or, if the winner already
+  finished, exits 0 after reporting the run's state.
 - `harness-gate-critic.test.ts`: a harness maker gated by an agentic
   (`check.critic.harness`) critic. The critic rejects then passes, and the
   card goes back through the maker to `done`; a second case always rejects
   and the per-gate `rework_cap` scraps the card.
+- `transform-critic-scrap-reason.test.ts`: a transform maker gated by a
+  transform critic, against a fake OpenAI-compatible gateway on
+  `CONDUIT_BASE_URL` (issue #42). The critic answers `{"accept": true}`,
+  prose with no JSON, or a verdict cut off at `finish_reason: length`, and the
+  card is scrapped as `critic-verdict-invalid: <validator error>`,
+  `critic-verdict-unparseable` or `critic-output-truncated`; `conduit run`
+  and `journal inspect` both print the reason, and neither prints
+  `model-incompatible`.
 - `harness-critic-budget.test.ts`: the run token budget counts the critic's
   spend (issue #26). Maker alone is under budget, maker plus critic is over,
   and the run halts on the tokens andon; a control run with more budget
   completes. The halt prints one andon line, and `run status` reports the run
   halted with its resume command (#83).
+- `harness-critic-visibility.test.ts`: a `kind: transform` station whose
+  only harness is its gate critic (issue #35). With the critic's binary
+  missing, `conduit doctor` prints a FAIL line for the critic and exits
+  nonzero, and `conduit run` refuses to start with `HARNESS_BINARY_NOT_FOUND`
+  naming the critic. With it present, doctor prints the critic's ok line and
+  `conduit explain` shows its adapter, model and tools with a `critic ` prefix.
+  The journey serves a stub `/models` so doctor's exit code turns on the
+  critic alone.
 - `harness-claude-session-usage.test.ts`: a Claude call's tokens are the
   session total from `modelUsage`, not the last `result` event's `usage`
   (issue #108). The maker's call emits two results, as a session with a
@@ -63,6 +94,15 @@ user or CI consumer actually sees, not internal implementation details.
   below the session total halts on the tokens andon before the second station
   runs, and a control run with more budget completes. Runs once behind
   `claude-headless` and once behind `agent-sdk`.
+- `prompt-edit-resume.test.ts`: editing a prompt or a skill between a halt
+  and a resume re-runs the station that renders it (issues #131 and #93). A
+  harness maker using one `worker.uses` skill, gated by a harness critic,
+  halts on the tokens andon after its checkpoint is written; `conduit resume`
+  then reuses the checkpoint when nothing changed, re-runs the maker when its
+  `prompt_file` or the skill's `SKILL.md` changed (with `prompt_version`
+  unchanged, and a different `prompt_template_version` on the journal row),
+  and re-runs only the critic, with the new text, when the critic's prompt
+  changed.
 - `harness-idle-timeout.test.ts`: `worker.idle_timeout_seconds` kills a
   silent call, which is retried up to `max_execution_attempts` and then
   scrapped as `harness-idle-timeout`. A `setsid` sleeper spawned by the stub
@@ -198,6 +238,15 @@ user or CI consumer actually sees, not internal implementation details.
   children. The confined case also checks that c1 and c2 each ran with their
   own `conduit-call-tmp-*` TMPDIR and that the kernel's TMPDIR is empty after
   the run: no call temp dir, run-scoped `CODEX_HOME` or opencode dir left.
+- `fault-ingress-sweep-storage-error.test.ts`: a storage error in the
+  listener's re-drive sweep (issue #47). It seeds a failed `ingress_events`
+  row and adds a trigger that fails every UPDATE of that table with SQLite's
+  disk-full message (`faults.setIngressStorageFault`,
+  `faults.seedFailedIngressEvent`), with the sweep interval shortened through
+  the `redriveIntervalMs` harness option. The listener must keep serving,
+  print one `event=redrive-sweep` alert across several failed ticks, log
+  `sweep_error`, count no attempt, and re-drive the row once the trigger is
+  dropped.
 - `stale-temp-dir-sweep.test.ts`: the first run in a kernel removes the
   run-scoped temp dirs (`conduit-call-tmp-`, `conduit-claude-config-`,
   `conduit-codex-home-`, `conduit-opencode-`) whose owner is gone, a dead pid
@@ -207,9 +256,24 @@ user or CI consumer actually sees, not internal implementation details.
   its target, a dir the sweep cannot remove does not stop the run, and the
   run's own `conduit-claude-config-` dir, tagged with the kernel's pid and
   start time, is gone after the run.
+- `schema-mismatch.test.ts`: a state DB stamped with a schema version the
+  binary cannot open (issue #50). Stamped far above the binary's version,
+  `conduit run status` exits nonzero and says the DB was written by a newer
+  Conduit and to upgrade the binary or image; stamped at version 1,
+  `conduit doctor` says the DB is older than the oldest version the binary
+  migrates and no migration ran. Both leave `PRAGMA user_version` unchanged,
+  and the version the message says the binary supports is the one the CLI
+  stamps on a fresh DB.
 - `no-internal-imports.test.ts` + `harness/import-scan.ts` — the zero-imports
   gate (AC-1): a TypeScript-compiler-API scan that fails if any file under
   `blackbox/` imports anything resolving into `src/`.
+- `webhook-duplicate-run-id.test.ts`: a duplicate webhook delivery names the
+  run the original started (issue #52). It boots `conduit listen` with two
+  HMAC-signed webhook flows of one deterministic station each, one unkeyed and
+  one keyed on `run_key`, without the journey harness or Slack. Per route it
+  POSTs the same delivery twice: the first answers `202` `accepted` with a
+  `run_id`, the second `200 {"outcome":"duplicate","run_id":…}` with the same
+  id, and `conduit run status --run <id>` finds that run.
 - `scaffold.test.ts` — pins the plumbing in this file (test-script scoping,
   the required `blackbox` CI job's name and unfiltered trigger).
 

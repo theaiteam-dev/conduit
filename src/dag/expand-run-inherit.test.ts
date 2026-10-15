@@ -13,20 +13,32 @@
  *        by walking parent_id ancestry — parent row can be absent)
  * AC-4: back-compat regression — fan-out under DEFAULT_RUN_ID still works
  */
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import type { Card } from '../types/kernel';
 import { openConduitDB, DEFAULT_RUN_ID, type ConduitDB } from '../persistence/db';
 import { commitFanOut } from './expand';
 import type { ArchitectProposal } from './expand';
 
+/**
+ * The project root commitFanOut confines owned_paths to; these proposals use
+ * relative paths. A fresh dir per test, so nothing left in the shared temp
+ * root can change how a path canonicalizes.
+ */
+let FANOUT_PROJECT_ROOT: string;
+
 let db: ConduitDB;
 
 beforeEach(() => {
   db = openConduitDB({ stateDbPath: ':memory:', journalDbPath: ':memory:' });
+  FANOUT_PROJECT_ROOT = mkdtempSync(join(tmpdir(), 'conduit-fanout-'));
 });
 
 afterEach(() => {
   db.close();
+  rmSync(FANOUT_PROJECT_ROOT, { recursive: true, force: true });
 });
 
 function makeParent(id: string, runId: string): Card {
@@ -59,7 +71,7 @@ describe('WI-478 AC-1: children inherit parent run_id at creation', () => {
     const parentRunId = 'run-abc-123';
     db.insertCard(makeParent('epic-A', parentRunId));
 
-    const result = commitFanOut(db, parentRunId, 'epic-A', simpleProposal, { onPathConflict: 'reject' });
+    const result = commitFanOut(db, parentRunId, 'epic-A', simpleProposal, { onPathConflict: 'reject', projectRoot: FANOUT_PROJECT_ROOT });
     expect(result.ok).toBe(true);
 
     for (const child of simpleProposal.children) {
@@ -73,7 +85,7 @@ describe('WI-478 AC-1: children inherit parent run_id at creation', () => {
     const parentRunId = 'run-custom-xyz';
     db.insertCard(makeParent('epic-B', parentRunId));
 
-    commitFanOut(db, parentRunId, 'epic-B', simpleProposal, { onPathConflict: 'reject' });
+    commitFanOut(db, parentRunId, 'epic-B', simpleProposal, { onPathConflict: 'reject', projectRoot: FANOUT_PROJECT_ROOT });
 
     for (const child of simpleProposal.children) {
       const row = db.getCard(parentRunId, child.id);
@@ -93,7 +105,7 @@ describe('WI-478 AC-1: children inherit parent run_id at creation', () => {
     };
     db.insertCard(makeParent('epic-C', parentRunId));
 
-    commitFanOut(db, parentRunId, 'epic-C', proposal, { onPathConflict: 'reject' });
+    commitFanOut(db, parentRunId, 'epic-C', proposal, { onPathConflict: 'reject', projectRoot: FANOUT_PROJECT_ROOT });
 
     for (const child of proposal.children) {
       expect(db.getCard(parentRunId, child.id)!.run_id).toBe(parentRunId);
@@ -104,7 +116,7 @@ describe('WI-478 AC-1: children inherit parent run_id at creation', () => {
     const parentRunId = 'run-parent-id-check';
     db.insertCard(makeParent('epic-D', parentRunId));
 
-    commitFanOut(db, parentRunId, 'epic-D', simpleProposal, { onPathConflict: 'reject' });
+    commitFanOut(db, parentRunId, 'epic-D', simpleProposal, { onPathConflict: 'reject', projectRoot: FANOUT_PROJECT_ROOT });
 
     for (const child of simpleProposal.children) {
       const row = db.getCard(parentRunId, child.id);
@@ -130,8 +142,8 @@ describe('WI-478 AC-2: same-named children in two runs coexist without collision
       children: [{ id: 'p01', depends_on: [], owned_paths: ['out/p01.json'] }],
     };
 
-    expect(() => commitFanOut(db, runA, 'epic', proposal, { onPathConflict: 'reject' })).not.toThrow();
-    expect(() => commitFanOut(db, runB, 'epic', proposal, { onPathConflict: 'reject' })).not.toThrow();
+    expect(() => commitFanOut(db, runA, 'epic', proposal, { onPathConflict: 'reject', projectRoot: FANOUT_PROJECT_ROOT })).not.toThrow();
+    expect(() => commitFanOut(db, runB, 'epic', proposal, { onPathConflict: 'reject', projectRoot: FANOUT_PROJECT_ROOT })).not.toThrow();
   });
 
   it("run A's p01 and run B's p01 are distinct rows carrying their respective run_ids", () => {
@@ -145,8 +157,8 @@ describe('WI-478 AC-2: same-named children in two runs coexist without collision
       children: [{ id: 'p01', depends_on: [], owned_paths: ['out/p01.json'] }],
     };
 
-    commitFanOut(db, runA, 'epic', proposal, { onPathConflict: 'reject' });
-    commitFanOut(db, runB, 'epic', proposal, { onPathConflict: 'reject' });
+    commitFanOut(db, runA, 'epic', proposal, { onPathConflict: 'reject', projectRoot: FANOUT_PROJECT_ROOT });
+    commitFanOut(db, runB, 'epic', proposal, { onPathConflict: 'reject', projectRoot: FANOUT_PROJECT_ROOT });
 
     const rowA = db.getCard(runA, 'p01');
     const rowB = db.getCard(runB, 'p01');
@@ -173,8 +185,8 @@ describe('WI-478 AC-2: same-named children in two runs coexist without collision
       ],
     };
 
-    commitFanOut(db, runA, 'parent', proposal, { onPathConflict: 'reject' });
-    commitFanOut(db, runB, 'parent', proposal, { onPathConflict: 'reject' });
+    commitFanOut(db, runA, 'parent', proposal, { onPathConflict: 'reject', projectRoot: FANOUT_PROJECT_ROOT });
+    commitFanOut(db, runB, 'parent', proposal, { onPathConflict: 'reject', projectRoot: FANOUT_PROJECT_ROOT });
 
     for (const child of proposal.children) {
       expect(db.getCard(runA, child.id)!.run_id).toBe(runA);
@@ -192,7 +204,7 @@ describe('WI-478 AC-3: child run_id is persisted on its own row (not derived fro
     const parentRunId = 'run-direct';
     db.insertCard(makeParent('epic-E', parentRunId));
 
-    commitFanOut(db, parentRunId, 'epic-E', simpleProposal, { onPathConflict: 'reject' });
+    commitFanOut(db, parentRunId, 'epic-E', simpleProposal, { onPathConflict: 'reject', projectRoot: FANOUT_PROJECT_ROOT });
 
     // Delete the parent row from the DB directly, simulating parent row removal.
     const stateDb = db.getStateDb();
@@ -209,7 +221,7 @@ describe('WI-478 AC-3: child run_id is persisted on its own row (not derived fro
     const parentRunId = 'run-raw';
     db.insertCard(makeParent('epic-F', parentRunId));
 
-    commitFanOut(db, parentRunId, 'epic-F', simpleProposal, { onPathConflict: 'reject' });
+    commitFanOut(db, parentRunId, 'epic-F', simpleProposal, { onPathConflict: 'reject', projectRoot: FANOUT_PROJECT_ROOT });
 
     // Verify via raw stateDb query — not via the getCard accessor.
     const stateDb = db.getStateDb();
@@ -230,7 +242,7 @@ describe('WI-478 AC-4: back-compat — fan-out under DEFAULT_RUN_ID unchanged', 
   it('children of a parent in DEFAULT_RUN_ID are stamped with DEFAULT_RUN_ID', () => {
     db.insertCard(makeParent('epic-default', DEFAULT_RUN_ID));
 
-    commitFanOut(db, DEFAULT_RUN_ID, 'epic-default', simpleProposal, { onPathConflict: 'reject' });
+    commitFanOut(db, DEFAULT_RUN_ID, 'epic-default', simpleProposal, { onPathConflict: 'reject', projectRoot: FANOUT_PROJECT_ROOT });
 
     for (const child of simpleProposal.children) {
       const row = db.getCard(DEFAULT_RUN_ID, child.id);
@@ -242,8 +254,8 @@ describe('WI-478 AC-4: back-compat — fan-out under DEFAULT_RUN_ID unchanged', 
   it('existing single-run fan-out test: idempotent re-call returns existing children without error', () => {
     db.insertCard(makeParent('epic-idem', DEFAULT_RUN_ID));
 
-    const r1 = commitFanOut(db, DEFAULT_RUN_ID, 'epic-idem', simpleProposal, { onPathConflict: 'reject' });
-    const r2 = commitFanOut(db, DEFAULT_RUN_ID, 'epic-idem', simpleProposal, { onPathConflict: 'reject' });
+    const r1 = commitFanOut(db, DEFAULT_RUN_ID, 'epic-idem', simpleProposal, { onPathConflict: 'reject', projectRoot: FANOUT_PROJECT_ROOT });
+    const r2 = commitFanOut(db, DEFAULT_RUN_ID, 'epic-idem', simpleProposal, { onPathConflict: 'reject', projectRoot: FANOUT_PROJECT_ROOT });
 
     expect(r1.ok).toBe(true);
     expect(r2.ok).toBe(true);
@@ -257,7 +269,7 @@ describe('WI-478 AC-4: back-compat — fan-out under DEFAULT_RUN_ID unchanged', 
   it('children status and lane are correct after DEFAULT_RUN_ID fan-out', () => {
     db.insertCard(makeParent('epic-status', DEFAULT_RUN_ID));
 
-    commitFanOut(db, DEFAULT_RUN_ID, 'epic-status', simpleProposal, { onPathConflict: 'reject' });
+    commitFanOut(db, DEFAULT_RUN_ID, 'epic-status', simpleProposal, { onPathConflict: 'reject', projectRoot: FANOUT_PROJECT_ROOT });
 
     for (const child of simpleProposal.children) {
       const row = db.getCard(DEFAULT_RUN_ID, child.id);

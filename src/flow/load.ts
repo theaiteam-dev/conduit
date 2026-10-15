@@ -48,6 +48,7 @@ import type {
 import { findCycleNodes } from './dag-utils';
 import { FEEDBACK_INPUT } from './render';
 import { harnessOutputInputOverlap } from './resolve-output';
+import { flowHarnesses } from './station-harnesses';
 import { resolveSkill, type ResolveSkillResult } from '../skills/resolve';
 import type { ParsedSkill } from '../skills/parse';
 import { detectExecutionSurface, type ExecutionSurfaceWarning } from '../skills/detect-surface';
@@ -2591,29 +2592,31 @@ export function loadFlow(
 // ---------------------------------------------------------------------------
 
 /**
- * Probe every `kind: harness` station's configured binary for presence/
- * executability. A SEPARATE async pass over an already-loaded FlowConfig —
- * HarnessAdapter.probeBinary() is async (WI-560) and cannot run inside the
- * synchronous collectErrors/loadFlow. FR-10: caught at load/startup, never at
- * first dispatch. Never invokes the adapter — probe only. Non-harness
- * stations and stations whose adapter is unresolvable (already reported by
- * loadFlow's UNKNOWN_HARNESS_ADAPTER) are skipped.
+ * Probe the configured binary of every harness the flow uses for presence/
+ * executability: each `kind: harness` maker and each `check.critic.harness`
+ * gate critic, whatever the critic's station kind (issue #35; the list comes
+ * from `flowHarnesses`). A SEPARATE async pass over an already-loaded
+ * FlowConfig — HarnessAdapter.probeBinary() is async (WI-560) and cannot run
+ * inside the synchronous collectErrors/loadFlow. FR-10: caught at
+ * load/startup, never at first dispatch. Never invokes the adapter — probe
+ * only. Adapters that do not resolve (already reported by loadFlow's
+ * UNKNOWN_HARNESS_ADAPTER) are skipped.
  */
 export async function probeHarnessBinaries(
   flow: FlowConfig,
   registry: HarnessRegistry,
 ): Promise<FlowValidationError[]> {
   const errors: FlowValidationError[] = [];
-  for (const [stationId, station] of Object.entries(flow.stations)) {
-    if (station.kind !== 'harness' || station.harness === undefined) continue;
-    const resolved = registry.resolve(station.harness);
+  for (const use of flowHarnesses(flow)) {
+    const resolved = registry.resolve(use.adapter);
     if (!resolved.ok) continue;
     const probe = await resolved.adapter.probeBinary();
     if (!probe.present) {
+      const which = use.role === 'critic' ? 'critic harness' : 'harness';
       errors.push({
         code: 'HARNESS_BINARY_NOT_FOUND',
         message:
-          `Station '${stationId}' harness adapter '${resolved.adapter.name}' binary not found` +
+          `Station '${use.stationId}' ${which} adapter '${resolved.adapter.name}' binary not found` +
           (probe.detail !== undefined ? ` at '${probe.detail}'` : ''),
       });
     }

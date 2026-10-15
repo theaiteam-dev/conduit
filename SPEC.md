@@ -494,7 +494,9 @@ declare a predicate that lets the kernel pass a card straight through to the sta
 ```
 
 - **`source: seed`** reads a top-level field of the card's `seed.json` (in
-  `owned_paths[0]`, written at fan-out, §9).
+  `owned_paths[0]`, written at fan-out, §9). A relative `owned_paths[0]` resolves against
+  the project root, not the kernel's working directory, and a `seed.json` that resolves
+  outside the owned directory (through a symlink) holds the card.
 - **`source: output`** (with `station: <id>`) reads a top-level field of the payload that
   an upstream `transform` station produced for the same card, from that station's latest
   checkpoint (§5). The station must declare the field in its `output_schema`, must reach
@@ -721,11 +723,16 @@ binding = hash(model_id, prompt_template_version, resolved_input_artifact_hashes
 ```
 
 `prompt_template_version` covers everything that becomes part of the worker's prompt,
-not only the template file. A `worker.uses` station folds the content hash of each
-injected skill into it, in declared order. A `kind: harness` station that runs a named
+not only the declared `prompt_version`. On a `transform` or `kind: harness` station it
+combines `prompt_version`, then the content hash of each `worker.uses` skill in declared
+order, then the SHA-256 of the template the station renders (the skills and the local
+`prompt_file` as composed, or the `prompt_file` alone). Editing a prompt file or a skill
+therefore invalidates the checkpoint without a `prompt_version` bump, and a bump still
+forces a re-run with the files unchanged. A `kind: harness` station that runs a named
 agent folds in the agent's name and the SHA-256 of its definition file, which the kernel
 locates in the adapter's configured plugin dirs. A station whose agent definition cannot be
-located holds rather than stamping on the name alone.
+located holds rather than stamping on the name alone. A gate critic writes no checkpoint and
+is never skipped, so each check renders the critic's current `prompt_file`.
 
 On resume, a completed station is skipped **only if its binding stamp matches the
 current config.** On mismatch the checkpoint is **invalidated and the invalidation
@@ -809,7 +816,12 @@ express it (this is why Conduit is a state machine, not Airflow). It is bounded 
    the API.)*
 2. **Per-execution-attempt cap.** Integrity-fail / parse-fail retries are bounded
    separately from quality rework (rev-1 H5) → on exhaustion, scrap with a
-   `model-incompatible`/`integrity` reason.
+   `model-incompatible`/`integrity` reason. A transform gate critic's failure
+   scraps under a reason naming its class instead: `critic-verdict-invalid:
+   <validator error>` (parsed, failed the verdict schema),
+   `critic-reject-without-findings`, `critic-verdict-unparseable`,
+   `critic-output-truncated` or `critic-vision-unsupported`. A harness critic
+   uses the matching `harness-critic-*` reasons.
 3. **Progress monotonicity — on the *findings*, not the artifact** (rev-1 H2). A
    rejection whose **critic findings hash** matches the previous attempt's = "same
    defect, no progress" → exhausts the cap immediately. Hashing the artifact is wrong:
@@ -1027,7 +1039,8 @@ split is harder and needs this in-transaction reservation.)*
   (schema-aligned recovery from fenced/garbled/prose-wrapped responses). A parse miss is
   a *paid re-bill* and happens on frontier models too. **Bounded:** parse retries count
   against `per_card.max_execution_attempts` (rev-1 H5); on exhaustion → scrap with
-  `model-incompatible`. Parse-miss rate is a first-class journal metric (§11).
+  `model-incompatible`, or, for a gate critic, a named `critic-*` reason (§6
+  guard 2). Parse-miss rate is a first-class journal metric (§11).
 - **Per-model adapters.** Native function-calling vs prompted XML/JSON blocks, normalized
   to the kernel tool protocol. A model with no function-calling falls back to the prompted
   adapter or is rejected at the Bench (§14) before it's allowed on a flow.
@@ -1106,11 +1119,34 @@ Conduit unfurls the plan at runtime rather than following a static script.
   `waiting`. **Waves are emergent** — a card unblocks when its deps reach a terminal lane.
 - **Disjoint ownership invariant (rev-1 H4).** Before committing children, the Kernel
   **validates that owned-path sets across concurrently-eligible cards are disjoint** —
-  or forces a `depends_on` serialization edge for a shared path. The Architect (an LLM)
+  or forces a `depends_on` serialization edge for a shared path. Paths are compared in
+  canonical form (the confinement step below resolves them first), so two spellings of
+  one path (`./a` and `a`, a relative and an absolute form, two symlinks to the same
+  directory) are the same path, and a directory overlaps every path inside it (`a` and
+  `a/b` are not disjoint). The Architect (an LLM)
   proposes; the Kernel (deterministic) enforces. This closes the "two cards both own
   `config.ts`" race that path-ownership alone misses. The overlap integrity rule for
   harness calls (§7) depends on this invariant: it attributes a touched path to the one
   in-flight card that owns it.
+- **Owned paths confined to the project root.** A child's `owned_paths` are model output.
+  The Kernel resolves every entry against the run's project root, never against its own
+  working directory, canonicalizes it with symlinks resolved in its longest existing
+  prefix (the resolver the integrity check uses, §7), and rejects the whole proposal with
+  `owned_path_out_of_bounds` when an entry lands outside the canonical root: an absolute
+  path elsewhere, a `..` escape, or a symlink pointing out. It runs before the
+  disjointness check, which compares the same canonical paths. The rejection writes no
+  `seed.json` and seeds no child, and holds the parent with the child and the path in its
+  reason. This one check covers every later use of the path: the `seed.json` write, the
+  card-scoped input reads, `skip_when` `source: seed`, and the child's own writes.
+- **One seed per directory.** The Kernel writes every child's `seed.json` into its
+  `owned_paths[0]` before any child runs, so two seeded children whose first owned path
+  resolves to the same directory (compared by the realpath the write uses, so `./a` and
+  `a` are one directory) would leave only the second seed. Such a proposal is rejected
+  with `seed_path_conflict` whether or not `depends_on` orders the two children: the
+  disjointness check above serializes overlapping children, and serialization does not
+  delay the seed writes. The parent is held with both child ids and the path in its
+  reason. Nested directories (`a` and `a/b`) hold separate `seed.json` files and do not
+  conflict here.
 - **Two axes of motion, deliberately different:**
   - **Forward-only across waves.** An implementation failure → **hard pause for a human**
     (`hold`), never an automatic "nuclear reversal" to Wave 1 (state rot).

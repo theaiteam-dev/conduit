@@ -1,10 +1,11 @@
 # Issue #122: the Landlock write-confinement helper (native/llexec/llexec.c),
 # built statically against musl so the binary runs in the Debian-based runtime
-# image below without any library from this stage. Pinned by tag, as the
-# runtime stage is: digest pinning belongs to both stages at once, and the
-# runtime tag is what the FR-13 test and the Bun bump procedure
-# (docs/installation.md §7) name, so it is a separate change.
-FROM alpine:3.20 AS llexec
+# image below without any library from this stage. Pinned by the digest of
+# the multi-arch index (issue #132) so every build compiles llexec with the
+# same toolchain. To move it, read the new index digest with
+# `docker buildx imagetools inspect alpine:<tag>` and update this line and
+# the matching row in docs/installation.md §1.
+FROM alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc AS llexec
 RUN apk add --no-cache gcc musl-dev
 COPY native/llexec/llexec.c /src/llexec.c
 RUN gcc -static -O2 -Wall -Wextra -Werror -o /llexec /src/llexec.c

@@ -103,7 +103,7 @@ describe('default-off: proposals without a seed commit unchanged (AC1)', () => {
       ],
     };
 
-    const result = expectOk(commitFanOut(db, DEFAULT_RUN_ID, 'epic', proposal, { onPathConflict: 'reject' }));
+    const result = expectOk(commitFanOut(db, DEFAULT_RUN_ID, 'epic', proposal, { onPathConflict: 'reject', projectRoot: root }));
 
     // Children persisted exactly as the pre-seed contract (parity with expand.test.ts AC1).
     expect(result.children.map((c) => c.id)).toEqual(['c1', 'c2']);
@@ -128,7 +128,7 @@ describe('default-off: proposals without a seed commit unchanged (AC1)', () => {
       ],
     };
 
-    expectOk(commitFanOut(db, DEFAULT_RUN_ID, 'epic', proposal, { onPathConflict: 'reject' }));
+    expectOk(commitFanOut(db, DEFAULT_RUN_ID, 'epic', proposal, { onPathConflict: 'reject', projectRoot: root }));
 
     // Seeded child gets a seed.json; the bare child gets none.
     expect(existsSync(seedFileIn(dirSeeded))).toBe(true);
@@ -160,7 +160,7 @@ describe('distinct per-child seeds are materialized (AC2)', () => {
       ],
     };
 
-    expectOk(commitFanOut(db, DEFAULT_RUN_ID, 'epic', proposal, { onPathConflict: 'reject' }));
+    expectOk(commitFanOut(db, DEFAULT_RUN_ID, 'epic', proposal, { onPathConflict: 'reject', projectRoot: root }));
 
     // Each child's seed is materialized in ITS OWN dir — distinct, not shared.
     expect(JSON.parse(readFileSync(seedFileIn(dir1), 'utf-8'))).toEqual(seed1);
@@ -180,7 +180,7 @@ describe('distinct per-child seeds are materialized (AC2)', () => {
       ],
     };
 
-    expectOk(commitFanOut(db, DEFAULT_RUN_ID, 'epic', proposal, { onPathConflict: 'reject' }));
+    expectOk(commitFanOut(db, DEFAULT_RUN_ID, 'epic', proposal, { onPathConflict: 'reject', projectRoot: root }));
 
     expect(JSON.parse(readFileSync(seedFileIn(dir1), 'utf-8'))).toBe('variant-7');
     expect(JSON.parse(readFileSync(seedFileIn(dir2), 'utf-8'))).toBe(42);
@@ -205,7 +205,7 @@ describe('seed materialized at <firstOwnedDir>/seed.json (AC3)', () => {
       ],
     };
 
-    expectOk(commitFanOut(db, DEFAULT_RUN_ID, 'epic', proposal, { onPathConflict: 'reject' }));
+    expectOk(commitFanOut(db, DEFAULT_RUN_ID, 'epic', proposal, { onPathConflict: 'reject', projectRoot: root }));
 
     // The seed file is the directory's CHILD named seed.json...
     expect(existsSync(join(firstDir, 'seed.json'))).toBe(true);
@@ -224,7 +224,7 @@ describe('seed materialized at <firstOwnedDir>/seed.json (AC3)', () => {
       children: [{ id: 'c1', depends_on: [], owned_paths: [dir], seed }],
     };
 
-    expectOk(commitFanOut(db, DEFAULT_RUN_ID, 'epic', proposal, { onPathConflict: 'reject' }));
+    expectOk(commitFanOut(db, DEFAULT_RUN_ID, 'epic', proposal, { onPathConflict: 'reject', projectRoot: root }));
 
     const raw = readFileSync(seedFileIn(dir), 'utf-8');
     expect(raw).toBe(JSON.stringify(seed, null, 2));
@@ -261,7 +261,7 @@ describe('atomicity: seed write shares the insert transaction (AC4)', () => {
       return realInsert(card);
     });
 
-    expect(() => commitFanOut(db, DEFAULT_RUN_ID, 'epic', proposal, { onPathConflict: 'reject' })).toThrow(
+    expect(() => commitFanOut(db, DEFAULT_RUN_ID, 'epic', proposal, { onPathConflict: 'reject', projectRoot: root })).toThrow(
       /mid fan-out/,
     );
     spy.mockRestore();
@@ -302,7 +302,7 @@ describe('idempotency: existing children short-circuit without rewriting seeds (
       children: [{ id: 'c1', depends_on: [], owned_paths: [dir], seed: { from: 'second-run' } }],
     };
 
-    const result = expectOk(commitFanOut(db, DEFAULT_RUN_ID, 'epic', proposal, { onPathConflict: 'reject' }));
+    const result = expectOk(commitFanOut(db, DEFAULT_RUN_ID, 'epic', proposal, { onPathConflict: 'reject', projectRoot: root }));
 
     // Returns the validated result...
     expect(result.children.map((c) => c.id)).toEqual(['c1']);
@@ -324,7 +324,7 @@ describe('idempotency: existing children short-circuit without rewriting seeds (
       children: [{ id: 'c1', depends_on: [], owned_paths: [dir], seed: { from: 'second-run' } }],
     };
 
-    expectOk(commitFanOut(db, DEFAULT_RUN_ID, 'epic', proposal, { onPathConflict: 'reject' }));
+    expectOk(commitFanOut(db, DEFAULT_RUN_ID, 'epic', proposal, { onPathConflict: 'reject', projectRoot: root }));
 
     // The idempotency short-circuit means the seed is never materialized on re-run.
     expect(existsSync(seedFileIn(dir))).toBe(false);
@@ -351,7 +351,7 @@ describe('out-of-bounds seed path is rejected (AC6)', () => {
       ],
     };
 
-    expectErr(commitFanOut(db, DEFAULT_RUN_ID, 'epic', proposal, { onPathConflict: 'reject' }));
+    expectErr(commitFanOut(db, DEFAULT_RUN_ID, 'epic', proposal, { onPathConflict: 'reject', projectRoot: root }));
 
     // No child row committed.
     expect(db.getCard(DEFAULT_RUN_ID, 'c1')).toBeNull();
@@ -368,7 +368,7 @@ describe('out-of-bounds seed path is rejected (AC6)', () => {
       ],
     };
 
-    expectErr(commitFanOut(db, DEFAULT_RUN_ID, 'epic', proposal, { onPathConflict: 'reject' }));
+    expectErr(commitFanOut(db, DEFAULT_RUN_ID, 'epic', proposal, { onPathConflict: 'reject', projectRoot: root }));
     expect(db.getCard(DEFAULT_RUN_ID, 'c1')).toBeNull();
   });
 
@@ -385,7 +385,7 @@ describe('out-of-bounds seed path is rejected (AC6)', () => {
       ],
     };
 
-    expectErr(commitFanOut(db, DEFAULT_RUN_ID, 'epic', proposal, { onPathConflict: 'reject' }));
+    expectErr(commitFanOut(db, DEFAULT_RUN_ID, 'epic', proposal, { onPathConflict: 'reject', projectRoot: root }));
 
     // No child row committed …
     expect(db.getCard(DEFAULT_RUN_ID, 'c1')).toBeNull();
@@ -406,7 +406,7 @@ describe('out-of-bounds seed path is rejected (AC6)', () => {
       ],
     };
 
-    expectErr(commitFanOut(db, DEFAULT_RUN_ID, 'epic', proposal, { onPathConflict: 'reject' }));
+    expectErr(commitFanOut(db, DEFAULT_RUN_ID, 'epic', proposal, { onPathConflict: 'reject', projectRoot: root }));
 
     // Neither child survives, and the good child's seed must not have leaked to disk.
     expect(db.getCard(DEFAULT_RUN_ID, 'good')).toBeNull();

@@ -148,10 +148,49 @@ export interface Harness {
     setStall(surface: string, on: boolean): void;
     /** While `on`, every signed event / interactive response is delivered twice. */
     setDuplicateDelivery(on: boolean): void;
+    /**
+     * While `on`, every UPDATE of the state DB's `ingress_events` table fails
+     * with SQLite's disk-full message, through a trigger added from outside
+     * the listener (issue #47).
+     */
+    setIngressStorageFault(on: boolean): void;
+    /**
+     * Inserts an `ingress_events` row in state `failed` with one spawn attempt
+     * and no flow attribution, the state a failed launch leaves behind, so the
+     * re-drive sweep picks it up on its next tick.
+     */
+    seedFailedIngressEvent(eventId: string): void;
   };
+  /** Raw state-DB read of one `ingress_events` row, or undefined. */
+  ingressEvent(eventId: string): { spawn_state: string; spawn_attempts: number } | undefined;
+  /** Raw journal-DB read of the `ingress_log` table, oldest first. */
+  ingressLog(): Array<{ source: string; event_id: string | null; outcome: string; reason: string | null }>;
+  /** The listener child's exit code, or null while it is running. */
+  listenerExitCode(): number | null;
+  /** The listener's HTTP base URL (http://127.0.0.1:<port>). */
+  listenerBaseUrl: string;
   waitFor(cond: () => boolean | Promise<boolean>, opts?: { timeoutMs?: number; intervalMs?: number }): Promise<void>;
   cleanup(): Promise<void>;
+  /** The run's project root (CONDUIT_PROJECT_ROOT). */
+  projectRoot: string;
+  /**
+   * A directory beside the project root, outside it. With
+   * `fanOutOwnedPaths: "outside"`, each child's proposed owned dir is
+   * `<outsideRoot>/<child dir>`, pre-created so only confinement can reject it.
+   * Undefined on a serial journey, which never creates it.
+   */
+  outsideRoot: string | undefined;
 }
+
+/**
+ * How the concurrent fan-out gateway spells each child's owned dir:
+ *   - absolute: `<projectRoot>/<dir>` (the default);
+ *   - relative: `<dir>`, which the kernel must resolve against the project
+ *     root, not its cwd (issue #124);
+ *   - outside:  `<outsideRoot>/<dir>`, an existing directory outside the
+ *     project root, which the kernel must reject (issue #73).
+ */
+export type FanOutOwnedPaths = "absolute" | "relative" | "outside";
 
 // ---------------------------------------------------------------------------
 // Slack v0 signature scheme — mirrors src/ingress/adapters/slack-events.ts
@@ -430,9 +469,10 @@ export const CONCURRENT_FANOUT_CHILDREN: ReadonlyArray<{ id: string; dir: string
 /**
  * OpenAI-compatible /chat/completions fake (CONDUIT_BASE_URL). Routes by prompt:
  *   • "Propose …"      → a fan-out proposal (the N homogeneous children above),
- *                        each owning an ABSOLUTE dir under projectRoot (the run
- *                        does not chdir, so commitFanOut's cwd-relative existsSync
- *                        needs an absolute owned path).
+ *                        each owning a dir spelled as `fanOutOwnedPaths` says
+ *                        (absolute under projectRoot by default). With
+ *                        `skipChild`, every seed carries `skip`, true only for
+ *                        that child, for the flow's `skip_when` predicate.
  *   • "…findings for…" → a review child; echoes THIS child's lens (rendered into
  *                        the prompt from its per-child seed.json) so each written
  *                        findings.json is distinguishable — proof of no-clobber.
@@ -443,7 +483,18 @@ export const CONCURRENT_FANOUT_CHILDREN: ReadonlyArray<{ id: string; dir: string
  * can prove real parallelism. `overlap` is off for the serial journeys, so their
  * timing and the default verdict path are byte-for-byte unchanged.
  */
-function startFakeModelGateway(opts: { projectRoot?: string; overlap?: boolean } = {}): FakeModelGateway {
+function startFakeModelGateway(
+  opts: {
+    projectRoot?: string;
+    outsideRoot?: string;
+    overlap?: boolean;
+    fanOutOwnedPaths?: FanOutOwnedPaths;
+    skipChild?: string;
+  } = {},
+): FakeModelGateway {
+  if (opts.fanOutOwnedPaths === "outside" && opts.outsideRoot === undefined) {
+    throw new Error('startFakeModelGateway: fanOutOwnedPaths "outside" requires outsideRoot');
+  }
   const holdOpenMs = opts.overlap ? 40 : 0;
   let inFlight = 0;
   let peak = 0;
@@ -477,11 +528,21 @@ function startFakeModelGateway(opts: { projectRoot?: string; overlap?: boolean }
         if (holdOpenMs > 0) await sleep(holdOpenMs);
 
         if (prompt.includes("Propose")) {
+          const ownedDir = (dir: string): string => {
+            switch (opts.fanOutOwnedPaths ?? "absolute") {
+              case "relative":
+                return dir;
+              case "outside":
+                return join(opts.outsideRoot!, dir);
+              default:
+                return opts.projectRoot ? join(opts.projectRoot, dir) : dir;
+            }
+          };
           const children = CONCURRENT_FANOUT_CHILDREN.map((c) => ({
             id: c.id,
             depends_on: [] as string[],
-            owned_paths: [opts.projectRoot ? join(opts.projectRoot, c.dir) : c.dir],
-            seed: { lens: c.lens },
+            owned_paths: [ownedDir(c.dir)],
+            seed: opts.skipChild === undefined ? { lens: c.lens } : { lens: c.lens, skip: c.id === opts.skipChild },
           }));
           return respond(JSON.stringify({ children }));
         }
@@ -562,6 +623,11 @@ security:
 `,
   );
   return path;
+}
+
+/** The directory beside the project root used as an out-of-project target. */
+function outsideRootOf(root: string): string {
+  return join(root, "outside");
 }
 
 interface Workspace {
@@ -669,7 +735,9 @@ security:
  * resolves concurrency as flag > flow default > 1). Each child's owned dir is
  * pre-created here so commitFanOut can seed it and the scoped output can land.
  */
-function scaffoldConcurrentFanoutWorkspace(opts: { childStaggerSeconds?: number } = {}): Workspace {
+function scaffoldConcurrentFanoutWorkspace(
+  opts: { childStaggerSeconds?: number; skipChild?: string } = {},
+): Workspace {
   const root = mkdtempSync(join(tmpdir(), "conduit-blackbox-"));
   const projectRoot = join(root, "workspace");
   mkdirSync(projectRoot, { recursive: true });
@@ -678,6 +746,8 @@ function scaffoldConcurrentFanoutWorkspace(opts: { childStaggerSeconds?: number 
   // dirs must EXIST before fan-out (same rule as the per-child seed).
   for (const c of CONCURRENT_FANOUT_CHILDREN) {
     mkdirSync(join(projectRoot, c.dir), { recursive: true });
+    // The same dirs outside the project root, for the confinement journey.
+    mkdirSync(join(outsideRootOf(root), c.dir), { recursive: true });
   }
 
   const promptsDir = join(root, "prompts");
@@ -689,6 +759,8 @@ function scaffoldConcurrentFanoutWorkspace(opts: { childStaggerSeconds?: number 
     opts.childStaggerSeconds && opts.childStaggerSeconds > 0
       ? `    child_stagger_seconds: ${opts.childStaggerSeconds}\n`
       : "";
+  const skipLine =
+    opts.skipChild !== undefined ? `    skip_when: { source: seed, field: skip, equals: true }\n` : "";
 
   const flowPath = join(root, "flow.yaml");
   writeFileSync(
@@ -732,7 +804,7 @@ ${staggerLine}
     outputs: [findings.json]
     output_scope: owned_dir
     wip: 3
-
+${skipLine}
   - id: gather
     next: done
     worker:
@@ -911,6 +983,12 @@ export async function startJourneyHarness(opts?: {
   concurrentFanOut?: boolean;
   /** concurrent fan-out journey: fan-out cache-warming stagger (seconds) on the plan station; concurrentFanOut only. */
   childStaggerSeconds?: number;
+  /** concurrentFanOut only: how the proposal spells each child's owned dir (issues #73, #124). */
+  fanOutOwnedPaths?: FanOutOwnedPaths;
+  /** concurrentFanOut only: add `skip_when: { source: seed, field: skip, equals: true }` to the review station; this child's seed has skip: true. */
+  skipChild?: string;
+  /** Periodic re-drive sweep interval for the listener (CONDUIT_REDRIVE_INTERVAL_MS); default 60s. */
+  redriveIntervalMs?: number;
 }): Promise<Harness> {
   // Spawn observation (SpawnObserver / descendantPids) reads /proc, which only
   // exists on Linux. On any other platform readdirSync('/proc') throws, is
@@ -924,6 +1002,23 @@ export async function startJourneyHarness(opts?: {
     );
   }
 
+  // A skipChild that names no child, or either fan-out option set without
+  // concurrentFanOut (the serial workspace has no fan-out station and no
+  // skip_when), would change nothing, and the journey would pass on a path it
+  // did not mean to exercise. Fail before starting any server.
+  if (opts?.skipChild !== undefined && opts.concurrentFanOut !== true) {
+    throw new Error("startJourneyHarness: skipChild requires concurrentFanOut: true");
+  }
+  if (opts?.fanOutOwnedPaths !== undefined && opts.concurrentFanOut !== true) {
+    throw new Error("startJourneyHarness: fanOutOwnedPaths requires concurrentFanOut: true");
+  }
+  if (opts?.skipChild !== undefined && !CONCURRENT_FANOUT_CHILDREN.some((c) => c.id === opts.skipChild)) {
+    throw new Error(
+      `startJourneyHarness: skipChild '${opts.skipChild}' is not a CONCURRENT_FANOUT_CHILDREN id ` +
+        `(${CONCURRENT_FANOUT_CHILDREN.map((c) => c.id).join(", ")})`,
+    );
+  }
+
   const fakeSlack = startFakeSlackServer();
   const ws = opts?.concurrentFanOut
     ? scaffoldConcurrentFanoutWorkspace(opts)
@@ -931,7 +1026,10 @@ export async function startJourneyHarness(opts?: {
   const listenFlows = `journey=${ws.flowPath},httpanchor=${writeHttpAnchorFlow(ws.root)}`;
   const fakeModel = startFakeModelGateway({
     projectRoot: ws.projectRoot,
+    outsideRoot: outsideRootOf(ws.root),
     overlap: opts?.concurrentFanOut === true,
+    fanOutOwnedPaths: opts?.fanOutOwnedPaths,
+    skipChild: opts?.skipChild,
   });
   const signingSecret = randomUUID();
   const appToken = `xapp-test-${randomUUID()}`;
@@ -949,6 +1047,9 @@ export async function startJourneyHarness(opts?: {
     CONDUIT_PROJECT_ROOT: ws.projectRoot,
     CONDUIT_API_KEY: "blackbox-test-key",
     CONDUIT_BASE_URL: fakeModel.baseUrl,
+    ...(opts?.redriveIntervalMs !== undefined && {
+      CONDUIT_REDRIVE_INTERVAL_MS: String(opts.redriveIntervalMs),
+    }),
   };
 
   let listenerProc = Bun.spawn(
@@ -1019,6 +1120,8 @@ export async function startJourneyHarness(opts?: {
   const harness: Harness = {
     slackBaseUrl: fakeSlack.baseUrl,
     signingSecret,
+    projectRoot: ws.projectRoot,
+    outsideRoot: opts?.concurrentFanOut ? outsideRootOf(ws.root) : undefined,
 
     signSlackRequest(rawBody: string, timestampSec = Math.floor(Date.now() / 1000)): SignedRequest {
       const signature = computeV0Signature(signingSecret, timestampSec, rawBody);
@@ -1219,7 +1322,64 @@ export async function startJourneyHarness(opts?: {
       setDuplicateDelivery(on) {
         fakeSlack.duplicateDelivery = on;
       },
+      setIngressStorageFault(on) {
+        const db = new Database(ws.stateDbPath);
+        try {
+          db.exec("PRAGMA busy_timeout = 5000");
+          db.exec(
+            on
+              ? `CREATE TRIGGER IF NOT EXISTS blackbox_ingress_disk_full
+                   BEFORE UPDATE ON ingress_events
+                   BEGIN SELECT RAISE(ABORT, 'database or disk is full'); END`
+              : "DROP TRIGGER IF EXISTS blackbox_ingress_disk_full",
+          );
+        } finally {
+          db.close();
+        }
+      },
+      seedFailedIngressEvent(eventId) {
+        const db = new Database(ws.stateDbPath);
+        try {
+          db.exec("PRAGMA busy_timeout = 5000");
+          db.query(
+            `INSERT INTO ingress_events (event_id, received_at, spawn_state, spawn_attempts)
+             VALUES (?, ?, 'failed', 1)`,
+          ).run(eventId, Math.floor(Date.now() / 1000));
+        } finally {
+          db.close();
+        }
+      },
     },
+
+    ingressEvent(eventId) {
+      const db = new Database(ws.stateDbPath, { readonly: true });
+      try {
+        // The listener may hold the write lock: wait rather than fail SQLITE_BUSY.
+        db.exec("PRAGMA busy_timeout = 5000");
+        const row = db
+          .query(`SELECT spawn_state, spawn_attempts FROM ingress_events WHERE event_id = ?`)
+          .get(eventId) as { spawn_state: string; spawn_attempts: number } | null;
+        return row ?? undefined;
+      } finally {
+        db.close();
+      }
+    },
+
+    ingressLog() {
+      const db = new Database(ws.journalDbPath, { readonly: true });
+      try {
+        // The listener may hold the write lock: wait rather than fail SQLITE_BUSY.
+        db.exec("PRAGMA busy_timeout = 5000");
+        return db
+          .query(`SELECT source, event_id, outcome, reason FROM ingress_log ORDER BY id`)
+          .all() as Array<{ source: string; event_id: string | null; outcome: string; reason: string | null }>;
+      } finally {
+        db.close();
+      }
+    },
+
+    listenerExitCode: () => listenerProc.exitCode,
+    listenerBaseUrl,
 
     waitFor: waitForCondition,
 

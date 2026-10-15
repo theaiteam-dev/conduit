@@ -11,6 +11,29 @@ historical context, not public releases or public repository history.
 
 ## [Unreleased]
 
+### Breaking
+
+- **Breaking default:** `conduit listen` now binds its HTTP server to
+  `127.0.0.1` instead of `0.0.0.0`. Anyone serving webhooks or the Slack Events
+  API through a published container port or from another host must pass
+  `--bind 0.0.0.0` (or the specific address to listen on) after upgrading.
+  `listen` also starts no HTTP server when every served binding uses Slack
+  Socket Mode ([#44](https://github.com/theaiteam-dev/conduit/issues/44)).
+  The server starts only when a served flow has a webhook route or a Slack
+  Events API binding. A new `--bind <addr>` flag sets the address. The startup log line
+  says which case applied: no HTTP listener, loopback by default, or the
+  `--bind` address.
+
+  **Upgrade note:** before this change the server always bound `0.0.0.0`. A
+  webhook or Slack Events API deployment that receives requests from another
+  host, or through a published Docker port, now refuses those connections
+  until you add `--bind 0.0.0.0`. In a container this applies even when a
+  reverse proxy on the same host fronts it, because a published port does not
+  reach the container's loopback. `docker-compose.operator.yml` now passes
+  `--bind 0.0.0.0`; update any compose file, unit or script of your own the
+  same way. Socket-Mode-only deployments need no change and no longer open
+  port 3000.
+
 ### Added
 
 - Harness event stream ([#70](https://github.com/theaiteam-dev/conduit/issues/70)).
@@ -117,26 +140,139 @@ historical context, not public releases or public repository history.
 
 ### Changed
 
-- `conduit listen` binds its HTTP server to `127.0.0.1` by default, and starts
-  no HTTP server when every served binding uses Slack Socket Mode
-  ([#44](https://github.com/theaiteam-dev/conduit/issues/44)). The server
-  starts only when a served flow has a webhook route or a Slack Events API
-  binding. A new `--bind <addr>` flag sets the address. The startup log line
-  says which case applied: no HTTP listener, loopback by default, or the
-  `--bind` address.
-
-  **Upgrade note:** before this change the server always bound `0.0.0.0`. A
-  webhook or Slack Events API deployment that receives requests from another
-  host, or through a published Docker port, now refuses those connections
-  until you add `--bind 0.0.0.0`. In a container this applies even when a
-  reverse proxy on the same host fronts it, because a published port does not
-  reach the container's loopback. `docker-compose.operator.yml` now passes
-  `--bind 0.0.0.0`; update any compose file, unit or script of your own the
-  same way. Socket-Mode-only deployments need no change and no longer open
-  port 3000.
+- The `llexec` build stage's base image is pinned by digest
+  ([#132](https://github.com/theaiteam-dev/conduit/issues/132)): `FROM
+  alpine:3.20@sha256:d9e853e8... AS llexec`, the digest of the multi-arch index.
+  The tag alone was mutable, so two builds of one commit could compile the
+  Landlock helper with different toolchains. The runtime stage
+  (`oven/bun:1.3.11-slim`) is still pinned by tag only.
 
 ### Fixed
 
+- Fan-out owned paths resolve against the project root and stay inside it
+  ([#124](https://github.com/theaiteam-dev/conduit/issues/124),
+  [#73](https://github.com/theaiteam-dev/conduit/issues/73)). `commitFanOut`
+  resolved a child's relative `owned_paths[0]` against the kernel's cwd, so a
+  run whose cwd was not the project root (Docker, `--project-root`) rejected a
+  valid proposal with `seed_path_out_of_bounds`; `skip_when` `source: seed`
+  read `seed.json` from the cwd the same way. Both now resolve against the
+  run's project root. A proposal whose `owned_paths` entry resolves outside the
+  root (an absolute path elsewhere, a `..` escape, or a symlink pointing out)
+  is rejected with the new `owned_path_out_of_bounds` code: nothing is seeded,
+  and the parent is held with the child and path in its reason.
+  The disjoint-ownership check compared raw strings, so `./a` and `a`, a
+  relative and an absolute spelling of one dir, two symlinks to one dir, or
+  `a` and `a/b` passed as disjoint; it now compares canonical paths, and a dir
+  overlaps every path inside it, under both `reject` and `serialize`.
+  `validateExpansion` and `commitFanOut` now require `projectRoot` in their
+  options. Two seeded children whose `owned_paths[0]` resolve to one directory
+  are rejected with the new `seed_path_conflict` code, with both child ids and
+  the path in the hold reason: every `seed.json` is written before any child
+  runs, so the second seed replaced the first even when `depends_on` ordered
+  the two.
+- A gate critic that runs on a harness adapter (`check.critic.harness`) is
+  now probed and reported like a harness maker
+  ([#35](https://github.com/theaiteam-dev/conduit/issues/35)). The binary
+  probe behind `conduit run`/`resume`, `conduit doctor` and `conduit explain`
+  all keyed on `station.kind === 'harness'`, so a critic on a `kind: transform`
+  station was skipped: doctor passed with the critic's binary missing and the
+  run scrapped the card at the first gate. All three now read one collector,
+  `src/flow/station-harnesses.ts`. A missing critic binary fails with
+  `HARNESS_BINARY_NOT_FOUND` naming `Station '<id>' critic harness adapter`;
+  doctor prints `harness '<name>' (station '<id>' critic)` lines, including the
+  usage-blind notice; explain shows `critic harness=`, `critic model=`,
+  `critic agent=`, `critic tools=` and `critic usage-blind`, and now also shows
+  a harness maker's `agent=`. Deploy note: `conduit doctor` and the run
+  preflight now probe gate-critic harness binaries, so a deployment that uses
+  `doctor` as a container health check goes unhealthy if a flow configures
+  `check.critic.harness` with an adapter whose binary is not in the image.
+  Check images before rolling out. Such a flow already failed at its first
+  gate before this change.
+- The binding stamp covers prompt content and harness skills
+  ([#131](https://github.com/theaiteam-dev/conduit/issues/131),
+  [#93](https://github.com/theaiteam-dev/conduit/issues/93)). A transform or
+  harness station's `prompt_template_version` now folds the SHA-256 of the
+  template it renders (its `prompt_file`, or the `worker.uses` composition of
+  skills plus the local prompt), and a harness station folds its ordered
+  `worker.uses` skill hashes as a transform station already did. Editing a
+  prompt file or a skill without bumping `prompt_version` now re-runs the
+  station on resume and cascades downstream; a `prompt_version` bump still
+  forces a re-run. The journal's `prompt_template_version` column records the
+  new value. A gate critic is unchanged: it writes no checkpoint and already
+  renders its current prompt file on every check. Upgrade note: every
+  transform and harness checkpoint written before this change carries the old
+  stamp. A card that is mid-run at deploy time (halted, held for HITL, or
+  crashed) re-runs the station it is at, once, on its first resume, and that
+  card's downstream checkpoints are invalidated (SPEC §5 treats any stamp
+  mismatch this way). An effectful station whose outbox intent (publish,
+  commit) is already committed is not re-run: it reuses its checkpoint as
+  before, so nothing publishes twice. Completed runs and new runs are
+  unaffected. Because the stamp now needs the template, a station whose
+  prompt file cannot be read holds its card on resume even when a checkpoint
+  exists for it; before this change a checkpoint hit never read the prompt
+  file.
+- A storage error in the ingress re-drive sweep no longer escapes as an
+  unhandled rejection ([#47](https://github.com/theaiteam-dev/conduit/issues/47)).
+  `redriveOnBoot` catches per row, so one row whose bookkeeping throws (for
+  example `SQLITE_FULL` from `incrementSpawnAttempts`) is reported in the new
+  `RedriveReport.errored` and logged with the new `ingress_log` outcome
+  `sweep_error`, and the sweep goes on to the next row. The periodic runner
+  catches a sweep that fails as a whole, logs `sweep_error` with no event id
+  when the journal allows, sends one alert per run of failed sweeps on the
+  listener-global channel (`event=redrive-sweep`), and, when the failed sweep
+  made no progress (it launched, recorded or deferred no
+  row), ignores slot-release kicks until the next interval tick,
+  which sweeps again. A throwing `onSweep`
+  sink is caught too. A launched child is handed to its exit watcher before
+  the writes that follow the launch, on the sweep, the hot path and the keyed
+  pass launcher, so a storage error in those writes no longer frees the run
+  slot of a running child (which let the next sweep launch a second process
+  for the same row) or leaves its exit unrecorded. A `sweep_error` reason, in
+  the log and in the alert, is cut to 500 characters.
+
+- A duplicate webhook delivery names its run
+  ([#52](https://github.com/theaiteam-dev/conduit/issues/52)). The answer was
+  `200 {"outcome":"duplicate"}`, so a caller whose first `202` was lost in
+  transit had no way to find the run its event started. It is now
+  `200 {"outcome":"duplicate","run_id":"…"}`, read from the event's stored
+  row. On a `run_key` binding the id is present only once the event was
+  launched as a pass, folded into the pending pass or consumed by a pass; a
+  redelivery that arrives while the first is still being routed, or after the
+  run refused the event, carries no `run_id`. A refused pending pass now
+  refuses every event folded into it, not only its latest: the older ones had
+  stayed `coalesced` with no pending pass, so their duplicates named a run they
+  never joined. See `docs/ingress-listener.md`.
+- A transform gate critic that fails now scraps the card under a reason naming
+  the failure ([#42](https://github.com/theaiteam-dev/conduit/issues/42)),
+  where every failure used to scrap as `model-incompatible`:
+  `critic-verdict-invalid: <validator error>` for a verdict that parsed but
+  has the wrong shape, `critic-reject-without-findings`,
+  `critic-verdict-unparseable`, `critic-output-truncated` and
+  `critic-vision-unsupported`. `conduit run` and `conduit journal inspect`
+  print the reason. A `model-incompatible` scrap from `runTransformStation`
+  carries, as `validationError`, the validator error of the most recent
+  response that parsed (within that response, the error of the
+  highest-priority candidate). The critic reason quotes that error only when
+  it is one of the critic schema's fixed errors. Transform makers
+  and harness critics keep their reasons.
+- Two `conduit run` launches of the same run id at the same moment no longer
+  risk `fatal: UNIQUE constraint failed: runs.run_id`
+  ([#48](https://github.com/theaiteam-dev/conduit/issues/48)). `registerRun`
+  inserts the row with `ON CONFLICT(run_id) DO NOTHING` inside its existing
+  `BEGIN IMMEDIATE` transaction, and a launch whose insert finds a row answers
+  from that row as `existing` or `conflict`. The losing launch exits 1 with the
+  lease-conflict message while the winner runs, or reports the run's state
+  once it has finished. `blackbox/fault-concurrent-same-run-id.test.ts` starts
+  two launches of one run id and checks that exactly one drives it.
+- The state DB schema-mismatch error names the newer side and the remedy
+  ([#50](https://github.com/theaiteam-dev/conduit/issues/50)). It used to say
+  "Manual migration required", and Conduit has no migrate command. A DB newer
+  than the binary now says it was written by a newer Conduit, to upgrade the
+  binary or engine image, and that rolling back past a schema migration is not
+  supported. A DB older than the oldest version the binary migrates says that
+  no migration ran and why. Both name the state DB path. `docs/installation.md`
+  documents that the image pin and the state DB schema are coupled and how to
+  compare `PRAGMA user_version` with `SCHEMA_VERSION` before changing the pin.
 - A gate critic on a child-entry station can see the child's inputs. The
   critic prompt was rendered with no card scope, so a critic that referenced
   `{{seed.json}}` threw at render and the card went to `hold`. `ownedPaths` and

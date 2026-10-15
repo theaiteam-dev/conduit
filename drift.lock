@@ -3,12 +3,12 @@ version = 1
 [[bindings]]
 doc = "CLAUDE.md"
 target = "SPEC.md#the-rework-loop-and-its-four-bounding-guards"
-sig = "c589b70ef7bb72cd"
+sig = "ad4136a22b151a97"
 
 [[bindings]]
 doc = "CLAUDE.md"
 target = "src/controller/executor.ts#runExecutor"
-sig = "3db2b6e7929c2d22"
+sig = "b44655b281bc86d4"
 
 [[bindings]]
 doc = "CLAUDE.md"
@@ -19,6 +19,11 @@ sig = "6af79b5e2d52ef3d"
 doc = "SPEC.md"
 target = "src/checkpoint/checkpoint.ts#computeBindingStamp"
 sig = "c285309b07a9de1d"
+
+[[bindings]]
+doc = "SPEC.md"
+target = "src/checkpoint/checkpoint.ts#computePromptContentAwarePromptTemplateVersion"
+sig = "f266c90d1416d66d"
 
 [[bindings]]
 doc = "SPEC.md"
@@ -103,4 +108,4 @@ sig = "bd240b0922e20e22"
 [[bindings]]
 doc = "docs/installation.md"
 target = "src/cli/main.ts"
-sig = "8442a840a89e93e0"
+sig = "2a54288a7668c85c"

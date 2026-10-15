@@ -28,6 +28,9 @@
  * behavioral intent of AC1 (no partial children, clean reconcile, no duplicate
  * children) is fully covered.
  */
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, it, expect, beforeEach, afterEach, spyOn } from 'bun:test';
 import { openConduitDB, type ConduitDB, DEFAULT_RUN_ID } from '../persistence/db';
 import {
@@ -46,6 +49,13 @@ import {
   applyHoldTimeout,
   type SlackTransport,
 } from '../channels/slack';
+
+/**
+ * The project root commitFanOut confines owned_paths to; these proposals use
+ * relative paths. A fresh dir per test, so nothing left in the shared temp
+ * root can change how a path canonicalizes.
+ */
+let FANOUT_PROJECT_ROOT: string;
 
 const FLOW_ID = 'reference-pipeline';
 const CHANNEL = '#content-pipeline';
@@ -108,10 +118,12 @@ let db: ConduitDB;
 beforeEach(() => {
   db = openConduitDB({ stateDbPath: ':memory:', journalDbPath: ':memory:' });
   ensureCheckpointSchema(db.getStateDb());
+  FANOUT_PROJECT_ROOT = mkdtempSync(join(tmpdir(), 'conduit-fanout-resume-'));
 });
 
 afterEach(() => {
   db.close();
+  rmSync(FANOUT_PROJECT_ROOT, { recursive: true, force: true });
 });
 
 // ===========================================================================
@@ -133,7 +145,7 @@ describe('crash mid fan-out before commit (AC1, AC2)', () => {
   function resumeFanOut(): void {
     const parent = db.getCard(DEFAULT_RUN_ID, 'parent');
     if (parent?.status === 'awaiting_children') return; // already fanned out — skip (no duplicate)
-    commitFanOut(db, DEFAULT_RUN_ID, 'parent', proposal, { onPathConflict: 'reject' });
+    commitFanOut(db, DEFAULT_RUN_ID, 'parent', proposal, { onPathConflict: 'reject', projectRoot: FANOUT_PROJECT_ROOT });
     db.getStateDb().prepare("UPDATE cards SET status = 'awaiting_children' WHERE id = 'parent'").run();
   }
 
@@ -158,7 +170,7 @@ describe('crash mid fan-out before commit (AC1, AC2)', () => {
       return realInsert(card);
     });
 
-    expect(() => commitFanOut(db, DEFAULT_RUN_ID, 'parent', proposal, { onPathConflict: 'reject' })).toThrow(
+    expect(() => commitFanOut(db, DEFAULT_RUN_ID, 'parent', proposal, { onPathConflict: 'reject', projectRoot: FANOUT_PROJECT_ROOT })).toThrow(
       /mid fan-out/,
     );
     spy.mockRestore();
@@ -171,7 +183,7 @@ describe('crash mid fan-out before commit (AC1, AC2)', () => {
     // RESUME (BUG 2): re-driving the fan-out must NOT throw a UNIQUE constraint
     // and must reconcile to the intended child set exactly once.
     expect(() =>
-      commitFanOut(db, DEFAULT_RUN_ID, 'parent', proposal, { onPathConflict: 'reject' }),
+      commitFanOut(db, DEFAULT_RUN_ID, 'parent', proposal, { onPathConflict: 'reject', projectRoot: FANOUT_PROJECT_ROOT }),
     ).not.toThrow();
     expect(childRows(db, 'parent').map((r) => r.id)).toEqual([...INTENDED_CHILDREN]);
   });
@@ -193,7 +205,7 @@ describe('crash mid fan-out before commit (AC1, AC2)', () => {
     // Re-dispatch drives commitFanOut again. It must DETECT the existing child
     // and skip re-insertion — not crash the executor on a UNIQUE violation.
     expect(() =>
-      commitFanOut(db, DEFAULT_RUN_ID, 'parent', proposal, { onPathConflict: 'reject' }),
+      commitFanOut(db, DEFAULT_RUN_ID, 'parent', proposal, { onPathConflict: 'reject', projectRoot: FANOUT_PROJECT_ROOT }),
     ).not.toThrow();
 
     // child-0 is present exactly once — never duplicated.

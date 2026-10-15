@@ -672,6 +672,76 @@ describe('WI-563 AC4 — harness binary presence probe (FR-10)', () => {
   });
 });
 
+describe('issue #35 — the binary probe covers a gate critic harness', () => {
+  const criticGate = (criticHarness: string): StationConfig['gateCheck'] => ({
+    criticModel: '',
+    criticPromptFile: '/tmp/verify.md',
+    criticPromptVersion: '1',
+    onReject: 'draft',
+    reworkCap: 2,
+    criticInputScope: [],
+    criticHarness,
+    criticTools: ['Read'],
+  });
+
+  it('fails a missing critic binary on a kind: transform station, naming the station and the critic', async () => {
+    const registry = createHarnessRegistry([missingBinaryAdapter('codex-exec', '/usr/local/bin/codex')]);
+    const flow = flowWith({
+      draft: {
+        kind: 'transform',
+        effectful: false,
+        wip: 1,
+        inputs: [],
+        outputs: [],
+        model: 'm',
+        gateCheck: criticGate('codex-exec'),
+      },
+    });
+
+    const errors = await probeHarnessBinaries(flow, registry);
+
+    expect(errors).toHaveLength(1);
+    expect(errors[0]!.code).toBe('HARNESS_BINARY_NOT_FOUND');
+    expect(errors[0]!.message).toBe(
+      "Station 'draft' critic harness adapter 'codex-exec' binary not found at '/usr/local/bin/codex'",
+    );
+  });
+
+  it('reports the maker and the critic separately when a station has both on different adapters', async () => {
+    const registry = createHarnessRegistry([
+      missingBinaryAdapter('claude-headless', '/usr/local/bin/claude'),
+      missingBinaryAdapter('codex-exec', '/usr/local/bin/codex'),
+    ]);
+    const flow = flowWith({
+      coder: { ...harnessStation('claude-headless'), gateCheck: criticGate('codex-exec') },
+    });
+
+    const errors = await probeHarnessBinaries(flow, registry);
+
+    expect(errors.map((e) => e.message)).toEqual([
+      "Station 'coder' harness adapter 'claude-headless' binary not found at '/usr/local/bin/claude'",
+      "Station 'coder' critic harness adapter 'codex-exec' binary not found at '/usr/local/bin/codex'",
+    ]);
+  });
+
+  it('passes a present critic binary', async () => {
+    const registry = registryOf([{ name: 'codex-exec', binaryPresent: true }]);
+    const flow = flowWith({
+      draft: {
+        kind: 'transform',
+        effectful: false,
+        wip: 1,
+        inputs: [],
+        outputs: [],
+        model: 'm',
+        gateCheck: criticGate('codex-exec'),
+      },
+    });
+
+    expect(await probeHarnessBinaries(flow, registry)).toEqual([]);
+  });
+});
+
 // ---------------------------------------------------------------------------
 // AC5 — a valid harness station loads onto a frozen FlowConfig.
 // ---------------------------------------------------------------------------
