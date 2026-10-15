@@ -287,6 +287,36 @@ export function killRecordedGrandchild(projectRoot: string): void {
 }
 
 /**
+ * Whether every grandchild `expectGrandchildReaped` covers on this host has
+ * both recorded its pid and created its sentinel. A pid file alone is not
+ * enough: the fixture writes each one before that grandchild's first touch,
+ * so a kill in between leaves no sentinel and the reap assertion fails on it
+ * (issue #143).
+ */
+export function grandchildrenRunning(projectRoot: string): boolean {
+  return REQUIRED_GRANDCHILDREN.every(
+    ({ pidFile, sentinel }) =>
+      readPidFile(projectRoot, pidFile) !== undefined && sentinelMtime(projectRoot, sentinel) !== undefined,
+  );
+}
+
+/**
+ * Poll until `grandchildrenRunning` holds or `budgetMs` elapses, then assert
+ * each grandchild's pid and sentinel by label, so a timeout names the one
+ * that never started.
+ */
+export async function waitForGrandchildrenRunning(projectRoot: string, budgetMs: number): Promise<void> {
+  const deadline = Date.now() + budgetMs;
+  while (!grandchildrenRunning(projectRoot) && Date.now() < deadline) {
+    await sleep(20);
+  }
+  for (const { label, pidFile, sentinel } of REQUIRED_GRANDCHILDREN) {
+    expect(readPidFile(projectRoot, pidFile), `${label}: no pid recorded`).toBeDefined();
+    expect(sentinelMtime(projectRoot, sentinel), `${label}: sentinel was never created`).toBeDefined();
+  }
+}
+
+/**
  * Assert that the fixture's grandchildren in `projectRoot` are dead, each two
  * ways: the recorded pid disappears, and the sentinel stops advancing. A live
  * grandchild touches its sentinel every 100ms, so an unchanged mtime across
