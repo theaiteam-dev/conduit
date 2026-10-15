@@ -1815,6 +1815,59 @@ describe('re-drive sweep error boundary (issue #47)', () => {
     expect(reports).toHaveLength(2);
   });
 
+  it('does not back off when the rows after an errored row were deferred on full slots', async () => {
+    // The deferred rows wait on a slot, not on the store; the release kick is
+    // what launches them, so it must not be dropped.
+    seedFailed('e-bad', 1);
+    db.acceptIngressEvent('e-waiting', 2000);
+    const flaky = new Proxy(db, {
+      get(target, prop, receiver) {
+        if (prop === 'incrementSpawnAttempts') {
+          return (eventId: string) => {
+            if (eventId === 'e-bad') throw diskFull();
+            target.incrementSpawnAttempts(eventId);
+          };
+        }
+        return forward(target, prop, receiver);
+      },
+    });
+    // A hot-path event takes the slot the moment e-bad's errored attempt frees it.
+    let stolen = false;
+    const slots = createRunSlots({
+      capacity: 1,
+      onRelease: () => {
+        if (!stolen) {
+          stolen = true;
+          slots.tryAcquire('hot-path-run');
+        }
+      },
+    });
+    const respawn = recordingRespawn(allSpawn);
+    const reports: RedriveReport[] = [];
+    const handle = startPeriodicRedrive({
+      db: flaky,
+      respawn: respawn.seam,
+      cap: CAP,
+      intervalMs: 60_000,
+      schedule: manualSchedule().schedule,
+      slots,
+      onSweep: (r) => reports.push(r),
+    });
+
+    handle.kick();
+    await settle();
+    expect(reports[0]!.errored).toHaveLength(1);
+    expect(reports[0]!.deferred).toEqual(['e-waiting']);
+
+    // The hot-path run exits and its slot release kicks the sweep.
+    slots.release('hot-path-run');
+    handle.kick();
+    await settle();
+    handle.stop();
+    expect(reports).toHaveLength(2);
+    expect(respawn.calls).toEqual(['e-waiting']);
+  });
+
   it('alerts once per run of failed sweeps, and again after a recovery', async () => {
     const failing = new Set<keyof ConduitDB>(['listRedrivable']);
     const { alerts, calls } = recordingAlert();

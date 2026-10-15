@@ -552,7 +552,9 @@ export function startPeriodicRedrive(deps: PeriodicRedriveDeps): PeriodicRedrive
   // Issue #47. backingOff: the last sweep failed and made no progress (its
   // snapshot threw, or every row it reached threw), so kicks wait for the
   // next interval tick instead of retrying on every child exit. A sweep that
-  // launched or recorded some row is working, so kicks keep running after it.
+  // launched, recorded or deferred some row is working, so kicks keep running
+  // after it. A tick clears backingOff so it can sweep; a failed sweep sets it
+  // again before any kick runs.
   // failing: the current run of failed sweeps has already alerted.
   let backingOff = false;
   let failing = false;
@@ -577,8 +579,14 @@ export function startPeriodicRedrive(deps: PeriodicRedriveDeps): PeriodicRedrive
         ...(now !== undefined && { now }),
         ...(keyed !== undefined && { keyed }),
       });
+      // A deferred row waits on a run slot, not on the store, and the slot
+      // release kick is what launches it, so deferrals count as progress.
       progressed =
-        report.spawned.length + report.failed.length + report.permanentlyFailed.length > 0;
+        report.spawned.length +
+          report.failed.length +
+          report.permanentlyFailed.length +
+          report.deferred.length >
+        0;
       const firstError = report.errored[0];
       if (firstError !== undefined) {
         failure =
