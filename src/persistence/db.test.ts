@@ -310,6 +310,69 @@ describe('schema version guard (AC5)', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Issue #50 — the schema-mismatch error says which side is newer and what to do.
+// ---------------------------------------------------------------------------
+
+describe('schema mismatch message names the newer side and the remedy (issue #50)', () => {
+  function stampVersion(version: number): void {
+    closeConduit();
+    const raw = new Database(stateDbPath);
+    raw.exec(`PRAGMA user_version = ${version}`);
+    raw.close();
+  }
+
+  function openError(): string {
+    try {
+      db = openConduitDB({ stateDbPath, journalDbPath });
+    } catch (err) {
+      db = null;
+      return err instanceof Error ? err.message : String(err);
+    }
+    throw new Error('expected openConduitDB to throw');
+  }
+
+  it('a DB newer than the binary: names both versions, says the DB is newer, and says to upgrade', () => {
+    stampVersion(SCHEMA_VERSION + 1);
+    const msg = openError();
+    expect(msg).toContain('schema mismatch');
+    expect(msg).toContain(stateDbPath);
+    expect(msg).toContain(`schema version ${SCHEMA_VERSION + 1},`);
+    expect(msg).toContain(`supports up to version ${SCHEMA_VERSION}`);
+    expect(msg).toContain('written by a newer Conduit');
+    expect(msg).toContain('upgrade the conduit binary or engine image');
+    expect(msg).toContain('rolling back past a schema migration is not supported');
+    expect(msg).not.toContain('Manual migration required');
+  });
+
+  it('a DB older than the oldest migration: says the binary is newer and why no migration ran', () => {
+    stampVersion(1);
+    const msg = openError();
+    expect(msg).toContain('schema mismatch');
+    expect(msg).toContain(stateDbPath);
+    expect(msg).toContain('schema version 1,');
+    expect(msg).toContain(`migrates versions 2 through ${SCHEMA_VERSION - 1} to ${SCHEMA_VERSION}`);
+    expect(msg).toContain('older than the oldest version this binary can migrate');
+    expect(msg).toContain('no migration ran');
+    expect(msg).toContain('start a new state DB');
+    expect(msg).not.toContain('Manual migration required');
+  });
+
+  it('a negative user_version takes the older-DB message', () => {
+    stampVersion(-1);
+    const msg = openError();
+    expect(msg).toContain('schema version -1,');
+    expect(msg).toContain('no migration ran');
+  });
+
+  it('does not quote the state DB path, so the CLI does not append its bare-metal open hint', () => {
+    // buildProductionDeps appends a CONDUIT_STATE_DB hint to any error that
+    // contains the path in single quotes, meant for a file that cannot be opened.
+    stampVersion(SCHEMA_VERSION + 1);
+    expect(openError()).not.toContain(`'${stateDbPath}'`);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // AC6 — ingress_events.event_id is a PRIMARY KEY; duplicate insert is rejected.
 // ---------------------------------------------------------------------------
 
@@ -1622,6 +1685,36 @@ describe('WI-474 AC-5: insertRun / getRun raw accessors', () => {
     expect(() =>
       db!.insertRun({ run_id: 'run-dup', flow: 'f2', input_fingerprint: 'fp2', status: 'done' })
     ).toThrow();
+  });
+
+  it('insertRunIfAbsent inserts once, then returns false and leaves the first row unchanged (issue #48)', () => {
+    const first = {
+      run_id: 'run-once',
+      flow: 'studio',
+      project_root: '/tmp/first',
+      input_fingerprint: 'fp-first',
+      status: 'running',
+      holder_pid: 4242,
+      lease_acquired_at: 1_000,
+      holder_start_time: 5_000,
+    };
+    expect(db!.insertRunIfAbsent(first)).toBe(true);
+    const recorded = db!.getRun('run-once');
+
+    expect(
+      db!.insertRunIfAbsent({
+        run_id: 'run-once',
+        flow: 'autocut',
+        project_root: '/tmp/second',
+        input_fingerprint: 'fp-second',
+        status: 'halted',
+        holder_pid: 7777,
+        lease_acquired_at: 2_000,
+        holder_start_time: 8_000,
+      }),
+    ).toBe(false);
+    expect(db!.getRun('run-once')).toEqual(recorded);
+    expect(recorded).toMatchObject(first);
   });
 
   it('getRun returns outcome and created_at when present', () => {
