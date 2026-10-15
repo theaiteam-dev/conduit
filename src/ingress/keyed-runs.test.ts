@@ -26,6 +26,7 @@
  *     busy slot.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
+import { Database } from 'bun:sqlite';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -392,6 +393,22 @@ describe('a duplicate delivery of a keyed event (issue #52)', () => {
     await finishPass(0, 1);
 
     expect(db.getIngressLog({ outcome: 'pass_limit', eventId: olderId }).map((r) => r.source)).toEqual([arrivedFrom]);
+  });
+
+  it("logs a folded event as 'unknown' source when its own coalesced row is gone", async () => {
+    const listener = await boot(makeFlow(keyedIngress({ max_passes: 1 })));
+    await listener.handleWebhook(prEvent({ repo: 'acme/widgets', pr: 7, seq: 0 }));
+    const older = prEvent({ repo: 'acme/widgets', pr: 7, seq: 1 });
+    await listener.handleWebhook(older);
+    await listener.handleWebhook(prEvent({ repo: 'acme/widgets', pr: 7, seq: 2 }));
+    const olderId = older.headers['x-delivery']!;
+    const journal = new Database(join(dir, 'journal.sqlite'));
+    journal.prepare(`DELETE FROM ingress_log WHERE event_id = $id AND outcome = 'coalesced'`).run({ $id: olderId });
+    journal.close();
+
+    await finishPass(0, 1);
+
+    expect(db.getIngressLog({ outcome: 'pass_limit', eventId: olderId }).map((r) => r.source)).toEqual(['unknown']);
   });
 
   it('names no run for any folded event once the kernel refuses the pass that covered it', async () => {

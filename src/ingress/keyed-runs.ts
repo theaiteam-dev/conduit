@@ -324,15 +324,18 @@ function refuse(
   return { outcome, runId: keyed.run_id };
 }
 
+/** ingress_log source for a folded event whose arrival source is unknown. */
+const UNKNOWN_SOURCE = 'unknown';
+
 /**
  * The ingress_log source a folded event arrived under, read from its own
  * 'coalesced' row. ingress_events keeps no source column, and the event a
  * pass is refused for may be a drained one logged as DRAIN_SOURCE, so its
- * source would misattribute the folded events. Falls back to `fallback` when
- * the row is missing.
+ * source would misattribute the folded events. A missing row yields
+ * UNKNOWN_SOURCE rather than a guess, so the gap shows in the log.
  */
-function arrivalSource(deps: KeyedRunDeps, eventId: string, fallback: string): string {
-  return deps.db.getIngressLog({ outcome: 'coalesced', eventId, limit: 1 })[0]?.source ?? fallback;
+function arrivalSource(deps: KeyedRunDeps, eventId: string): string {
+  return deps.db.getIngressLog({ outcome: 'coalesced', eventId, limit: 1 })[0]?.source ?? UNKNOWN_SOURCE;
 }
 
 /**
@@ -358,7 +361,7 @@ function refusePass(
     if (row.event_id === event.eventId) continue;
     db.markIngressRefused(row.event_id);
     db.appendIngressLog({
-      source: arrivalSource(deps, row.event_id, event.source),
+      source: arrivalSource(deps, row.event_id),
       eventId: row.event_id,
       outcome,
       reason: `run '${keyed.run_id}' takes no new pass: ${detail} (folded into the refused pass of '${event.eventId}')`,
