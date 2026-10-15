@@ -22,6 +22,11 @@ sig = "c285309b07a9de1d"
 
 [[bindings]]
 doc = "SPEC.md"
+target = "src/checkpoint/checkpoint.ts#computePromptContentAwarePromptTemplateVersion"
+sig = "f266c90d1416d66d"
+
+[[bindings]]
+doc = "SPEC.md"
 target = "src/controller/harness-overlap.ts#OverlapWindows"
 sig = "92ccb841810270de"
 

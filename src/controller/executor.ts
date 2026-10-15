@@ -84,6 +84,7 @@ import {
   computeBindingStamp,
   computeSkillAwarePromptTemplateVersion,
   computeAgentAwarePromptTemplateVersion,
+  computePromptContentAwarePromptTemplateVersion,
   writeCheckpoint,
   readCheckpoint,
   invalidateCheckpoint,
@@ -3522,6 +3523,40 @@ async function runGateCheckOrAdvance(args: GateCheckOrAdvanceArgs): Promise<bool
 }
 
 // ---------------------------------------------------------------------------
+// Prompt template + its stamp input (SPEC §5), shared by transform and harness
+// ---------------------------------------------------------------------------
+
+/**
+ * The prompt template a transform or harness station renders: a worker.uses
+ * station's composed prompt_content (skills in order, then the local prompt,
+ * WI-555), otherwise its prompt_file read now. The caller hashes this string
+ * into the stamp and renders the same string, so the stamp describes the
+ * prompt that was sent even if the file changes between the two.
+ */
+function readStationPromptTemplate(stationConfig: StationConfig): string {
+  return stationConfig.prompt_content ?? readFileSync(stationConfig.prompt_file!, 'utf-8');
+}
+
+/**
+ * The promptTemplateVersion a transform or harness station folds into its
+ * binding stamp, before any named agent: the declared prompt_version, then
+ * the ordered content hash of each worker.uses skill (WI-557, issue #93 for
+ * harness stations), then the SHA-256 of the rendered template (issue #131).
+ * Each layer combines with the one before it, so a prompt_version bump, a
+ * skill edit, a skill reorder and a prompt edit each move the stamp.
+ */
+function stationPromptTemplateVersion(stationConfig: StationConfig, promptTemplate: string): string {
+  const skillHashes = stationConfig.skill_content_hashes;
+  const versioned =
+    skillHashes !== undefined && skillHashes.length > 0
+      ? computeSkillAwarePromptTemplateVersion(stationConfig.prompt_version ?? '', skillHashes)
+      : stationConfig.prompt_version ?? '';
+  return computePromptContentAwarePromptTemplateVersion(
+    versioned, createHash('sha256').update(promptTemplate).digest('hex'),
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Transform station (with optional gate check)
 // ---------------------------------------------------------------------------
 
@@ -3670,16 +3705,27 @@ async function executeTransformStation(args: TransformArgs): Promise<boolean> {
   // image surfaces immediately, not as an opaque gateway 400.
   assertImagePayloadWithinLimits(images);
 
-  // WI-557 (FR-4): a worker.uses station's promptTemplateVersion combines the
-  // declared prompt_version with each injected skill's content hash, in
-  // worker.uses order — so editing a skill body/references file invalidates
-  // this station's checkpoint (and cascades) on resume. A non-uses station is
-  // unaffected: skill_content_hashes is absent and the stamp input is the bare
-  // prompt_version, exactly as before this item.
-  const promptTemplateVersion =
-    stationConfig.skill_content_hashes !== undefined && stationConfig.skill_content_hashes.length > 0
-      ? computeSkillAwarePromptTemplateVersion(stationConfig.prompt_version ?? '', stationConfig.skill_content_hashes)
-      : stationConfig.prompt_version ?? '';
+  // promptTemplateVersion folds prompt_version, each worker.uses skill's
+  // content hash in order (WI-557) and the template's own content (issue #131),
+  // so editing a skill or the prompt file invalidates this station's
+  // checkpoint (and cascades) on resume. The template read here is the one
+  // rendered below. The read runs before the checkpoint check, because the
+  // stamp cannot be computed without it, so a template that cannot be read
+  // holds the card, as on the harness path, even when a checkpoint exists:
+  // without the template that checkpoint cannot be confirmed as current. It
+  // runs before any outbox intent is written, so the hold leaves none behind.
+  let promptTemplate: string;
+  try {
+    promptTemplate = readStationPromptTemplate(stationConfig);
+  } catch (readErr) {
+    escalateToHold(
+      stateDb, db, cardId, stationId, card,
+      `transform station '${stationId}' could not read its prompt template: ${(readErr as Error).message}`,
+      err, runId,
+    );
+    return false;
+  }
+  const promptTemplateVersion = stationPromptTemplateVersion(stationConfig, promptTemplate);
 
   const bindingStamp = computeBindingStamp({
     modelId: stationConfig.model!,
@@ -3771,11 +3817,7 @@ async function executeTransformStation(args: TransformArgs): Promise<boolean> {
     : null;
 
   if (stationOutput === null) {
-    // ── Render prompt from template ─────────────────────────────────────────
-    // A worker.uses station's composed prompt_content (skills-in-order, then
-    // the local prompt) is preferred over the raw prompt_file (WI-555, D1
-    // carrier option A) — the one allowed touch to this render path.
-    const promptTemplate = stationConfig.prompt_content ?? readFileSync(stationConfig.prompt_file!, 'utf-8');
+    // ── Render prompt from the template the stamp hashed ────────────────────
     const prompt = renderPrompt(promptTemplate, stationConfig.inputs, projectRoot, feedbackString, (stationConfig.image_inputs ?? []).map((d) => d.path), card.owned_paths, stationConfig.input_scope?.owned_dir);
 
     // ── Build output schema ─────────────────────────────────────────────────
@@ -4063,7 +4105,23 @@ async function executeHarnessStationBody(args: HarnessArgs): Promise<boolean> {
   // than stamping on the name alone, which would let an edited agent replay
   // from a stale checkpoint.
   const effectiveAgent = stationConfig.agent ?? harnessAdapter.agent;
-  let promptTemplateVersion = stationConfig.prompt_version ?? '';
+  // The template is read once, here, and both hashed into the stamp and
+  // rendered below, as on the transform path: prompt_version, then the
+  // worker.uses skill hashes (issue #93), then the template content (issue
+  // #131), then the agent. A template that cannot be read holds the card, as a
+  // render failure does, rather than stamping without it.
+  let promptTemplate: string;
+  try {
+    promptTemplate = readStationPromptTemplate(stationConfig);
+  } catch (readErr) {
+    escalateToHold(
+      stateDb, db, cardId, stationId, card,
+      `harness station '${stationId}' could not read its prompt template: ${(readErr as Error).message}`,
+      err, runId, true,
+    );
+    return false;
+  }
+  let promptTemplateVersion = stationPromptTemplateVersion(stationConfig, promptTemplate);
   let agentSha256: string | undefined;
   if (effectiveAgent !== undefined) {
     const definition = resolveHarnessAgent(harnessAdapter, effectiveAgent);
@@ -4122,7 +4180,8 @@ async function executeHarnessStationBody(args: HarnessArgs): Promise<boolean> {
 
   const bindingStamp = computeBindingStamp({
     modelId: effectiveModel ?? '',
-    // prompt_version, with the effective agent folded in when there is one.
+    // prompt_version, skills and template content, with the effective agent
+    // folded in when there is one.
     promptTemplateVersion,
     inputArtifactHashes: inputHashes,
     flowVersion: flow.version,
@@ -4227,7 +4286,6 @@ async function executeHarnessStationBody(args: HarnessArgs): Promise<boolean> {
     let mountedInputs: MountedInput[];
     let declaredOutputs: ResolvedOutput[];
     try {
-      const promptTemplate = stationConfig.prompt_content ?? readFileSync(stationConfig.prompt_file!, 'utf-8');
       prompt = renderPrompt(
         promptTemplate, stationConfig.inputs, projectRoot, feedbackString, [], card.owned_paths,
         stationConfig.input_scope?.owned_dir,
