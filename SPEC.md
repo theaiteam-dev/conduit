@@ -811,7 +811,12 @@ express it (this is why Conduit is a state machine, not Airflow). It is bounded 
    the API.)*
 2. **Per-execution-attempt cap.** Integrity-fail / parse-fail retries are bounded
    separately from quality rework (rev-1 H5) → on exhaustion, scrap with a
-   `model-incompatible`/`integrity` reason.
+   `model-incompatible`/`integrity` reason. A transform gate critic's failure
+   scraps under a reason naming its class instead: `critic-verdict-invalid:
+   <validator error>` (parsed, failed the verdict schema),
+   `critic-reject-without-findings`, `critic-verdict-unparseable`,
+   `critic-output-truncated` or `critic-vision-unsupported`. A harness critic
+   uses the matching `harness-critic-*` reasons.
 3. **Progress monotonicity — on the *findings*, not the artifact** (rev-1 H2). A
    rejection whose **critic findings hash** matches the previous attempt's = "same
    defect, no progress" → exhausts the cap immediately. Hashing the artifact is wrong:
@@ -1029,7 +1034,8 @@ split is harder and needs this in-transaction reservation.)*
   (schema-aligned recovery from fenced/garbled/prose-wrapped responses). A parse miss is
   a *paid re-bill* and happens on frontier models too. **Bounded:** parse retries count
   against `per_card.max_execution_attempts` (rev-1 H5); on exhaustion → scrap with
-  `model-incompatible`. Parse-miss rate is a first-class journal metric (§11).
+  `model-incompatible`, or, for a gate critic, a named `critic-*` reason (§6
+  guard 2). Parse-miss rate is a first-class journal metric (§11).
 - **Per-model adapters.** Native function-calling vs prompted XML/JSON blocks, normalized
   to the kernel tool protocol. A model with no function-calling falls back to the prompted
   adapter or is rejected at the Bench (§14) before it's allowed on a flow.
