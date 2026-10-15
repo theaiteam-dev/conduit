@@ -115,6 +115,15 @@ historical context, not public releases or public repository history.
   nullable: existing journals migrate in place, pre-split rows stay readable,
   and run/wave budgets still count the same totals (they sum all four columns).
 
+### Changed
+
+- The `llexec` build stage's base image is pinned by digest
+  ([#132](https://github.com/theaiteam-dev/conduit/issues/132)): `FROM
+  alpine:3.20@sha256:d9e853e8... AS llexec`, the digest of the multi-arch index.
+  The tag alone was mutable, so two builds of one commit could compile the
+  Landlock helper with different toolchains. The runtime stage
+  (`oven/bun:1.3.11-slim`) is still pinned by tag only.
+
 ### Fixed
 
 - A storage error in the ingress re-drive sweep no longer escapes as an
@@ -134,6 +143,24 @@ historical context, not public releases or public repository history.
   slot of a running child (which let the next sweep launch a second process
   for the same row) or leaves its exit unrecorded. A `sweep_error` reason, in
   the log and in the alert, is cut to 500 characters.
+- Two `conduit run` launches of the same run id at the same moment no longer
+  risk `fatal: UNIQUE constraint failed: runs.run_id`
+  ([#48](https://github.com/theaiteam-dev/conduit/issues/48)). `registerRun`
+  inserts the row with `ON CONFLICT(run_id) DO NOTHING` inside its existing
+  `BEGIN IMMEDIATE` transaction, and a launch whose insert finds a row answers
+  from that row as `existing` or `conflict`. The losing launch exits 1 with the
+  lease-conflict message while the winner runs, or reports the run's state
+  once it has finished. `blackbox/fault-concurrent-same-run-id.test.ts` starts
+  two launches of one run id and checks that exactly one drives it.
+- The state DB schema-mismatch error names the newer side and the remedy
+  ([#50](https://github.com/theaiteam-dev/conduit/issues/50)). It used to say
+  "Manual migration required", and Conduit has no migrate command. A DB newer
+  than the binary now says it was written by a newer Conduit, to upgrade the
+  binary or engine image, and that rolling back past a schema migration is not
+  supported. A DB older than the oldest version the binary migrates says that
+  no migration ran and why. Both name the state DB path. `docs/installation.md`
+  documents that the image pin and the state DB schema are coupled and how to
+  compare `PRAGMA user_version` with `SCHEMA_VERSION` before changing the pin.
 - A gate critic on a child-entry station can see the child's inputs. The
   critic prompt was rendered with no card scope, so a critic that referenced
   `{{seed.json}}` threw at render and the card went to `hold`. `ownedPaths` and
