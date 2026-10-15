@@ -1742,6 +1742,37 @@ describe('re-drive sweep error boundary (issue #47)', () => {
     expect(reports).toHaveLength(4);
   });
 
+  it('a tick whose sweep also fails re-arms the backoff, including for a kick queued during it', async () => {
+    // runSweep clears backingOff when a tick starts so that the tick can
+    // sweep; a sweep that fails again with no progress sets it back before
+    // any kick is let through.
+    seedFailed('e-still-full', 1);
+    const failing = new Set<keyof ConduitDB>(['incrementSpawnAttempts']);
+    const reports: RedriveReport[] = [];
+    const clock = manualSchedule();
+    const handle = startPeriodicRedrive({
+      db: faultyDb(failing),
+      respawn: recordingRespawn(allSpawn).seam,
+      cap: CAP,
+      intervalMs: 60_000,
+      schedule: clock.schedule,
+      onSweep: (r) => reports.push(r),
+    });
+
+    clock.fire();
+    await settle();
+    clock.fire(); // backing off: the tick still sweeps, and fails again
+    handle.kick(); // arrives mid-sweep, so it is coalesced as the follow-up
+    await settle();
+    expect(reports).toHaveLength(2); // the coalesced follow-up was dropped
+
+    handle.kick();
+    await settle();
+    handle.stop();
+    expect(reports).toHaveLength(2);
+    expect(db.getIngressEvent('e-still-full')).toMatchObject({ spawn_state: 'failed', spawn_attempts: 1 });
+  });
+
   it('does not back off when the sweep made progress past an errored row', async () => {
     seedFailed('e-bad', 1);
     db.acceptIngressEvent('e-good', 2000);
