@@ -47,10 +47,24 @@ user or CI consumer actually sees, not internal implementation details.
 - `harness-happy-path.test.ts`: one harness maker writes its declared output
   and the card reaches `done`; checks exit code, `run status` occupancy, the
   `<station>.harness` span and its usage, and the argv the kernel passed.
+- `fault-concurrent-same-run-id.test.ts`: two `conduit run` launches of one
+  run id start at the same moment (issue #48), over five fresh workspaces.
+  Neither prints a constraint error, the stub is called once, and the card
+  reaches `done` with one `research.harness` span. The other launch exits 1
+  with the lease-conflict message naming the run, or, if the winner already
+  finished, exits 0 after reporting the run's state.
 - `harness-gate-critic.test.ts`: a harness maker gated by an agentic
   (`check.critic.harness`) critic. The critic rejects then passes, and the
   card goes back through the maker to `done`; a second case always rejects
   and the per-gate `rework_cap` scraps the card.
+- `transform-critic-scrap-reason.test.ts`: a transform maker gated by a
+  transform critic, against a fake OpenAI-compatible gateway on
+  `CONDUIT_BASE_URL` (issue #42). The critic answers `{"accept": true}`,
+  prose with no JSON, or a verdict cut off at `finish_reason: length`, and the
+  card is scrapped as `critic-verdict-invalid: <validator error>`,
+  `critic-verdict-unparseable` or `critic-output-truncated`; `conduit run`
+  and `journal inspect` both print the reason, and neither prints
+  `model-incompatible`.
 - `harness-critic-budget.test.ts`: the run token budget counts the critic's
   spend (issue #26). Maker alone is under budget, maker plus critic is over,
   and the run halts on the tokens andon; a control run with more budget
@@ -215,9 +229,24 @@ user or CI consumer actually sees, not internal implementation details.
   its target, a dir the sweep cannot remove does not stop the run, and the
   run's own `conduit-claude-config-` dir, tagged with the kernel's pid and
   start time, is gone after the run.
+- `schema-mismatch.test.ts`: a state DB stamped with a schema version the
+  binary cannot open (issue #50). Stamped far above the binary's version,
+  `conduit run status` exits nonzero and says the DB was written by a newer
+  Conduit and to upgrade the binary or image; stamped at version 1,
+  `conduit doctor` says the DB is older than the oldest version the binary
+  migrates and no migration ran. Both leave `PRAGMA user_version` unchanged,
+  and the version the message says the binary supports is the one the CLI
+  stamps on a fresh DB.
 - `no-internal-imports.test.ts` + `harness/import-scan.ts` — the zero-imports
   gate (AC-1): a TypeScript-compiler-API scan that fails if any file under
   `blackbox/` imports anything resolving into `src/`.
+- `webhook-duplicate-run-id.test.ts`: a duplicate webhook delivery names the
+  run the original started (issue #52). It boots `conduit listen` with two
+  HMAC-signed webhook flows of one deterministic station each, one unkeyed and
+  one keyed on `run_key`, without the journey harness or Slack. Per route it
+  POSTs the same delivery twice: the first answers `202` `accepted` with a
+  `run_id`, the second `200 {"outcome":"duplicate","run_id":…}` with the same
+  id, and `conduit run status --run <id>` finds that run.
 - `scaffold.test.ts` — pins the plumbing in this file (test-script scoping,
   the required `blackbox` CI job's name and unfiltered trigger).
 

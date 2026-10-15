@@ -253,15 +253,34 @@ describe('handleWebhookRequest — ack on accept (the original acknowledgement-o
     expect(db.getIngressEvent('evt-1')).toMatchObject({ spawn_state: 'spawned' });
   });
 
-  it('answers 200 and names the duplicate outcome on a re-delivery', async () => {
+  it('answers 200 and names the duplicate outcome on a re-delivery, with the run id of the first 202', async () => {
+    // Issue #52: the lost-ack case. The first 202 carrying run_id never
+    // reached the caller, so the redelivery's answer is the only way to
+    // connect the event to its run.
     const deps = makeDeps({ authOk: true });
     const req = makeRequest();
 
-    await handleWebhookRequest(deps, req);
+    const first = await handleWebhookRequest(deps, req);
     const second = await handleWebhookRequest(deps, req);
 
+    expect(first.status).toBe(202);
+    const firstRunId = (JSON.parse(first.body!) as { run_id: string }).run_id;
+    expect(firstRunId).toBe(spawnCalls[0].runId);
     expect(second.status).toBe(200);
-    expect(JSON.parse(second.body!)).toEqual({ outcome: 'duplicate' });
+    expect(JSON.parse(second.body!)).toEqual({ outcome: 'duplicate', run_id: firstRunId });
+  });
+
+  it('omits run_id on a duplicate whose stored row has no run id (a pre-v9 row)', async () => {
+    // A row accepted before attribution existed records no run id. Deriving
+    // one from this delivery would be a guess, so the answer carries none.
+    const deps = makeDeps({ authOk: true });
+    db.acceptIngressEvent('evt-1', 500);
+
+    const res = await handleWebhookRequest(deps, makeRequest());
+
+    expect(res.status).toBe(200);
+    expect(JSON.parse(res.body!)).toEqual({ outcome: 'duplicate' });
+    expect(spawnCalls).toHaveLength(0);
   });
 });
 

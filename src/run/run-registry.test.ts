@@ -284,6 +284,69 @@ describe('registerRun: a failed launch is retried in place', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Issue #48: two launches of one run id register at the same moment. The read
+// and the insert share one BEGIN IMMEDIATE transaction, so across connections
+// the second launch waits and reads the first one's row. The insert must still
+// not throw when a row appears between the read and the write: the loser takes
+// the existing or conflict path instead of dying on the primary key.
+// ---------------------------------------------------------------------------
+
+describe('registerRun: a row recorded between the read and the insert (issue #48)', () => {
+  const WINNER = { pid: 4242, acquiredAt: 1_000, startTime: 5_000 };
+  const LOSER = { pid: 7777, acquiredAt: 1_001, startTime: 8_000 };
+  const LIVE = { isPidAlive: () => true, processStartTime: () => 5_000 };
+
+  /**
+   * Force the interleave: the first `getRun` inside registerRun reports no
+   * row, and before it returns another writer records the run with its own
+   * flow, fingerprint and lease. Later reads see the row. The other writer
+   * uses the same connection, because a second connection cannot write while
+   * registerRun holds the IMMEDIATE lock; that lock is what keeps this
+   * interleave out of two real processes.
+   */
+  function racedBy(runId: string, fingerprint: string): void {
+    const realGetRun = db.getRun.bind(db);
+    let raced = false;
+    db.getRun = (id: string) => {
+      if (raced || id !== runId) return realGetRun(id);
+      raced = true;
+      db.insertRun({
+        run_id: runId,
+        flow: 'studio',
+        input_fingerprint: fingerprint,
+        status: 'running',
+        holder_pid: WINNER.pid,
+        lease_acquired_at: WINNER.acquiredAt,
+        holder_start_time: WINNER.startTime,
+      });
+      return null;
+    };
+  }
+
+  it('reports existing, not a UNIQUE constraint error, when the other writer registered the same input', () => {
+    racedBy('run-race', 'fp');
+    const result = registerRun(db, 'run-race', 'studio', 'fp', undefined, LOSER, LIVE);
+    expect(result.kind).toBe('existing');
+    expect((result as Extract<RegisterRunResult, { kind: 'existing' }>).run.input_fingerprint).toBe('fp');
+  });
+
+  it('reports conflict when the other writer registered a different input', () => {
+    racedBy('run-race', 'fp-winner');
+    const result = registerRun(db, 'run-race', 'studio', 'fp-loser', undefined, LOSER, LIVE);
+    expect(result.kind).toBe('conflict');
+    expect((result as Extract<RegisterRunResult, { kind: 'conflict' }>).recorded.input_fingerprint).toBe('fp-winner');
+  });
+
+  it("leaves the winner's row and lease untouched", () => {
+    racedBy('run-race', 'fp');
+    registerRun(db, 'run-race', 'studio', 'fp', undefined, LOSER, LIVE);
+    expect(peekRunLeaseHolder(db, 'run-race')).toEqual({ holderPid: 4242, acquiredAt: 1_000, holderStartTime: 5_000 });
+    const count = db.getStateDb().prepare(`SELECT COUNT(*) AS n FROM runs WHERE run_id = 'run-race'`).get() as { n: number };
+    expect(count.n).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // AC-3: conflict detection — same id, different flow or fingerprint → 'conflict'.
 // ---------------------------------------------------------------------------
 
