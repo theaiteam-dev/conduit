@@ -157,8 +157,9 @@ export interface Harness {
    * A directory beside the project root, outside it. With
    * `fanOutOwnedPaths: "outside"`, each child's proposed owned dir is
    * `<outsideRoot>/<child dir>`, pre-created so only confinement can reject it.
+   * Undefined on a serial journey, which never creates it.
    */
-  outsideRoot: string;
+  outsideRoot: string | undefined;
 }
 
 /**
@@ -1044,7 +1045,7 @@ export async function startJourneyHarness(opts?: {
     slackBaseUrl: fakeSlack.baseUrl,
     signingSecret,
     projectRoot: ws.projectRoot,
-    outsideRoot: outsideRootOf(ws.root),
+    outsideRoot: opts?.concurrentFanOut ? outsideRootOf(ws.root) : undefined,
 
     signSlackRequest(rawBody: string, timestampSec = Math.floor(Date.now() / 1000)): SignedRequest {
       const signature = computeV0Signature(signingSecret, timestampSec, rawBody);

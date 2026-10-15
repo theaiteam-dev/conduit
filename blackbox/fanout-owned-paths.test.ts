@@ -146,8 +146,9 @@ describe("fan-out owned_paths outside the project root are rejected (#73, shippe
       const runId = runIdFromArgs(h.spawns.runInvocations()[0]!.args)!;
       expect(runId).toBeDefined();
 
+      const outsideRoot = h.outsideRoot!;
       const first = CONCURRENT_FANOUT_CHILDREN[0]!;
-      const escaping = join(h.outsideRoot, first.dir);
+      const escaping = join(outsideRoot, first.dir);
       let journey: { stdout: string; exitCode: number } | undefined;
       await h.waitFor(
         async () => {
@@ -162,8 +163,8 @@ describe("fan-out owned_paths outside the project root are rejected (#73, shippe
 
       // The escaping directories exist, so only confinement stopped the seed.
       for (const c of CONCURRENT_FANOUT_CHILDREN) {
-        expect(existsSync(join(h.outsideRoot, c.dir))).toBe(true);
-        expect(existsSync(join(h.outsideRoot, c.dir, "seed.json"))).toBe(false);
+        expect(existsSync(join(outsideRoot, c.dir))).toBe(true);
+        expect(existsSync(join(outsideRoot, c.dir, "seed.json"))).toBe(false);
         expect(() => h.assert.artifactContent(`${c.dir}/seed.json`)).toThrow();
       }
 

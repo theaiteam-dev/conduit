@@ -911,18 +911,20 @@ async function crashMidFanOut(): Promise<OracleTrial> {
     rmSync(fanOutProjectRoot, { recursive: true, force: true });
     throw err;
   }
-  const stateDb = db.getStateDb();
 
-  const proposal: ArchitectProposal = {
-    children: CHILD_IDS.map((id) => ({
-      id,
-      depends_on: [],
-      owned_paths: [`out/${id}.json`],
-    })),
-  };
-
+  // Everything after the db open runs inside the try, so its finally removes
+  // the temp root whatever throws.
   try {
+    const stateDb = db.getStateDb();
     ensureCheckpointSchema(stateDb);
+
+    const proposal: ArchitectProposal = {
+      children: CHILD_IDS.map((id) => ({
+        id,
+        depends_on: [],
+        owned_paths: [`out/${id}.json`],
+      })),
+    };
 
     // Insert parent card — fan-out execution began but not yet committed.
     stateDb
