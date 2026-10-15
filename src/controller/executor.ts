@@ -3449,7 +3449,7 @@ async function runGateCheckOrAdvance(args: GateCheckOrAdvanceArgs): Promise<bool
       case 'scrap': {
         // Direct scrap decisions from gate-rework (rework_cap with capPolicy=scrap,
         // no_progress, invalid_verdict, or a propagated gate-check reason —
-        // 'model-incompatible' for a transform critic, a distinct
+        // a 'critic-*' reason for a transform critic (issue #42), a distinct
         // 'harness-critic-*' reason for an agentic one, a pre-public engine review) bypass
         // the FSM.
         //

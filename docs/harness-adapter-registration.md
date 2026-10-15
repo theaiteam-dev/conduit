@@ -561,6 +561,18 @@ failure mode scraps under its own named reason
 `model-incompatible` label — each names the specific thing that went wrong
 in `gate_verdict` / journal output.
 
+A transform critic (`check.critic.model`, no `harness`) returns the same
+verdict shape as its response text and is retried up to
+`max_execution_attempts`. When no attempt yields a valid verdict, it scraps
+under the matching `critic-*` reason: `critic-verdict-invalid: <validator
+error>` when the response parsed but failed the shape on the last attempt
+that parsed (only a known schema error is quoted; any other gives a bare
+`critic-verdict-invalid`, so model output never reaches the journal),
+`critic-reject-without-findings`, `critic-verdict-unparseable`
+when no attempt parsed, `critic-output-truncated` when the model stopped at
+`max_tokens`, and `critic-vision-unsupported` when the model refused image
+input. `model-incompatible` stays the reason for a transform maker.
+
 [`examples/prompts/research-critic.md`](../examples/prompts/research-critic.md)
 is the reference critic prompt that instructs the model to write exactly this
 shape — see [`examples/research-flow.yaml`](../examples/research-flow.yaml)
