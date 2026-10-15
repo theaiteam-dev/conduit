@@ -723,11 +723,16 @@ binding = hash(model_id, prompt_template_version, resolved_input_artifact_hashes
 ```
 
 `prompt_template_version` covers everything that becomes part of the worker's prompt,
-not only the template file. A `worker.uses` station folds the content hash of each
-injected skill into it, in declared order. A `kind: harness` station that runs a named
+not only the declared `prompt_version`. On a `transform` or `kind: harness` station it
+combines `prompt_version`, then the content hash of each `worker.uses` skill in declared
+order, then the SHA-256 of the template the station renders (the skills and the local
+`prompt_file` as composed, or the `prompt_file` alone). Editing a prompt file or a skill
+therefore invalidates the checkpoint without a `prompt_version` bump, and a bump still
+forces a re-run with the files unchanged. A `kind: harness` station that runs a named
 agent folds in the agent's name and the SHA-256 of its definition file, which the kernel
 locates in the adapter's configured plugin dirs. A station whose agent definition cannot be
-located holds rather than stamping on the name alone.
+located holds rather than stamping on the name alone. A gate critic writes no checkpoint and
+is never skipped, so each check renders the critic's current `prompt_file`.
 
 On resume, a completed station is skipped **only if its binding stamp matches the
 current config.** On mismatch the checkpoint is **invalidated and the invalidation

@@ -28,6 +28,7 @@ import pc from 'picocolors';
 import { table } from 'table';
 import type { FanInPolicyConfig, FlowConfig, StationConfig } from '../types/kernel';
 import type { HarnessRegistry } from '../worker/harness-adapter';
+import { stationHarnesses } from '../flow/station-harnesses';
 
 const DEFAULT_TERMINALS = ['done', 'scrap', 'hold'];
 type Colors = ReturnType<typeof pc.createColors>;
@@ -529,9 +530,14 @@ function stationKindLabel(station: StationConfig): string {
 
 /**
  * Harness-specific explain surface (WI-573, NFR-Op-4): the flow author's
- * mental model must match the runtime. Returns [] for non-harness stations.
- *   - adapter identity (station.harness) and the declared tools allowlist —
- *     available from the frozen StationConfig alone (WI-559), no registry.
+ * mental model must match the runtime. Returns [] for a station that uses no
+ * harness. Covers the `kind: harness` maker and a `check.critic.harness` gate
+ * critic on a station of any kind (issue #35, via `stationHarnesses`); every
+ * critic entry is prefixed `critic ` so it is not read as the maker's.
+ *   - adapter identity and the declared tools allowlist, plus the critic's
+ *     model and either role's agent, available from the frozen StationConfig
+ *     alone (WI-559), no registry. The maker's model already renders as
+ *     `model=`.
  *   - a VISIBLE unrestricted_tools waiver WARNING (NFR-Security-3) — the
  *     operator must SEE a security opt-out, never a silent one.
  *   - a usage-blind indicator (NFR-Op-2) — only resolvable via the engine-config
@@ -539,19 +545,23 @@ function stationKindLabel(station: StationConfig): string {
  *     so this entry appears only when `harnessRegistry` is supplied.
  */
 function harnessDetails(station: StationConfig, harnessRegistry?: HarnessRegistry): string[] {
-  if (station.kind !== 'harness') return [];
   const details: string[] = [];
-  if (station.harness !== undefined) details.push(`harness=${station.harness}`);
-  if (station.tools !== undefined && station.tools.length > 0) {
-    details.push(`tools=${station.tools.join(',')}`);
-  }
-  if (station.unrestricted_tools === true) {
-    details.push('WARNING: unrestricted_tools waiver active (tools allowlist not enforced)');
-  }
-  if (harnessRegistry !== undefined && station.harness !== undefined) {
-    const resolved = harnessRegistry.resolve(station.harness);
-    if (resolved.ok && resolved.adapter.reportsUsage === false) {
-      details.push('usage-blind (adapter cannot report token/cost usage)');
+  for (const use of stationHarnesses(station)) {
+    const prefix = use.role === 'critic' ? 'critic ' : '';
+    details.push(`${prefix}harness=${use.adapter}`);
+    if (use.role === 'critic' && use.model !== undefined) details.push(`critic model=${use.model}`);
+    if (use.agent !== undefined) details.push(`${prefix}agent=${use.agent}`);
+    if (use.tools !== undefined && use.tools.length > 0) {
+      details.push(`${prefix}tools=${use.tools.join(',')}`);
+    }
+    if (use.unrestrictedTools) {
+      details.push('WARNING: unrestricted_tools waiver active (tools allowlist not enforced)');
+    }
+    if (harnessRegistry !== undefined) {
+      const resolved = harnessRegistry.resolve(use.adapter);
+      if (resolved.ok && resolved.adapter.reportsUsage === false) {
+        details.push(`${prefix}usage-blind (adapter cannot report token/cost usage)`);
+      }
     }
   }
   return details;

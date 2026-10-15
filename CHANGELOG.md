@@ -147,6 +147,48 @@ historical context, not public releases or public repository history.
   the path in the hold reason: every `seed.json` is written before any child
   runs, so the second seed replaced the first even when `depends_on` ordered
   the two.
+- A gate critic that runs on a harness adapter (`check.critic.harness`) is
+  now probed and reported like a harness maker
+  ([#35](https://github.com/theaiteam-dev/conduit/issues/35)). The binary
+  probe behind `conduit run`/`resume`, `conduit doctor` and `conduit explain`
+  all keyed on `station.kind === 'harness'`, so a critic on a `kind: transform`
+  station was skipped: doctor passed with the critic's binary missing and the
+  run scrapped the card at the first gate. All three now read one collector,
+  `src/flow/station-harnesses.ts`. A missing critic binary fails with
+  `HARNESS_BINARY_NOT_FOUND` naming `Station '<id>' critic harness adapter`;
+  doctor prints `harness '<name>' (station '<id>' critic)` lines, including the
+  usage-blind notice; explain shows `critic harness=`, `critic model=`,
+  `critic agent=`, `critic tools=` and `critic usage-blind`, and now also shows
+  a harness maker's `agent=`. Deploy note: `conduit doctor` and the run
+  preflight now probe gate-critic harness binaries, so a deployment that uses
+  `doctor` as a container health check goes unhealthy if a flow configures
+  `check.critic.harness` with an adapter whose binary is not in the image.
+  Check images before rolling out. Such a flow already failed at its first
+  gate before this change.
+- The binding stamp covers prompt content and harness skills
+  ([#131](https://github.com/theaiteam-dev/conduit/issues/131),
+  [#93](https://github.com/theaiteam-dev/conduit/issues/93)). A transform or
+  harness station's `prompt_template_version` now folds the SHA-256 of the
+  template it renders (its `prompt_file`, or the `worker.uses` composition of
+  skills plus the local prompt), and a harness station folds its ordered
+  `worker.uses` skill hashes as a transform station already did. Editing a
+  prompt file or a skill without bumping `prompt_version` now re-runs the
+  station on resume and cascades downstream; a `prompt_version` bump still
+  forces a re-run. The journal's `prompt_template_version` column records the
+  new value. A gate critic is unchanged: it writes no checkpoint and already
+  renders its current prompt file on every check. Upgrade note: every
+  transform and harness checkpoint written before this change carries the old
+  stamp. A card that is mid-run at deploy time (halted, held for HITL, or
+  crashed) re-runs the station it is at, once, on its first resume, and that
+  card's downstream checkpoints are invalidated (SPEC §5 treats any stamp
+  mismatch this way). An effectful station whose outbox intent (publish,
+  commit) is already committed is not re-run: it reuses its checkpoint as
+  before, so nothing publishes twice. Completed runs and new runs are
+  unaffected. Because the stamp now needs the template, a station whose
+  prompt file cannot be read holds its card on resume even when a checkpoint
+  exists for it; before this change a checkpoint hit never read the prompt
+  file.
+
 - A duplicate webhook delivery names its run
   ([#52](https://github.com/theaiteam-dev/conduit/issues/52)). The answer was
   `200 {"outcome":"duplicate"}`, so a caller whose first `202` was lost in

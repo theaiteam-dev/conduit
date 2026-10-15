@@ -61,6 +61,7 @@ import { parseHarnessConfig } from '../worker/harness-config';
 import { describeContainment, resolveContainment, type Containment } from '../worker/cgroup-containment';
 import { describeWriteConfinement, resolveWriteConfinement, type WriteConfinement } from '../worker/landlock-confinement';
 import { loadFlow, probeHarnessBinaries } from '../flow/load';
+import { flowHarnesses } from '../flow/station-harnesses';
 import { reclaimOrphanedWorkers } from '../dispatch/claim';
 import { ensureCheckpointSchema, reconcileOnResume } from '../checkpoint/checkpoint';
 import { runExecutor, resolveSlackFetchTimeoutMs, resolveSocketConnectionsOpenUrl, type SubflowSeam, type SubflowInvocation } from '../controller/executor';
@@ -2258,19 +2259,20 @@ async function cmdDoctor(argv: string[], deps: CliDeps): Promise<number> {
         const registry = deps.harnessRegistry;
         const harnessErrors = await probeHarnessBinaries(flowResult.flow, registry);
         if (harnessErrors.length > 0) anyFail = true;
-        for (const [stationId, station] of Object.entries(flowResult.flow.stations)) {
-          if (station.kind !== 'harness' || station.harness === undefined) continue;
-          const resolved = registry.resolve(station.harness);
+        // Issue #35: flowHarnesses lists gate critics too, whatever their station's kind.
+        for (const use of flowHarnesses(flowResult.flow)) {
+          const resolved = registry.resolve(use.adapter);
           if (!resolved.ok) continue; // load-time UNKNOWN_HARNESS_ADAPTER already covers this
           const probe = await resolved.adapter.probeBinary();
           const status = probe.present ? 'ok' : 'FAIL';
           const pathDetail = probe.detail !== undefined ? ` at '${probe.detail}'` : '';
-          deps.io.out(
-            `  harness '${resolved.adapter.name}' (station '${stationId}')${pathDetail}: ${status}`,
-          );
+          const owner = use.role === 'critic' ? `station '${use.stationId}' critic` : `station '${use.stationId}'`;
+          deps.io.out(`  harness '${resolved.adapter.name}' (${owner})${pathDetail}: ${status}`);
           if (resolved.adapter.reportsUsage === false) {
+            // The maker's line keeps its original shape; the critic's names its station and role.
+            const subject = use.role === 'critic' ? ` (${owner})` : '';
             deps.io.out(
-              `  harness '${resolved.adapter.name}' is usage-blind (cannot report token/cost usage)`,
+              `  harness '${resolved.adapter.name}'${subject} is usage-blind (cannot report token/cost usage)`,
             );
           }
         }

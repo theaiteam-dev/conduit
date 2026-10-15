@@ -412,3 +412,193 @@ describe('finding 4 — run/resume fail at startup on a missing harness binary (
     expect(io.errors.join('\n')).toContain('HARNESS_BINARY_NOT_FOUND');
   });
 });
+
+// ---------------------------------------------------------------------------
+// Issue #35 — a gate critic on a harness adapter is a harness too, whatever the
+// station's own kind. explain, doctor and the startup probe must all list it,
+// labelled as the critic's so it is not read as the maker's.
+// ---------------------------------------------------------------------------
+
+const CRITIC_GATE: StationGateConfig = {
+  ...GATE,
+  criticModel: 'gpt-5',
+  criticHarness: 'codex-exec',
+  criticTools: ['Read', 'Bash(ls)'],
+  criticAgent: 'reviewer',
+};
+
+function transformStation(overrides: Partial<StationConfig> = {}): StationConfig {
+  return { kind: 'transform', effectful: false, wip: 1, inputs: [], outputs: [], model: 'sonnet', ...overrides };
+}
+
+/** Drop table borders and collapse whitespace, so a note the rich table wrapped reads as one line. */
+function flatten(out: string): string {
+  return out.replace(/[║│]/g, ' ').replace(/\s+/g, ' ');
+}
+
+describe('issue #35 — explain renders a harness critic', () => {
+  it.each(MODES)('renders the critic adapter, model, agent and tools on a kind: transform station (%s)', (_mode, opts) => {
+    const flow = makeFlow({ draft: transformStation({ gateCheck: CRITIC_GATE }) });
+
+    const out = flatten(renderFlow(flow, opts));
+
+    expect(out).toContain('critic harness=codex-exec');
+    expect(out).toContain('critic model=gpt-5');
+    expect(out).toContain('critic agent=reviewer');
+    expect(out).toContain('critic tools=Read,Bash(ls)');
+    // No maker harness on a transform station.
+    expect(out).not.toMatch(/(?<!critic )harness=/);
+  });
+
+  it.each(MODES)('omits critic model and agent when the critic declares neither (%s)', (_mode, opts) => {
+    // The loader stores an undeclared critic model as ''.
+    const gate: StationGateConfig = { ...GATE, criticModel: '', criticHarness: 'codex-exec', criticTools: ['Read'] };
+    const flow = makeFlow({ draft: transformStation({ gateCheck: gate }) });
+
+    const out = flatten(renderFlow(flow, opts));
+
+    expect(out).toContain('critic harness=codex-exec');
+    expect(out).not.toContain('critic model=');
+    expect(out).not.toContain('critic agent=');
+  });
+
+  it.each(MODES)("renders a usage-blind critic adapter as the critic's (%s)", (_mode, opts) => {
+    const flow = makeFlow({ draft: transformStation({ gateCheck: CRITIC_GATE }) });
+    const registry = createHarnessRegistry([
+      makeFakeHarnessAdapter({ name: 'codex-exec', reportsUsage: false }).adapter,
+    ]);
+
+    const out = flatten(renderFlow(flow, { ...opts, harnessRegistry: registry }));
+
+    expect(out).toContain('critic usage-blind');
+  });
+
+  it.each(MODES)('reports both the maker and the critic when they use different adapters (%s)', (_mode, opts) => {
+    const flow = makeFlow({ coder: harnessStation({ agent: 'team:coder', gateCheck: CRITIC_GATE }) });
+    const registry = createHarnessRegistry([
+      makeFakeHarnessAdapter({ name: 'claude-headless', reportsUsage: false }).adapter,
+      makeFakeHarnessAdapter({ name: 'codex-exec', reportsUsage: true }).adapter,
+    ]);
+
+    const out = flatten(renderFlow(flow, { ...opts, harnessRegistry: registry }));
+
+    expect(out).toContain('harness=claude-headless');
+    expect(out).toContain('agent=team:coder');
+    expect(out).toContain('critic harness=codex-exec');
+    // Only the maker's adapter is usage-blind here.
+    expect(out).toContain('usage-blind (adapter cannot report token/cost usage)');
+    expect(out).not.toContain('critic usage-blind');
+  });
+});
+
+/** A maker of `makerKind` gated by a harness critic on `criticAdapter`. */
+function writeCriticFlow(criticAdapter: string, makerKind: 'transform' | 'harness' = 'transform'): string {
+  mkdirSync(join(dir, 'prompts'), { recursive: true });
+  writeFileSync(join(dir, 'prompts', 'coder.md'), 'Implement the task.');
+  writeFileSync(join(dir, 'prompts', 'verify.md'), 'Check the work.');
+  const makerHarness = makerKind === 'harness' ? '\n      harness: claude-headless\n      tools: [Read, Write]' : '';
+  const yaml = `
+flow: issue35-doctor
+flow_version: 1
+terminal_lanes: [done, scrap, hold]
+stations:
+  - id: draft
+    worker:
+      kind: ${makerKind}${makerHarness}
+      model: sonnet
+      prompt_file: prompts/coder.md
+      prompt_version: "1"
+      output_schema:
+        fields:
+          - { name: result, type: string, required: true }
+    inputs: [task.md]
+    outputs: [result.md]
+    next: done
+    check:
+      kind: gate
+      critic:
+        role: critic
+        harness: ${criticAdapter}
+        tools: [Read]
+        prompt_file: prompts/verify.md
+        prompt_version: "1"
+      on_reject: draft
+`;
+  const path = join(dir, 'flow.yaml');
+  writeFileSync(path, yaml, 'utf-8');
+  return path;
+}
+
+describe('issue #35 — doctor probes a harness critic', () => {
+  it('prints a critic probe line and fails when the critic binary of a kind: transform station is missing', async () => {
+    const registry = createHarnessRegistry([
+      probingAdapter('codex-exec', { present: false, detail: '/usr/local/bin/codex' }),
+    ]);
+    const flowPath = writeCriticFlow('codex-exec');
+    const io = makeIO();
+
+    const code = await main(['doctor', flowPath], makeDoctorDeps(io, registry));
+
+    expect(code).not.toBe(0);
+    expect(io.lines).toContain("  harness 'codex-exec' (station 'draft' critic) at '/usr/local/bin/codex': FAIL");
+  });
+
+  it("prints the critic's usage-blind notice when its adapter cannot report usage", async () => {
+    const registry = createHarnessRegistry([
+      probingAdapter('codex-exec', { present: true, detail: '/usr/local/bin/codex' }, { reportsUsage: false }),
+    ]);
+    const flowPath = writeCriticFlow('codex-exec');
+    const io = makeIO();
+
+    const code = await main(['doctor', flowPath], makeDoctorDeps(io, registry));
+
+    expect(code).toBe(0);
+    expect(io.lines).toContain("  harness 'codex-exec' (station 'draft' critic) at '/usr/local/bin/codex': ok");
+    expect(io.lines).toContain(
+      "  harness 'codex-exec' (station 'draft' critic) is usage-blind (cannot report token/cost usage)",
+    );
+  });
+
+  it('prints a line for the maker and one for the critic when a station has both', async () => {
+    const registry = createHarnessRegistry([
+      probingAdapter('claude-headless', { present: true, detail: '/usr/local/bin/claude' }),
+      probingAdapter('codex-exec', { present: false, detail: '/usr/local/bin/codex' }),
+    ]);
+    const flowPath = writeCriticFlow('codex-exec', 'harness');
+    const io = makeIO();
+
+    const code = await main(['doctor', flowPath], makeDoctorDeps(io, registry));
+
+    expect(code).not.toBe(0);
+    expect(io.lines).toContain("  harness 'claude-headless' (station 'draft') at '/usr/local/bin/claude': ok");
+    expect(io.lines).toContain("  harness 'codex-exec' (station 'draft' critic) at '/usr/local/bin/codex': FAIL");
+  });
+
+  it("keeps the maker's usage-blind line unprefixed and adds none for a critic that reports usage", async () => {
+    const registry = createHarnessRegistry([
+      probingAdapter('claude-headless', { present: true, detail: '/usr/local/bin/claude' }, { reportsUsage: false }),
+      probingAdapter('codex-exec', { present: true, detail: '/usr/local/bin/codex' }),
+    ]);
+    const flowPath = writeCriticFlow('codex-exec', 'harness');
+    const io = makeIO();
+
+    const code = await main(['doctor', flowPath], makeDoctorDeps(io, registry));
+
+    expect(code).toBe(0);
+    expect(io.lines).toContain("  harness 'claude-headless' is usage-blind (cannot report token/cost usage)");
+    expect(io.lines.filter((line) => line.includes('usage-blind'))).toHaveLength(1);
+  });
+
+  it('cmdRun fails at startup when only the critic binary is missing', async () => {
+    const registry = createHarnessRegistry([
+      probingAdapter('codex-exec', { present: false, detail: '/usr/local/bin/codex' }),
+    ]);
+    const flowPath = writeCriticFlow('codex-exec');
+    const io = makeIO();
+
+    const code = await main(['run', flowPath], makeStartupGateDeps(io, registry));
+
+    expect(code).not.toBe(0);
+    expect(io.errors.join('\n')).toContain("Station 'draft' critic harness adapter 'codex-exec' binary not found");
+  });
+});

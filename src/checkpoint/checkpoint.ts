@@ -174,6 +174,25 @@ export function computeSkillAwarePromptTemplateVersion(
 }
 
 /**
+ * Combine a station's promptTemplateVersion with the SHA-256 of the prompt
+ * template it renders (issue #131): the composed `prompt_content` of a
+ * `worker.uses` station, otherwise the content of its `prompt_file`. Editing
+ * the prompt without bumping prompt_version then invalidates the checkpoint
+ * and cascades, as editing a skill body does. The declared prompt_version
+ * stays in the hash, so a manual bump still forces a re-run.
+ *
+ * Folded on every transform and harness station, after the skill hashes and
+ * before the agent, so it moved every such stamp once when it was introduced.
+ */
+export function computePromptContentAwarePromptTemplateVersion(
+  promptTemplateVersion: string,
+  promptTemplateSha256: string,
+): string {
+  const canonical = JSON.stringify([promptTemplateVersion, 'prompt', promptTemplateSha256]);
+  return createHash('sha256').update(canonical).digest('hex');
+}
+
+/**
  * Combine a harness station's promptTemplateVersion with the named agent it
  * runs (issue #28): the agent name and the SHA-256 of its definition file.
  * The same combining discipline as computeSkillAwarePromptTemplateVersion: an
