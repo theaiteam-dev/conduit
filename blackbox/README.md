@@ -213,6 +213,14 @@ user or CI consumer actually sees, not internal implementation details.
   its target, a dir the sweep cannot remove does not stop the run, and the
   run's own `conduit-claude-config-` dir, tagged with the kernel's pid and
   start time, is gone after the run.
+- `schema-mismatch.test.ts`: a state DB stamped with a schema version the
+  binary cannot open (issue #50). Stamped far above the binary's version,
+  `conduit run status` exits nonzero and says the DB was written by a newer
+  Conduit and to upgrade the binary or image; stamped at version 1,
+  `conduit doctor` says the DB is older than the oldest version the binary
+  migrates and no migration ran. Both leave `PRAGMA user_version` unchanged,
+  and the version the message says the binary supports is the one the CLI
+  stamps on a fresh DB.
 - `no-internal-imports.test.ts` + `harness/import-scan.ts` — the zero-imports
   gate (AC-1): a TypeScript-compiler-API scan that fails if any file under
   `blackbox/` imports anything resolving into `src/`.
