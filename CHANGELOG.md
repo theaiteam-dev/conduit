@@ -126,6 +126,15 @@ historical context, not public releases or public repository history.
 
 ### Fixed
 
+- The state DB schema-mismatch error names the newer side and the remedy
+  ([#50](https://github.com/theaiteam-dev/conduit/issues/50)). It used to say
+  "Manual migration required", and Conduit has no migrate command. A DB newer
+  than the binary now says it was written by a newer Conduit, to upgrade the
+  binary or engine image, and that rolling back past a schema migration is not
+  supported. A DB older than the oldest version the binary migrates says that
+  no migration ran and why. Both name the state DB path. `docs/installation.md`
+  documents that the image pin and the state DB schema are coupled and how to
+  compare `PRAGMA user_version` with `SCHEMA_VERSION` before changing the pin.
 - A gate critic on a child-entry station can see the child's inputs. The
   critic prompt was rendered with no card scope, so a critic that referenced
   `{{seed.json}}` threw at render and the card went to `hold`. `ownedPaths` and
