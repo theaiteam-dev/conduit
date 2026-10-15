@@ -136,7 +136,8 @@ historical context, not public releases or public repository history.
   print the reason. A `model-incompatible` scrap from `runTransformStation`
   carries, as `validationError`, the validator error of the most recent
   response that parsed (within that response, the error of the
-  highest-priority candidate). Transform makers
+  highest-priority candidate). The critic reason quotes that error only when
+  it is one of the critic schema's fixed errors. Transform makers
   and harness critics keep their reasons.
 - Two `conduit run` launches of the same run id at the same moment no longer
   risk `fatal: UNIQUE constraint failed: runs.run_id`

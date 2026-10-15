@@ -110,6 +110,8 @@ export type TransformResult<T> =
        * Issue #42: on a `model-incompatible` scrap, the schema validator's
        * error for the most recent response that parsed. Absent when no
        * response parsed. The transform gate critic names its scrap from it.
+       * Untrusted: a validator error may quote model output, so a consumer
+       * that journals or prints it must allowlist it first.
        */
       validationError?: string;
     };

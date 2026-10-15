@@ -14,7 +14,13 @@
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import { openConduitDB, DEFAULT_RUN_ID, type ConduitDB } from '../persistence/db';
 import type { ModelAdapter, ModelResponse } from '../worker/adapter';
-import { runGateCheck, REJECT_WITHOUT_FINDINGS_ERROR, type GateConfig, type GateDecision } from './gate';
+import {
+  runGateCheck,
+  transformCriticScrapReason,
+  REJECT_WITHOUT_FINDINGS_ERROR,
+  type GateConfig,
+  type GateDecision,
+} from './gate';
 
 let db: ConduitDB;
 
@@ -169,4 +175,28 @@ describe('runGateCheck: a transform critic scrap reason carries no model output 
       expect(reason).not.toContain(MARKER);
     });
   }
+});
+
+describe('transformCriticScrapReason: only known validator errors reach the reason (issue #42)', () => {
+  // The seam itself, not gateCriticSchema's current strings: a validator error
+  // that quotes model output must not be interpolated into the journaled reason.
+  it('drops a validator error that is not one of the known gateCriticSchema errors', () => {
+    const hostile = 'verdict must be "pass" or "reject", got "SECRET-PROMPT-ECHO"';
+
+    const reason = transformCriticScrapReason({ status: 'scrapped', reason: 'model-incompatible', attempts: 3, validationError: hostile });
+
+    expect(reason).toBe('critic-verdict-invalid');
+    expect(reason).not.toContain('SECRET-PROMPT-ECHO');
+  });
+
+  it('keeps a known validator error', () => {
+    const reason = transformCriticScrapReason({
+      status: 'scrapped',
+      reason: 'model-incompatible',
+      attempts: 3,
+      validationError: 'findings must be an array',
+    });
+
+    expect(reason).toBe('critic-verdict-invalid: findings must be an array');
+  });
 });

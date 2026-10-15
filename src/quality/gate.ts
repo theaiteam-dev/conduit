@@ -155,20 +155,36 @@ function isRejectWithoutFindings(v: Record<string, unknown>): boolean {
   return v.verdict === 'reject' && (!Array.isArray(v.findings) || v.findings.length === 0);
 }
 
+const EXPECTED_OBJECT_ERROR = 'expected object';
+const VERDICT_VALUE_ERROR = 'verdict must be "pass" or "reject"';
+const FINDINGS_ARRAY_ERROR = 'findings must be an array';
+
+/**
+ * Every error gateCriticSchema returns. transformCriticScrapReason interpolates
+ * a validator error only when it is in this set, so a validator error that
+ * quotes model output cannot reach the journal.
+ */
+const CRITIC_SCHEMA_ERRORS: ReadonlySet<string> = new Set([
+  EXPECTED_OBJECT_ERROR,
+  VERDICT_VALUE_ERROR,
+  REJECT_WITHOUT_FINDINGS_ERROR,
+  FINDINGS_ARRAY_ERROR,
+]);
+
 const gateCriticSchema: OutputSchema<GateCriticVerdict> = {
   validate(value) {
     if (value === null || typeof value !== 'object' || Array.isArray(value)) {
-      return { ok: false, error: 'expected object' };
+      return { ok: false, error: EXPECTED_OBJECT_ERROR };
     }
     const v = value as Record<string, unknown>;
     if (v.verdict !== 'pass' && v.verdict !== 'reject') {
-      return { ok: false, error: 'verdict must be "pass" or "reject"' };
+      return { ok: false, error: VERDICT_VALUE_ERROR };
     }
     if (isRejectWithoutFindings(v)) {
       return { ok: false, error: REJECT_WITHOUT_FINDINGS_ERROR };
     }
     if (!Array.isArray(v.findings)) {
-      return { ok: false, error: 'findings must be an array' };
+      return { ok: false, error: FINDINGS_ARRAY_ERROR };
     }
     return {
       ok: true,
@@ -195,7 +211,8 @@ const gateCriticSchema: OutputSchema<GateCriticVerdict> = {
  *   - `critic-verdict-invalid: <validator error>`: no attempt passed the
  *     schema and at least one parsed. The error is the one from the last
  *     attempt that parsed, so a parsed-but-invalid attempt followed by an
- *     unparseable one still reports this reason with the earlier error
+ *     unparseable one still reports this reason with the earlier error. An
+ *     error outside CRITIC_SCHEMA_ERRORS gives a bare `critic-verdict-invalid`
  *   - `critic-verdict-unparseable`: no attempt produced parseable JSON
  *   - `critic-output-truncated`: finish_reason `length` with no valid verdict
  *   - `critic-vision-unsupported`: the adapter refused image input
@@ -204,11 +221,12 @@ const gateCriticSchema: OutputSchema<GateCriticVerdict> = {
  * critic kinds apart.
  *
  * The reason is journaled and printed by `conduit run` and `journal inspect`,
- * so it must carry no model output. Every error gateCriticSchema returns is a
- * fixed string that does not quote the value it rejected; keep it that way.
- * gate-transform-scrap-reason.test.ts pins this.
+ * so it must carry no model output. TransformResult.validationError is
+ * untrusted; only an error in the CRITIC_SCHEMA_ERRORS allowlist is
+ * interpolated. gate-transform-scrap-reason.test.ts pins this. Exported for
+ * that test.
  */
-function transformCriticScrapReason(
+export function transformCriticScrapReason(
   result: Extract<TransformResult<GateCriticVerdict>, { status: 'scrapped' }>,
 ): string {
   // No default branch on purpose: with a `string` return type, a reason added
@@ -223,6 +241,7 @@ function transformCriticScrapReason(
       if (result.validationError === REJECT_WITHOUT_FINDINGS_ERROR) {
         return `critic-reject-without-findings: ${REJECT_WITHOUT_FINDINGS_ERROR}`;
       }
+      if (!CRITIC_SCHEMA_ERRORS.has(result.validationError)) return 'critic-verdict-invalid';
       return `critic-verdict-invalid: ${result.validationError}`;
   }
 }
