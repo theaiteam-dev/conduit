@@ -51,11 +51,18 @@ export function latestTag(tags: readonly string[]): string | undefined {
 const HEADING = /^## \[/;
 const UNRELEASED = /^## \[Unreleased\]\s*$/;
 
-/** Rewrites only the `"version"` field so the rest of package.json keeps its formatting. */
+/**
+ * Rewrites only the top-level `"version"` field so the rest of package.json
+ * keeps its formatting. A nested `"version"` key is skipped: each candidate
+ * line is tried, and the one whose rewrite parses to the expected object wins.
+ */
 export function bumpPackageJson(text: string, version: string): string {
-  const field = /^(\s*"version"\s*:\s*)"[^"]*"/m;
-  if (!field.test(text)) throw new Error('package.json has no "version" field');
-  return text.replace(field, `$1"${version}"`);
+  const expected = JSON.stringify({ ...JSON.parse(text), version });
+  for (const m of text.matchAll(/^(\s*"version"\s*:\s*)"[^"]*"/gm)) {
+    const candidate = text.slice(0, m.index) + `${m[1]}"${version}"` + text.slice(m.index! + m[0].length);
+    if (JSON.stringify(JSON.parse(candidate)) === expected) return candidate;
+  }
+  throw new Error('package.json has no top-level "version" field on a line of its own');
 }
 
 export interface RollOptions {

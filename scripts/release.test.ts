@@ -72,6 +72,13 @@ describe("bumpPackageJson", () => {
       `{\n  "name": "conduit",\n  "version": "2.0.0",\n  "deps": { "x": "1.1.2" }\n}\n`,
     );
   });
+
+  it("skips a nested version key that comes before the top-level one", () => {
+    const before = `{\n  "engines": {\n    "version": "9.9.9"\n  },\n  "version": "1.1.2"\n}\n`;
+    expect(bumpPackageJson(before, "2.0.0")).toBe(
+      `{\n  "engines": {\n    "version": "9.9.9"\n  },\n  "version": "2.0.0"\n}\n`,
+    );
+  });
 });
 
 describe("rollChangelog", () => {

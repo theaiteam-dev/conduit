@@ -70,8 +70,15 @@ jobs:
           APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
         run: |
           branch="release/v$VERSION"
-          if git ls-remote --exit-code --heads origin "$branch" > /dev/null; then
+          # --exit-code returns 2 only when the ref is absent; any other
+          # failure (network, auth) must stop the job, not read as "absent".
+          status=0
+          git ls-remote --exit-code --heads origin "$branch" > /dev/null || status=$?
+          if [ "$status" -eq 0 ]; then
             echo "::error::Branch $branch already exists. Close its PR and delete the branch to prepare again."
+            exit 1
+          elif [ "$status" -ne 2 ]; then
+            echo "::error::git ls-remote failed (exit $status) while checking for $branch."
             exit 1
           fi
 

@@ -28,8 +28,10 @@ To abandon a release, close the PR and delete the `release/vX.Y.Z` branch.
 Prepare release refuses to run while that branch exists.
 
 To retry a release that failed after merge (a flaky gate, a registry outage),
-re-run the failed jobs of that Release run. It uses the same commit, and it
-will not create a tag that already exists.
+re-run the failed jobs of that Release run. It uses the same commit. If the
+tag already exists at that commit, the run skips the tag and release and only
+publishes the image again; it does that only while the tag is still the newest
+release, so an old run cannot move `latest` backwards.
 
 ## What runs where
 

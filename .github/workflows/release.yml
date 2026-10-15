@@ -7,7 +7,8 @@
 # publishes the versioned engine image, so the main ruleset needs no bypass.
 #
 # To retry a failed release, re-run the failed jobs of that run. A re-run uses
-# the same commit, and the tag check makes it safe to repeat.
+# the same commit. If the tag already exists at that commit, the run skips the
+# tag and release and only publishes the image again.
 name: Release
 
 on:
@@ -32,7 +33,7 @@ jobs:
     permissions:
       contents: write
     outputs:
-      published: ${{ steps.publish.outcome == 'success' }}
+      published: ${{ steps.publish.outcome == 'success' || steps.detect.outputs.republish == 'true' }}
       version: ${{ steps.detect.outputs.version }}
 
     steps:
@@ -45,27 +46,50 @@ jobs:
 
       # The release signal is a package.json version change, not a commit
       # message, so a squash title edited at merge time cannot hide or fake one.
+      # Both versions must be plain MAJOR.MINOR.PATCH before either is written
+      # to GITHUB_OUTPUT or used in a tag name.
       - name: Detect a release commit
         id: detect
         env:
           BEFORE: ${{ github.event.before }}
         run: |
+          semver='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+          not_a_release() {
+            echo "$1; not a release."
+            echo "release=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          }
+
           version=$(jq -r .version package.json)
-          echo "version=$version" >> "$GITHUB_OUTPUT"
           if [ "$BEFORE" = "0000000000000000000000000000000000000000" ] \
             || ! previous=$(git show "$BEFORE:package.json" 2> /dev/null | jq -r .version); then
-            echo "No previous commit to compare against; not a release."
-            echo "release=false" >> "$GITHUB_OUTPUT"
-            exit 0
+            not_a_release "No previous commit to compare against"
           fi
-          if [ "$previous" = "$version" ]; then
-            echo "package.json version unchanged ($version); not a release."
-            echo "release=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          if git rev-parse -q --verify "refs/tags/v$version" > /dev/null; then
-            echo "::error::package.json moved $previous -> $version but tag v$version already exists."
+          [[ "$previous" =~ $semver ]] || not_a_release "Previous package.json has no plain version"
+          [ "$previous" != "$version" ] || not_a_release "package.json version unchanged ($version)"
+          if ! [[ "$version" =~ $semver ]]; then
+            echo "::error::package.json version is not MAJOR.MINOR.PATCH; refusing to release it."
             exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+          # A tag at this same commit means a re-run of a release that already
+          # published its tag: skip the tag and release, but let the image job
+          # run again, unless a newer release has moved `latest` on since.
+          if tagged=$(git rev-parse -q --verify "refs/tags/v$version^{commit}"); then
+            if [ "$tagged" != "$GITHUB_SHA" ]; then
+              echo "::error::package.json moved $previous -> $version but tag v$version already exists at $tagged."
+              exit 1
+            fi
+            newest=$(git tag --list 'v*' --sort=-v:refname | head -n 1)
+            if [ "$newest" = "v$version" ]; then
+              echo "v$version already tagged at this commit; re-running the image publish only."
+              echo "republish=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "v$version already tagged and $newest is newer; nothing to do."
+            fi
+            echo "release=false" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
           echo "Release commit: $previous -> $version"
           echo "release=true" >> "$GITHUB_OUTPUT"
