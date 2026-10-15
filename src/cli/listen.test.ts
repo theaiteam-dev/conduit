@@ -260,6 +260,42 @@ describe('conduit listen HTTP bind (#44)', () => {
     expect(io.errors.join('\n')).toContain('--bind 0.0.0.0 ignored');
   });
 
+  // Nitpick (src/cli/main.ts ~line 2664, cmdListen): an explicit --port was
+  // silently dropped on a Socket-Mode-only flow while --bind warned. --port
+  // must warn too, and the two must fold into one line when both are given.
+  it('warns that --port is ignored when no binding needs HTTP', async () => {
+    const { deps, served } = depsServing(false);
+    const code = await main(['listen', '--flows', 'myflow=/flows/my.yaml', '--port', '8080'], deps);
+
+    expect(code).toBe(0);
+    expect(served).toEqual([{ http: null }]);
+    expect(io.errors.join('\n')).toContain('--port 8080 ignored');
+  });
+
+  it('warns once naming both --port and --bind when no binding needs HTTP', async () => {
+    const { deps, served } = depsServing(false);
+    const code = await main(
+      ['listen', '--flows', 'myflow=/flows/my.yaml', '--port', '8080', '--bind', '0.0.0.0'],
+      deps,
+    );
+
+    expect(code).toBe(0);
+    expect(served).toEqual([{ http: null }]);
+    const errors = io.errors.join('\n');
+    expect(errors).toContain('--port 8080 and --bind 0.0.0.0 ignored');
+    // Exactly one warning line, not one per flag.
+    expect(io.errors.filter((l) => l.includes('ignored')).length).toBe(1);
+  });
+
+  it('does not warn when neither --port nor --bind is given, even though port defaults to 3000', async () => {
+    const { deps, served } = depsServing(false);
+    const code = await main(['listen', '--flows', 'myflow=/flows/my.yaml'], deps);
+
+    expect(code).toBe(0);
+    expect(served).toEqual([{ http: null }]);
+    expect(io.errors.join('\n')).not.toContain('ignored');
+  });
+
   it.each([['empty', ''], ['whitespace', ' '], ['flag-like', '--port']])(
     'rejects a malformed --bind value (%s) before starting the listener',
     async (_label, value) => {

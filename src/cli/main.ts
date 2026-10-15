@@ -2505,6 +2505,7 @@ async function cmdListen(argv: string[], deps: CliDeps): Promise<number> {
   let manifestPath: string | undefined;
   let validateOnly = false;
   let port = 3000;
+  let portExplicit = false;
   let bind: string | undefined;
   let globalAlertChannel: string | undefined;
   let maxConcurrentRuns: number | undefined;
@@ -2524,6 +2525,7 @@ async function cmdListen(argv: string[], deps: CliDeps): Promise<number> {
         return 1;
       }
       port = parsed;
+      portExplicit = true;
     } else if (arg === '--bind') {
       // #44: the HTTP server binds loopback unless the operator names another
       // address. A missing or malformed value fails loud rather than falling
@@ -2661,9 +2663,15 @@ async function cmdListen(argv: string[], deps: CliDeps): Promise<number> {
   // #44: no HTTP server when every served binding is Socket Mode, and loopback
   // unless --bind names another address.
   const needsHttp = result.listener.needsHttp === true;
-  if (!needsHttp && bind !== undefined) {
+  if (!needsHttp && (bind !== undefined || portExplicit)) {
+    const ignoredFlags =
+      portExplicit && bind !== undefined
+        ? `--port ${port} and --bind ${bind}`
+        : portExplicit
+          ? `--port ${port}`
+          : `--bind ${bind}`;
     deps.io.err(
-      `conduit listen: --bind ${bind} ignored: no served binding needs an inbound HTTP port`,
+      `conduit listen: ${ignoredFlags} ignored: no served binding needs an inbound HTTP port`,
     );
   }
   if (deps.serve) {

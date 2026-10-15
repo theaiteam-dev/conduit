@@ -205,7 +205,15 @@ conduit listen: serving ingress on http://127.0.0.1:8080 (loopback only by defau
 conduit listen: serving ingress on http://0.0.0.0:8080 (--bind 0.0.0.0)
 ```
 
-`--bind` given when no binding needs HTTP is reported on stderr as ignored.
+When no binding needs HTTP, an explicit `--port` or `--bind` is reported on
+stderr as ignored, in one line naming the flags that were passed. The default
+port never triggers it:
+
+```
+conduit listen: --bind 0.0.0.0 ignored: no served binding needs an inbound HTTP port
+conduit listen: --port 8080 ignored: no served binding needs an inbound HTTP port
+conduit listen: --port 8080 and --bind 0.0.0.0 ignored: no served binding needs an inbound HTTP port
+```
 
 **In a container, the default is not reachable from outside.** On Docker's
 default bridge network, a published port is forwarded to the container's network

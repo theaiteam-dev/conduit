@@ -18,6 +18,7 @@
 
 import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, readdirSync, readFileSync, readlinkSync, rmSync, writeFileSync } from "node:fs";
+import { connect } from "node:net";
 import { networkInterfaces, tmpdir } from "node:os";
 import { join } from "node:path";
 import { reserveEphemeralPort } from "./harness/journey-harness";
@@ -222,14 +223,34 @@ async function startListen(ingress: string, extraArgs: string[]): Promise<Listen
   return listen;
 }
 
-/** True when a TCP connection to host:port is refused (nothing listening there). */
-async function connectionRefused(host: string, port: number): Promise<boolean> {
-  try {
-    await fetch(`http://${host}:${port}/`, { signal: AbortSignal.timeout(3000) });
-    return false;
-  } catch {
-    return true;
-  }
+/**
+ * Raw TCP connect probe to host:port. Resolves "connected" on a successful
+ * connect (then closes the socket), "refused" only when the OS reports
+ * ECONNREFUSED. Throws on a 3s timeout or any other error, since neither of
+ * those is a refusal.
+ */
+function probeTcp(host: string, port: number): Promise<"connected" | "refused"> {
+  return new Promise((resolve, reject) => {
+    const socket = connect({ host, port });
+    const timer = setTimeout(() => {
+      socket.destroy();
+      reject(new Error(`probeTcp(${host}:${port}) timed out after 3000ms`));
+    }, 3000);
+    socket.once("connect", () => {
+      clearTimeout(timer);
+      socket.end();
+      resolve("connected");
+    });
+    socket.once("error", (err: NodeJS.ErrnoException) => {
+      clearTimeout(timer);
+      socket.destroy();
+      if (err.code === "ECONNREFUSED") {
+        resolve("refused");
+        return;
+      }
+      reject(new Error(`probeTcp(${host}:${port}) failed: ${err.code ?? "unknown"} ${err.message}`));
+    });
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -246,7 +267,7 @@ describe.skipIf(process.platform !== "linux")("conduit listen HTTP bind (#44)", 
       expect(l.stdout()).toContain("conduit listen: no HTTP listener");
       expect(l.stdout()).not.toContain("serving ingress");
       expect(listeningSockets(l.pid)).toEqual([]);
-      expect(await connectionRefused("127.0.0.1", port)).toBe(true);
+      expect(await probeTcp("127.0.0.1", port)).toBe("refused");
     },
     JOURNEY_TIMEOUT_MS,
   );
@@ -270,7 +291,7 @@ describe.skipIf(process.platform !== "linux")("conduit listen HTTP bind (#44)", 
 
       const external = nonLoopbackIPv4();
       if (external !== undefined) {
-        expect(await connectionRefused(external, port)).toBe(true);
+        expect(await probeTcp(external, port)).toBe("refused");
       }
     },
     JOURNEY_TIMEOUT_MS,
@@ -287,7 +308,7 @@ describe.skipIf(process.platform !== "linux")("conduit listen HTTP bind (#44)", 
 
       const external = nonLoopbackIPv4();
       if (external !== undefined) {
-        expect(await connectionRefused(external, port)).toBe(false);
+        expect(await probeTcp(external, port)).toBe("connected");
       }
     },
     JOURNEY_TIMEOUT_MS,
