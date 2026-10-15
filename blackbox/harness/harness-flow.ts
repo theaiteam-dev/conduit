@@ -61,6 +61,10 @@ export interface JournalSpanRow {
   adapter: string | null;
   duration_ms: number | null;
   usage_unknown: number;
+  /** The checkpoint binding stamp of a stamped station span (SPEC §5), else null. */
+  binding_stamp: string | null;
+  /** The effective prompt_template_version folded into that stamp, else null. */
+  prompt_template_version: string | null;
 }
 
 /**
@@ -417,7 +421,8 @@ export function startHarnessFlow<R = FakeClaudeRole>(opts: HarnessFlowOptions<R>
         const rows = db
           .query(
             `SELECT card_id, station, attempt, name, attributes_json, model, input_tokens, output_tokens,
-                    cache_read_input_tokens, cache_creation_input_tokens, cost_usd, adapter, duration_ms, usage_unknown
+                    cache_read_input_tokens, cache_creation_input_tokens, cost_usd, adapter, duration_ms, usage_unknown,
+                    binding_stamp, prompt_template_version
                FROM journal WHERE run_id = ? AND card_id = ? ORDER BY id`,
           )
           .all(runId, card) as Array<Omit<JournalSpanRow, "attributes"> & { attributes_json: string }>;
