@@ -71,6 +71,14 @@ user or CI consumer actually sees, not internal implementation details.
   and the run halts on the tokens andon; a control run with more budget
   completes. The halt prints one andon line, and `run status` reports the run
   halted with its resume command (#83).
+- `harness-critic-visibility.test.ts`: a `kind: transform` station whose
+  only harness is its gate critic (issue #35). With the critic's binary
+  missing, `conduit doctor` prints a FAIL line for the critic and exits
+  nonzero, and `conduit run` refuses to start with `HARNESS_BINARY_NOT_FOUND`
+  naming the critic. With it present, doctor prints the critic's ok line and
+  `conduit explain` shows its adapter, model and tools with a `critic ` prefix.
+  The journey serves a stub `/models` so doctor's exit code turns on the
+  critic alone.
 - `harness-claude-session-usage.test.ts`: a Claude call's tokens are the
   session total from `modelUsage`, not the last `result` event's `usage`
   (issue #108). The maker's call emits two results, as a session with a

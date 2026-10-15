@@ -126,6 +126,24 @@ historical context, not public releases or public repository history.
 
 ### Fixed
 
+- A gate critic that runs on a harness adapter (`check.critic.harness`) is
+  now probed and reported like a harness maker
+  ([#35](https://github.com/theaiteam-dev/conduit/issues/35)). The binary
+  probe behind `conduit run`/`resume`, `conduit doctor` and `conduit explain`
+  all keyed on `station.kind === 'harness'`, so a critic on a `kind: transform`
+  station was skipped: doctor passed with the critic's binary missing and the
+  run scrapped the card at the first gate. All three now read one collector,
+  `src/flow/station-harnesses.ts`. A missing critic binary fails with
+  `HARNESS_BINARY_NOT_FOUND` naming `Station '<id>' critic harness adapter`;
+  doctor prints `harness '<name>' (station '<id>' critic)` lines, including the
+  usage-blind notice; explain shows `critic harness=`, `critic model=`,
+  `critic agent=`, `critic tools=` and `critic usage-blind`, and now also shows
+  a harness maker's `agent=`. Deploy note: `conduit doctor` and the run
+  preflight now probe gate-critic harness binaries, so a deployment that uses
+  `doctor` as a container health check goes unhealthy if a flow configures
+  `check.critic.harness` with an adapter whose binary is not in the image.
+  Check images before rolling out. Such a flow already failed at its first
+  gate before this change.
 - The binding stamp covers prompt content and harness skills
   ([#131](https://github.com/theaiteam-dev/conduit/issues/131),
   [#93](https://github.com/theaiteam-dev/conduit/issues/93)). A transform or
