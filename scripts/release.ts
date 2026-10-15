@@ -50,6 +50,29 @@ export function latestTag(tags: readonly string[]): string | undefined {
 
 const HEADING = /^## \[/;
 const UNRELEASED = /^## \[Unreleased\]\s*$/;
+const LINK_REF = /^\[[^\]]+\]: /;
+
+/**
+ * Index of the link-reference block at the foot of the file: the trailing run
+ * of `[label]: url` lines (blank lines allowed). A link reference written inside
+ * a section body is followed by prose or a heading, so it is not part of it.
+ */
+function footerStart(lines: readonly string[]): number {
+  let start = lines.length;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (lines[i]!.trim() === "") continue;
+    if (!LINK_REF.test(lines[i]!)) break;
+    start = i;
+  }
+  return start;
+}
+
+/** The end of the section whose heading is at `start`: the next heading or the footer. */
+function sectionEnd(lines: readonly string[], start: number): number {
+  const next = lines.findIndex((l, i) => i > start && HEADING.test(l));
+  const footer = footerStart(lines);
+  return next === -1 ? footer : Math.min(next, footer);
+}
 
 /**
  * Rewrites only the top-level `"version"` field so the rest of package.json
@@ -87,11 +110,7 @@ export function rollChangelog(text: string, { version, date, previousTag }: Roll
     throw new Error(`CHANGELOG.md already has a section for ${version}`);
   }
 
-  let end = lines.findIndex((l, i) => i > start && HEADING.test(l));
-  // No later release section: the body runs to the link references.
-  if (end === -1) end = lines.findIndex((l, i) => i > start && /^\[[^\]]+\]: /.test(l));
-  if (end === -1) end = lines.length;
-
+  const end = sectionEnd(lines, start);
   const body = lines.slice(start + 1, end).join("\n").trim();
   if (body === "") throw new Error("the Unreleased section is empty: there is nothing to release");
 
@@ -124,9 +143,7 @@ export function releaseNotes(text: string, version: string): string {
   const lines = text.split("\n");
   const start = lines.findIndex((l) => l === `## [${version}]` || l.startsWith(`## [${version}] `));
   if (start === -1) throw new Error(`CHANGELOG.md has no section for ${version}`);
-  let end = lines.findIndex((l, i) => i > start && (HEADING.test(l) || /^\[[^\]]+\]: /.test(l)));
-  if (end === -1) end = lines.length;
-  const body = lines.slice(start + 1, end).join("\n").trim();
+  const body = lines.slice(start + 1, sectionEnd(lines, start)).join("\n").trim();
   if (body === "") throw new Error(`the ${version} section of CHANGELOG.md is empty`);
   return body;
 }
@@ -135,21 +152,21 @@ function flag(args: string[], name: string): string | undefined {
   const at = args.indexOf(name);
   if (at === -1) return undefined;
   const value = args[at + 1];
-  if (value === undefined) throw new Error(`${name} needs a value`);
+  if (value === undefined || value.startsWith("--")) throw new Error(`${name} needs a value`);
   return value;
 }
 
-function main(argv: string[]): void {
+/**
+ * Runs one command against the repository at `root` and returns what it
+ * prints. Exported so the tests can drive the CLI against a fixture repo.
+ */
+export function run(argv: string[], root: string): string {
   const [command, version, ...rest] = argv;
-  const root = join(import.meta.dir, "..");
   const changelogPath = join(root, "CHANGELOG.md");
   if (!version) throw new Error("usage: bun scripts/release.ts <prepare|notes> <X.Y.Z> [options]");
   const next = parseVersion(version);
 
-  if (command === "notes") {
-    process.stdout.write(releaseNotes(readFileSync(changelogPath, "utf8"), version) + "\n");
-    return;
-  }
+  if (command === "notes") return releaseNotes(readFileSync(changelogPath, "utf8"), version);
   if (command !== "prepare") throw new Error(`unknown command "${command}"`);
 
   const previousTag =
@@ -176,12 +193,12 @@ function main(argv: string[]): void {
   const pkg = bumpPackageJson(pkgText, version);
   writeFileSync(changelogPath, changelog);
   writeFileSync(pkgPath, pkg);
-  console.log(`Prepared ${version} (previous tag ${previousTag}, dated ${date}).`);
+  return `Prepared ${version} (previous tag ${previousTag}, dated ${date}).`;
 }
 
 if (import.meta.main) {
   try {
-    main(process.argv.slice(2));
+    console.log(run(process.argv.slice(2), join(import.meta.dir, "..")));
   } catch (err) {
     console.error(`release: ${(err as Error).message}`);
     process.exit(1);
