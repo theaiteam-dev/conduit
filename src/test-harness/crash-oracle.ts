@@ -899,12 +899,18 @@ async function crashAfterEffectfulCommit(): Promise<OracleTrial> {
 // operation with no model calls and no outbox effects.
 
 async function crashMidFanOut(): Promise<OracleTrial> {
-  const db = openConduitDB({ stateDbPath: ':memory:', journalDbPath: ':memory:' });
   // The project root commitFanOut confines owned_paths to; the proposal uses
   // relative paths. A fresh dir per trial, so nothing left in the shared temp
-  // root can change how a path canonicalizes.
+  // root can change how a path canonicalizes. Created before the db, so a
+  // failure here leaves nothing to clean up, and a failed db open removes it.
   const fanOutProjectRoot = mkdtempSync(join(tmpdir(), 'conduit-crash-oracle-fanout-'));
-  ensureCheckpointSchema(db.getStateDb());
+  let db: ConduitDB;
+  try {
+    db = openConduitDB({ stateDbPath: ':memory:', journalDbPath: ':memory:' });
+  } catch (err) {
+    rmSync(fanOutProjectRoot, { recursive: true, force: true });
+    throw err;
+  }
   const stateDb = db.getStateDb();
 
   const proposal: ArchitectProposal = {
@@ -916,6 +922,8 @@ async function crashMidFanOut(): Promise<OracleTrial> {
   };
 
   try {
+    ensureCheckpointSchema(stateDb);
+
     // Insert parent card — fan-out execution began but not yet committed.
     stateDb
       .prepare(
