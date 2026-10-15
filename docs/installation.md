@@ -59,7 +59,7 @@ docker build -t conduit-engine:1.0.0 .
 >
 > | Step | Purpose |
 > |------|---------|
-> | `FROM alpine:3.20 AS llexec` + `gcc -static` | Build stage: compiles the Landlock write-confinement helper (`native/llexec/llexec.c`) as a static binary. Nothing else from this stage reaches the image |
+> | `FROM alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc AS llexec` + `gcc -static` | Build stage: compiles the Landlock write-confinement helper (`native/llexec/llexec.c`) as a static binary. The base is pinned by the digest of the `alpine:3.20` multi-arch index, so every build uses the same toolchain; the Dockerfile comment above the `FROM` says how to move it. Nothing else from this stage reaches the image |
 > | `FROM oven/bun:1.3.11-slim` | Pinned Bun runtime, the image's base — see [§7](#7-bump-the-bun-version) to change it |
 > | `COPY --from=llexec /llexec /usr/local/bin/llexec` | The helper overlapped harness calls run under (reported by the `write-confinement` doctor probe) |
 > | Create `conduit` user/group | Least-privilege execution — the container never runs as root |
@@ -167,6 +167,44 @@ ephemeral container filesystem is wiped on `docker rm`.
 # Create the named volume once (idempotent).
 docker volume create conduit_data
 ```
+
+### State DB schema and the image pin
+
+The state DB records its schema version in `PRAGMA user_version`, and each
+binary carries the version it writes (`SCHEMA_VERSION` in
+`src/persistence/db.ts`). On open, a binary migrates an older state DB forward
+to its own version automatically and stamps the new version. Migrations run
+forward only. Once a newer image has migrated the DB on `/data`, an older image
+cannot open it, so the image pin and the state DB are coupled. Before you
+change the pin, and especially before you roll it back, compare the two
+versions:
+
+```bash
+# The DB's version. This opens the DB read-only; stop the engine first.
+docker run --rm -v conduit_data:/data --entrypoint bun conduit-engine \
+  -e 'const { Database } = require("bun:sqlite");
+      const db = new Database("/data/conduit.sqlite", { readonly: true });
+      console.log(db.query("PRAGMA user_version").get().user_version);'
+
+# The version the image you are about to run writes.
+docker run --rm --entrypoint grep conduit-engine \
+  -m1 'export const SCHEMA_VERSION' /app/src/persistence/db.ts
+```
+
+If the DB's version is higher than the image's, run an image at least as new
+as the one that wrote the DB.
+
+A binary that cannot open the state DB exits nonzero and leaves the version
+stamp unchanged. The error says which side is newer:
+
+```
+fatal: conduit state DB schema mismatch: the state DB at /data/conduit.sqlite is at schema version 13, and this conduit binary supports up to version 12. The DB was written by a newer Conduit: upgrade the conduit binary or engine image to that version or later. Migrations run forward only, so rolling back past a schema migration is not supported. The DB's version was left unchanged.
+```
+
+The other direction, a DB older than the oldest version the binary can
+migrate (version 1), says that no migration ran. The binary has no migration
+for that version, so start a new state DB by pointing `CONDUIT_STATE_DB` at a
+new file.
 
 ### Secret injection (FR-5)
 
