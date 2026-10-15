@@ -138,7 +138,19 @@ historical context, not public releases or public repository history.
   refuses every event folded into it, not only its latest: the older ones had
   stayed `coalesced` with no pending pass, so their duplicates named a run they
   never joined. See `docs/ingress-listener.md`.
-
+- A transform gate critic that fails now scraps the card under a reason naming
+  the failure ([#42](https://github.com/theaiteam-dev/conduit/issues/42)),
+  where every failure used to scrap as `model-incompatible`:
+  `critic-verdict-invalid: <validator error>` for a verdict that parsed but
+  has the wrong shape, `critic-reject-without-findings`,
+  `critic-verdict-unparseable`, `critic-output-truncated` and
+  `critic-vision-unsupported`. `conduit run` and `conduit journal inspect`
+  print the reason. A `model-incompatible` scrap from `runTransformStation`
+  carries, as `validationError`, the validator error of the most recent
+  response that parsed (within that response, the error of the
+  highest-priority candidate). The critic reason quotes that error only when
+  it is one of the critic schema's fixed errors. Transform makers
+  and harness critics keep their reasons.
 - Two `conduit run` launches of the same run id at the same moment no longer
   risk `fatal: UNIQUE constraint failed: runs.run_id`
   ([#48](https://github.com/theaiteam-dev/conduit/issues/48)). `registerRun`

@@ -32,8 +32,8 @@
  *     | { action: 'pass';           output: StationOutput<GateCriticVerdict> }
  *     | { action: 'reject';         returnTo: Lane; output: StationOutput<GateCriticVerdict> }
  *     | { action: 'invalid_verdict'; reason: 'invalid_return_to' }
- *     | { action: 'scrapped';       reason: string };  // 'model-incompatible' (transform critic,
- *                                                       // runGateCheck) or a distinct
+ *     | { action: 'scrapped';       reason: string };  // a 'critic-*' reason (transform critic,
+ *                                                       // runGateCheck, issue #42) or a distinct
  *                                                       // 'harness-critic-*' reason (agentic
  *                                                       // critic, runHarnessGateCheck) — a pre-public engine review
  *                                                       // review, @queso findings 1 + 2a.
@@ -266,12 +266,12 @@ describe('runGateCheck (gate / converge)', () => {
     expect(a.output.findings_hash).toBe(b.output.findings_hash);
   });
 
-  it('propagates a model-incompatible scrap when the critic call cannot be parsed', async () => {
+  it('scraps as critic-verdict-unparseable when the critic call cannot be parsed (issue #42)', async () => {
     const { adapter } = makeStubAdapter([resp('not json'), resp('still not json'), resp('nope')]);
 
     const decision = await runGateCheck(gateConfig({ adapter, maxExecutionAttempts: 3 }));
 
-    expect(decision).toEqual({ action: 'scrapped', reason: 'model-incompatible' });
+    expect(decision).toEqual({ action: 'scrapped', reason: 'critic-verdict-unparseable' });
   });
 
   it('is a function of its input: identical critic responses yield identical decisions (purity) (AC6)', async () => {
