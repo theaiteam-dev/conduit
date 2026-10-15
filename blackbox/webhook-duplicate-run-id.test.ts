@@ -15,7 +15,6 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { createHmac, randomUUID } from "node:crypto";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -39,18 +38,8 @@ async function waitFor(
   throw new Error(`timed out after ${opts.timeoutMs}ms waiting for ${opts.what}`);
 }
 
-/** A free TCP port on 127.0.0.1, released before the listener binds it. */
-async function freePort(): Promise<number> {
-  return new Promise((resolve, reject) => {
-    const server = createServer();
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", () => {
-      const address = server.address();
-      const port = typeof address === "object" && address !== null ? address.port : 0;
-      server.close(() => resolve(port));
-    });
-  });
-}
+/** The line `conduit listen` prints once its server is bound. */
+const SERVING = /serving ingress on http:\/\/[^:\s]+:(\d+)/;
 
 /**
  * A one-station deterministic flow whose ingress is a webhook on `route`. The
@@ -111,8 +100,6 @@ describe("issue #52: a duplicate webhook delivery carries the original run_id", 
     writeFileSync(join(projectRoot, "seed.txt"), "webhook duplicate journey\n");
     const plain = writeFlow(root, "plain", "/hooks/plain", false);
     const keyed = writeFlow(root, "keyed", "/hooks/keyed", true);
-    const port = await freePort();
-    baseUrl = `http://127.0.0.1:${port}`;
     env = {
       ...(process.env as Record<string, string>),
       [SECRET_ENV]: secret,
@@ -132,22 +119,30 @@ describe("issue #52: a duplicate webhook delivery carries the original run_id", 
         "listen",
         "--flows",
         `plain=${plain},keyed=${keyed}`,
+        // Port 0: the listener binds a free port itself and prints it, so no
+        // other process can take the port between choosing and binding it.
         "--port",
-        String(port),
+        "0",
         "--global-alert-channel",
         "#blackbox",
       ],
-      { env, stdout: "ignore", stderr: "pipe" },
+      { env, stdout: "pipe", stderr: "pipe" },
     );
     listener = proc;
-    void (async () => {
-      const decoder = new TextDecoder();
-      try {
-        for await (const chunk of proc.stderr) stderr += decoder.decode(chunk, { stream: true });
-      } catch {
-        // stream closed
-      }
-    })();
+    let stdout = "";
+    for (const [stream, append] of [
+      [proc.stdout, (text: string) => (stdout += text)],
+      [proc.stderr, (text: string) => (stderr += text)],
+    ] as const) {
+      void (async () => {
+        const decoder = new TextDecoder();
+        try {
+          for await (const chunk of stream) append(decoder.decode(chunk, { stream: true }));
+        } catch {
+          // stream closed
+        }
+      })();
+    }
 
     let exited: number | undefined;
     void proc.exited.then((code) => {
@@ -156,6 +151,9 @@ describe("issue #52: a duplicate webhook delivery carries the original run_id", 
     await waitFor(
       async () => {
         if (exited !== undefined) throw new Error(`conduit listen exited ${exited} during boot: ${stderr}`);
+        const port = SERVING.exec(stdout)?.[1];
+        if (port === undefined) return false;
+        baseUrl = `http://127.0.0.1:${port}`;
         try {
           await fetch(`${baseUrl}/`, { method: "GET" });
           return true;
@@ -168,9 +166,13 @@ describe("issue #52: a duplicate webhook delivery carries the original run_id", 
   }, JOURNEY_TIMEOUT_MS);
 
   afterAll(async () => {
+    // The listener must be dead before its state files are deleted: SIGTERM,
+    // then SIGKILL if it has not exited within 5s, then wait for the exit.
     if (listener !== undefined) {
       listener.kill();
-      await Promise.race([listener.exited, sleep(5_000)]);
+      const stopped = await Promise.race([listener.exited.then(() => true), sleep(5_000).then(() => false)]);
+      if (!stopped) listener.kill("SIGKILL");
+      await listener.exited;
     }
     if (root !== undefined) rmSync(root, { recursive: true, force: true });
   });

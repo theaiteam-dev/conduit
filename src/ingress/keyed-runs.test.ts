@@ -377,6 +377,23 @@ describe('a duplicate delivery of a keyed event (issue #52)', () => {
     }
   });
 
+  it('logs each folded event refused with its pass under the source it arrived from', async () => {
+    // The pass_limit refusal below runs on the drain path, whose own log rows
+    // carry the drain source; a folded event's refusal names its own source.
+    const listener = await boot(makeFlow(keyedIngress({ max_passes: 1 })));
+    await listener.handleWebhook(prEvent({ repo: 'acme/widgets', pr: 7, seq: 0 }));
+    const older = prEvent({ repo: 'acme/widgets', pr: 7, seq: 1 });
+    const latest = prEvent({ repo: 'acme/widgets', pr: 7, seq: 2 });
+    await listener.handleWebhook(older);
+    await listener.handleWebhook(latest);
+    const olderId = older.headers['x-delivery']!;
+    const arrivedFrom = db.getIngressLog({ outcome: 'coalesced', eventId: olderId })[0]!.source;
+
+    await finishPass(0, 1);
+
+    expect(db.getIngressLog({ outcome: 'pass_limit', eventId: olderId }).map((r) => r.source)).toEqual([arrivedFrom]);
+  });
+
   it('names no run for any folded event once the kernel refuses the pass that covered it', async () => {
     const listener = await boot(makeFlow(keyedIngress()));
     await listener.handleWebhook(prEvent({ repo: 'acme/widgets', pr: 7, seq: 0 }));

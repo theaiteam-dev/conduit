@@ -325,6 +325,17 @@ function refuse(
 }
 
 /**
+ * The ingress_log source a folded event arrived under, read from its own
+ * 'coalesced' row. ingress_events keeps no source column, and the event a
+ * pass is refused for may be a drained one logged as DRAIN_SOURCE, so its
+ * source would misattribute the folded events. Falls back to `fallback` when
+ * the row is missing.
+ */
+function arrivalSource(deps: KeyedRunDeps, eventId: string, fallback: string): string {
+  return deps.db.getIngressLog({ outcome: 'coalesced', eventId, limit: 1 })[0]?.source ?? fallback;
+}
+
+/**
  * Refuse a pass the run could not take: every event folded into it that no
  * pass consumed, then the event it was launched or drained from. A pass covers
  * all of its folded events (coveredEvents), so refusing only its latest event
@@ -347,7 +358,7 @@ function refusePass(
     if (row.event_id === event.eventId) continue;
     db.markIngressRefused(row.event_id);
     db.appendIngressLog({
-      source: event.source,
+      source: arrivalSource(deps, row.event_id, event.source),
       eventId: row.event_id,
       outcome,
       reason: `run '${keyed.run_id}' takes no new pass: ${detail} (folded into the refused pass of '${event.eventId}')`,
