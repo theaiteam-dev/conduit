@@ -142,6 +142,14 @@ export interface RedriveReport {
    * is written for them.
    */
   deferred: string[];
+  /**
+   * Rows whose processing threw (issue #47), most likely a storage error in
+   * the row's bookkeeping. The sweep moved on to the next row; each one is
+   * logged 'sweep_error' when the journal accepts the write. A row here is in
+   * no other bucket. Its child may still have launched: if so, its exit
+   * watcher holds the run slot and records the exit.
+   */
+  errored: Array<{ eventId: string; reason: string }>;
 }
 
 // ---------------------------------------------------------------------------
@@ -157,119 +165,169 @@ export interface RedriveReport {
  * Returns a summary report of all outcomes.
  */
 export async function redriveOnBoot(deps: RedriveDeps): Promise<RedriveReport> {
-  const { db, respawn, cap, source = 'boot-recovery', slots, alerts, now = Date.now } = deps;
+  const { db, cap, source = 'boot-recovery' } = deps;
 
-  const report: RedriveReport = { spawned: [], failed: [], permanentlyFailed: [], deferred: [] };
+  const report: RedriveReport = {
+    spawned: [],
+    failed: [],
+    permanentlyFailed: [],
+    deferred: [],
+    errored: [],
+  };
 
   // Snapshot eligible rows once — do not re-query mid-loop so concurrent writes
   // or state changes during re-drive do not alter the set being processed.
   // listRedrivable orders by received_at ASC, so a queued burst launches in
   // arrival order (the original listener-backpressure work).
+  // A throw here ends the sweep; the periodic runner catches it (issue #47).
   const redrivable = db.listRedrivable(cap);
 
   for (const [index, event] of redrivable.entries()) {
-    // ── Keyed rows (issue #36) ────────────────────────────────────────────
-    // Routed, not respawned: see RedriveDeps.keyed. A keyed row is not
-    // reported as spawned/failed unless the router launched it; one it folded
-    // or refused is recorded in ingress_log.
-    if (deps.keyed !== undefined && isKeyedRow(db, event)) {
-      const routed = await routeKeyedEvent(
-        deps.keyed,
-        {
-          eventId: event.event_id,
-          runId: event.run_id!,
-          flowId: event.flow_id!,
-          flowPath: event.flow_path!,
-          substrateJson: event.substrate_json!,
-          source,
-        },
-        'sweep',
-      );
-      if (routed.outcome === 'accepted') report.spawned.push(event.event_id);
-      else if (routed.outcome === 'spawn_failed') report.failed.push(event.event_id);
-      else if (routed.outcome === 'deferred') report.deferred.push(event.event_id);
-      else if (routed.outcome === 'queued') {
-        // No free slot: like the unkeyed gate, everything later waits.
-        report.deferred.push(...redrivable.slice(index).map((e) => e.event_id));
-        break;
-      }
-      continue;
-    }
-
-    // ── Run-slot gate (the original listener-backpressure work) ───────────────────────────────────────────
-    const acquisition = slots?.tryAcquire(event.event_id) ?? 'acquired';
-    if (acquisition === 'duplicate') {
-      // A launch for this event is in flight RIGHT NOW (hot path or an earlier
-      // sweep) — its row just hasn't reached a terminal state yet. Re-driving
-      // it would only burn an attempt on a run-lease conflict. Skip; attempts
-      // untouched.
-      report.deferred.push(event.event_id);
-      continue;
-    }
-    if (acquisition === 'full') {
-      // Capacity exhausted — everything else in this (ordered) snapshot waits
-      // for a freed slot. The release kick or the next tick resumes the queue.
-      report.deferred.push(...redrivable.slice(index).map((e) => e.event_id));
-      break;
-    }
-
-    // The original acknowledgement-on-accept work: a launched child owns its slot until it exits; the release
-    // then belongs to the exit watcher rather than to this iteration.
-    let slotHandedOff = false;
+    let outcome: 'next' | 'stop';
     try {
-      // Persist the attempt increment BEFORE launching — mirrors outbox discipline.
-      // A crash after this point but before completion leaves the row counted, so
-      // the next boot stays within the cap.
-      db.incrementSpawnAttempts(event.event_id);
-
-      // Delegate the actual launch to the seam (does not touch ingress_events/log).
-      const launch = normalizeRedriveLaunch(await respawn(event));
-
-      if (launch.result === 'spawned') {
-        // 'spawned' means LAUNCHED (the original acknowledgement-on-accept work) — a child that later dies is
-        // marked failed by the exit watcher below.
-        db.markIngressSpawned(event.event_id);
-        report.spawned.push(event.event_id);
-      } else if (launch.result === 'transient_failure') {
-        db.markIngressFailed(event.event_id);
-        // Alert on a transient launch failure too (#8). The hot path alerts on
-        // EVERY launch failure without grading it, and an operator cannot tell
-        // a "will retry" from a "gave up" by the silence — the run is stalled
-        // either way until a later sweep succeeds. Mirroring it keeps one
-        // failure story across both paths; the reason text carries the nuance.
-        void fireRedriveAlert(alerts, event, 're-drive launch failed — will retry while under the attempt cap');
-        report.failed.push(event.event_id);
-      } else {
-        // permanent_failure: mark failed and exhaust the remaining cap headroom so
-        // listRedrivable skips this row on future boots (spawn_attempts reaches >= cap).
-        db.markIngressFailed(event.event_id);
-        exhaustCapForPermanentFailure(db, event.event_id, event.spawn_attempts, cap);
-        // The loudest case (#8): the row is now excluded from listRedrivable, so
-        // this alert is the ONLY thing that will ever surface the event again.
-        void fireRedriveAlert(alerts, event, 're-drive launch failed permanently — the event will not be retried');
-        report.permanentlyFailed.push(event.event_id);
-      }
-
-      // Record every re-drive attempt in the ingress log, regardless of outcome.
-      db.appendIngressLog({ source, eventId: event.event_id, outcome: 'redriven' });
-
-      if (launch.result === 'spawned' && launch.exited !== undefined) {
-        slotHandedOff = true;
-        void watchRedrivenChildExit(
-          { db, source, now, ...(alerts !== undefined && { alerts }), ...(slots !== undefined && { slots }) },
-          event,
-          launch.exited,
-        );
-      }
-    } finally {
-      // Release AFTER the row's terminal state is marked (never re-throws on a
-      // seam throw path without freeing the slot). A handed-off slot stays held:
-      // its child is still running.
-      if (!slotHandedOff) slots?.release(event.event_id);
+      outcome = await redriveRow(deps, event, index, redrivable, report);
+    } catch (err) {
+      // Issue #47: one row's storage error must not abort the rest of the
+      // snapshot. The row keeps whatever state the throw left it in, and a
+      // later sweep finds it again if it is still eligible.
+      const reason = errorMessage(err);
+      report.errored.push({ eventId: event.event_id, reason });
+      appendSweepError(db, source, event.event_id, reason);
+      continue;
     }
+    if (outcome === 'stop') break;
   }
 
   return report;
+}
+
+/**
+ * Re-drive one snapshot row. Returns 'stop' when the rest of the snapshot must
+ * wait for a free run slot. Throws on a storage error; redriveOnBoot records
+ * it and moves on.
+ */
+async function redriveRow(
+  deps: RedriveDeps,
+  event: IngressEventRecord,
+  index: number,
+  redrivable: IngressEventRecord[],
+  report: RedriveReport,
+): Promise<'next' | 'stop'> {
+  const { db, respawn, cap, source = 'boot-recovery', slots, alerts, now = Date.now } = deps;
+  // ── Keyed rows (issue #36) ────────────────────────────────────────────
+  // Routed, not respawned: see RedriveDeps.keyed. A keyed row is not
+  // reported as spawned/failed unless the router launched it; one it folded
+  // or refused is recorded in ingress_log.
+  if (deps.keyed !== undefined && isKeyedRow(db, event)) {
+    const routed = await routeKeyedEvent(
+      deps.keyed,
+      {
+        eventId: event.event_id,
+        runId: event.run_id!,
+        flowId: event.flow_id!,
+        flowPath: event.flow_path!,
+        substrateJson: event.substrate_json!,
+        source,
+      },
+      'sweep',
+    );
+    if (routed.outcome === 'accepted') report.spawned.push(event.event_id);
+    else if (routed.outcome === 'spawn_failed') report.failed.push(event.event_id);
+    else if (routed.outcome === 'deferred') report.deferred.push(event.event_id);
+    else if (routed.outcome === 'queued') {
+      // No free slot: like the unkeyed gate, everything later waits.
+      report.deferred.push(...redrivable.slice(index).map((e) => e.event_id));
+      return 'stop';
+    }
+    return 'next';
+  }
+
+  // ── Run-slot gate (the original listener-backpressure work) ───────────────────────────────────────────
+  const acquisition = slots?.tryAcquire(event.event_id) ?? 'acquired';
+  if (acquisition === 'duplicate') {
+    // A launch for this event is in flight RIGHT NOW (hot path or an earlier
+    // sweep) — its row just hasn't reached a terminal state yet. Re-driving
+    // it would only burn an attempt on a run-lease conflict. Skip; attempts
+    // untouched.
+    report.deferred.push(event.event_id);
+    return 'next';
+  }
+  if (acquisition === 'full') {
+    // Capacity exhausted — everything else in this (ordered) snapshot waits
+    // for a freed slot. The release kick or the next tick resumes the queue.
+    report.deferred.push(...redrivable.slice(index).map((e) => e.event_id));
+    return 'stop';
+  }
+
+  // The original acknowledgement-on-accept work: a launched child owns its slot until it exits; the release
+  // then belongs to the exit watcher rather than to this iteration.
+  let slotHandedOff = false;
+  let launch: RedriveLaunch | undefined;
+  try {
+    // Persist the attempt increment BEFORE launching — mirrors outbox discipline.
+    // A crash after this point but before completion leaves the row counted, so
+    // the next boot stays within the cap.
+    db.incrementSpawnAttempts(event.event_id);
+
+    // Delegate the actual launch to the seam (does not touch ingress_events/log).
+    launch = normalizeRedriveLaunch(await respawn(event));
+
+    // Hand the live child to its exit watcher BEFORE any bookkeeping that can
+    // throw (issue #47 review). Otherwise a storage error below would release
+    // the slot of a running child, letting the next sweep launch a second
+    // process for the same row, and would leave nothing to record its exit.
+    // The bookkeeping below is synchronous, so the watcher cannot act on the
+    // exit before this iteration has finished writing the row.
+    if (launch.result === 'spawned' && launch.exited !== undefined) {
+      slotHandedOff = true;
+      void watchRedrivenChildExit(
+        { db, source, now, ...(alerts !== undefined && { alerts }), ...(slots !== undefined && { slots }) },
+        event,
+        launch.exited,
+      );
+    }
+
+    if (launch.result === 'spawned') {
+      // 'spawned' means LAUNCHED (the original acknowledgement-on-accept work) — a child that later dies is
+      // marked failed by the exit watcher below.
+      db.markIngressSpawned(event.event_id);
+    } else if (launch.result === 'transient_failure') {
+      db.markIngressFailed(event.event_id);
+      // Alert on a transient launch failure too (#8). The hot path alerts on
+      // EVERY launch failure without grading it, and an operator cannot tell
+      // a "will retry" from a "gave up" by the silence — the run is stalled
+      // either way until a later sweep succeeds. Mirroring it keeps one
+      // failure story across both paths; the reason text carries the nuance.
+      void fireRedriveAlert(alerts, event, 're-drive launch failed — will retry while under the attempt cap');
+    } else {
+      // permanent_failure: mark failed and exhaust the remaining cap headroom so
+      // listRedrivable skips this row on future boots (spawn_attempts reaches >= cap).
+      db.markIngressFailed(event.event_id);
+      exhaustCapForPermanentFailure(db, event.event_id, event.spawn_attempts, cap);
+      // The loudest case (#8): the row is now excluded from listRedrivable, so
+      // this alert is the ONLY thing that will ever surface the event again.
+      void fireRedriveAlert(alerts, event, 're-drive launch failed permanently — the event will not be retried');
+    }
+
+    // Record every re-drive attempt in the ingress log, regardless of outcome.
+    db.appendIngressLog({ source, eventId: event.event_id, outcome: 'redriven' });
+
+    // Report the row only once all of its writes have landed, so a row whose
+    // bookkeeping threw is reported in `errored` alone (issue #47 review).
+    if (launch.result === 'spawned') report.spawned.push(event.event_id);
+    else if (launch.result === 'transient_failure') report.failed.push(event.event_id);
+    else report.permanentlyFailed.push(event.event_id);
+  } finally {
+    // Release AFTER the row's terminal state is marked (never re-throws on a
+    // seam throw path without freeing the slot). A handed-off slot stays held:
+    // its child is still running.
+    if (!slotHandedOff) slots?.release(event.event_id);
+    // A failed launch that still reported an exit has no watcher, so a
+    // rejection there must not surface as an unhandled one.
+    if (!slotHandedOff) launch?.exited?.catch(() => {});
+  }
+
+  return 'next';
 }
 
 /**
@@ -306,6 +364,11 @@ function normalizeRedriveLaunch(value: RedriveResult | RedriveLaunch): RedriveLa
  * stays 'spawned', the log records 'parked', and the sweep resumes it once
  * its gate passes (ingress/parked.ts). A pre-v9 row carries no run_id, so it
  * cannot be recognised as parked and keeps the failure path.
+ *
+ * Awaits `exited` before it reads or writes anything (issue #47 review): the
+ * launch path starts this watcher before it writes the row, and relies on
+ * that await to run the watcher after those writes. The already-exited child
+ * test in recovery.test.ts pins the order.
  */
 async function watchRedrivenChildExit(
   deps: { db: ConduitDB; source: string; now: () => number; alerts?: RedriveAlerting; slots?: RunSlots },
@@ -386,6 +449,46 @@ async function fireRedriveAlert(
   }
 }
 
+/**
+ * Event id on the alert for a sweep that failed as a whole (issue #47). The
+ * alert seam requires one, and the failure belongs to the sweep, not to an
+ * event.
+ */
+export const REDRIVE_SWEEP_ALERT_EVENT_ID = 'redrive-sweep';
+
+/**
+ * Longest reason a sweep error stores in ingress_log or sends in an alert
+ * (issue #47 review). A storage error's message is written as thrown and can
+ * be long (a driver that appends a statement or a path list); the journal row
+ * and the alert carry a bounded prefix of it. The bound is applied where the
+ * reason is written, after any prefix or suffix is added.
+ */
+export const SWEEP_ERROR_REASON_MAX = 500;
+
+const TRUNCATION_MARK = '… (truncated)';
+
+function boundReason(reason: string, max: number = SWEEP_ERROR_REASON_MAX): string {
+  if (reason.length <= max) return reason;
+  return reason.slice(0, max - TRUNCATION_MARK.length) + TRUNCATION_MARK;
+}
+
+function errorMessage(err: unknown): string {
+  return boundReason(err instanceof Error ? err.message : String(err));
+}
+
+/**
+ * Record a sweep storage error in ingress_log (issue #47), if the journal
+ * still accepts the write. Never throws: the error being recorded is often
+ * the same full disk.
+ */
+function appendSweepError(db: ConduitDB, source: string, eventId: string | null, reason: string): void {
+  try {
+    db.appendIngressLog({ source, eventId, outcome: 'sweep_error', reason: boundReason(reason) });
+  } catch {
+    // The alert and the next tick's retry are what is left.
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Periodic re-drive (the original ingress-attribution work, FR-3)
 // ---------------------------------------------------------------------------
@@ -442,47 +545,122 @@ export function startPeriodicRedrive(deps: PeriodicRedriveDeps): PeriodicRedrive
       return { cancel: () => clearInterval(id) };
     });
 
+  const source = 'periodic-recovery';
   let sweepInFlight = false;
   let kickPending = false;
   let stopped = false;
+  // Issue #47. backingOff: the last sweep failed and made no progress (its
+  // snapshot threw, or every row it reached threw), so kicks wait for the
+  // next interval tick instead of retrying on every child exit. A sweep that
+  // launched, recorded or deferred some row is working, so kicks keep running
+  // after it. A tick clears backingOff so it can sweep; a failed sweep sets it
+  // again before any kick runs.
+  // failing: the current run of failed sweeps has already alerted.
+  let backingOff = false;
+  let failing = false;
 
-  const runSweep = () => {
-    if (sweepInFlight || stopped) return;
-    sweepInFlight = true;
-    void redriveOnBoot({
-      db,
-      respawn,
-      cap,
-      source: 'periodic-recovery',
-      ...(slots !== undefined && { slots }),
-      ...(alerts !== undefined && { alerts }),
-      ...(now !== undefined && { now }),
-      ...(keyed !== undefined && { keyed }),
-    })
-      .then(async (report) => {
-        if (stopped) return;
-        onSweep?.(report);
-        try {
-          await afterSweep?.();
-        } catch {
-          // A persistence error in the parked-run resume must not become an
-          // unhandled rejection that wedges the loop — the next tick sweeps
-          // again, the same discipline as the detached exit watchers.
-        }
-      })
-      .finally(() => {
-        sweepInFlight = false;
-        // A slot freed while this sweep was running (its snapshot predates the
-        // release) — run the coalesced follow-up so queued work isn't stranded
-        // until the next interval tick.
-        if (kickPending && !stopped) {
-          kickPending = false;
-          runSweep();
-        }
+  /**
+   * One sweep plus its after-sweep work. Never rejects (issue #47): this runs
+   * detached from a timer or a slot-release kick, where an unhandled rejection
+   * can end the listener process.
+   */
+  const sweepOnce = async (): Promise<void> => {
+    let failure: string | null = null;
+    let progressed = false;
+    let report: RedriveReport | null = null;
+    try {
+      report = await redriveOnBoot({
+        db,
+        respawn,
+        cap,
+        source,
+        ...(slots !== undefined && { slots }),
+        ...(alerts !== undefined && { alerts }),
+        ...(now !== undefined && { now }),
+        ...(keyed !== undefined && { keyed }),
       });
+      // A deferred row waits on a run slot, not on the store, and the slot
+      // release kick is what launches it, so deferrals count as progress.
+      progressed =
+        report.spawned.length +
+          report.failed.length +
+          report.permanentlyFailed.length +
+          report.deferred.length >
+        0;
+      const firstError = report.errored[0];
+      if (firstError !== undefined) {
+        failure =
+          `re-drive sweep hit ${report.errored.length} error(s), first on event ` +
+          `'${firstError.eventId}': ${firstError.reason}`;
+      }
+    } catch (err) {
+      // The snapshot itself failed: no row was touched.
+      failure = `re-drive sweep failed: ${errorMessage(err)}`;
+      appendSweepError(db, source, null, failure);
+    }
+    if (stopped) return;
+
+    if (failure === null) {
+      failing = false;
+    } else {
+      if (!progressed) backingOff = true;
+      if (!failing) {
+        failing = true;
+        alertSweepFailure(failure);
+      }
+    }
+
+    if (report !== null) {
+      try {
+        onSweep?.(report);
+      } catch {
+        // An observability sink must not end the listener.
+      }
+    }
+    try {
+      await afterSweep?.();
+    } catch {
+      // A persistence error in the parked-run resume must not become an
+      // unhandled rejection that wedges the loop — the next tick sweeps
+      // again, the same discipline as the detached exit watchers.
+    }
   };
 
-  const handle = schedule(runSweep, intervalMs);
+  /** Best effort and not awaited, like fireRedriveAlert. */
+  const alertSweepFailure = (failure: string): void => {
+    if (alerts === undefined) return;
+    const suffix = '; the listener keeps running and retries on the next interval tick';
+    const reason = boundReason(failure, SWEEP_ERROR_REASON_MAX - suffix.length) + suffix;
+    void Promise.resolve()
+      .then(() =>
+        alerts.alert({
+          flowId: UNATTRIBUTED_FLOW_ID,
+          channel: alerts.globalAlertChannel,
+          eventId: REDRIVE_SWEEP_ALERT_EVENT_ID,
+          reason,
+        }),
+      )
+      .catch(() => {});
+  };
+
+  const runSweep = (trigger: 'tick' | 'kick') => {
+    if (sweepInFlight || stopped) return;
+    if (trigger === 'kick' && backingOff) return;
+    backingOff = false;
+    sweepInFlight = true;
+    void sweepOnce().finally(() => {
+      sweepInFlight = false;
+      // A slot freed while this sweep was running (its snapshot predates the
+      // release) — run the coalesced follow-up so queued work isn't stranded
+      // until the next interval tick. Skipped while backing off.
+      if (kickPending && !stopped) {
+        kickPending = false;
+        runSweep('kick');
+      }
+    });
+  };
+
+  const handle = schedule(() => runSweep('tick'), intervalMs);
 
   return {
     stop() {
@@ -495,7 +673,7 @@ export function startPeriodicRedrive(deps: PeriodicRedriveDeps): PeriodicRedrive
         kickPending = true;
         return;
       }
-      runSweep();
+      runSweep('kick');
     },
   };
 }

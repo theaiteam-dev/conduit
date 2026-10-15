@@ -963,3 +963,65 @@ describe('exit watcher × parked run (issue #7)', () => {
     expect(alert.alerts[0]!.reason).toBe('conduit run exited with code 1');
   });
 });
+
+// ===========================================================================
+// Bookkeeping throw after the launch (issue #47 review)
+// ===========================================================================
+
+describe('a storage error after the child is launched', () => {
+  /** The real DB, except that markIngressSpawned throws SQLITE_FULL. */
+  function markSpawnedFails(): ConduitDB {
+    return new Proxy(db, {
+      get(target, prop, receiver) {
+        if (prop === 'markIngressSpawned') {
+          return () => {
+            throw Object.assign(new Error('database or disk is full'), { code: 'SQLITE_FULL' });
+          };
+        }
+        const value = Reflect.get(target, prop, receiver);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+  }
+
+  it('keeps the slot held for the live child and still records its exit', async () => {
+    const spawn = launchingSpawn();
+    const alert = recordingAlert();
+    const slots = createRunSlots({ capacity: 1 });
+
+    await expect(
+      runSpawnPath(
+        { db: markSpawnedFails(), spawn: spawn.seam, alert: alert.seam, globalAlertChannel: '#l', redriveCap: 3, slots },
+        baseInput(),
+      ),
+    ).rejects.toThrow('database or disk is full');
+
+    // The child is running: a sweep must see its launch in flight, not a free slot.
+    expect(slots.inFlight('evt-1')).toBe(true);
+
+    spawn.exit(9);
+    await settleExitWatcher();
+
+    expect(slots.inFlightCount()).toBe(0);
+    expect(db.getIngressEvent('evt-1')).toMatchObject({ spawn_state: 'failed' });
+    expect(db.getIngressLog().map((e) => e.outcome)).toContain('spawn_failed');
+  });
+
+  it('a child that has already exited when the seam returns is recorded after the launch writes', async () => {
+    const slots = createRunSlots({ capacity: 1 });
+    const spawn: SpawnSeam = async () => ({ ok: true, exited: Promise.resolve({ code: 9 }) });
+
+    const result = await runSpawnPath(
+      { db, spawn, alert: recordingAlert().seam, globalAlertChannel: '#l', redriveCap: 3, slots },
+      baseInput(),
+    );
+    await settleExitWatcher();
+
+    expect(result).toEqual({ outcome: 'accepted', runId: deriveIngressRunId('evt-1') });
+    // Had the watcher written before the launch path, 'spawned' would have
+    // overwritten 'failed' and the log would start with 'spawn_failed'.
+    expect(db.getIngressEvent('evt-1')).toMatchObject({ spawn_state: 'failed' });
+    expect(db.getIngressLog().map((e) => e.outcome)).toEqual(['accepted', 'spawn_failed']);
+    expect(slots.inFlightCount()).toBe(0);
+  });
+});

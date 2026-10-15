@@ -365,12 +365,12 @@ export async function runSpawnPath(
 
     if (spawnResult.ok) {
       // ── Step 5a: Launched ─────────────────────────────────────────────────
-      // 'spawned' means LAUNCHED from here on (the original acknowledgement-on-accept work) — see the header.
-      db.markIngressSpawned(eventId);
-      db.appendIngressLog({ source, eventId, outcome: 'accepted' });
-
-      // The marks above are done, so the watcher can never observe a row this
-      // call has not finished writing.
+      // Hand the live child to its exit watcher BEFORE the marks below, which
+      // can throw on a storage error (issue #47 review). A throw after the
+      // launch must not free the slot of a running child, or the sweep would
+      // launch a second process for the row, and the child's exit must still
+      // be recorded. The marks are synchronous, so the watcher cannot act on
+      // the exit before this call has finished writing the row.
       if (spawnResult.exited !== undefined) {
         slotHandedOff = true;
         void watchChildExit(
@@ -379,6 +379,10 @@ export async function runSpawnPath(
           spawnResult.exited,
         );
       }
+
+      // 'spawned' means LAUNCHED from here on (the original acknowledgement-on-accept work) — see the header.
+      db.markIngressSpawned(eventId);
+      db.appendIngressLog({ source, eventId, outcome: 'accepted' });
 
       return { outcome: 'accepted', runId };
     }
@@ -544,6 +548,11 @@ async function fireSpawnFailedAlert(alert: AlertSeam, notice: SpawnFailedAlert):
  * Never rejects — it runs detached, so an escaping throw would be an unhandled
  * rejection with no caller to report to (same discipline as the post-ack Slack
  * pipeline).
+ *
+ * Awaits `exited` before it reads or writes anything (issue #47 review): the
+ * launch path starts this watcher before it writes the row, and relies on
+ * that await to run the watcher after those writes. The already-exited child
+ * test in spawn.test.ts pins the order.
  */
 async function watchChildExit(
   deps: ChildExitDeps,

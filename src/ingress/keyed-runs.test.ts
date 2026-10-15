@@ -1018,6 +1018,95 @@ describe('restart and re-drive', () => {
     expect(launches[1]!.appendPass).toBeUndefined();
     listener.redrive.stop();
   });
+
+  it('a storage error after the pass launched keeps its slot held and still watches its exit (issue #47 review)', async () => {
+    seedFinishedRun();
+    acceptRow('ev-a', NOW - 10, { round: 'a' });
+    const slots = createRunSlots({ capacity: 1 });
+    const failing = new Proxy(db, {
+      get(target, prop, receiver) {
+        if (prop === 'markIngressSpawned') {
+          return () => {
+            throw Object.assign(new Error('database or disk is full'), { code: 'SQLITE_FULL' });
+          };
+        }
+        const value = Reflect.get(target, prop, receiver);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+    const deps: KeyedRunDeps = {
+      db: failing,
+      spawn: controlledSpawn,
+      alerts: { alert: async (a) => void alerts.push(a), channels: {}, globalAlertChannel: '#ops' },
+      slots,
+      redriveCap: 3,
+      now: () => NOW,
+      launching: new Set<string>(),
+    };
+
+    await expect(
+      routeKeyedEvent(
+        deps,
+        {
+          eventId: 'ev-a',
+          runId: RUN,
+          flowId: FLOW_ID,
+          flowPath: FLOW_PATH,
+          substrateJson: db.getIngressEvent('ev-a')!.substrate_json!,
+          source: 'test',
+        },
+        'sweep',
+      ),
+    ).rejects.toThrow('database or disk is full');
+
+    // The pass is running: its run slot stays held, so no second pass launches.
+    expect(launches).toHaveLength(1);
+    expect(slots.inFlightCount()).toBe(1);
+
+    launches[0]!.exit(9);
+    await settle();
+
+    expect(slots.inFlightCount()).toBe(0);
+    // The run is still concluded and appendable, so the watcher reads the
+    // non-zero exit as a pass that ran and failed.
+    expect(db.getIngressLog().map((e) => e.outcome)).toEqual(['pass_failed']);
+  });
+
+  it('a pass whose child has already exited when the launch returns is recorded after the launch writes (issue #47 review)', async () => {
+    seedFinishedRun();
+    acceptRow('ev-a', NOW - 10, { round: 'a' });
+    const slots = createRunSlots({ capacity: 1 });
+    const deps: KeyedRunDeps = {
+      db,
+      // The child died before the seam returned: the exit promise is already settled.
+      spawn: async () => ({ ok: true, exited: Promise.resolve({ code: 9 }) }),
+      alerts: { alert: async (a) => void alerts.push(a), channels: {}, globalAlertChannel: '#ops' },
+      slots,
+      redriveCap: 3,
+      now: () => NOW,
+      launching: new Set<string>(),
+    };
+
+    const routed = await routeKeyedEvent(
+      deps,
+      {
+        eventId: 'ev-a',
+        runId: RUN,
+        flowId: FLOW_ID,
+        flowPath: FLOW_PATH,
+        substrateJson: db.getIngressEvent('ev-a')!.substrate_json!,
+        source: 'test',
+      },
+      'sweep',
+    );
+    await settle();
+
+    expect(routed).toEqual({ outcome: 'accepted', runId: RUN, pass: 2 });
+    // The launch's own writes land first; the watcher's record follows them.
+    expect(db.getIngressLog().map((e) => e.outcome)).toEqual(['redriven', 'pass_failed']);
+    expect(db.getIngressEvent('ev-a')).toMatchObject({ spawn_state: 'spawned' });
+    expect(slots.inFlightCount()).toBe(0);
+  });
 });
 
 describe('drainKeyedRun on a pending event the router cannot simply launch', () => {

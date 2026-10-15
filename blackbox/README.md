@@ -238,6 +238,15 @@ user or CI consumer actually sees, not internal implementation details.
   children. The confined case also checks that c1 and c2 each ran with their
   own `conduit-call-tmp-*` TMPDIR and that the kernel's TMPDIR is empty after
   the run: no call temp dir, run-scoped `CODEX_HOME` or opencode dir left.
+- `fault-ingress-sweep-storage-error.test.ts`: a storage error in the
+  listener's re-drive sweep (issue #47). It seeds a failed `ingress_events`
+  row and adds a trigger that fails every UPDATE of that table with SQLite's
+  disk-full message (`faults.setIngressStorageFault`,
+  `faults.seedFailedIngressEvent`), with the sweep interval shortened through
+  the `redriveIntervalMs` harness option. The listener must keep serving,
+  print one `event=redrive-sweep` alert across several failed ticks, log
+  `sweep_error`, count no attempt, and re-drive the row once the trigger is
+  dropped.
 - `stale-temp-dir-sweep.test.ts`: the first run in a kernel removes the
   run-scoped temp dirs (`conduit-call-tmp-`, `conduit-claude-config-`,
   `conduit-codex-home-`, `conduit-opencode-`) whose owner is gone, a dead pid
