@@ -39,7 +39,8 @@ user or CI consumer actually sees, not internal implementation details.
   scrubs the child env, so `bun` may not be on its PATH). It runs the real
   `conduit run`, `conduit run status`, `conduit journal inspect` and
   `conduit doctor` as subprocesses. No Slack or listener. `journalSpans()` is
-  a read-only journal DB read for span usage columns, which no CLI prints.
+  a read-only journal DB read for span usage and binding-stamp columns
+  (`binding_stamp`, `prompt_template_version`), which no CLI prints.
   With `stubSink`, it also serves the stub's call counter, log and barriers
   over HTTP on 127.0.0.1 (`startStubSink`), for a stub that runs
   write-confined and so cannot write the stub dir; the server appends to the
@@ -70,6 +71,14 @@ user or CI consumer actually sees, not internal implementation details.
   and the run halts on the tokens andon; a control run with more budget
   completes. The halt prints one andon line, and `run status` reports the run
   halted with its resume command (#83).
+- `harness-critic-visibility.test.ts`: a `kind: transform` station whose
+  only harness is its gate critic (issue #35). With the critic's binary
+  missing, `conduit doctor` prints a FAIL line for the critic and exits
+  nonzero, and `conduit run` refuses to start with `HARNESS_BINARY_NOT_FOUND`
+  naming the critic. With it present, doctor prints the critic's ok line and
+  `conduit explain` shows its adapter, model and tools with a `critic ` prefix.
+  The journey serves a stub `/models` so doctor's exit code turns on the
+  critic alone.
 - `harness-claude-session-usage.test.ts`: a Claude call's tokens are the
   session total from `modelUsage`, not the last `result` event's `usage`
   (issue #108). The maker's call emits two results, as a session with a
@@ -77,6 +86,15 @@ user or CI consumer actually sees, not internal implementation details.
   below the session total halts on the tokens andon before the second station
   runs, and a control run with more budget completes. Runs once behind
   `claude-headless` and once behind `agent-sdk`.
+- `prompt-edit-resume.test.ts`: editing a prompt or a skill between a halt
+  and a resume re-runs the station that renders it (issues #131 and #93). A
+  harness maker using one `worker.uses` skill, gated by a harness critic,
+  halts on the tokens andon after its checkpoint is written; `conduit resume`
+  then reuses the checkpoint when nothing changed, re-runs the maker when its
+  `prompt_file` or the skill's `SKILL.md` changed (with `prompt_version`
+  unchanged, and a different `prompt_template_version` on the journal row),
+  and re-runs only the critic, with the new text, when the critic's prompt
+  changed.
 - `harness-idle-timeout.test.ts`: `worker.idle_timeout_seconds` kills a
   silent call, which is retried up to `max_execution_attempts` and then
   scrapped as `harness-idle-timeout`. A `setsid` sleeper spawned by the stub
