@@ -240,7 +240,7 @@ user or CI consumer actually sees, not internal implementation details.
   the run: no call temp dir, run-scoped `CODEX_HOME` or opencode dir left.
 - `fault-ingress-sweep-storage-error.test.ts`: a storage error in the
   listener's re-drive sweep (issue #47). It seeds a failed `ingress_events`
-  row and adds a trigger that fails every UPDATE of that table with SQLite's
+  row attributed to the journey flow and adds a trigger that fails every UPDATE of that table with SQLite's
   disk-full message (`faults.setIngressStorageFault`,
   `faults.seedFailedIngressEvent`), with the sweep interval shortened through
   the `redriveIntervalMs` harness option. The listener must keep serving,

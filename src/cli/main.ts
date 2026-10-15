@@ -245,6 +245,19 @@ export interface RunEngineArgs {
   resolveWriteConfinement?: () => Promise<WriteConfinement>;
 }
 
+/** The address `conduit listen` binds its HTTP server to when `--bind` is absent (#44). */
+export const DEFAULT_LISTEN_BIND = '127.0.0.1';
+
+/** What `conduit listen` asks the serve seam to bind (#44). */
+export interface ServeOptions {
+  /**
+   * The HTTP server to start, or null when no served binding needs an inbound
+   * port (every binding is Socket Mode), in which case no port is opened.
+   * `explicitBind` is false when `hostname` is the loopback default.
+   */
+  http: { port: number; hostname: string; explicitBind: boolean } | null;
+}
+
 export interface CliDeps {
   io: CliIO;
   now: () => number;
@@ -299,11 +312,13 @@ export interface CliDeps {
    * Optional HTTP-serving seam — present in production, omitted in unit tests.
    *
    * When present, cmdListen hands the booted listener to this seam, which binds
-   * an HTTP server and BLOCKS until a shutdown signal (SIGTERM/SIGINT). When
-   * absent (the injected-seam test path), cmdListen returns immediately after a
-   * successful boot so the lifecycle stays unit-testable without binding a port.
+   * an HTTP server when `opts.http` is non-null, starts the Socket Mode clients
+   * and the re-drive sweep, and BLOCKS until a shutdown signal (SIGTERM/SIGINT).
+   * When absent (the injected-seam test path), cmdListen returns immediately
+   * after a successful boot so the lifecycle stays unit-testable without
+   * binding a port.
    */
-  serve?: (listener: Listener, opts: { port: number }) => Promise<void>;
+  serve?: (listener: Listener, opts: ServeOptions) => Promise<void>;
   /**
    * Optional worker-pool factory — present in production (real Bun.spawn workers),
    * omitted in unit tests that drive the synchronous path. cmdRun/cmdResume call
@@ -2476,14 +2491,22 @@ async function cmdJournal(argv: string[], deps: CliDeps): Promise<number> {
  * most n spawned `conduit run` processes in flight at once. Precedence: flag >
  * manifest max_concurrent_runs > CONDUIT_MAX_CONCURRENT_RUNS env. Omitted →
  * unlimited (before listener backpressure behavior).
+ *
+ * --port <n> / --bind <addr> (#44): the HTTP server listens on <addr>:<n>,
+ * default 127.0.0.1:3000. It is started only when a served binding receives
+ * events over inbound HTTP (a webhook route or a Slack Events API binding); a
+ * Socket-Mode-only listener opens no port.
  */
 async function cmdListen(argv: string[], deps: CliDeps): Promise<number> {
   // ── Parse: listen [--flows <name=path>[...]] [--manifest <file>] [--validate]
-  //           [--port <n>] [--global-alert-channel <c>] [--max-concurrent-runs <n>] ──
+  //           [--port <n>] [--bind <addr>] [--global-alert-channel <c>]
+  //           [--max-concurrent-runs <n>] ──
   let flowsValue: string | undefined;
   let manifestPath: string | undefined;
   let validateOnly = false;
   let port = 3000;
+  let portExplicit = false;
+  let bind: string | undefined;
   let globalAlertChannel: string | undefined;
   let maxConcurrentRuns: number | undefined;
 
@@ -2502,6 +2525,17 @@ async function cmdListen(argv: string[], deps: CliDeps): Promise<number> {
         return 1;
       }
       port = parsed;
+      portExplicit = true;
+    } else if (arg === '--bind') {
+      // #44: the HTTP server binds loopback unless the operator names another
+      // address. A missing or malformed value fails loud rather than falling
+      // back to a default the operator did not choose.
+      const value = argv[++i];
+      if (value === undefined || value.length === 0 || /\s/.test(value) || value.startsWith('-')) {
+        deps.io.err(`invalid --bind value: '${value ?? ''}' (expected an address such as 0.0.0.0)`);
+        return 1;
+      }
+      bind = value;
     } else if (arg === '--global-alert-channel' && i + 1 < argv.length) {
       globalAlertChannel = argv[++i];
     } else if (arg === '--max-concurrent-runs' && i + 1 < argv.length) {
@@ -2518,7 +2552,7 @@ async function cmdListen(argv: string[], deps: CliDeps): Promise<number> {
 
   const usage =
     'usage: conduit listen (--flows <name=path>[,<name=path>...] | --manifest <engine.yaml>) ' +
-    '[--validate] [--port <n>] [--max-concurrent-runs <n>]';
+    '[--validate] [--port <n>] [--bind <addr>] [--max-concurrent-runs <n>]';
 
   if (flowsValue !== undefined && manifestPath !== undefined) {
     deps.io.err(`--flows and --manifest are mutually exclusive. ${usage}`);
@@ -2621,12 +2655,31 @@ async function cmdListen(argv: string[], deps: CliDeps): Promise<number> {
     );
   }
 
-  // ── Serve HTTP and block until shutdown (#1) ──────────────────────────────
+  // ── Serve and block until shutdown (#1) ───────────────────────────────────
   // In production, deps.serve binds an HTTP server routing webhook/Slack POSTs
   // to the booted listener and blocks until SIGTERM/SIGINT. In unit tests the
   // serve seam is absent, so cmdListen returns immediately after a clean boot.
+  //
+  // #44: no HTTP server when every served binding is Socket Mode, and loopback
+  // unless --bind names another address.
+  const needsHttp = result.listener.needsHttp === true;
+  if (!needsHttp && (bind !== undefined || portExplicit)) {
+    const ignoredFlags =
+      portExplicit && bind !== undefined
+        ? `--port ${port} and --bind ${bind}`
+        : portExplicit
+          ? `--port ${port}`
+          : `--bind ${bind}`;
+    deps.io.err(
+      `conduit listen: ${ignoredFlags} ignored: no served binding needs an inbound HTTP port`,
+    );
+  }
   if (deps.serve) {
-    await deps.serve(result.listener, { port });
+    await deps.serve(result.listener, {
+      http: needsHttp
+        ? { port, hostname: bind ?? DEFAULT_LISTEN_BIND, explicitBind: bind !== undefined }
+        : null,
+    });
   }
 
   return 0;
@@ -3065,9 +3118,10 @@ export function buildProductionDeps(): CliDeps {
         ...spend,
       };
     },
-    // #1: real HTTP server — binds a port, routes webhook/Slack POSTs to the
-    // booted listener, and blocks until SIGTERM/SIGINT, stopping gracefully.
-    serve: (listener, { port }) => serveListener(listener, port, io),
+    // #1: real HTTP server — binds a port (when a binding needs one, #44),
+    // routes webhook/Slack POSTs to the booted listener, and blocks until
+    // SIGTERM/SIGINT, stopping gracefully.
+    serve: (listener, opts) => serveListener(listener, opts, io),
     // Wire the real WI-410 listener assembly with production I/O seams.
     startListener: (config) => {
       // #3: resolve secrets, the Slack signing secret, and the global alert
@@ -3462,20 +3516,77 @@ function resolveIngressSecrets(
 const SLACK_EVENTS_ROUTE = '/slack/events';
 
 /**
- * Serve the booted listener over HTTP until a shutdown signal arrives.
+ * Serve the booted listener until a shutdown signal arrives.
  *
- * Routing (POST only):
+ * When `opts.http` is non-null, an HTTP server listens on its hostname and
+ * port. Routing (POST only):
  *   - POST /slack/events → listener.handleSlack (ack-fast, processes async)
  *   - POST <any other path> → listener.handleWebhook (the adapter resolves the
  *     route and itself returns 404 for an unwatched path)
  *   - everything else → 404
+ * When it is null (#44), no port is opened; the Socket Mode clients and the
+ * re-drive sweep still run. The startup log line names which case applied.
  *
  * Resolves (allowing cmdListen to return 0) once SIGTERM or SIGINT is received
  * and the server has been stopped gracefully.
  */
-async function serveListener(listener: Listener, port: number, io: CliIO): Promise<void> {
-  const server = Bun.serve({
-    port,
+async function serveListener(listener: Listener, opts: ServeOptions, io: CliIO): Promise<void> {
+  const server = opts.http === null ? null : startIngressHttpServer(listener, opts.http);
+
+  if (server === null || opts.http === null) {
+    io.out('conduit listen: no HTTP listener (every served binding uses Slack Socket Mode)');
+  } else {
+    const host = opts.http.hostname.includes(':') ? `[${opts.http.hostname}]` : opts.http.hostname;
+    const scope = opts.http.explicitBind
+      ? `--bind ${opts.http.hostname}`
+      : `loopback only by default; pass --bind 0.0.0.0 to accept connections from other hosts`;
+    io.out(`conduit listen: serving ingress on http://${host}:${server.port} (${scope})`);
+  }
+
+  // Socket Mode transport (the original Slack Socket Mode work): open outbound wss connections for any
+  // socket-transport slack flows. Deliberately NOT awaited — an unreachable
+  // Slack retries with backoff forever, and the HTTP transports must serve
+  // regardless. A listener with no socket flows makes this a no-op. The catch
+  // covers failures OUTSIDE the client's own retry loop (e.g. a WebSocket
+  // constructor throw on a malformed URL) so they surface as a log line, not
+  // an unhandled rejection.
+  listener.sockets.start().catch((err) => {
+    io.err(
+      `[slack socket] failed to start socket clients: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+  });
+
+  // Periodic re-drive sweep (the original ingress-attribution work, FR-3): recover transiently-failed
+  // events while the listener is up, not only at the next boot.
+  listener.redrive.start();
+
+  // Block until SIGTERM/SIGINT, then stop the server gracefully.
+  await new Promise<void>((resolveSignal) => {
+    const onSignal = (sig: NodeJS.Signals) => {
+      io.err(`conduit listen: received ${sig}, shutting down`);
+      process.off('SIGTERM', onSignal);
+      process.off('SIGINT', onSignal);
+      resolveSignal();
+    };
+    process.on('SIGTERM', onSignal);
+    process.on('SIGINT', onSignal);
+  });
+
+  listener.redrive.stop();
+  listener.sockets.stop();
+  await server?.stop();
+}
+
+/** Bind the ingress HTTP server routing webhook and Slack Events API POSTs. */
+function startIngressHttpServer(
+  listener: Listener,
+  http: { port: number; hostname: string },
+): ReturnType<typeof Bun.serve> {
+  return Bun.serve({
+    port: http.port,
+    hostname: http.hostname,
     async fetch(req): Promise<Response> {
       const url = new URL(req.url);
 
@@ -3518,43 +3629,6 @@ async function serveListener(listener: Listener, port: number, io: CliIO): Promi
       });
     },
   });
-
-  io.out(`conduit listen: serving ingress on http://0.0.0.0:${server.port}`);
-
-  // Socket Mode transport (the original Slack Socket Mode work): open outbound wss connections for any
-  // socket-transport slack flows. Deliberately NOT awaited — an unreachable
-  // Slack retries with backoff forever, and the HTTP transports must serve
-  // regardless. A listener with no socket flows makes this a no-op. The catch
-  // covers failures OUTSIDE the client's own retry loop (e.g. a WebSocket
-  // constructor throw on a malformed URL) so they surface as a log line, not
-  // an unhandled rejection.
-  listener.sockets.start().catch((err) => {
-    io.err(
-      `[slack socket] failed to start socket clients: ${
-        err instanceof Error ? err.message : String(err)
-      }`,
-    );
-  });
-
-  // Periodic re-drive sweep (the original ingress-attribution work, FR-3): recover transiently-failed
-  // events while the listener is up, not only at the next boot.
-  listener.redrive.start();
-
-  // Block until SIGTERM/SIGINT, then stop the server gracefully.
-  await new Promise<void>((resolveSignal) => {
-    const onSignal = (sig: NodeJS.Signals) => {
-      io.err(`conduit listen: received ${sig}, shutting down`);
-      process.off('SIGTERM', onSignal);
-      process.off('SIGINT', onSignal);
-      resolveSignal();
-    };
-    process.on('SIGTERM', onSignal);
-    process.on('SIGINT', onSignal);
-  });
-
-  listener.redrive.stop();
-  listener.sockets.stop();
-  await server.stop();
 }
 
 /**

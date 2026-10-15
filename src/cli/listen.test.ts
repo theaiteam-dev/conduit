@@ -41,7 +41,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import { openConduitDB, type ConduitDB } from '../persistence/db';
 import type { ModelAdapter } from '../worker/adapter';
-import { formatIngressAlert, main, type CliDeps, type CliIO } from './main';
+import { formatIngressAlert, main, type CliDeps, type CliIO, type ServeOptions } from './main';
 import type { ListenerConfig, StartListenerResult, Listener } from '../ingress/listener';
 
 function makeIO(): CliIO & { lines: string[]; errors: string[] } {
@@ -210,6 +210,115 @@ describe('conduit listen --max-concurrent-runs (the original listener-backpressu
       expect(io.errors.join('\n')).toContain('invalid --max-concurrent-runs value');
     },
   );
+});
+
+// ---------------------------------------------------------------------------
+// Issue #44: no HTTP server when no binding needs one; loopback by default;
+// --bind opts in to another address.
+// ---------------------------------------------------------------------------
+describe('conduit listen HTTP bind (#44)', () => {
+  function depsServing(needsHttp: boolean): { deps: CliDeps; served: ServeOptions[] } {
+    const served: ServeOptions[] = [];
+    const listener = { alertChannels: {}, needsHttp } as unknown as Listener;
+    const deps = makeDeps({ startResult: { ok: true, listener } });
+    deps.serve = async (_l, opts) => {
+      served.push(opts);
+    };
+    return { deps, served };
+  }
+
+  it('starts no HTTP server when no binding needs one', async () => {
+    const { deps, served } = depsServing(false);
+    const code = await main(['listen', '--flows', 'myflow=/flows/my.yaml'], deps);
+
+    expect(code).toBe(0);
+    expect(served).toEqual([{ http: null }]);
+  });
+
+  it('binds loopback by default when a binding needs HTTP', async () => {
+    const { deps, served } = depsServing(true);
+    const code = await main(['listen', '--flows', 'myflow=/flows/my.yaml', '--port', '8080'], deps);
+
+    expect(code).toBe(0);
+    expect(served).toEqual([{ http: { port: 8080, hostname: '127.0.0.1', explicitBind: false } }]);
+  });
+
+  it('binds the --bind address when given', async () => {
+    const { deps, served } = depsServing(true);
+    const code = await main(['listen', '--flows', 'myflow=/flows/my.yaml', '--bind', '0.0.0.0'], deps);
+
+    expect(code).toBe(0);
+    expect(served).toEqual([{ http: { port: 3000, hostname: '0.0.0.0', explicitBind: true } }]);
+  });
+
+  it('warns that --bind is ignored when no binding needs HTTP', async () => {
+    const { deps, served } = depsServing(false);
+    const code = await main(['listen', '--flows', 'myflow=/flows/my.yaml', '--bind', '0.0.0.0'], deps);
+
+    expect(code).toBe(0);
+    expect(served).toEqual([{ http: null }]);
+    expect(io.errors.join('\n')).toContain('--bind 0.0.0.0 ignored');
+  });
+
+  // Nitpick (src/cli/main.ts ~line 2664, cmdListen): an explicit --port was
+  // silently dropped on a Socket-Mode-only flow while --bind warned. --port
+  // must warn too, and the two must fold into one line when both are given.
+  it('warns that --port is ignored when no binding needs HTTP', async () => {
+    const { deps, served } = depsServing(false);
+    const code = await main(['listen', '--flows', 'myflow=/flows/my.yaml', '--port', '8080'], deps);
+
+    expect(code).toBe(0);
+    expect(served).toEqual([{ http: null }]);
+    expect(io.errors.join('\n')).toContain('--port 8080 ignored');
+  });
+
+  it('warns once naming both --port and --bind when no binding needs HTTP', async () => {
+    const { deps, served } = depsServing(false);
+    const code = await main(
+      ['listen', '--flows', 'myflow=/flows/my.yaml', '--port', '8080', '--bind', '0.0.0.0'],
+      deps,
+    );
+
+    expect(code).toBe(0);
+    expect(served).toEqual([{ http: null }]);
+    const errors = io.errors.join('\n');
+    expect(errors).toContain('--port 8080 and --bind 0.0.0.0 ignored');
+    // Exactly one warning line, not one per flag.
+    expect(io.errors.filter((l) => l.includes('ignored')).length).toBe(1);
+  });
+
+  it('does not warn when neither --port nor --bind is given, even though port defaults to 3000', async () => {
+    const { deps, served } = depsServing(false);
+    const code = await main(['listen', '--flows', 'myflow=/flows/my.yaml'], deps);
+
+    expect(code).toBe(0);
+    expect(served).toEqual([{ http: null }]);
+    expect(io.errors.join('\n')).not.toContain('ignored');
+  });
+
+  it.each([['empty', ''], ['whitespace', ' '], ['flag-like', '--port']])(
+    'rejects a malformed --bind value (%s) before starting the listener',
+    async (_label, value) => {
+      const code = await main(['listen', '--flows', 'myflow=/flows/my.yaml', '--bind', value], makeDeps());
+
+      expect(code).toBe(1);
+      expect(listenerCalls).toHaveLength(0);
+      expect(io.errors.join('\n')).toContain('invalid --bind value');
+    },
+  );
+
+  it('rejects --bind with no value', async () => {
+    const code = await main(['listen', '--flows', 'myflow=/flows/my.yaml', '--bind'], makeDeps());
+
+    expect(code).toBe(1);
+    expect(listenerCalls).toHaveLength(0);
+    expect(io.errors.join('\n')).toContain('invalid --bind value');
+  });
+
+  it('lists --bind in the usage string', async () => {
+    await main(['listen'], makeDeps());
+    expect(io.errors.join('\n')).toContain('[--bind <addr>]');
+  });
 });
 
 // ---------------------------------------------------------------------------

@@ -11,6 +11,29 @@ historical context, not public releases or public repository history.
 
 ## [Unreleased]
 
+### Breaking
+
+- **Breaking default:** `conduit listen` now binds its HTTP server to
+  `127.0.0.1` instead of `0.0.0.0`. Anyone serving webhooks or the Slack Events
+  API through a published container port or from another host must pass
+  `--bind 0.0.0.0` (or the specific address to listen on) after upgrading.
+  `listen` also starts no HTTP server when every served binding uses Slack
+  Socket Mode ([#44](https://github.com/theaiteam-dev/conduit/issues/44)).
+  The server starts only when a served flow has a webhook route or a Slack
+  Events API binding. A new `--bind <addr>` flag sets the address. The startup log line
+  says which case applied: no HTTP listener, loopback by default, or the
+  `--bind` address.
+
+  **Upgrade note:** before this change the server always bound `0.0.0.0`. A
+  webhook or Slack Events API deployment that receives requests from another
+  host, or through a published Docker port, now refuses those connections
+  until you add `--bind 0.0.0.0`. In a container this applies even when a
+  reverse proxy on the same host fronts it, because a published port does not
+  reach the container's loopback. `docker-compose.operator.yml` now passes
+  `--bind 0.0.0.0`; update any compose file, unit or script of your own the
+  same way. Socket-Mode-only deployments need no change and no longer open
+  port 3000.
+
 ### Added
 
 - Harness event stream ([#70](https://github.com/theaiteam-dev/conduit/issues/70)).

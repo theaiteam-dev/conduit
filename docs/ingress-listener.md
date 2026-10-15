@@ -96,8 +96,9 @@ accepted work as failed. Generic providers (GitHub, Stripe) time out after
   3. Validate all bindings (malformed?, route collision?)
   4. Resolve alert channels per flow (flow.egress || listener-global)
   5. Re-drive recoverable events (bounded by cap)
-  6. Start HTTP server (webhook adapter)
-  7. Register Slack event handler
+  6. Start HTTP server (webhook and Slack Events API adapters), only when a
+     served binding needs one; 127.0.0.1 unless --bind names another address
+  7. Open Socket Mode connections for socket-transport Slack bindings
     ↓
 [Idle]
   - Accept events
@@ -174,6 +175,60 @@ under saturation the true process count can exceed `max_concurrent_runs` by the 
 in-flight resumes. A second concurrent resume for the *same* run is suppressed (logged
 `'duplicate'`) — the double-driver guard; the run lease remains the backstop for resumes
 that bypassed the gate.
+
+### HTTP server: when it starts and where it binds (`--port`, `--bind`)
+
+The listener starts an HTTP server only when a served flow has a binding that
+receives events over inbound HTTP: a `webhook` binding, or a `slack` binding on
+the Events API transport (`transport: events`, the default). When every served
+binding is Slack Socket Mode (`transport: socket`), it opens no port at all:
+Socket Mode is outbound-only. A flow quarantined at boot does not count.
+
+When the server starts, it binds `127.0.0.1` on port 3000 by default. Change
+the port with `--port <n>` and the address with `--bind <addr>`:
+
+```bash
+# Loopback only (the default): reachable from this host, for example by a
+# reverse proxy on the same machine.
+conduit listen --manifest engine.yaml --port 8080
+
+# Every IPv4 interface: needed when another host, or a published Docker port,
+# must reach the listener directly.
+conduit listen --manifest engine.yaml --port 8080 --bind 0.0.0.0
+```
+
+The startup log line states which case applied:
+
+```
+conduit listen: no HTTP listener (every served binding uses Slack Socket Mode)
+conduit listen: serving ingress on http://127.0.0.1:8080 (loopback only by default; pass --bind 0.0.0.0 to accept connections from other hosts)
+conduit listen: serving ingress on http://0.0.0.0:8080 (--bind 0.0.0.0)
+```
+
+When no binding needs HTTP, an explicit `--port` or `--bind` is reported on
+stderr as ignored, in one line naming the flags that were passed. The default
+port never triggers it:
+
+```
+conduit listen: --bind 0.0.0.0 ignored: no served binding needs an inbound HTTP port
+conduit listen: --port 8080 ignored: no served binding needs an inbound HTTP port
+conduit listen: --port 8080 and --bind 0.0.0.0 ignored: no served binding needs an inbound HTTP port
+```
+
+**In a container, the default is not reachable from outside.** On Docker's
+default bridge network, a published port is forwarded to the container's network
+interface, not to its loopback, so a
+listener bound to `127.0.0.1` inside the container cannot be reached through
+`-p 8080:8080` or a compose `ports:` entry. A containerised listener that
+receives webhooks or Slack Events API requests must pass `--bind 0.0.0.0`, and
+the host side of the port mapping then decides who can reach it: publish it on
+the host's loopback (`-p 127.0.0.1:8080:8080`) when a reverse proxy on the same
+host terminates TLS. `docker-compose.operator.yml` passes `--bind 0.0.0.0` for
+this reason. A Socket-Mode-only container needs neither `--bind` nor a published
+port.
+
+Before #44 the server always started and always bound `0.0.0.0`. See the
+CHANGELOG upgrade note.
 
 ### Per-flow binding declaration
 

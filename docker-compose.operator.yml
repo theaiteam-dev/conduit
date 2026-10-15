@@ -20,7 +20,10 @@ services:
   listener:
     image: ${CONDUIT_FLOW_IMAGE:-branching-flow}
     # Forwards the `listen` subcommand to the inherited engine ENTRYPOINT (FR-10).
-    command: ["listen", "--flows", "branching=/flow/flow.yaml", "--port", "8080"]
+    # `--bind 0.0.0.0`: the listener binds 127.0.0.1 by default (#44), which a
+    # published port cannot reach from outside the container. A flow whose
+    # ingress is Slack Socket Mode only opens no port; drop `ports:` for it.
+    command: ["listen", "--flows", "branching=/flow/flow.yaml", "--port", "8080", "--bind", "0.0.0.0"]
     ports:
       # Webhook ingress port; reverse-proxy or cloud load-balancer terminates TLS.
       - "8080:8080"

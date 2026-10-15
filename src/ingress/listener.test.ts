@@ -1301,3 +1301,85 @@ describe('parked-run resume (issue #7)', () => {
     expect(db.getIngressEvent('evt-parked')!.spawn_state).toBe('spawned');
   });
 });
+
+// ===========================================================================
+// Issue #44: the listener reports whether any surviving binding needs an
+// inbound HTTP port, so `conduit listen` can skip the HTTP server entirely for
+// a Socket-Mode-only deployment.
+// ===========================================================================
+describe('needsHttp (#44)', () => {
+  it('is false when every binding is a Socket Mode slack binding', async () => {
+    const { seam } = makeFakeSocketSeam();
+    const flows = { '/flows/studio.yaml': makeFlow(socketIngress('C-STUDIO'), '#studio-alerts') };
+    const deps = makeDeps({ loadFlow: loadFlowFrom(flows), socket: seam });
+    const listener = expectStarted(
+      await startListener(
+        deps,
+        baseConfig({
+          allowlist: { studio: '/flows/studio.yaml' },
+          secrets: { SLACK_APP_TOKEN: 'xapp-fake-token' },
+        }),
+      ),
+    );
+    expect(listener.needsHttp).toBe(false);
+  });
+
+  it('is true when a webhook binding is served', async () => {
+    const flows = { '/flows/a.yaml': makeFlow(webhookIngress('/hooks/a'), '#a') };
+    const deps = makeDeps({ loadFlow: loadFlowFrom(flows) });
+    const listener = expectStarted(
+      await startListener(deps, baseConfig({ allowlist: { a: '/flows/a.yaml' } })),
+    );
+    expect(listener.needsHttp).toBe(true);
+  });
+
+  it('is true when a slack binding uses the Events API (HTTP) transport', async () => {
+    const flows = { '/flows/s.yaml': makeFlow(slackIngress('C-EVENTS'), '#s') };
+    const deps = makeDeps({ loadFlow: loadFlowFrom(flows) });
+    const listener = expectStarted(
+      await startListener(deps, baseConfig({ allowlist: { s: '/flows/s.yaml' } })),
+    );
+    expect(listener.needsHttp).toBe(true);
+  });
+
+  it('is true when a socket flow and a webhook flow are served together', async () => {
+    const { seam } = makeFakeSocketSeam();
+    const flows = {
+      '/flows/studio.yaml': makeFlow(socketIngress('C-STUDIO'), '#studio-alerts'),
+      '/flows/a.yaml': makeFlow(webhookIngress('/hooks/a'), '#a'),
+    };
+    const deps = makeDeps({ loadFlow: loadFlowFrom(flows), socket: seam });
+    const listener = expectStarted(
+      await startListener(
+        deps,
+        baseConfig({
+          allowlist: { studio: '/flows/studio.yaml', a: '/flows/a.yaml' },
+          secrets: { WH_SECRET: 'wh-shared', SLACK_APP_TOKEN: 'xapp-fake-token' },
+        }),
+      ),
+    );
+    expect(listener.needsHttp).toBe(true);
+  });
+
+  it('counts only flows that survive quarantine', async () => {
+    const { seam } = makeFakeSocketSeam();
+    const flows = {
+      '/flows/studio.yaml': makeFlow(socketIngress('C-STUDIO'), '#studio-alerts'),
+      // A webhook binding with no route fails validation and is quarantined.
+      '/flows/a.yaml': makeFlow(webhookIngress(undefined), '#a'),
+    };
+    const deps = makeDeps({ loadFlow: loadFlowFrom(flows), socket: seam });
+    const listener = expectStarted(
+      await startListener(
+        deps,
+        baseConfig({
+          allowlist: { studio: '/flows/studio.yaml', a: '/flows/a.yaml' },
+          secrets: { WH_SECRET: 'wh-shared', SLACK_APP_TOKEN: 'xapp-fake-token' },
+          quarantine: true,
+        }),
+      ),
+    );
+    expect(Object.keys(listener.quarantined)).toEqual(['a']);
+    expect(listener.needsHttp).toBe(false);
+  });
+});

@@ -155,9 +155,12 @@ export interface Harness {
      */
     setIngressStorageFault(on: boolean): void;
     /**
-     * Inserts an `ingress_events` row in state `failed` with one spawn attempt
-     * and no flow attribution, the state a failed launch leaves behind, so the
-     * re-drive sweep picks it up on its next tick.
+     * Inserts an `ingress_events` row in state `failed` with one spawn attempt,
+     * attributed to the journey flow, the state a failed launch leaves behind,
+     * so the re-drive sweep picks it up on its next tick. The attribution
+     * matters: the listener serves two flows (journey and the HTTP anchor), and
+     * an unattributed pre-v9 row is only re-drivable by a single-flow listener;
+     * here it would be marked permanently failed instead.
      */
     seedFailedIngressEvent(eventId: string): void;
   };
@@ -246,7 +249,7 @@ async function waitForCondition(
 }
 
 /** Binds an ephemeral port by opening then immediately closing a throwaway server. */
-function reserveEphemeralPort(): number {
+export function reserveEphemeralPort(): number {
   const probe = Bun.serve({ port: 0, fetch: () => new Response("ok") });
   const port = Number(probe.url.port);
   probe.stop(true);
@@ -574,6 +577,56 @@ function startFakeModelGateway(
 // ---------------------------------------------------------------------------
 
 const HARNESS_CHANNEL = "C_HARNESS";
+
+/**
+ * A second allowlisted flow whose only job is to declare a webhook route, so
+ * the listener starts its HTTP server (#44: a listener whose bindings are all
+ * Socket Mode opens no port). The journeys POST Slack events to that server's
+ * /slack/events route, which routes by channel to the socket-transport journey
+ * flow. Nothing ever posts to the anchor's own route.
+ */
+function writeHttpAnchorFlow(root: string): string {
+  const path = join(root, "http-anchor.yaml");
+  writeFileSync(
+    path,
+    `flow: blackbox-http-anchor
+project_root: ./workspace
+flow_version: 1
+
+terminal_lanes: [done, scrap, hold]
+
+stations:
+  - id: noop
+    next: done
+    worker:
+      kind: deterministic
+      role: noop
+      command: cp
+      args: ["seed/delivery.txt", "anchor.txt"]
+    wip: 1
+    inputs: []
+    outputs: [anchor.txt]
+
+channels:
+  ingress:
+    type: webhook
+    route: /hooks/http-anchor
+    auth: { type: hmac, secret_env: HTTP_ANCHOR_SECRET }
+    event_id: { from: json_path, path: "$.id" }
+  egress:
+    - type: slack
+      target: "${HARNESS_CHANNEL}"
+      uses: [alerts]
+
+security:
+  bash:
+    allow: ["cp"]
+    deny_shell_metachars: true
+  network_egress: deny
+`,
+  );
+  return path;
+}
 
 /** The directory beside the project root used as an out-of-project target. */
 function outsideRootOf(root: string): string {
@@ -973,6 +1026,7 @@ export async function startJourneyHarness(opts?: {
   const ws = opts?.concurrentFanOut
     ? scaffoldConcurrentFanoutWorkspace(opts)
     : scaffoldWorkspace(opts);
+  const listenFlows = `journey=${ws.flowPath},httpanchor=${writeHttpAnchorFlow(ws.root)}`;
   const fakeModel = startFakeModelGateway({
     projectRoot: ws.projectRoot,
     outsideRoot: outsideRootOf(ws.root),
@@ -1007,7 +1061,7 @@ export async function startJourneyHarness(opts?: {
       CONDUIT_ENTRY,
       "listen",
       "--flows",
-      `journey=${ws.flowPath}`,
+      listenFlows,
       "--port",
       String(listenerPort),
     ],
@@ -1166,7 +1220,7 @@ export async function startJourneyHarness(opts?: {
           CONDUIT_ENTRY,
           "listen",
           "--flows",
-          `journey=${ws.flowPath}`,
+          listenFlows,
           "--port",
           String(listenerPort),
         ],
@@ -1291,9 +1345,11 @@ export async function startJourneyHarness(opts?: {
         try {
           db.exec("PRAGMA busy_timeout = 5000");
           db.query(
-            `INSERT INTO ingress_events (event_id, received_at, spawn_state, spawn_attempts)
-             VALUES (?, ?, 'failed', 1)`,
-          ).run(eventId, Math.floor(Date.now() / 1000));
+            `INSERT INTO ingress_events
+               (event_id, received_at, spawn_state, spawn_attempts,
+                flow_id, flow_path, run_id, substrate_json)
+             VALUES (?, ?, 'failed', 1, 'journey', ?, ?, '{}')`,
+          ).run(eventId, Math.floor(Date.now() / 1000), ws.flowPath, `redrive-${eventId}`);
         } finally {
           db.close();
         }
