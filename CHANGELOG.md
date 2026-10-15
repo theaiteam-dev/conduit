@@ -167,6 +167,24 @@ historical context, not public releases or public repository history.
   prompt file cannot be read holds its card on resume even when a checkpoint
   exists for it; before this change a checkpoint hit never read the prompt
   file.
+- A storage error in the ingress re-drive sweep no longer escapes as an
+  unhandled rejection ([#47](https://github.com/theaiteam-dev/conduit/issues/47)).
+  `redriveOnBoot` catches per row, so one row whose bookkeeping throws (for
+  example `SQLITE_FULL` from `incrementSpawnAttempts`) is reported in the new
+  `RedriveReport.errored` and logged with the new `ingress_log` outcome
+  `sweep_error`, and the sweep goes on to the next row. The periodic runner
+  catches a sweep that fails as a whole, logs `sweep_error` with no event id
+  when the journal allows, sends one alert per run of failed sweeps on the
+  listener-global channel (`event=redrive-sweep`), and, when the failed sweep
+  made no progress (it launched, recorded or deferred no
+  row), ignores slot-release kicks until the next interval tick,
+  which sweeps again. A throwing `onSweep`
+  sink is caught too. A launched child is handed to its exit watcher before
+  the writes that follow the launch, on the sweep, the hot path and the keyed
+  pass launcher, so a storage error in those writes no longer frees the run
+  slot of a running child (which let the next sweep launch a second process
+  for the same row) or leaves its exit unrecorded. A `sweep_error` reason, in
+  the log and in the alert, is cut to 500 characters.
 
 - A duplicate webhook delivery names its run
   ([#52](https://github.com/theaiteam-dev/conduit/issues/52)). The answer was

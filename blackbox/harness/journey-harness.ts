@@ -148,7 +148,27 @@ export interface Harness {
     setStall(surface: string, on: boolean): void;
     /** While `on`, every signed event / interactive response is delivered twice. */
     setDuplicateDelivery(on: boolean): void;
+    /**
+     * While `on`, every UPDATE of the state DB's `ingress_events` table fails
+     * with SQLite's disk-full message, through a trigger added from outside
+     * the listener (issue #47).
+     */
+    setIngressStorageFault(on: boolean): void;
+    /**
+     * Inserts an `ingress_events` row in state `failed` with one spawn attempt
+     * and no flow attribution, the state a failed launch leaves behind, so the
+     * re-drive sweep picks it up on its next tick.
+     */
+    seedFailedIngressEvent(eventId: string): void;
   };
+  /** Raw state-DB read of one `ingress_events` row, or undefined. */
+  ingressEvent(eventId: string): { spawn_state: string; spawn_attempts: number } | undefined;
+  /** Raw journal-DB read of the `ingress_log` table, oldest first. */
+  ingressLog(): Array<{ source: string; event_id: string | null; outcome: string; reason: string | null }>;
+  /** The listener child's exit code, or null while it is running. */
+  listenerExitCode(): number | null;
+  /** The listener's HTTP base URL (http://127.0.0.1:<port>). */
+  listenerBaseUrl: string;
   waitFor(cond: () => boolean | Promise<boolean>, opts?: { timeoutMs?: number; intervalMs?: number }): Promise<void>;
   cleanup(): Promise<void>;
 }
@@ -861,6 +881,8 @@ export async function startJourneyHarness(opts?: {
   concurrentFanOut?: boolean;
   /** concurrent fan-out journey: fan-out cache-warming stagger (seconds) on the plan station; concurrentFanOut only. */
   childStaggerSeconds?: number;
+  /** Periodic re-drive sweep interval for the listener (CONDUIT_REDRIVE_INTERVAL_MS); default 60s. */
+  redriveIntervalMs?: number;
 }): Promise<Harness> {
   // Spawn observation (SpawnObserver / descendantPids) reads /proc, which only
   // exists on Linux. On any other platform readdirSync('/proc') throws, is
@@ -898,6 +920,9 @@ export async function startJourneyHarness(opts?: {
     CONDUIT_PROJECT_ROOT: ws.projectRoot,
     CONDUIT_API_KEY: "blackbox-test-key",
     CONDUIT_BASE_URL: fakeModel.baseUrl,
+    ...(opts?.redriveIntervalMs !== undefined && {
+      CONDUIT_REDRIVE_INTERVAL_MS: String(opts.redriveIntervalMs),
+    }),
   };
 
   let listenerProc = Bun.spawn(
@@ -1168,7 +1193,64 @@ export async function startJourneyHarness(opts?: {
       setDuplicateDelivery(on) {
         fakeSlack.duplicateDelivery = on;
       },
+      setIngressStorageFault(on) {
+        const db = new Database(ws.stateDbPath);
+        try {
+          db.exec("PRAGMA busy_timeout = 5000");
+          db.exec(
+            on
+              ? `CREATE TRIGGER IF NOT EXISTS blackbox_ingress_disk_full
+                   BEFORE UPDATE ON ingress_events
+                   BEGIN SELECT RAISE(ABORT, 'database or disk is full'); END`
+              : "DROP TRIGGER IF EXISTS blackbox_ingress_disk_full",
+          );
+        } finally {
+          db.close();
+        }
+      },
+      seedFailedIngressEvent(eventId) {
+        const db = new Database(ws.stateDbPath);
+        try {
+          db.exec("PRAGMA busy_timeout = 5000");
+          db.query(
+            `INSERT INTO ingress_events (event_id, received_at, spawn_state, spawn_attempts)
+             VALUES (?, ?, 'failed', 1)`,
+          ).run(eventId, Math.floor(Date.now() / 1000));
+        } finally {
+          db.close();
+        }
+      },
     },
+
+    ingressEvent(eventId) {
+      const db = new Database(ws.stateDbPath, { readonly: true });
+      try {
+        // The listener may hold the write lock: wait rather than fail SQLITE_BUSY.
+        db.exec("PRAGMA busy_timeout = 5000");
+        const row = db
+          .query(`SELECT spawn_state, spawn_attempts FROM ingress_events WHERE event_id = ?`)
+          .get(eventId) as { spawn_state: string; spawn_attempts: number } | null;
+        return row ?? undefined;
+      } finally {
+        db.close();
+      }
+    },
+
+    ingressLog() {
+      const db = new Database(ws.journalDbPath, { readonly: true });
+      try {
+        // The listener may hold the write lock: wait rather than fail SQLITE_BUSY.
+        db.exec("PRAGMA busy_timeout = 5000");
+        return db
+          .query(`SELECT source, event_id, outcome, reason FROM ingress_log ORDER BY id`)
+          .all() as Array<{ source: string; event_id: string | null; outcome: string; reason: string | null }>;
+      } finally {
+        db.close();
+      }
+    },
+
+    listenerExitCode: () => listenerProc.exitCode,
+    listenerBaseUrl,
 
     waitFor: waitForCondition,
 
