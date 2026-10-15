@@ -155,9 +155,12 @@ export interface Harness {
      */
     setIngressStorageFault(on: boolean): void;
     /**
-     * Inserts an `ingress_events` row in state `failed` with one spawn attempt
-     * and no flow attribution, the state a failed launch leaves behind, so the
-     * re-drive sweep picks it up on its next tick.
+     * Inserts an `ingress_events` row in state `failed` with one spawn attempt,
+     * attributed to the journey flow, the state a failed launch leaves behind,
+     * so the re-drive sweep picks it up on its next tick. The attribution
+     * matters: the listener serves two flows (journey and the HTTP anchor), and
+     * an unattributed pre-v9 row is only re-drivable by a single-flow listener;
+     * here it would be marked permanently failed instead.
      */
     seedFailedIngressEvent(eventId: string): void;
   };
@@ -1342,9 +1345,11 @@ export async function startJourneyHarness(opts?: {
         try {
           db.exec("PRAGMA busy_timeout = 5000");
           db.query(
-            `INSERT INTO ingress_events (event_id, received_at, spawn_state, spawn_attempts)
-             VALUES (?, ?, 'failed', 1)`,
-          ).run(eventId, Math.floor(Date.now() / 1000));
+            `INSERT INTO ingress_events
+               (event_id, received_at, spawn_state, spawn_attempts,
+                flow_id, flow_path, run_id, substrate_json)
+             VALUES (?, ?, 'failed', 1, 'journey', ?, ?, '{}')`,
+          ).run(eventId, Math.floor(Date.now() / 1000), ws.flowPath, `redrive-${eventId}`);
         } finally {
           db.close();
         }
