@@ -26,7 +26,9 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { startJourneyHarness, CONCURRENT_FANOUT_CHILDREN } from "./harness/journey-harness";
 
-const JOURNEY_TIMEOUT_MS = 90_000;
+// Above the longest sum of inner waits (30s spawn + 60s findings), so an inner
+// waitFor times out first and reports the check it was waiting on.
+const JOURNEY_TIMEOUT_MS = 120_000;
 const SKIPPED = "review-style";
 
 /** Parse a spawned run's run id from its argv (`--run-id` / `--run`). */
