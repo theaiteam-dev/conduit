@@ -2,7 +2,9 @@
  * Tests for the release-PR tooling (scripts/release.ts).
  *
  * NOT part of the required `tests` gate: `bun run test` is scoped to `src/`.
- * The advisory Docs workflow runs `bun test scripts/`, which picks this up.
+ * The advisory Docs workflow runs `bun test scripts/`, and both release
+ * workflows run this file before they use the script, so a broken script
+ * fails the release run instead of producing a malformed release PR.
  */
 import { describe, expect, it } from "bun:test";
 import {
@@ -98,6 +100,14 @@ describe("rollChangelog", () => {
 
   it("round-trips with releaseNotes", () => {
     expect(releaseNotes(rolled, "2.0.0")).toBe("### Breaking\n\n- Bind loopback by default.\n\n### Added\n\n- A thing.");
+  });
+
+  it("refuses a previous tag that is not a plain v-tag, so the compare link never dangles", () => {
+    for (const previousTag of ["1.1.2", "v1.1", "v1.1.2-rc.1"]) {
+      expect(() => rollChangelog(CHANGELOG, { version: "2.0.0", date: "2026-10-15", previousTag })).toThrow(
+        /not a vMAJOR.MINOR.PATCH tag/,
+      );
+    }
   });
 
   it("refuses an empty Unreleased section", () => {

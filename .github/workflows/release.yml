@@ -81,7 +81,8 @@ jobs:
               echo "::error::package.json moved $previous -> $version but tag v$version already exists at $tagged."
               exit 1
             fi
-            newest=$(git tag --list 'v*' --sort=-v:refname | head -n 1)
+            # Plain vX.Y.Z tags only, the same rule as latestTag() in scripts/release.ts.
+          newest=$(git tag --list 'v*' --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1 || true)
             if [ "$newest" = "v$version" ]; then
               echo "v$version already tagged at this commit; re-running the image publish only."
               echo "republish=true" >> "$GITHUB_OUTPUT"
@@ -98,6 +99,10 @@ jobs:
         if: steps.detect.outputs.release == 'true'
         with:
           bun-version: 1.3.11
+
+      - name: Test the release script
+        if: steps.detect.outputs.release == 'true'
+        run: bun test scripts/release.test.ts
 
       # Fails before the gates if the CHANGELOG has no section for the version.
       - name: Check the release notes

@@ -76,6 +76,10 @@ export interface RollOptions {
  * Unreleased heading above it, and updates the link references at the foot.
  */
 export function rollChangelog(text: string, { version, date, previousTag }: RollOptions): string {
+  // The tag goes into the compare link verbatim, so it must be a real tag name.
+  if (!previousTag.startsWith("v") || !/^\d+\.\d+\.\d+$/.test(previousTag.slice(1))) {
+    throw new Error(`previous tag "${previousTag}" is not a vMAJOR.MINOR.PATCH tag`);
+  }
   const lines = text.split("\n");
   const start = lines.findIndex((l) => UNRELEASED.test(l));
   if (start === -1) throw new Error("CHANGELOG.md has no `## [Unreleased]` heading");
@@ -152,7 +156,8 @@ function main(argv: string[]): void {
     flag(rest, "--previous-tag") ??
     latestTag(execFileSync("git", ["tag", "--list", "v*"], { cwd: root, encoding: "utf8" }).split("\n"));
   if (!previousTag) throw new Error("no v* tag found; pass --previous-tag");
-  if (compareVersions(next, parseVersion(previousTag.replace(/^v/, ""))) <= 0) {
+  if (!previousTag.startsWith("v")) throw new Error(`--previous-tag "${previousTag}" needs its leading v`);
+  if (compareVersions(next, parseVersion(previousTag.slice(1))) <= 0) {
     throw new Error(`${version} is not greater than the latest tag ${previousTag}`);
   }
 

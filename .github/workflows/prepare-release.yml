@@ -8,8 +8,9 @@
 # two reasons: a PR opened with GITHUB_TOKEN triggers no workflows, so the
 # required `tests` and `blackbox` checks would never report on it; and the
 # repository does not allow Actions to create pull requests. The App needs
-# Contents and Pull requests write on this repository. It pushes only to the
-# release branch, never to main.
+# Contents and Pull requests write on this repository. This job pushes only
+# the release branch. A push to main with the token would be rejected anyway:
+# the main ruleset requires a pull request and has no bypass actors.
 name: Prepare release
 
 on:
@@ -55,6 +56,9 @@ jobs:
         with:
           bun-version: 1.3.11
 
+      - name: Test the release script
+        run: bun test scripts/release.test.ts
+
       # The script validates the version (strict MAJOR.MINOR.PATCH, greater
       # than the newest tag and package.json) before anything below uses it in
       # a branch name or a shell word. It needs no dependencies, so no install.
@@ -86,11 +90,8 @@ jobs:
           git config user.name "${APP_SLUG}[bot]"
           git config user.email "${bot_id}+${APP_SLUG}[bot]@users.noreply.github.com"
 
-          git switch -c "$branch"
-          git add package.json CHANGELOG.md
-          git commit -m "chore(release): $VERSION"
-          git push origin "$branch"
-
+          # Everything that can fail runs before the push, so a failed run
+          # leaves no release branch behind and can simply be run again.
           {
             echo "Release PR for **v$VERSION**, opened by the Prepare release workflow."
             echo
@@ -100,6 +101,11 @@ jobs:
             echo
             bun scripts/release.ts notes "$VERSION"
           } > "$RUNNER_TEMP/pr-body.md"
+
+          git switch -c "$branch"
+          git add package.json CHANGELOG.md
+          git commit -m "chore(release): $VERSION"
+          git push origin "$branch"
 
           gh pr create --base main --head "$branch" \
             --title "chore(release): $VERSION" \
