@@ -115,6 +115,15 @@ historical context, not public releases or public repository history.
   nullable: existing journals migrate in place, pre-split rows stay readable,
   and run/wave budgets still count the same totals (they sum all four columns).
 
+### Changed
+
+- The `llexec` build stage's base image is pinned by digest
+  ([#132](https://github.com/theaiteam-dev/conduit/issues/132)): `FROM
+  alpine:3.20@sha256:d9e853e8... AS llexec`, the digest of the multi-arch index.
+  The tag alone was mutable, so two builds of one commit could compile the
+  Landlock helper with different toolchains. The runtime stage
+  (`oven/bun:1.3.11-slim`) is still pinned by tag only.
+
 ### Fixed
 
 - The state DB schema-mismatch error names the newer side and the remedy
