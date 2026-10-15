@@ -79,7 +79,7 @@ jobs:
           status=0
           git ls-remote --exit-code --heads origin "$branch" > /dev/null || status=$?
           if [ "$status" -eq 0 ]; then
-            echo "::error::Branch $branch already exists. Close its PR and delete the branch to prepare again."
+            echo "::error::Branch $branch already exists. Delete it (and close its PR, if one was opened) to prepare again."
             exit 1
           elif [ "$status" -ne 2 ]; then
             echo "::error::git ls-remote failed (exit $status) while checking for $branch."

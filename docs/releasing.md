@@ -25,7 +25,8 @@ ordinary merge to `main`, and the maintainer picks the version.
    `latest`.
 
 To abandon a release, close the PR and delete the `release/vX.Y.Z` branch.
-Prepare release refuses to run while that branch exists.
+Prepare release refuses to run while that branch exists. If a run pushed the
+branch but failed to open the PR, delete the branch and run it again.
 
 To retry a release that failed after merge (a flaky gate, a registry outage),
 re-run the failed jobs of that Release run. It uses the same commit. If the
