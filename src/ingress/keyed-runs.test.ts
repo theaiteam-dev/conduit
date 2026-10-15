@@ -26,6 +26,7 @@
  *     busy slot.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
+import { Database } from 'bun:sqlite';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -34,7 +35,7 @@ import type { FlowConfig, FlowChannels, FlowEgressChannel } from '../types/kerne
 import type { LoadFlowResult } from '../flow/load';
 import { buildEnvelope } from './envelope';
 import { deriveIngressRunId, deriveKeyedIngressRunId } from './run-id';
-import { EXIT_RUN_LEASE_CONFLICT } from '../run/run-passes';
+import { EXIT_PASS_REFUSED, EXIT_RUN_LEASE_CONFLICT } from '../run/run-passes';
 import type { SpawnExit, SpawnFailedAlert, SpawnInvocation, SpawnSeam } from './spawn';
 import { startListener, type ListenerDeps, type ListenerConfig } from './listener';
 import { drainKeyedRun, routeKeyedEvent, type KeyedRunDeps } from './keyed-runs';
@@ -281,6 +282,155 @@ describe('run key resolution', () => {
     await listener.handleWebhook(prEvent({ repo: 'acme/widgets', issue: 7 }));
     expect(launches[1]!.runId).toBe(RUN);
     expect(launches[1]!.appendPass).toBe(true);
+  });
+});
+
+describe('a duplicate delivery of a keyed event (issue #52)', () => {
+  // The duplicate names the run only once the event is bound to it: launched
+  // as a pass, folded into the pending pass, or consumed by a pass. While the
+  // first delivery is still being routed, and after the run refused the
+  // event, it names none, since the event may never become part of the run.
+  const body = (res: { body?: string }) => JSON.parse(res.body!) as Record<string, unknown>;
+
+  it('names the keyed run for a redelivery of an event that launched a pass', async () => {
+    const listener = await boot(makeFlow(keyedIngress()));
+    const req = prEvent({ repo: 'acme/widgets', pr: 7 });
+
+    const first = await listener.handleWebhook(req);
+    const second = await listener.handleWebhook(req);
+
+    expect(body(first)).toEqual({ outcome: 'accepted', run_id: RUN });
+    expect(second.status).toBe(200);
+    expect(body(second)).toEqual({ outcome: 'duplicate', run_id: RUN });
+    expect(launches).toHaveLength(1);
+  });
+
+  it('names the keyed run for a redelivery of an event folded into the pending pass', async () => {
+    const listener = await boot(makeFlow(keyedIngress()));
+    await listener.handleWebhook(prEvent({ repo: 'acme/widgets', pr: 7, seq: 0 }));
+    const req = prEvent({ repo: 'acme/widgets', pr: 7, seq: 1 });
+
+    expect(body(await listener.handleWebhook(req))).toEqual({ outcome: 'coalesced', run_id: RUN });
+    expect(body(await listener.handleWebhook(req))).toEqual({ outcome: 'duplicate', run_id: RUN });
+  });
+
+  it('names the keyed run for a redelivery of an event a pass consumed', async () => {
+    const listener = await boot(makeFlow(keyedIngress()));
+    const req = prEvent({ repo: 'acme/widgets', pr: 7 });
+    await listener.handleWebhook(req);
+    await finishPass(0, 1);
+
+    expect(db.getPassForEvent(req.headers['x-delivery']!)).toEqual({ run_id: RUN, pass: 1 });
+    expect(body(await listener.handleWebhook(req))).toEqual({ outcome: 'duplicate', run_id: RUN });
+  });
+
+  it('names no run for a redelivery that arrives while the first is still being routed', async () => {
+    let releaseLaunch: () => void = () => {};
+    const launchGate = new Promise<void>((resolve) => {
+      releaseLaunch = resolve;
+    });
+    const gatedSpawn: SpawnSeam = async (invocation) => {
+      await launchGate;
+      return controlledSpawn(invocation);
+    };
+    const listener = await boot(makeFlow(keyedIngress()), { spawn: gatedSpawn });
+    const req = prEvent({ repo: 'acme/widgets', pr: 7 });
+
+    const first = listener.handleWebhook(req);
+    await settle();
+    expect(db.getIngressEvent(req.headers['x-delivery']!)!.spawn_state).toBe('accepted');
+    const second = await listener.handleWebhook(req);
+    releaseLaunch();
+
+    expect(second.status).toBe(200);
+    expect(body(second)).toEqual({ outcome: 'duplicate' });
+    expect(body(await first)).toEqual({ outcome: 'accepted', run_id: RUN });
+    expect(launches).toHaveLength(1);
+  });
+
+  it('names no run for a redelivery of an event the run refused', async () => {
+    const listener = await boot(makeFlow(keyedIngress({ max_passes: 1 })));
+    await listener.handleWebhook(prEvent({ repo: 'acme/widgets', pr: 7 }));
+    await finishPass(0, 1);
+    const req = prEvent({ repo: 'acme/widgets', pr: 7 });
+
+    expect(body(await listener.handleWebhook(req))).toEqual({ outcome: 'pass_limit' });
+    expect(db.getIngressEvent(req.headers['x-delivery']!)!.spawn_state).toBe('refused');
+    expect(body(await listener.handleWebhook(req))).toEqual({ outcome: 'duplicate' });
+  });
+
+  it('names no run for any folded event once its pending pass is refused at max_passes', async () => {
+    const listener = await boot(makeFlow(keyedIngress({ max_passes: 1 })));
+    await listener.handleWebhook(prEvent({ repo: 'acme/widgets', pr: 7, seq: 0 }));
+    const older = prEvent({ repo: 'acme/widgets', pr: 7, seq: 1 });
+    const latest = prEvent({ repo: 'acme/widgets', pr: 7, seq: 2 });
+    expect(body(await listener.handleWebhook(older))).toEqual({ outcome: 'coalesced', run_id: RUN });
+    expect(body(await listener.handleWebhook(latest))).toEqual({ outcome: 'coalesced', run_id: RUN });
+
+    await finishPass(0, 1);
+
+    expect(launches).toHaveLength(1);
+    for (const req of [older, latest]) {
+      const id = req.headers['x-delivery']!;
+      expect(db.getIngressEvent(id)!.spawn_state).toBe('refused');
+      expect(db.getIngressLog({ outcome: 'pass_limit', eventId: id })).toHaveLength(1);
+      expect(body(await listener.handleWebhook(req))).toEqual({ outcome: 'duplicate' });
+    }
+  });
+
+  it('logs each folded event refused with its pass under the source it arrived from', async () => {
+    // The pass_limit refusal below runs on the drain path, whose own log rows
+    // carry the drain source; a folded event's refusal names its own source.
+    const listener = await boot(makeFlow(keyedIngress({ max_passes: 1 })));
+    await listener.handleWebhook(prEvent({ repo: 'acme/widgets', pr: 7, seq: 0 }));
+    const older = prEvent({ repo: 'acme/widgets', pr: 7, seq: 1 });
+    const latest = prEvent({ repo: 'acme/widgets', pr: 7, seq: 2 });
+    await listener.handleWebhook(older);
+    await listener.handleWebhook(latest);
+    const olderId = older.headers['x-delivery']!;
+    const arrivedFrom = db.getIngressLog({ outcome: 'coalesced', eventId: olderId })[0]!.source;
+
+    await finishPass(0, 1);
+
+    expect(db.getIngressLog({ outcome: 'pass_limit', eventId: olderId }).map((r) => r.source)).toEqual([arrivedFrom]);
+  });
+
+  it("logs a folded event as 'unknown' source when its own coalesced row is gone", async () => {
+    const listener = await boot(makeFlow(keyedIngress({ max_passes: 1 })));
+    await listener.handleWebhook(prEvent({ repo: 'acme/widgets', pr: 7, seq: 0 }));
+    const older = prEvent({ repo: 'acme/widgets', pr: 7, seq: 1 });
+    await listener.handleWebhook(older);
+    await listener.handleWebhook(prEvent({ repo: 'acme/widgets', pr: 7, seq: 2 }));
+    const olderId = older.headers['x-delivery']!;
+    const journal = new Database(join(dir, 'journal.sqlite'));
+    journal.prepare(`DELETE FROM ingress_log WHERE event_id = $id AND outcome = 'coalesced'`).run({ $id: olderId });
+    journal.close();
+
+    await finishPass(0, 1);
+
+    expect(db.getIngressLog({ outcome: 'pass_limit', eventId: olderId }).map((r) => r.source)).toEqual(['unknown']);
+  });
+
+  it('names no run for any folded event once the kernel refuses the pass that covered it', async () => {
+    const listener = await boot(makeFlow(keyedIngress()));
+    await listener.handleWebhook(prEvent({ repo: 'acme/widgets', pr: 7, seq: 0 }));
+    const older = prEvent({ repo: 'acme/widgets', pr: 7, seq: 1 });
+    const latest = prEvent({ repo: 'acme/widgets', pr: 7, seq: 2 });
+    await listener.handleWebhook(older);
+    await listener.handleWebhook(latest);
+    await finishPass(0, 1);
+    expect(launches).toHaveLength(2);
+    expect(launches[1]!.passEvents).toEqual([older.headers['x-delivery']!, latest.headers['x-delivery']!]);
+
+    launches[1]!.exit(EXIT_PASS_REFUSED);
+    await settle();
+
+    for (const req of [older, latest]) {
+      const id = req.headers['x-delivery']!;
+      expect(db.getIngressEvent(id)!.spawn_state).toBe('refused');
+      expect(db.getIngressLog({ outcome: 'run_not_appendable', eventId: id })).toHaveLength(1);
+      expect(body(await listener.handleWebhook(req))).toEqual({ outcome: 'duplicate' });
+    }
   });
 });
 

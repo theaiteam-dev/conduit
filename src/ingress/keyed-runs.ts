@@ -324,6 +324,52 @@ function refuse(
   return { outcome, runId: keyed.run_id };
 }
 
+/** ingress_log source for a folded event whose arrival source is unknown. */
+const UNKNOWN_SOURCE = 'unknown';
+
+/**
+ * The ingress_log source a folded event arrived under, read from its own
+ * 'coalesced' row. ingress_events keeps no source column, and the event a
+ * pass is refused for may be a drained one logged as DRAIN_SOURCE, so its
+ * source would misattribute the folded events. A missing row yields
+ * UNKNOWN_SOURCE rather than a guess, so the gap shows in the log.
+ */
+function arrivalSource(deps: KeyedRunDeps, eventId: string): string {
+  return deps.db.getIngressLog({ outcome: 'coalesced', eventId, limit: 1 })[0]?.source ?? UNKNOWN_SOURCE;
+}
+
+/**
+ * Refuse a pass the run could not take: every event folded into it that no
+ * pass consumed, then the event it was launched or drained from. A pass covers
+ * all of its folded events (coveredEvents), so refusing only its latest event
+ * would leave the older ones 'coalesced' with no pending pointer: a duplicate
+ * of one would still name the run (issue #52), and a later pass, once the run
+ * took passes again, would fold in events whose own pass was refused. The
+ * folded events are refused first, so a throw leaves `event` unrefused and
+ * the caller's pending pointer set, and the next drain finishes the job
+ * without refusing anything twice. Events folded after `event` stay pending.
+ */
+function refusePass(
+  deps: KeyedRunDeps,
+  keyed: KeyedRunRecord,
+  event: KeyedEvent,
+  outcome: 'pass_limit' | 'run_not_appendable',
+  detail: string,
+): KeyedRouteOutcome {
+  const { db } = deps;
+  for (const row of db.listUnappliedCoalesced(keyed.run_id, event.eventId)) {
+    if (row.event_id === event.eventId) continue;
+    db.markIngressRefused(row.event_id);
+    db.appendIngressLog({
+      source: arrivalSource(deps, row.event_id),
+      eventId: row.event_id,
+      outcome,
+      reason: `run '${keyed.run_id}' takes no new pass: ${detail} (folded into the refused pass of '${event.eventId}')`,
+    });
+  }
+  return refuse(deps, keyed, event, outcome, detail);
+}
+
 // ---------------------------------------------------------------------------
 // Launch
 // ---------------------------------------------------------------------------
@@ -462,7 +508,7 @@ async function watchPassExit(
       if (code === EXIT_RUN_LEASE_CONFLICT) {
         coalesce(deps, fresh, event, 'another process holds the run lease');
       } else if (code === EXIT_PASS_REFUSED) {
-        refuse(deps, fresh, event, 'run_not_appendable', 'the kernel refused the pass (see the run state)');
+        refusePass(deps, fresh, event, 'run_not_appendable', 'the kernel refused the pass (see the run state)');
       } else {
         const parked = inspectParkedRun(db, keyed.run_id, Math.floor(deps.now() / 1000));
         if (parked !== null) {
@@ -634,15 +680,15 @@ export async function drainKeyedRun(deps: KeyedRunDeps, runId: string): Promise<
     case 'held':
       return null;
     case 'pass_limit': {
-      // refuse() writes the durable mark and log before the pending pointer
+      // refusePass() writes the durable marks and logs before the pending pointer
       // is cleared, so a throw from it leaves the pointer intact rather than
       // dropping the event with no pending pointer, no refused mark and no log.
-      const outcome = refuse(deps, keyed, event, 'pass_limit', decision.detail);
+      const outcome = refusePass(deps, keyed, event, 'pass_limit', decision.detail);
       db.setKeyedRunPending(runId, null);
       return outcome;
     }
     case 'not_appendable': {
-      const outcome = refuse(deps, keyed, event, 'run_not_appendable', decision.detail);
+      const outcome = refusePass(deps, keyed, event, 'run_not_appendable', decision.detail);
       db.setKeyedRunPending(runId, null);
       return outcome;
     }

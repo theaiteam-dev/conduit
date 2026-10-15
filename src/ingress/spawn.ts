@@ -173,7 +173,12 @@ export interface SpawnPathInput {
 export type SpawnPathResult =
   /** Accepted and LAUNCHED — the run is executing (the original acknowledgement-on-accept work), not finished. */
   | { outcome: 'accepted'; runId: string }
-  | { outcome: 'duplicate' }
+  /**
+   * Already handled. `runId` is the run the original delivery started or
+   * joined, read from its stored row (issue #52, duplicateRunId); absent when
+   * the event is not bound to a run.
+   */
+  | { outcome: 'duplicate'; runId?: string }
   | { outcome: 'spawn_failed' }
   /** Accepted and recorded, but all run slots are busy — spawns via the sweep. */
   | { outcome: 'queued'; runId: string }
@@ -183,6 +188,49 @@ export type SpawnPathResult =
   | { outcome: 'pass_limit'; runId: string }
   /** Issue #36: the keyed run is halted, held, or crashed mid-pass. */
   | { outcome: 'run_not_appendable'; runId: string };
+
+// ---------------------------------------------------------------------------
+// Duplicate answer (issue #52)
+// ---------------------------------------------------------------------------
+
+/**
+ * The run a duplicate delivery of eventId names: the run its original
+ * delivery started or joined, or undefined when the event is not bound to
+ * one. It reads only what is stored, never this delivery's own derivation: a
+ * redelivery with the same event id may carry a different body, and so a
+ * different run key.
+ *
+ *   - A row with no run id (accepted before v9 attribution) names none.
+ *   - An event a pass consumed (run_pass_events) names that pass's run.
+ *   - An unkeyed event names its row's run id in every state a duplicate can
+ *     find it in. The id is written with the accept, before the launch, and
+ *     the event is only ever launched under it, so a redelivery that arrives
+ *     while the first is still launching names it too.
+ *   - A keyed event names its run once it is launched as a pass ('spawned')
+ *     or folded into the run's pending pass ('coalesced'). While it is still
+ *     'accepted' (being routed, or queued behind busy slots) the router may
+ *     yet refuse it, and a 'refused' event never joined the run, so neither
+ *     names one.
+ *
+ * The answer describes the event at the moment of the duplicate. When the run
+ * later refuses the pending pass an event was folded into, every event of that
+ * pass is refused (keyed-runs.ts refusePass), so a later duplicate of any of
+ * them names no run.
+ */
+function duplicateRunId(db: ConduitDB, eventId: string): string | undefined {
+  const row = db.getIngressEvent(eventId);
+  if (row === null || row.run_id === null) return undefined;
+  const applied = db.getPassForEvent(eventId);
+  if (applied !== null) return applied.run_id;
+  if (db.getKeyedRun(row.run_id) === null) return row.run_id;
+  return row.spawn_state === 'spawned' || row.spawn_state === 'coalesced' ? row.run_id : undefined;
+}
+
+/** The duplicate result for eventId, with its run id when it has one. */
+function duplicateResult(db: ConduitDB, eventId: string): SpawnPathResult {
+  const runId = duplicateRunId(db, eventId);
+  return runId === undefined ? { outcome: 'duplicate' } : { outcome: 'duplicate', runId };
+}
 
 // ---------------------------------------------------------------------------
 // Core path
@@ -262,7 +310,7 @@ export async function runSpawnPath(
   });
   if (!acceptResult.accepted) {
     db.appendIngressLog({ source, eventId, outcome: 'duplicate' });
-    return { outcome: 'duplicate' };
+    return duplicateResult(db, eventId);
   }
 
   // ── Step 2b: Claim a run slot (the original listener-backpressure work) ────────────────────────────────
@@ -292,7 +340,7 @@ export async function runSpawnPath(
       outcome: 'duplicate',
       reason: 'a launch for this event is already in flight',
     });
-    return { outcome: 'duplicate' };
+    return duplicateResult(db, eventId);
   }
 
   // Slot ownership (the original acknowledgement-on-accept work): the gate bounds concurrent RUNS, so once a
@@ -422,7 +470,7 @@ async function runKeyedSpawnPath(
   })();
   if (!accepted) {
     db.appendIngressLog({ source, eventId, outcome: 'duplicate' });
-    return { outcome: 'duplicate' };
+    return duplicateResult(db, eventId);
   }
 
   const routed = await routeKeyedEvent(
@@ -442,7 +490,7 @@ async function runKeyedSpawnPath(
     case 'already_applied':
       // Unreachable on the hot path too: a pass can only have consumed an
       // event that was accepted before this call.
-      return { outcome: 'duplicate' };
+      return duplicateResult(db, eventId);
     default:
       return { outcome: routed.outcome, runId };
   }

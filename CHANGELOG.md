@@ -143,6 +143,31 @@ historical context, not public releases or public repository history.
   slot of a running child (which let the next sweep launch a second process
   for the same row) or leaves its exit unrecorded. A `sweep_error` reason, in
   the log and in the alert, is cut to 500 characters.
+- A duplicate webhook delivery names its run
+  ([#52](https://github.com/theaiteam-dev/conduit/issues/52)). The answer was
+  `200 {"outcome":"duplicate"}`, so a caller whose first `202` was lost in
+  transit had no way to find the run its event started. It is now
+  `200 {"outcome":"duplicate","run_id":"…"}`, read from the event's stored
+  row. On a `run_key` binding the id is present only once the event was
+  launched as a pass, folded into the pending pass or consumed by a pass; a
+  redelivery that arrives while the first is still being routed, or after the
+  run refused the event, carries no `run_id`. A refused pending pass now
+  refuses every event folded into it, not only its latest: the older ones had
+  stayed `coalesced` with no pending pass, so their duplicates named a run they
+  never joined. See `docs/ingress-listener.md`.
+- A transform gate critic that fails now scraps the card under a reason naming
+  the failure ([#42](https://github.com/theaiteam-dev/conduit/issues/42)),
+  where every failure used to scrap as `model-incompatible`:
+  `critic-verdict-invalid: <validator error>` for a verdict that parsed but
+  has the wrong shape, `critic-reject-without-findings`,
+  `critic-verdict-unparseable`, `critic-output-truncated` and
+  `critic-vision-unsupported`. `conduit run` and `conduit journal inspect`
+  print the reason. A `model-incompatible` scrap from `runTransformStation`
+  carries, as `validationError`, the validator error of the most recent
+  response that parsed (within that response, the error of the
+  highest-priority candidate). The critic reason quotes that error only when
+  it is one of the critic schema's fixed errors. Transform makers
+  and harness critics keep their reasons.
 - Two `conduit run` launches of the same run id at the same moment no longer
   risk `fatal: UNIQUE constraint failed: runs.run_id`
   ([#48](https://github.com/theaiteam-dev/conduit/issues/48)). `registerRun`
