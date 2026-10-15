@@ -126,6 +126,18 @@ historical context, not public releases or public repository history.
 
 ### Fixed
 
+- A duplicate webhook delivery names its run
+  ([#52](https://github.com/theaiteam-dev/conduit/issues/52)). The answer was
+  `200 {"outcome":"duplicate"}`, so a caller whose first `202` was lost in
+  transit had no way to find the run its event started. It is now
+  `200 {"outcome":"duplicate","run_id":"…"}`, read from the event's stored
+  row. On a `run_key` binding the id is present only once the event was
+  launched as a pass, folded into the pending pass or consumed by a pass; a
+  redelivery that arrives while the first is still being routed, or after the
+  run refused the event, carries no `run_id`. A refused pending pass now
+  refuses every event folded into it, not only its latest: the older ones had
+  stayed `coalesced` with no pending pass, so their duplicates named a run they
+  never joined. See `docs/ingress-listener.md`.
 - A transform gate critic that fails now scraps the card under a reason naming
   the failure ([#42](https://github.com/theaiteam-dev/conduit/issues/42)),
   where every failure used to scrap as `model-incompatible`:

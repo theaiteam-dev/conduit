@@ -232,6 +232,13 @@ user or CI consumer actually sees, not internal implementation details.
 - `no-internal-imports.test.ts` + `harness/import-scan.ts` — the zero-imports
   gate (AC-1): a TypeScript-compiler-API scan that fails if any file under
   `blackbox/` imports anything resolving into `src/`.
+- `webhook-duplicate-run-id.test.ts`: a duplicate webhook delivery names the
+  run the original started (issue #52). It boots `conduit listen` with two
+  HMAC-signed webhook flows of one deterministic station each, one unkeyed and
+  one keyed on `run_key`, without the journey harness or Slack. Per route it
+  POSTs the same delivery twice: the first answers `202` `accepted` with a
+  `run_id`, the second `200 {"outcome":"duplicate","run_id":…}` with the same
+  id, and `conduit run status --run <id>` finds that run.
 - `scaffold.test.ts` — pins the plumbing in this file (test-script scoping,
   the required `blackbox` CI job's name and unfiltered trigger).
 

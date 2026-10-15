@@ -35,7 +35,7 @@
  *   }
  *
  *   export type SpawnPathResult =
- *     | { outcome: 'accepted'; runId: string } | { outcome: 'duplicate' }
+ *     | { outcome: 'accepted'; runId: string } | { outcome: 'duplicate'; runId?: string }
  *     | { outcome: 'spawn_failed' } | { outcome: 'queued'; runId: string };
  *
  *   export function runSpawnPath(deps: SpawnPathDeps, input: SpawnPathInput): Promise<SpawnPathResult>;
@@ -330,15 +330,43 @@ describe('duplicate suppression (AC2, NFR-2)', () => {
     const second = await runSpawnPath(deps, baseInput()); // same event_id re-delivered
 
     expect(first).toEqual({ outcome: 'accepted', runId: deriveIngressRunId('evt-1') });
-    expect(second).toEqual({ outcome: 'duplicate' });
+    // Issue #52: the duplicate names the run the first delivery started.
+    expect(second).toEqual({ outcome: 'duplicate', runId: deriveIngressRunId('evt-1') });
     expect(spawn.calls).toHaveLength(1); // NOT 2 — the second delivery never spawns
     expect(db.getIngressLog().map((e) => e.outcome)).toEqual(['accepted', 'duplicate']);
     // State is untouched by the duplicate.
     expect(db.getIngressEvent('evt-1')).toMatchObject({ spawn_state: 'spawned', spawn_attempts: 1 });
   });
 
+  it('names the run id on a duplicate that arrives while the first delivery is still launching', async () => {
+    // Issue #52: the run id is written with the accept, before the launch, so
+    // a concurrent redelivery can name it even though the child is not live yet.
+    let releaseLaunch: () => void = () => {};
+    const launchGate = new Promise<void>((resolve) => {
+      releaseLaunch = resolve;
+    });
+    const calls: SpawnInvocation[] = [];
+    const seam: SpawnSeam = async (inv) => {
+      calls.push(inv);
+      await launchGate;
+      return SPAWN_OK;
+    };
+    const deps = { db, spawn: seam, alert: recordingAlert().seam, globalAlertChannel: '#listener', redriveCap: 100 };
+
+    const first = runSpawnPath(deps, baseInput());
+    expect(db.getIngressEvent('evt-1')).toMatchObject({ spawn_state: 'accepted' });
+    const second = await runSpawnPath(deps, baseInput());
+    releaseLaunch();
+
+    expect(second).toEqual({ outcome: 'duplicate', runId: deriveIngressRunId('evt-1') });
+    expect(await first).toEqual({ outcome: 'accepted', runId: deriveIngressRunId('evt-1') });
+    expect(calls).toHaveLength(1);
+  });
+
   it('treats an already-accepted (not yet spawned) event as a duplicate without spawning', async () => {
     // A prior attempt accepted the event but had not yet spawned (e.g. concurrent delivery).
+    // Accepted with no attribution, as a pre-v9 row was: it has no run id, so
+    // the duplicate names none rather than deriving one (issue #52).
     db.acceptIngressEvent('evt-1', 500);
     const spawn = recordingSpawn(SPAWN_OK);
 
@@ -580,7 +608,8 @@ describe('run-slot backpressure (the original listener-backpressure work)', () =
       baseInput(),
     );
 
-    expect(result).toEqual({ outcome: 'duplicate' });
+    // Issue #52: the run the sweep is launching.
+    expect(result).toEqual({ outcome: 'duplicate', runId: deriveIngressRunId('evt-1') });
     expect(spawn.calls).toHaveLength(0);
     // The redelivery must NOT free the sweep's slot.
     expect(slots.inFlight('evt-1')).toBe(true);
