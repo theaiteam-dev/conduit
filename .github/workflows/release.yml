@@ -92,6 +92,14 @@ jobs:
             echo "release=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          # Prepare release checks this too, but the release branch can be
+          # edited before merge. A lower version would move `latest` back.
+          newest=$(git tag --list 'v*' --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1 || true)
+          if [ -n "$newest" ] \
+            && [ "$(printf '%s\n' "${newest#v}" "$version" | sort -V | tail -n 1)" != "$version" ]; then
+            echo "::error::package.json version $version is not greater than the newest tag $newest."
+            exit 1
+          fi
           echo "Release commit: $previous -> $version"
           echo "release=true" >> "$GITHUB_OUTPUT"
 
