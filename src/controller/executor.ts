@@ -6480,11 +6480,14 @@ function handleFanOutComplete(args: FanOutCompleteArgs): boolean {
     // out of bounds: reject the whole proposal. Never seed partial expansions;
     // they leave orphaned cards.
     const e = expansion.error;
+    // Child ids and paths come from the model's proposal. Escape control
+    // characters so a newline in them cannot forge a line in the hold reason.
+    const q = (text: string): string => JSON.stringify(text).slice(1, -1);
     const where =
       e.code === 'owned_path_out_of_bounds' || e.code === 'seed_path_out_of_bounds'
-        ? ` (child '${e.child}', path '${e.path}')`
+        ? ` (child '${q(e.child)}', path '${q(e.path)}')`
         : e.code === 'seed_path_conflict'
-          ? ` (children '${e.children[0]}' and '${e.children[1]}', path '${e.path}')`
+          ? ` (children '${q(e.children[0])}' and '${q(e.children[1])}', path '${q(e.path)}')`
           : '';
     escalateToHold(
       stateDb,

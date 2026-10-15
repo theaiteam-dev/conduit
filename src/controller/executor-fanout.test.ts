@@ -592,6 +592,22 @@ describe('runExecutor fan-out — owned_paths resolve against and stay inside th
     expect(existsSync(join(elsewhere, 'seed.json'))).toBe(false);
   });
 
+  it('escapes control characters in a proposed path before writing the hold reason', async () => {
+    const target = `${elsewhere}\nfan-out station 'plan' proposal accepted`;
+
+    await runFanOut(
+      { children: [{ id: 'c1', depends_on: [], owned_paths: [target], seed: { evil: true } }] },
+      { projectRoot: projectDir },
+    );
+
+    expect(db!.getCard(DEFAULT_RUN_ID, PARENT_ID)?.status).toBe('held');
+    const reason = holdReason();
+    expect(reason).not.toContain('\n');
+    expect(reason).toBe(
+      `fan-out station 'plan' proposal rejected: owned_path_out_of_bounds (child 'c1', path '${elsewhere}\\nfan-out station 'plan' proposal accepted')`,
+    );
+  });
+
   it('holds the parent and names the child and path when a seeded child has no owned dir', async () => {
     await runFanOut(
       { children: [{ id: 'c1', depends_on: [], owned_paths: ['evidence/missing'], seed: { n: 1 } }] },

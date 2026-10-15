@@ -982,8 +982,11 @@ async function crashMidFanOut(): Promise<OracleTrial> {
       terminalState,
     };
   } finally {
-    db.close();
-    rmSync(fanOutProjectRoot, { recursive: true, force: true });
+    try {
+      db.close();
+    } finally {
+      rmSync(fanOutProjectRoot, { recursive: true, force: true });
+    }
   }
 }
 
