@@ -32,6 +32,9 @@
  * byte-comparable.
  */
 
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { openConduitDB, DEFAULT_RUN_ID } from '../persistence/db';
 import type { ConduitDB } from '../persistence/db';
 import {
@@ -51,6 +54,7 @@ import { evaluateFanIn, commitFanOut } from '../dag/expand';
 import type { ArchitectProposal } from '../dag/expand';
 import { egressSend } from '../channels/slack';
 import type { ModelAdapter, ModelResponse } from '../worker/adapter';
+
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -895,19 +899,36 @@ async function crashAfterEffectfulCommit(): Promise<OracleTrial> {
 // operation with no model calls and no outbox effects.
 
 async function crashMidFanOut(): Promise<OracleTrial> {
-  const db = openConduitDB({ stateDbPath: ':memory:', journalDbPath: ':memory:' });
-  ensureCheckpointSchema(db.getStateDb());
-  const stateDb = db.getStateDb();
-
-  const proposal: ArchitectProposal = {
-    children: CHILD_IDS.map((id) => ({
-      id,
-      depends_on: [],
-      owned_paths: [`out/${id}.json`],
-    })),
-  };
-
+  // The project root commitFanOut confines owned_paths to; the proposal uses
+  // relative paths. A fresh dir per trial, so nothing left in the shared temp
+  // root can change how a path canonicalizes. Created before the db, so a
+  // failure here leaves nothing to clean up, and a failed db open removes it.
+  // A plain prefix, not the owner-tagged run-scoped naming: no kernel creates
+  // this dir, so no kernel sweep would look for it; it lives in the test
+  // process like every other test mkdtemp.
+  const fanOutProjectRoot = mkdtempSync(join(tmpdir(), 'conduit-crash-oracle-fanout-'));
+  let db: ConduitDB;
   try {
+    db = openConduitDB({ stateDbPath: ':memory:', journalDbPath: ':memory:' });
+  } catch (err) {
+    rmSync(fanOutProjectRoot, { recursive: true, force: true });
+    throw err;
+  }
+
+  // Everything after the db open runs inside the try, so its finally removes
+  // the temp root whatever throws.
+  try {
+    const stateDb = db.getStateDb();
+    ensureCheckpointSchema(stateDb);
+
+    const proposal: ArchitectProposal = {
+      children: CHILD_IDS.map((id) => ({
+        id,
+        depends_on: [],
+        owned_paths: [`out/${id}.json`],
+      })),
+    };
+
     // Insert parent card — fan-out execution began but not yet committed.
     stateDb
       .prepare(
@@ -944,7 +965,7 @@ async function crashMidFanOut(): Promise<OracleTrial> {
     const resumeFanOut = (): void => {
       const parent = db.getCard(DEFAULT_RUN_ID, 'parent');
       if (parent?.status === 'awaiting_children') return;
-      commitFanOut(db, DEFAULT_RUN_ID, 'parent', proposal, { onPathConflict: 'reject' });
+      commitFanOut(db, DEFAULT_RUN_ID, 'parent', proposal, { onPathConflict: 'reject', projectRoot: fanOutProjectRoot });
       stateDb
         .prepare("UPDATE cards SET status = 'awaiting_children' WHERE id = 'parent'")
         .run();
@@ -966,7 +987,11 @@ async function crashMidFanOut(): Promise<OracleTrial> {
       terminalState,
     };
   } finally {
-    db.close();
+    try {
+      db.close();
+    } finally {
+      rmSync(fanOutProjectRoot, { recursive: true, force: true });
+    }
   }
 }
 

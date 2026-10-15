@@ -8,21 +8,27 @@
  *   1. Cycle detection via findCycleNodes (REUSED from WI-292 dag-utils) — a
  *      cyclic depends_on graph is rejected before any child is committed.
  *   2. Disjoint-ownership invariant (rev-1 H4) — concurrently-eligible children
- *      must not share owned_paths; conflicts are rejected or serialised.
+ *      must not own overlapping paths (equal after canonicalization, or one
+ *      inside the other); conflicts are rejected or serialised.
  *   3. Categorisation into ready (all deps terminal) vs waiting (emergent waves).
  *   4. Fan-in policy: all | quorum(k ratio) | best_effort.
+ *   5. Owned-path confinement (validateExpansion, issues #73 and #124): every
+ *      proposed owned_paths entry resolves against the run's project root and
+ *      must stay inside it, symlinks resolved.
  *
  * NOTE: the cards table (WI-290) has no depends_on column, so the depends_on
  * graph lives in ExpansionResult.children (in-process wave state) and is NOT
  * persisted.  commitFanOut only writes parent_id + owned_paths via insertCard.
  */
 
-import { writeFileSync, unlinkSync, existsSync, statSync, realpathSync } from 'node:fs';
+import { writeFileSync, unlinkSync, statSync, realpathSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import type { Status, Lane } from '../types/kernel';
 import type { ConduitDB } from '../persistence/db';
 import { DEFAULT_RUN_ID } from '../persistence/db';
 import { findCycleNodes } from '../flow/dag-utils';
+import { canonicalOwnedPaths, ownedPathSetsIntersect } from '../controller/harness-overlap';
+import { isContainedIn, resolveOwnedPath } from '../worker/integrity';
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -48,16 +54,45 @@ export interface ValidatedChild {
   owned_paths: string[];
 }
 
-/** What to do when two concurrent children claim the same owned_path. */
 export interface ExpandOptions {
+  /** What to do when two concurrent children claim overlapping owned paths. */
   onPathConflict: 'reject' | 'serialize';
+  /**
+   * The run's project root (issues #73, #124). Every owned path is resolved
+   * against it, not against the kernel's cwd, must stay inside it, and is
+   * compared with its siblings' in canonical form.
+   */
+  projectRoot: string;
 }
 
 export type ExpansionError =
   | { code: 'dependency_cycle'; cycle: string[] }
   | { code: 'overlapping_owned_paths'; stations: [string, string]; path: string }
   | { code: 'unknown_dependency'; child: string; dependency: string }
+  /**
+   * A seeded child has no usable directory to write `seed.json` into: its
+   * `owned_paths` is empty (`path` is `''`), or `owned_paths[0]` does not
+   * exist or is not a directory. The name predates issue #73 and is kept
+   * because hold reasons and callers already match on it; a path outside the
+   * project root is reported as `owned_path_out_of_bounds`, by
+   * `validateExpansion` or, for a seed dir whose realpath moved outside after
+   * that check, by `resolveSeedDir`.
+   */
   | { code: 'seed_path_out_of_bounds'; child: string; path: string }
+  /**
+   * A proposed owned_paths entry resolves outside the run's project root:
+   * an absolute path elsewhere, a `..` escape, or a symlink that points out
+   * (issue #73). `path` is the entry as proposed.
+   */
+  | { code: 'owned_path_out_of_bounds'; child: string; path: string }
+  /**
+   * Two seeded children's `owned_paths[0]` resolve to the same directory.
+   * commitFanOut writes every seed.json before any child runs, so the second
+   * would replace the first; `depends_on` ordering does not prevent it.
+   * `children` is [first, second] in proposal order, and `path` is the second
+   * child's entry as proposed.
+   */
+  | { code: 'seed_path_conflict'; children: [string, string]; path: string }
   /**
    * A proposed child id is already a card in this run under another parent
    * (issue #36). Card ids are unique per run, and a keyed run's later pass may
@@ -101,11 +136,20 @@ function computeTransitiveDeps(
 // ---------------------------------------------------------------------------
 
 /**
- * Validate an Architect proposal: cycle detection then disjoint-ownership.
+ * Validate an Architect proposal: cycle detection, owned-path confinement,
+ * then disjoint ownership.
  *
  * - Cycle detection REUSES findCycleNodes from src/flow/dag-utils (WI-292).
+ * - Confinement (confineOwnedPaths) rejects an owned path outside the
+ *   project root before any two paths are compared.
+ * - Disjointness compares canonical paths (canonicalOwnedPaths, the resolver
+ *   the integrity check uses) with ownedPathSetsIntersect, the overlap batch's
+ *   comparator, so `./a` and `a`, a relative and an absolute spelling, or two
+ *   symlinks to one dir are the same path, and a dir overlaps every path
+ *   inside it.
  * - Path conflict resolution is controlled by opts.onPathConflict:
- *     'reject'    → return error naming both stations and the shared path.
+ *     'reject'    → return error naming both stations and the overlapping
+ *                   entry as proposed by the second.
  *     'serialize' → inject a forced depends_on edge so the two are no longer
  *                   concurrent; the forced edge is recorded in forcedEdges.
  *
@@ -158,7 +202,18 @@ export function validateExpansion(
     return { ok: false, error: { code: 'dependency_cycle', cycle: Array.from(cycleNodes) } };
   }
 
-  // ── 2. Disjoint-ownership invariant ───────────────────────────────────────
+  // ── 2. Owned-path confinement (issue #73) ─────────────────────────────────
+  // Before disjointness: an escaping or non-string entry cannot be compared.
+  // The pass returns the canonical paths it checked, so step 3 reuses them
+  // rather than resolving every entry a second time.
+  const confined = confineOwnedPaths(opts.projectRoot, children);
+  if (!confined.ok) return { ok: false, error: confined.error };
+
+  // ── 3. Disjoint-ownership invariant, on canonical paths ───────────────────
+  // canonical.get(id)[k] is the canonical form of owned_paths[k]: one entry
+  // per proposed entry, in order, so an index found in one indexes the other.
+  const canonical = confined.canonical;
+
   // Build a mutable transitive-deps map so serialization updates propagate.
   const transitiveDeps = new Map<string, Set<string>>(
     children.map((c) => [c.id, computeTransitiveDeps(c.id, depsMap)]),
@@ -178,10 +233,13 @@ export function validateExpansion(
       const bDepA = transitiveDeps.get(b.id)?.has(a.id) ?? false;
       if (aDepB || bDepA) continue;
 
-      // Check for shared owned paths between concurrent children.
-      const aPathSet = new Set(a.owned_paths);
-      const sharedPath = b.owned_paths.find((p) => aPathSet.has(p));
-      if (sharedPath === undefined) continue;
+      // Check for overlapping owned paths between concurrent children: equal
+      // after canonicalization, or one inside the other.
+      const aCanonical = canonical.get(a.id)!;
+      const bCanonical = canonical.get(b.id)!;
+      const overlapIndex = bCanonical.findIndex((p) => ownedPathSetsIntersect(aCanonical, [p]));
+      if (overlapIndex === -1) continue;
+      const sharedPath = b.owned_paths[overlapIndex]!;
 
       if (opts.onPathConflict === 'reject') {
         return {
@@ -213,6 +271,99 @@ export function validateExpansion(
   }));
 
   return { ok: true, children: validatedChildren, forcedEdges };
+}
+
+// ---------------------------------------------------------------------------
+// confineOwnedPaths — confine proposed owned_paths to the project root
+// ---------------------------------------------------------------------------
+
+/**
+ * Confine every proposed owned_paths entry to `projectRoot` (issue #73, SPEC §7
+ * path ownership). Returns the first entry that resolves outside it as an
+ * `owned_path_out_of_bounds` error, or, when every entry is inside, each
+ * child's canonical owned paths keyed by child id, index-aligned with its
+ * `owned_paths` (one canonical path per proposed entry, in order).
+ *
+ * A proposal is model output, and the kernel writes seed.json to a child's
+ * owned_paths[0], reads it back from there (card-scoped inputs, `skip_when`
+ * `source: seed`), and lets the child write anywhere inside its owned paths.
+ * So every entry of every child is checked, seeded or not.
+ *
+ * Entries go through `canonicalOwnedPaths`, the resolver the overlap
+ * disjointness check and `checkIntegrity` use: relative entries resolve against
+ * the project root, and symlinks in the longest existing prefix are resolved,
+ * so an entry that does not exist yet is still checked through any symlinked
+ * ancestor. The result is compared against the canonical project root.
+ *
+ * Never throws: a non-string entry (the proposal shape check accepts any array)
+ * is reported as out of bounds rather than surfacing a TypeError.
+ */
+export function confineOwnedPaths(
+  projectRoot: string,
+  children: readonly ProposedChild[],
+): { ok: true; canonical: Map<string, string[]> } | { ok: false; error: ExpansionError } {
+  const canonicalRoot = resolveOwnedPath(resolve(projectRoot));
+  const canonical = new Map<string, string[]>();
+  for (const child of children) {
+    const paths: string[] = [];
+    for (const entry of child.owned_paths) {
+      if (typeof entry !== 'string') {
+        return { ok: false, error: { code: 'owned_path_out_of_bounds', child: child.id, path: String(entry) } };
+      }
+      const [path] = canonicalOwnedPaths(canonicalRoot, [entry]);
+      if (path === undefined || !isContainedIn(path, canonicalRoot)) {
+        return { ok: false, error: { code: 'owned_path_out_of_bounds', child: child.id, path: entry } };
+      }
+      paths.push(path);
+    }
+    canonical.set(child.id, paths);
+  }
+  return { ok: true, canonical };
+}
+
+/**
+ * The directory commitFanOut writes a child's seed.json into: `rawDir` (the
+ * child's owned_paths[0]) resolved against the project root, symlinks
+ * resolved. Fails with `seed_path_out_of_bounds` when the entry does not exist
+ * or is not a directory, and with `owned_path_out_of_bounds` when its realpath
+ * lies outside the canonical project root.
+ *
+ * validateExpansion has already confined the entry, but it read the
+ * filesystem earlier: a symlink re-pointed between that read and this one
+ * would send the seed outside the root. The containment check here runs on
+ * the realpath string commitFanOut then writes `seed.json` under, so
+ * re-pointing `owned_paths[0]` itself after this call has no effect on the
+ * write.
+ *
+ * A race remains and is accepted: a directory on that realpath replaced by a
+ * symlink between this check and the write would still be followed, since
+ * Bun exposes no `openat2(RESOLVE_BENEATH)`-style write anchored to the
+ * checked inode. Exploiting it needs concurrent write access to the project
+ * root during the fan-out commit; the container (ADR-0003) is the boundary
+ * for that case, as it is for the integrity check's own reads (§7).
+ *
+ * Never throws: a path removed or re-pointed to a missing target between the
+ * existence check and `realpathSync` is reported as `seed_path_out_of_bounds`.
+ */
+export function resolveSeedDir(
+  projectRoot: string,
+  rawDir: string,
+): { ok: true; dir: string } | { ok: false; code: 'seed_path_out_of_bounds' | 'owned_path_out_of_bounds' } {
+  const absDir = resolve(projectRoot, rawDir);
+  // The entry must exist AND be a directory: a file entry would cause ENOTDIR
+  // on write. statSync and realpathSync throw on a missing path, including one
+  // removed after an earlier check, so any throw is the same rejection.
+  let dir: string;
+  try {
+    if (!statSync(absDir).isDirectory()) return { ok: false, code: 'seed_path_out_of_bounds' };
+    dir = realpathSync(absDir);
+  } catch {
+    return { ok: false, code: 'seed_path_out_of_bounds' };
+  }
+  if (!isContainedIn(dir, resolveOwnedPath(resolve(projectRoot)))) {
+    return { ok: false, code: 'owned_path_out_of_bounds' };
+  }
+  return { ok: true, dir };
 }
 
 // ---------------------------------------------------------------------------
@@ -264,8 +415,11 @@ export function commitFanOut(
     proposal = parentIdOrProposal as ArchitectProposal;
     expandOpts = proposalOrOpts as ExpandOptions;
   }
+  // validateExpansion also confines every owned path to the project root.
   const result = validateExpansion(proposal, expandOpts);
   if (!result.ok) return result;
+
+  const { projectRoot } = expandOpts;
 
   const stateDb = db.getStateDb();
 
@@ -293,13 +447,17 @@ export function commitFanOut(
   }
 
   // Build a map from child id → seed file path for each seeded child.
-  // Validate out-of-bounds seed paths before touching the filesystem or DB:
-  //   1. A seeded child with empty owned_paths has no directory to write into.
-  //   2. The raw owned_paths[0] entry must exist and be a directory — check
-  //      existence BEFORE calling realpathSync (which throws on missing paths).
-  //   3. realpathSync resolves symlinks so a symlink escaping the sandbox is
-  //      caught at write time by the integrity gate rather than silently allowed.
+  // Validate seed paths before touching the filesystem or DB:
+  //   1. A seeded child with empty owned_paths has no directory to write into
+  //      (`seed_path_out_of_bounds`, see its doc on ExpansionError).
+  //   2. resolveSeedDir resolves owned_paths[0] against the project root (never
+  //      the kernel's cwd, issue #124), requires an existing directory, and
+  //      re-checks its realpath against the root, since validateExpansion's
+  //      confinement read the filesystem earlier.
+  //   3. No two seeded children share that realpath (`seed_path_conflict`).
   const seedPaths = new Map<string, string>();
+  /** Seed dir realpath → the seeded child that writes into it. */
+  const seedDirOwner = new Map<string, string>();
   for (const child of proposal.children) {
     // null is treated as "no seed" — only undefined and null are skipped.
     if (child.seed === undefined || child.seed === null) continue;
@@ -310,22 +468,18 @@ export function commitFanOut(
       };
     }
     const rawDir = child.owned_paths[0]!;
-    // The entry must exist AND be a directory — a non-existent path indicates
-    // traversal outside the sandbox; a file entry would cause ENOTDIR on write.
-    if (!existsSync(rawDir)) {
-      return {
-        ok: false,
-        error: { code: 'seed_path_out_of_bounds', child: child.id, path: rawDir },
-      };
+    const seedDir = resolveSeedDir(projectRoot, rawDir);
+    if (!seedDir.ok) {
+      return { ok: false, error: { code: seedDir.code, child: child.id, path: rawDir } };
     }
-    if (!statSync(rawDir).isDirectory()) {
-      return {
-        ok: false,
-        error: { code: 'seed_path_out_of_bounds', child: child.id, path: rawDir },
-      };
+    // Compare the realpath the write uses: two spellings of one dir, or two
+    // symlinks to it, land on the same seed.json.
+    const sharer = seedDirOwner.get(seedDir.dir);
+    if (sharer !== undefined) {
+      return { ok: false, error: { code: 'seed_path_conflict', children: [sharer, child.id], path: rawDir } };
     }
-    const firstDir = realpathSync(rawDir); // symlink-resolved
-    const seedPath = join(firstDir, 'seed.json');
+    seedDirOwner.set(seedDir.dir, child.id);
+    const seedPath = join(seedDir.dir, 'seed.json');
     seedPaths.set(child.id, seedPath);
   }
 

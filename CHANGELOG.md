@@ -126,6 +126,27 @@ historical context, not public releases or public repository history.
 
 ### Fixed
 
+- Fan-out owned paths resolve against the project root and stay inside it
+  ([#124](https://github.com/theaiteam-dev/conduit/issues/124),
+  [#73](https://github.com/theaiteam-dev/conduit/issues/73)). `commitFanOut`
+  resolved a child's relative `owned_paths[0]` against the kernel's cwd, so a
+  run whose cwd was not the project root (Docker, `--project-root`) rejected a
+  valid proposal with `seed_path_out_of_bounds`; `skip_when` `source: seed`
+  read `seed.json` from the cwd the same way. Both now resolve against the
+  run's project root. A proposal whose `owned_paths` entry resolves outside the
+  root (an absolute path elsewhere, a `..` escape, or a symlink pointing out)
+  is rejected with the new `owned_path_out_of_bounds` code: nothing is seeded,
+  and the parent is held with the child and path in its reason.
+  The disjoint-ownership check compared raw strings, so `./a` and `a`, a
+  relative and an absolute spelling of one dir, two symlinks to one dir, or
+  `a` and `a/b` passed as disjoint; it now compares canonical paths, and a dir
+  overlaps every path inside it, under both `reject` and `serialize`.
+  `validateExpansion` and `commitFanOut` now require `projectRoot` in their
+  options. Two seeded children whose `owned_paths[0]` resolve to one directory
+  are rejected with the new `seed_path_conflict` code, with both child ids and
+  the path in the hold reason: every `seed.json` is written before any child
+  runs, so the second seed replaced the first even when `depends_on` ordered
+  the two.
 - A gate critic that runs on a harness adapter (`check.critic.harness`) is
   now probed and reported like a harness maker
   ([#35](https://github.com/theaiteam-dev/conduit/issues/35)). The binary

@@ -18,6 +18,14 @@ user or CI consumer actually sees, not internal implementation details.
 - `fault-*.test.ts` — fault variants of the golden journey (see "The standing
   rule" below). `fault-stalled-slack.test.ts` (WI-680) is the first shipped
   example.
+- `fanout-owned-paths.test.ts`: fan-out owned paths (issues #73 and #124),
+  with the kernel's cwd different from the project root. A proposal of
+  relative child dirs seeds each `seed.json` under the project root, and a
+  `skip_when: { source: seed }` predicate reads it from there. A proposal of
+  existing dirs outside the project root is rejected: no child is seeded,
+  nothing is written, and the parent is held with `owned_path_out_of_bounds`,
+  the child and the path in its reason. Driven through
+  `startJourneyHarness({ concurrentFanOut: true, fanOutOwnedPaths, skipChild })`.
 - `harness/fake-claude.ts`: a scenario-driven stand-in for the headless
   Claude Code CLI. The harness-flow journeys point the shipped
   `claude-headless` adapter at it through engine config

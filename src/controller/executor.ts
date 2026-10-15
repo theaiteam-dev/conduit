@@ -802,7 +802,7 @@ export async function runExecutor(args: RunEngineArgs): Promise<void> {
     // re-enter the loop: the promote step readies a skipped card at its next
     // lane, and planning now would find nothing to dispatch for it and read
     // the run as stalled.
-    if (applySkipWhen({ db, stateDb, runId, flow, happyPathNext, terminalLanes, maxExecutionAttempts, now: currentNow, err: io.err, runMemo: skipWhenRunMemo })) {
+    if (applySkipWhen({ db, stateDb, runId, flow, happyPathNext, terminalLanes, maxExecutionAttempts, now: currentNow, err: io.err, runMemo: skipWhenRunMemo, projectRoot })) {
       lastLaneChangeAt = currentNow;
       continue;
     }
@@ -3395,6 +3395,7 @@ async function runGateCheckOrAdvance(args: GateCheckOrAdvanceArgs): Promise<bool
             flow,
             err,
             now: currentNow,
+            projectRoot,
           });
         }
 
@@ -3494,6 +3495,7 @@ async function runGateCheckOrAdvance(args: GateCheckOrAdvanceArgs): Promise<bool
       flow,
       err,
       now: currentNow,
+      projectRoot,
     });
   }
 
@@ -5526,6 +5528,8 @@ interface ApplySkipWhenArgs {
   maxExecutionAttempts: number;
   now: number;
   err: (msg: string) => void;
+  /** The run's project root: `source: seed` reads resolve against it, not the cwd (issue #124). */
+  projectRoot: string;
   /**
    * 'run' decisions memoized for the lifetime of the runExecutor call, keyed
    * by `${cardId}\0${lane}\0${attempt}` (issue #32). A card whose predicate
@@ -5608,7 +5612,7 @@ function withVerifiedReadyCard(
  * the write-lock re-check below) does not count.
  */
 function applySkipWhen(args: ApplySkipWhenArgs): boolean {
-  const { db, stateDb, runId, flow, happyPathNext, terminalLanes, maxExecutionAttempts, now, err, runMemo } = args;
+  const { db, stateDb, runId, flow, happyPathNext, terminalLanes, maxExecutionAttempts, now, err, runMemo, projectRoot } = args;
   const skipStations = Object.keys(flow.stations).filter((id) => flow.stations[id]!.skip_when !== undefined);
   if (skipStations.length === 0) return false;
 
@@ -5675,6 +5679,7 @@ function applySkipWhen(args: ApplySkipWhenArgs): boolean {
       stateDb,
       runId,
       flowVersion: String(flow.version),
+      projectRoot,
       card: { id, owned_paths: ownedPaths },
     });
 
@@ -6446,6 +6451,8 @@ interface FanOutCompleteArgs {
   err: (msg: string) => void;
   /** Injected epoch seconds — used to stamp the fan-out cache-warming stagger. */
   now: number;
+  /** The run's project root: proposed owned_paths resolve against it and must stay inside it (#73, #124). */
+  projectRoot: string;
 }
 
 /**
@@ -6462,7 +6469,8 @@ interface FanOutCompleteArgs {
  * Failure modes (parent escalated to held, no children seeded):
  *   - Structurally non-conforming payload (children not array / child not object)
  *   - commitFanOut ExpansionError (dependency_cycle / overlapping_owned_paths /
- *     unknown_dependency) — the whole proposal is rejected, never partially applied
+ *     unknown_dependency / child_id_collision / seed_path_out_of_bounds /
+ *     seed_path_conflict / owned_path_out_of_bounds) — the whole proposal is rejected, never partially applied
  *   - FSM illegal_transition on FAN_OUT (contradictory card state)
  *
  * Extension seams:
@@ -6487,6 +6495,7 @@ function handleFanOutComplete(args: FanOutCompleteArgs): boolean {
     flow,
     err,
     now,
+    projectRoot,
   } = args;
 
   // ── Structural validation ────────────────────────────────────────────────
@@ -6520,18 +6529,31 @@ function handleFanOutComplete(args: FanOutCompleteArgs): boolean {
   // ── Validate + seed children (WIRE, don't reimplement — dag/expand.ts) ───
   // commitFanOut runs validateExpansion (cycle detection + disjoint ownership)
   // atomically with insertCard — either all children are inserted or none are.
-  const expansion = commitFanOut(db, runId, cardId, proposal, { onPathConflict: 'reject' });
+  // Owned paths resolve against the run's project root, not the kernel's cwd,
+  // and an entry outside it rejects the proposal (issues #73, #124).
+  const expansion = commitFanOut(db, runId, cardId, proposal, { onPathConflict: 'reject', projectRoot });
 
   if (!expansion.ok) {
-    // Dependency cycle, overlapping paths, or unknown dependency — reject whole
-    // proposal. Never seed partial expansions; they leave orphaned cards.
+    // Dependency cycle, overlapping paths, unknown dependency, or an owned path
+    // out of bounds: reject the whole proposal. Never seed partial expansions;
+    // they leave orphaned cards.
+    const e = expansion.error;
+    // Child ids and paths come from the model's proposal. Escape control
+    // characters so a newline in them cannot forge a line in the hold reason.
+    const q = (text: string): string => JSON.stringify(text).slice(1, -1);
+    const where =
+      e.code === 'owned_path_out_of_bounds' || e.code === 'seed_path_out_of_bounds'
+        ? ` (child '${q(e.child)}', path '${q(e.path)}')`
+        : e.code === 'seed_path_conflict'
+          ? ` (children '${q(e.children[0])}' and '${q(e.children[1])}', path '${q(e.path)}')`
+          : '';
     escalateToHold(
       stateDb,
       db,
       cardId,
       stationId,
       card,
-      `fan-out station '${stationId}' proposal rejected: ${expansion.error.code}`,
+      `fan-out station '${stationId}' proposal rejected: ${e.code}${where}`,
       err,
       runId,
     );
