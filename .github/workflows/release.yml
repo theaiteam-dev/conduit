@@ -1,15 +1,22 @@
+# Release: tags and publishes when a release PR merges. See docs/releasing.md.
+#
+# A release PR (opened by prepare-release.yml) changes the package.json
+# version. This workflow runs on every push to main and does nothing unless
+# that push changed the version and no vX.Y.Z tag exists yet. It never pushes
+# to main: it creates the tag and the GitHub release through the API, then
+# publishes the versioned engine image, so the main ruleset needs no bypass.
+#
+# To retry a failed release, re-run the failed jobs of that run. A re-run uses
+# the same commit. If the tag already exists at that commit, the run skips the
+# tag and release and only publishes the image again.
 name: Release
 
 on:
   push:
     branches: [main]
-  workflow_dispatch:
 
 permissions:
-  contents: write
-  issues: write
-  pull-requests: write
-  packages: write
+  contents: read
 
 concurrency:
   group: release
@@ -23,21 +30,97 @@ jobs:
     name: Verify and release
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    permissions:
+      contents: write
     outputs:
-      published: ${{ steps.semantic.outputs.new_release_published }}
-      version: ${{ steps.semantic.outputs.new_release_version }}
+      published: ${{ steps.publish.outcome == 'success' || steps.detect.outputs.republish == 'true' }}
+      version: ${{ steps.detect.outputs.version }}
 
     steps:
+      # Full history so the version at the pushed-over commit and the existing
+      # tags are both available to the detect step.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
-          persist-credentials: true
+          persist-credentials: false
+
+      # The release signal is a package.json version change, not a commit
+      # message, so a squash title edited at merge time cannot hide or fake one.
+      # Both versions must be plain MAJOR.MINOR.PATCH before either is written
+      # to GITHUB_OUTPUT or used in a tag name.
+      - name: Detect a release commit
+        id: detect
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: |
+          semver='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+          not_a_release() {
+            echo "$1; not a release."
+            echo "release=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          }
+
+          version=$(jq -r .version package.json)
+          if [ "$BEFORE" = "0000000000000000000000000000000000000000" ] \
+            || ! previous=$(git show "$BEFORE:package.json" 2> /dev/null | jq -r .version); then
+            not_a_release "No previous commit to compare against"
+          fi
+          [[ "$previous" =~ $semver ]] || not_a_release "Previous package.json has no plain version"
+          [ "$previous" != "$version" ] || not_a_release "package.json version unchanged ($version)"
+          if ! [[ "$version" =~ $semver ]]; then
+            echo "::error::package.json version is not MAJOR.MINOR.PATCH; refusing to release it."
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+          # A tag at this same commit means a re-run of a release that already
+          # published its tag: skip the tag and release, but let the image job
+          # run again, unless a newer release has moved `latest` on since.
+          if tagged=$(git rev-parse -q --verify "refs/tags/v$version^{commit}"); then
+            if [ "$tagged" != "$GITHUB_SHA" ]; then
+              echo "::error::package.json moved $previous -> $version but tag v$version already exists at $tagged."
+              exit 1
+            fi
+            # Plain vX.Y.Z tags only, the same rule as latestTag() in scripts/release.ts.
+          newest=$(git tag --list 'v*' --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1 || true)
+            if [ "$newest" = "v$version" ]; then
+              echo "v$version already tagged at this commit; re-running the image publish only."
+              echo "republish=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "v$version already tagged and $newest is newer; nothing to do."
+            fi
+            echo "release=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Prepare release checks this too, but the release branch can be
+          # edited before merge. A lower version would move `latest` back.
+          newest=$(git tag --list 'v*' --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1 || true)
+          if [ -n "$newest" ] \
+            && [ "$(printf '%s\n' "${newest#v}" "$version" | sort -V | tail -n 1)" != "$version" ]; then
+            echo "::error::package.json version $version is not greater than the newest tag $newest."
+            exit 1
+          fi
+          echo "Release commit: $previous -> $version"
+          echo "release=true" >> "$GITHUB_OUTPUT"
 
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        if: steps.detect.outputs.release == 'true'
         with:
           bun-version: 1.3.11
 
+      - name: Test the release script
+        if: steps.detect.outputs.release == 'true'
+        run: bun test scripts/release.test.ts
+
+      # Fails before the gates if the CHANGELOG has no section for the version.
+      - name: Check the release notes
+        if: steps.detect.outputs.release == 'true'
+        env:
+          VERSION: ${{ steps.detect.outputs.version }}
+        run: bun scripts/release.ts notes "$VERSION" > "$RUNNER_TEMP/notes.md"
+
       - name: Install (frozen lockfile)
+        if: steps.detect.outputs.release == 'true'
         run: bun install --frozen-lockfile
 
       # The same gates as the required PR checks (test.yml, blackbox.yml).
@@ -45,17 +128,21 @@ jobs:
       # job runs them again before it publishes. blackbox/scaffold.test.ts
       # pins this list.
       - name: Typecheck
+        if: steps.detect.outputs.release == 'true'
         run: bun run typecheck
 
       - name: Black-box typecheck
+        if: steps.detect.outputs.release == 'true'
         run: bun run typecheck:blackbox
 
       # Issue #122: the Landlock helper both test steps below need, as in
       # test.yml and blackbox.yml.
       - name: Build the llexec helper
+        if: steps.detect.outputs.release == 'true'
         run: scripts/build-llexec.sh
 
       - name: Test
+        if: steps.detect.outputs.release == 'true'
         env:
           CONDUIT_REQUIRE_CGROUP_CONTAINMENT: '1'
           CONDUIT_REQUIRE_LANDLOCK: '1'
@@ -67,9 +154,11 @@ jobs:
           bun run test
 
       - name: Mutation check (harness usage fold sites)
+        if: steps.detect.outputs.release == 'true'
         run: bun run test:mutation
 
       - name: Black-box test
+        if: steps.detect.outputs.release == 'true'
         env:
           CONDUIT_REQUIRE_CGROUP_CONTAINMENT: '1'
           CONDUIT_REQUIRE_LANDLOCK: '1'
@@ -80,20 +169,19 @@ jobs:
           echo $$ | sudo tee "$cg/cgroup.procs" > /dev/null
           bun run test:blackbox
 
-      # @semantic-release/npm updates package.json but does not publish this
-      # private, Docker-first package to npm. The git plugin commits the version.
-      - name: Semantic release
-        id: semantic
-        uses: cycjimmy/semantic-release-action@16ca923e6ccbb50770c415a0ccd43709a8c5f7a4 # v4.2.2
-        with:
-          extra_plugins: |
-            @semantic-release/commit-analyzer
-            @semantic-release/release-notes-generator
-            @semantic-release/npm
-            @semantic-release/github
-            @semantic-release/git
+      # Creates the tag at the merged commit through the API. No push to main.
+      - name: Create the tag and GitHub release
+        id: publish
+        if: steps.detect.outputs.release == 'true'
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.detect.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v$VERSION" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "v$VERSION" \
+            --notes-file "$RUNNER_TEMP/notes.md"
 
   image:
     name: Publish release image
