@@ -11,6 +11,8 @@ historical context, not public releases or public repository history.
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-10-16
+
 ### Breaking
 
 - **Breaking default:** `conduit listen` now binds its HTTP server to
@@ -119,24 +121,6 @@ historical context, not public releases or public repository history.
   stamps, and a changed per-child file re-executes that child on resume. A
   card-scoped input that cannot be read fails the render instead of falling
   back to the project-root file of the same name.
-
-- Journal now records the token split and provider capacity per call
-  ([#5](https://github.com/theaiteam-dev/conduit/issues/5)). `output_tokens`
-  was `0` on every priced row and `cache_read`/`cache_creation` had nowhere to
-  go, because the harness path summed all four token classes into a single
-  scalar and wrote it to `input_tokens`. The journal gains
-  `cache_read_input_tokens` and `cache_creation_input_tokens`, `input_tokens`
-  now means UNCACHED input only, and `model` is filled from what the provider
-  actually billed. The `claude-headless` adapter reads
-  `--output-format stream-json --verbose`, whose `rate_limit_event` records
-  per-window utilization and reset times as journal attributes — so "what
-  fraction of spend is cache reads" and "what did this run draw against the
-  plan" are queries rather than inferences. `model` is attributed to the model
-  that consumed the most tokens, since a normal agentic call bills two or more.
-  The stream is filtered line-by-line as it arrives, so reading these events
-  does not hold an entire multi-minute agent transcript in memory. Additive and
-  nullable: existing journals migrate in place, pre-split rows stay readable,
-  and run/wave budgets still count the same totals (they sum all four columns).
 
 ### Changed
 
@@ -284,6 +268,63 @@ historical context, not public releases or public repository history.
   `inputs: ['../../../etc/passwd']` read that file. Reads now get the same
   lexical and symlink-aware escape check that output writes already had.
 
+## [1.1.2] - 2026-09-21
+
+### Fixed
+
+- Harness gate critics are billed against the run and wave budgets
+  ([#26](https://github.com/theaiteam-dev/conduit/issues/26)).
+
+## [1.1.1] - 2026-09-21
+
+### Fixed
+
+- Triage: scan evidence is fenced instead of inlined in markdown
+  ([#25](https://github.com/theaiteam-dev/conduit/issues/25)).
+
+## [1.1.0] - 2026-09-12
+
+### Added
+
+- Automated issue triage flow ([#22](https://github.com/theaiteam-dev/conduit/issues/22)).
+
+## [1.0.4] - 2026-09-11
+
+### Fixed
+
+- A rate limit hit at rework time parks the card and resumes instead of
+  scrapping the run ([#7](https://github.com/theaiteam-dev/conduit/issues/7)).
+
+## [1.0.3] - 2026-09-05
+
+### Fixed
+
+- Ingress alerts on re-drive failures ([#8](https://github.com/theaiteam-dev/conduit/issues/8)).
+
+## [1.0.2] - 2026-08-31
+
+### Added
+
+- Journal now records the token split and provider capacity per call
+  ([#5](https://github.com/theaiteam-dev/conduit/issues/5)). `output_tokens`
+  was `0` on every priced row and `cache_read`/`cache_creation` had nowhere to
+  go, because the harness path summed all four token classes into a single
+  scalar and wrote it to `input_tokens`. The journal gains
+  `cache_read_input_tokens` and `cache_creation_input_tokens`, `input_tokens`
+  now means UNCACHED input only, and `model` is filled from what the provider
+  actually billed. The `claude-headless` adapter reads
+  `--output-format stream-json --verbose`, whose `rate_limit_event` records
+  per-window utilization and reset times as journal attributes — so "what
+  fraction of spend is cache reads" and "what did this run draw against the
+  plan" are queries rather than inferences. `model` is attributed to the model
+  that consumed the most tokens, since a normal agentic call bills two or more.
+  The stream is filtered line-by-line as it arrives, so reading these events
+  does not hold an entire multi-minute agent transcript in memory. Additive and
+  nullable: existing journals migrate in place, pre-split rows stay readable,
+  and run/wave budgets still count the same totals (they sum all four columns).
+
+### Fixed
+
 - A provider rate limit no longer destroys a run
   ([#3](https://github.com/theaiteam-dev/conduit/issues/3)). A 429 was
   indistinguishable from a crash — both surfaced as `harness-nonzero-exit`,
@@ -303,6 +344,10 @@ historical context, not public releases or public repository history.
   becoming one long blocking sleep. Under the default 10-minute run budget a
   capped run halts on wall clock; what fixes #3 is that the card stays `ready`
   rather than terminal, so `conduit resume` has something to dispatch.
+
+## [1.0.1] - 2026-08-29
+
+### Fixed
 
 - Scoped the bounded-rework cap to each gate instead of the whole card
   ([#1](https://github.com/theaiteam-dev/conduit/issues/1)). `rework_cap` is
@@ -337,5 +382,13 @@ historical context, not public releases or public repository history.
 - Added a locally verified, model-free README quickstart and a decision guide
   comparing Conduit with Temporal, n8n, and LangGraph.
 
-[Unreleased]: https://github.com/theaiteam-dev/conduit/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/theaiteam-dev/conduit/compare/v2.0.0...HEAD
+[2.0.0]: https://github.com/theaiteam-dev/conduit/compare/v1.1.2...v2.0.0
+[1.1.2]: https://github.com/theaiteam-dev/conduit/compare/v1.1.1...v1.1.2
+[1.1.1]: https://github.com/theaiteam-dev/conduit/compare/v1.1.0...v1.1.1
+[1.1.0]: https://github.com/theaiteam-dev/conduit/compare/v1.0.4...v1.1.0
+[1.0.4]: https://github.com/theaiteam-dev/conduit/compare/v1.0.3...v1.0.4
+[1.0.3]: https://github.com/theaiteam-dev/conduit/compare/v1.0.2...v1.0.3
+[1.0.2]: https://github.com/theaiteam-dev/conduit/compare/v1.0.1...v1.0.2
+[1.0.1]: https://github.com/theaiteam-dev/conduit/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/theaiteam-dev/conduit/releases/tag/v1.0.0
