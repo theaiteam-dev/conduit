@@ -11,6 +11,8 @@ historical context, not public releases or public repository history.
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-10-16
+
 ### Breaking
 
 - **Breaking default:** `conduit listen` now binds its HTTP server to
@@ -337,5 +339,6 @@ historical context, not public releases or public repository history.
 - Added a locally verified, model-free README quickstart and a decision guide
   comparing Conduit with Temporal, n8n, and LangGraph.
 
-[Unreleased]: https://github.com/theaiteam-dev/conduit/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/theaiteam-dev/conduit/compare/v2.0.0...HEAD
+[2.0.0]: https://github.com/theaiteam-dev/conduit/compare/v1.1.2...v2.0.0
 [1.0.0]: https://github.com/theaiteam-dev/conduit/releases/tag/v1.0.0
