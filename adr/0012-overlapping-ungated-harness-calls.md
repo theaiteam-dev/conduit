@@ -1,6 +1,6 @@
 # ADR-0012: Ungated harness calls may overlap under `--concurrency`, with owned-dir attribution in the integrity check
 
-Status: Accepted (maintainer decision 2026-10-08 to build ahead of the measurement; #30 acceptance item 3 still needs a measured number). Amended by [ADR-0013](./0013-os-enforced-write-confinement-of-overlapped-harness-calls.md) (2026-10-10): the gap below is closed where write confinement is active.
+Status: Accepted (maintainer decision 2026-10-08 to build ahead of the measurement). The measurement for #30 acceptance item 3 was posted on 2026-10-08 and supports keeping the opt-in; see *Measured result* under *Ship condition*. Amended by [ADR-0013](./0013-os-enforced-write-confinement-of-overlapped-harness-calls.md) (2026-10-10): the gap below is closed where write confinement is active.
 Date: 2026-10-07 (written), 2026-10-08 (accepted)
 
 ## Context
@@ -49,8 +49,8 @@ enforces SPEC §6, and making it re-entrant is not needed for the Shakedown shap
 rule that attributes a touched path inside an overlapping sibling's owned paths to that
 sibling. The rule cannot detect a Bash write from one sibling into another's owned paths,
 and SPEC §7 states that gap.** The maintainer decided on 2026-10-08 to build it ahead of the
-measurement described under *Ship condition* below; that measurement is still owed to #30,
-and its result decides whether the station opt-in stays.
+measurement described under *Ship condition* below. That measurement was posted to #30 on
+2026-10-08, and its result keeps the station opt-in (*Measured result*, below).
 
 ### Opt-in: `overlap: true` on the station
 
@@ -176,6 +176,34 @@ serial is 450 to 900 s for 3 to 6 walkers against 300 s at three-wide. If the me
 serial busy time for the walker station usually fits in 300 s, a new ADR decides whether to
 remove the opt-in and its integrity gap, superseding this one. An overlapped run's measured
 wall clock replaces the packed estimate in the #30 record.
+
+### Measured result (2026-10-08)
+
+Three Shakedown runs against one PR, posted to
+[#30](https://github.com/theaiteam-dev/conduit/issues/30#issuecomment-6063977802) on 2026-10-08. The
+build was PR #121 at `5fa661a`; `walk_web`, `walk_api` and `walk_db` are `agent-sdk` harness
+stations with `overlap: true`, wip 3, a 240 s timeout and `enforce_owned_paths: true`, run at
+`--concurrency 3`.
+
+| Run | Checks | Overlapped walk | Walker call durations added up |
+|---|---|---|---|
+| sd-c1 | 4 | 427 s | 640 s |
+| sd-c2 | 6 | 307 s | 622 s |
+| sd-cf | 6 | 202 s | 525 s |
+
+The right-hand column is the serial figure this section asks for, but it is derived: each
+call's overlapped duration, added up. No serial run was recorded. On that figure the walker
+station's serial busy time exceeds the 300 s walk budget in all three runs, by 225 to 340 s.
+The overlapped walks fit the budget in one run, sd-cf; sd-c1 includes a 240 s timeout that
+ran as a batch of one after the first batch finished, and sd-c2 waited 67 s for the slowest
+member of its first batch. Both overruns come from batch dispatch waiting for its slowest
+member, which is tracked as [#123](https://github.com/theaiteam-dev/conduit/issues/123).
+
+The integrity rule held across the three runs: `overlap_attributed` attributed about 50 paths
+written into a sibling's owned dir, and no card was held for a false integrity violation.
+
+Decision: the opt-in stays. The serial figure does not fit the budget, so the condition for a
+superseding ADR that removes it is not met.
 
 ## Alternatives
 
