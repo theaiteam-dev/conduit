@@ -6,6 +6,13 @@ missionId: ~
 
 **Author:** Josh Owens  **Date:** 2026-05-31  **Revised:** 2026-06-29  **Status:** Draft
 
+> **Implementation proposal (2026-10-08):**
+> [Building Kaizen from Delivered Outcomes](../../docs/kaizen-implementation.md)
+> proposes a Nitpick-first sequence, explicit artifact/delivery attribution, and
+> project-specific evaluation policies. Its staged promotion and evidence rules
+> differ from this draft; those differences are listed for public review rather
+> than silently superseding this document's Acceptance Bar.
+
 > Scope note: this is a **post-MVP** PRD covering **build-order step 10**
 > ([`docs/build-order.md`](../../docs/build-order.md#after-the-mvp)) — the continuous-improvement
 > loop that turns a producing flow-shop into a *self-tuning* one. It **depends on the shipped MVP

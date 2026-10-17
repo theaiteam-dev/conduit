@@ -1,160 +1,145 @@
 # Why Conduit?
 
-Conduit is for a narrower problem than most workflow and agent frameworks:
-repeatedly producing AI-generated artifacts while making quality, rework, cost,
-and human judgment explicit parts of execution.
+**Conduit runs LLM jobs from a YAML file, with safety, replay, and logging built in.**
 
-That distinction matters. Temporal, n8n, and LangGraph are all good choices in
-their lanes. Conduit is compelling when the hard question is not merely “did the
-workflow run?” but “was the result inspected, was rework bounded, and can we
-explain why this artifact was accepted?”
+Define your production flow in YAML, with prompts and scripts alongside it.
+Conduit runs the steps, applies your checks, sends findings back for bounded
+revisions, and pauses for human review where configured.
 
-Last reviewed against the linked official documentation: 2026-08-27.
+Its value is the production process you can configure: choose a maker and a
+critic, declare their inputs and outputs, decide where rejected work returns,
+and set revision limits. Conduit executes those rules and records what happened.
+You supply the domain knowledge that makes the checks useful.
 
-## The short answer
+Competitor capabilities below were reviewed against the linked official
+documentation on 2026-10-08.
 
-Use Conduit when all of these are true:
+## When Conduit Fits
 
-- AI produces or evaluates an artifact.
-- A first draft is not trustworthy enough to ship automatically.
-- Maker and checker should be separate roles.
-- Rejection should cause specific, bounded rework rather than a generic retry.
-- Cost, attempts, findings, human decisions, and terminal outcomes need one
-  durable audit trail.
-- The legal route through the workflow should remain deterministic even when the
-  labor is not.
+Consider Conduit when you have a recurring transformation, such as code changes
+into review findings, an idea into marketing assets, or footage into a finished
+video, and:
 
-If those are not the central requirements, another tool is probably a better
-starting point.
+- you want the production steps, model choices, checks, and revision limits in
+  version-controlled configuration;
+- rejected work needs specific feedback and another bounded attempt;
+- you need to inspect why work advanced, was rejected, or stopped;
+- configured human selection belongs in the process;
+- a single-host runtime fits your deployment.
 
-## The different center of gravity
+Start with the [marketing ideas example](../examples/tiktok-shoppable-ideas/README.md)
+to see generation and inspection together. The
+[installation guide](./installation.md) covers the runtime and deployment setup.
 
-| Tool | Primary abstraction | Reach for it when |
-|---|---|---|
-| **Conduit** | An artifact moving through stations, inspection gates, bounded rework, and explicit terminal outcomes | The product is AI-generated work and the main risk is variable quality, silent rejection loops, or unaccounted cost |
-| **Temporal** | Durable application workflows and activities | The main risk is infrastructure failure across long-running, mission-critical business processes |
-| **n8n** | A visual integration workflow made of app and data-processing nodes | The main job is connecting APIs and SaaS systems quickly with little code |
-| **LangGraph** | A stateful graph for agents and long-running, tool-using model applications | The main job is controlling an agent's state, tool loop, streaming, memory, or dynamic interaction |
+## What You Still Build and Operate
 
-This is a difference in defaults, not a claim that the other systems are
-incapable. You can implement maker/checker separation, budgets, or bounded
-quality loops using general orchestration primitives. Conduit's value is that
-those policies are the runtime's native vocabulary and journal model rather
-than application conventions every team must design and enforce again.
+YAML defines the production rules. Prompts, schemas, and custom commands define
+the work and its checks. You still configure credentials, install the tools your
+steps need, retain state, and connect any delivery or review channels.
 
-## Why not Temporal?
+Conduit provides CLI run, resume, status, journal, and diagnostic commands, plus
+webhook and Slack ingress. An external scheduler can launch periodic work;
+Conduit has no built-in calendar scheduler. Its current runtime uses Bun and
+SQLite on one host. Agent harness containment depends on the
+[adapter](./harness-containment.md).
 
-[Temporal](https://docs.temporal.io/) is designed for crash-proof durable
-execution: application workflows resume after process, network, or
-infrastructure failures, including workflows that last for very long periods.
-That is a broader and more mature durability problem than Conduit attempts to
-solve.
+The aim is to reduce the custom orchestration code needed for an inspected
+production flow. Whether that is easier for your team depends on the flow and
+the infrastructure you already operate.
 
-Choose Temporal first when you need:
+## Why Not Temporal?" -->
 
-- multi-service business transactions, schedules, signals, and long-lived
-  process coordination;
-- mature distributed execution and operational infrastructure;
-- durable timers and recovery across services or hosts;
-- a general application platform where AI is only one activity among many.
+## Why Not Temporal?
 
-Choose Conduit first when one durable business process contains a production
-line of non-deterministic AI work and the missing abstraction is quality
-control. Conduit distinguishes an execution failure from a quality rejection,
-routes critic findings back to the correct maker, caps rework, records model and
-artifact bindings for resume, and gives `pass`, `scrap`, and `hold` explicit
-meanings.
+[Temporal](https://docs.temporal.io/) gives application code durable execution:
+a workflow's event history records every activity it scheduled and the result
+it returned, and when a worker dies the workflow replays that history and
+continues from the last recorded step. For a long-running business process that
+spans services, with timers, signals, and schedules, it is the mature answer and
+Conduit does not compete with it there.
 
-They can be complementary: Temporal can own the outer business process while a
-Conduit run performs one quality-controlled AI production stage. Temporal is the
-stronger answer to “will this business process survive?” Conduit is the more
-opinionated answer to “why was this AI artifact allowed to advance?”
+Run LLM work on Temporal and the history does one thing well: a crash never
+re-bills a completed activity. What the history does not hold is anything about
+the model call itself. It records that an activity returned a value, not which
+prompt version, model, or inputs produced it, so when you change a prompt
+Temporal has no way to say which steps are now stale. You reset the workflow to
+an event ID by hand, or you build the dependency tracking in your own code.
 
-## Why not n8n?
+Conduit keys each checkpoint by a binding stamp:
+`hash(model, prompt version, input artifact hashes, flow version)`, where the
+prompt version includes the injected skills and the harness agent definition.
+On resume a station runs again only if its stamp changed, and the invalidation
+cascades to the stations that consume its output. Bump one `prompt_version` and
+only that station and its dependents re-run. The upstream model calls are
+reused. Change `flow_version` and `conduit resume --rebind` re-validates every
+stamp.
 
-[n8n](https://docs.n8n.io/) describes itself as a workflow automation tool that
-combines AI capabilities with business-process automation. Its strength is
-connecting applications and APIs through a visual workflow, built-in nodes,
-credentials, triggers, and low-code data mapping.
+The second difference is what gets recorded. Temporal's history is activity
+inputs and outputs. Conduit's journal is the model call's model, tokens, cost,
+prompt version, and binding stamp; the card log is every lane change, every
+critic verdict with its findings, and the terminal reason. When a run ends you
+can answer "why was this accepted" and "what did this cost" from the database,
+not from your own logging.
 
-Choose n8n first when you need:
+The third is what you have to write. A critic with a rework cap, a token budget,
+a command allowlist for an agent's shell calls, and an intent log for a publish
+step are all workflow and activity code on Temporal. On Conduit they are keys
+in `flow.yaml` that the kernel enforces.
 
-- a large catalog of SaaS and API integrations;
-- a visual canvas that non-specialists can edit;
-- webhook-to-CRM, spreadsheet, email, ticketing, or data-sync automation;
-- fast operational glue where each node's successful completion is the main
-  execution concern.
+Choose Temporal when the job is a durable business process and the model call
+is one activity among many. Choose Conduit when the job is mostly model calls
+and you need replay keyed to the prompt, a journal of verdicts and cost, and
+bounded loops without writing them. They compose: Temporal can own the outer
+process and start a Conduit run for the model-heavy stage. Conduit is one host
+on SQLite and a developer preview; Temporal is neither, and that is a reason to
+pick Temporal when the surrounding process needs its scale.
 
-Choose Conduit first when a successful API call is not evidence that the work is
-good. Conduit's graph is intentionally a production line: stations declare
-inputs and outputs, gates produce verdicts and findings, rejected work follows a
-bounded back-edge, and the journal preserves the full quality history. That is a
-more constrained authoring model, but the constraint is the feature when AI
-quality is the product risk.
+## Why Not n8n?
 
-They can also sit together: n8n can collect a trigger or deliver an accepted
-artifact, while Conduit owns the expensive maker/checker/rework section in the
-middle.
+[n8n](https://docs.n8n.io/) combines AI features with business-process automation.
+Its visual workflow authoring and integrations are useful when the primary job
+is connecting applications and services.
 
-## Why not LangGraph?
+Consider Conduit when you want to maintain the production process as YAML,
+prompts, and scripts, and maker/checker separation, revision routing, and recorded
+findings are central requirements. General automation tools can implement those
+policies too; Conduit supplies a specific model for them.
 
-[LangGraph](https://docs.langchain.com/oss/python/langgraph/overview) is a
-low-level orchestration runtime for long-running, stateful agents. Its official
-documentation emphasizes durable execution, persistence, streaming, and
-human-in-the-loop. Its
-[persistence model](https://docs.langchain.com/oss/python/langgraph/persistence)
-checkpoints graph state, and
-[interrupts](https://docs.langchain.com/oss/python/langgraph/interrupts) pause a
-graph for external input and later resume it.
+An existing automation system can trigger a Conduit flow through its configured
+webhook ingress. Account for the work needed to connect delivery and results
+back to that system.
 
-Choose LangGraph first when you need:
+## Why Not LangGraph?
 
-- an agent whose next action depends dynamically on accumulated state;
-- first-class tool-calling loops, conversational memory, streaming, or state
-  inspection;
-- fine-grained control over agent nodes and transitions in application code;
-- a general substrate for many agent architectures rather than one opinionated
-  quality process.
+[LangGraph](https://docs.langchain.com/oss/python/langgraph/overview) provides
+orchestration for stateful agents, including durable execution, streaming, and
+human intervention. It fits applications that need detailed control over agent
+state and interaction in code.
 
-Choose Conduit first when you do not want the model or agent loop to own the
-production route. In Conduit, an LLM can make an artifact or judge one, but the
-kernel decides the legal next state. Maker and checker are separate stations;
-rework has explicit caps; consumption and liveness are separate stop
-conditions; effectful work uses intent and idempotency discipline; and a run
-ends in a named operational outcome.
+Consider Conduit when a declared production route with explicit inputs, outputs,
+checks, and revision caps fits your application. A station can delegate
+tool-using work to a supported harness while Conduit manages the surrounding
+process. Neither deterministic routing nor quality loops are exclusive to
+Conduit; the distinction is the authoring model and the policies supplied by
+the runtime.
 
-A LangGraph application could still be packaged behind a Conduit harness or
-deterministic adapter when one station genuinely needs a dynamic agent. In that
-shape, LangGraph owns the local reasoning loop and Conduit owns the surrounding
-artifact contract, quality gate, budget, and route.
+## What “Improve” Means Today
 
-## What Conduit gives up
+Conduit can revise an artifact within a run using critic findings. Its recorded
+history helps a developer diagnose failures and change prompts or checks for
+future runs.
 
-Conduit's opinionated model has real costs:
+Learning from delivered work is a separate, planned capability. Conduit does
+not yet collect code-comment acceptance rates or video performance and use them
+to propose, evaluate, and promote changes. See the
+[roadmap](../ROADMAP.md) and [feedback-loop design](./feedback-loops.md).
 
-- It is a developer preview with a much smaller ecosystem and user community.
-- It is single-host and SQLite-based today; it is not a distributed durability
-  platform.
-- It has no visual workflow canvas or broad connector marketplace.
-- Its Law-grade in-kernel agentic Tool-Bridge remains planned. The shipped
-  `kind: harness` tier has a deliberately narrower containment claim.
-- Fixed, inspectable production lines are a better fit than highly dynamic
-  conversational agents.
+## Try the Decision on One Flow
 
-Those limitations are reasons to choose another tool, not footnotes to hide.
+Pick one real artifact and its acceptance criteria. Configure its maker,
+inspection, revision limit, and any human selection. Run it, inspect a rejection,
+resume interrupted work, and check how you would operate it after handoff.
 
-## The practical decision
-
-Start with the system whose native abstraction matches your hardest failure:
-
-- **Business process disappears or must coordinate reliably across services:**
-  Temporal.
-- **Applications need to be connected quickly:** n8n.
-- **An agent needs dynamic state, tools, memory, and interrupts:** LangGraph.
-- **AI work completes but is variably good, expensive to redo, and difficult to
-  audit:** Conduit.
-
-Conduit's bet is that AI production needs more than orchestration. It needs a
-quality system: separate makers and inspectors, explicit findings, bounded
-rework, proof-carrying checkpoints, and a deterministic authority that knows
-when to accept, reject, or escalate.
+Adopt Conduit if that exercise saves meaningful implementation and operating
+work for your team. The quality loop and execution history are available today;
+learning from external outcomes is the direction we are building toward.
