@@ -74,6 +74,14 @@ user or CI consumer actually sees, not internal implementation details.
   `critic-verdict-unparseable` or `critic-output-truncated`; `conduit run`
   and `journal inspect` both print the reason, and neither prints
   `model-incompatible`.
+- `transform-cache-tokens.test.ts`: three transform stations against a fake
+  OpenAI-compatible gateway on `CONDUIT_BASE_URL` (issue #156). One answers
+  with `usage.prompt_tokens_details.cached_tokens`, one with the
+  `fireworks-cached-prompt-tokens` header only, one with no cache figure.
+  `run status` prints each station's cache reads and share of input, and
+  "no cache figure" for the third; `journal inspect` appends the split to the
+  two spans that have one; the span columns hold uncached input and cache
+  reads summing to `prompt_tokens`.
 - `harness-critic-budget.test.ts`: the run token budget counts the critic's
   spend (issue #26). Maker alone is under budget, maker plus critic is over,
   and the run halts on the tokens andon; a control run with more budget

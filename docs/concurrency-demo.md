@@ -158,6 +158,24 @@ the batch, and while several calls run it takes the largest of their samples,
 so a waiting card is counted once. Calls journaled before this report existed
 carry no waiting sample and are listed as not sampled.
 
+After the occupancy lines, a run whose spans carry token usage (harness and
+transform calls alike) also prints cache reads per station (issue #156):
+
+```text
+cache reads (share of input = cache reads / (uncached input + cache reads + cache creation)):
+  draft: cache read 600 of 1000 input tokens (60.0%), 1 call(s)
+  polish: no cache figure, 1 call(s)
+  research: cache read 700 of 1000 input tokens (70.0%), cache creation 200, 1 call(s)
+```
+
+Only spans that record a cache split count toward a station's figure. A span
+whose adapter reported no split, or one journaled before the split existed,
+adds to the call count and nothing else, so a station with only such spans
+prints `no cache figure` rather than 0%; a station with some prints how many
+(`2 call(s), 1 with no cache figure`). Cache creation is printed only when an
+adapter reported it: the transform adapter reports cache reads alone.
+`conduit journal inspect` appends the same split to each span that has one.
+
 ## What this validates
 
 - The event-driven worker pool is wired into the production binary (`cmdRun` /

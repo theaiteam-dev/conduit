@@ -588,7 +588,11 @@ async function executeModelCall(
   // ensure we never propagate NaN/undefined into the returned ModelResponse.
   const data = (await response.json()) as {
     choices?: unknown;
-    usage?: { prompt_tokens?: unknown; completion_tokens?: unknown };
+    usage?: {
+      prompt_tokens?: unknown;
+      completion_tokens?: unknown;
+      prompt_tokens_details?: { cached_tokens?: unknown } | null;
+    };
   };
 
   // ── Response shape guard ──────────────────────────────────────────────────
@@ -646,9 +650,15 @@ async function executeModelCall(
   // NFR-6 (tokens): explicit 0 when usage is absent, a field is missing, or a
   // field coerces to a non-finite number — same discipline as costUsd below.
   // Optional chaining guards against `data.usage` being undefined entirely.
-  const inputTokens = Number.isFinite(Number(usage?.prompt_tokens))
+  const promptTokens = Number.isFinite(Number(usage?.prompt_tokens))
     ? Number(usage?.prompt_tokens)
     : 0;
+  // Issue #156: the cache-read split. `prompt_tokens` includes cached tokens,
+  // so with a usable figure `inputTokens` narrows to uncached input and the
+  // two still sum to `prompt_tokens`: budget totals do not move.
+  const cacheReadInputTokens = parseCacheReadTokens(usage, response.headers);
+  const inputTokens =
+    cacheReadInputTokens !== undefined ? promptTokens - cacheReadInputTokens : promptTokens;
   const outputTokens = Number.isFinite(Number(usage?.completion_tokens))
     ? Number(usage?.completion_tokens)
     : 0;
@@ -673,8 +683,51 @@ async function executeModelCall(
     inputTokens,
     outputTokens,
     costUsd,
+    ...(cacheReadInputTokens !== undefined && { cacheReadInputTokens }),
     ...(finishReason !== undefined && { finishReason }),
   };
+}
+
+/** A non-negative integer token count, from a number or a string of digits; else undefined. */
+function tokenCount(value: unknown): number | undefined {
+  if (typeof value === 'number') {
+    return Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+  }
+  if (typeof value === 'string' && /^\d+$/.test(value.trim())) {
+    const n = Number(value.trim());
+    return Number.isSafeInteger(n) ? n : undefined;
+  }
+  return undefined;
+}
+
+/**
+ * Issue #156: the cache-read figure a gateway reported, or undefined for no
+ * split.
+ *
+ * Sources, in order:
+ *   1. `usage.prompt_tokens_details.cached_tokens` (OpenAI, xAI, LiteLLM).
+ *   2. The `fireworks-cached-prompt-tokens` response header, read only when
+ *      the body carries no figure (the field absent or null).
+ *
+ * A figure that is not a non-negative integer, or exceeds `prompt_tokens`
+ * (or `prompt_tokens` is itself unusable), records no split rather than a
+ * guess (NFR-6). A malformed body figure does not fall back to the header:
+ * the body is the source the provider chose, and a header that disagreed
+ * with a broken body would be a guess too.
+ */
+function parseCacheReadTokens(
+  usage: { prompt_tokens?: unknown; prompt_tokens_details?: { cached_tokens?: unknown } | null } | undefined,
+  headers: Headers,
+): number | undefined {
+  const bodyFigure = usage?.prompt_tokens_details?.cached_tokens;
+  const raw = bodyFigure !== undefined && bodyFigure !== null
+    ? bodyFigure
+    : headers.get('fireworks-cached-prompt-tokens');
+  if (raw === null) return undefined;
+  const cached = tokenCount(raw);
+  const prompt = tokenCount(usage?.prompt_tokens);
+  if (cached === undefined || prompt === undefined || cached > prompt) return undefined;
+  return cached;
 }
 
 // ---------------------------------------------------------------------------
