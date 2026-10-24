@@ -1,6 +1,6 @@
 # ADR-0012: Ungated harness calls may overlap under `--concurrency`, with owned-dir attribution in the integrity check
 
-Status: Accepted (maintainer decision 2026-10-08 to build ahead of the measurement). The measurement for #30 acceptance item 3 was posted on 2026-10-08 and supports keeping the opt-in; see *Measured result* under *Ship condition*. Amended by [ADR-0013](./0013-os-enforced-write-confinement-of-overlapped-harness-calls.md) (2026-10-10): the gap below is closed where write confinement is active.
+Status: Accepted (maintainer decision 2026-10-08 to build ahead of the measurement). A measurement for #30 acceptance item 3 was posted on 2026-10-08. It does not meet the ship condition as written, and the maintainer kept the opt-in on it; see *Measured result* under *Ship condition*. Amended by [ADR-0013](./0013-os-enforced-write-confinement-of-overlapped-harness-calls.md) (2026-10-10): the gap below is closed where write confinement is active.
 Date: 2026-10-07 (written), 2026-10-08 (accepted)
 
 ## Context
@@ -50,7 +50,8 @@ rule that attributes a touched path inside an overlapping sibling's owned paths 
 sibling. The rule cannot detect a Bash write from one sibling into another's owned paths,
 and SPEC §7 states that gap.** The maintainer decided on 2026-10-08 to build it ahead of the
 measurement described under *Ship condition* below. That measurement was posted to #30 on
-2026-10-08, and its result keeps the station opt-in (*Measured result*, below).
+2026-10-08. It does not meet that condition as written, and the maintainer kept the station
+opt-in on it (*Measured result*, below).
 
 ### Opt-in: `overlap: true` on the station
 
@@ -202,8 +203,18 @@ member, which is tracked as [#123](https://github.com/theaiteam-dev/conduit/issu
 The integrity rule held across the three runs: `overlap_attributed` attributed about 50 paths
 written into a sibling's owned dir, and no card was held for a false integrity violation.
 
-Decision: the opt-in stays. The serial figure does not fit the budget, so the condition for a
-superseding ADR that removes it is not met.
+**The ship condition above is not met as written.** It asks for a measured serial run, and
+the serial column here is derived. It also asks for the three-wide walks to fit under 300 s,
+and two of the three did not.
+
+**Decision (maintainer, 2026-10-08): the opt-in stays anyway.** Without overlap, the derived
+serial figures run 225 to 340 s over budget. The overlapped runs went over because the next
+card waited for the whole batch to finish. With a pool, where the first free lane starts the
+next card, that card would have started 129 s sooner in sd-c1 (+57 s against +186 s), 45 s
+sooner in sd-c2 (+22 s against +67 s) and 34 s sooner in sd-cf (+23 s against +57 s). For
+comparison, Shakedown's Node orchestrator, which uses a pool of 3, walked the sd-c2 plan in
+255 s. Pool dispatch is #123. A serial Conduit run of Shakedown is still not recorded. If one
+is recorded and fits in 300 s, the superseding-ADR rule above applies.
 
 ## Alternatives
 
