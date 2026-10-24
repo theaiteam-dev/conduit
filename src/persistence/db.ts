@@ -664,6 +664,25 @@ export interface StoredJournalSpan {
   agentSha256?: string | null;
   /** Invocation id of the harness call (issue #71); null on any other span. */
   invocationId?: string | null;
+  /** Input tokens (uncached when a cache split is present); null on a span with no usage. */
+  inputTokens?: number | null;
+  /** Cache-read input tokens; null when the span records no cache split (issue #156). */
+  cacheReadInputTokens?: number | null;
+  /** Cache-creation input tokens; null when the adapter reported none. */
+  cacheCreationInputTokens?: number | null;
+}
+
+/** One span's token columns, as read by getSpanTokenUsageForRun (issue #156). */
+export interface SpanTokenUsage {
+  cardId: string;
+  station: string;
+  name: string;
+  /** UNCACHED input when either cache column is set (issue #5). */
+  inputTokens: number;
+  outputTokens: number | null;
+  /** NULL when the span records no cache split. */
+  cacheReadInputTokens: number | null;
+  cacheCreationInputTokens: number | null;
 }
 
 /** The harness event kinds the journal keeps (issue #71). Deltas are not among them. */
@@ -1229,6 +1248,11 @@ export interface ConduitDB {
    * kind (null when the run has none). Read by run/harness-occupancy.ts.
    */
   getHarnessTimingsForRun(runId: string): HarnessTimings;
+  /**
+   * Issue #156: the token columns of every span of a run that carries usage
+   * (`input_tokens` not NULL), in insertion order. Read by run/cache-usage.ts.
+   */
+  getSpanTokenUsageForRun(runId: string): SpanTokenUsage[];
   /**
    * Issue #71: append one durable harness event. INSERT OR IGNORE on the
    * (run, card, station, attempt, invocation_id, seq) key, so a replay is a
@@ -1967,12 +1991,42 @@ class ConduitDBImpl implements ConduitDB {
     };
   }
 
+  getSpanTokenUsageForRun(runId: string): SpanTokenUsage[] {
+    const rows = this.journalDb
+      .prepare(
+        `SELECT card_id, station, name, input_tokens, output_tokens,
+                cache_read_input_tokens, cache_creation_input_tokens
+         FROM journal
+         WHERE run_id = $run_id AND input_tokens IS NOT NULL
+         ORDER BY id ASC`,
+      )
+      .all({ $run_id: runId }) as {
+        card_id: string;
+        station: string;
+        name: string;
+        input_tokens: number;
+        output_tokens: number | null;
+        cache_read_input_tokens: number | null;
+        cache_creation_input_tokens: number | null;
+      }[];
+    return rows.map((row) => ({
+      cardId: row.card_id,
+      station: row.station,
+      name: row.name,
+      inputTokens: row.input_tokens,
+      outputTokens: row.output_tokens,
+      cacheReadInputTokens: row.cache_read_input_tokens,
+      cacheCreationInputTokens: row.cache_creation_input_tokens,
+    }));
+  }
+
   getJournalSpansForRun(runId: string, cardId: string): StoredJournalSpan[] {
     const rows = this.journalDb
       .prepare(
         `SELECT card_id, station, attempt, name, attributes_json,
                 adapter, duration_ms, usage_unknown,
-                binding_stamp, prompt_template_version, agent, agent_sha256, invocation_id
+                binding_stamp, prompt_template_version, agent, agent_sha256, invocation_id,
+                input_tokens, cache_read_input_tokens, cache_creation_input_tokens
          FROM journal
          WHERE run_id = $run_id AND card_id = $card_id
          ORDER BY id ASC`,
@@ -1991,6 +2045,9 @@ class ConduitDBImpl implements ConduitDB {
         agent: string | null;
         agent_sha256: string | null;
         invocation_id: string | null;
+        input_tokens: number | null;
+        cache_read_input_tokens: number | null;
+        cache_creation_input_tokens: number | null;
       }[];
 
     return rows.map((row) => ({
@@ -2011,6 +2068,9 @@ class ConduitDBImpl implements ConduitDB {
       agent: row.agent,
       agentSha256: row.agent_sha256,
       invocationId: row.invocation_id,
+      inputTokens: row.input_tokens,
+      cacheReadInputTokens: row.cache_read_input_tokens,
+      cacheCreationInputTokens: row.cache_creation_input_tokens,
     }));
   }
 

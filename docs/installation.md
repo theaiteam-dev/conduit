@@ -597,6 +597,11 @@ carry a corrected `--input`, since nothing ran under the first one. For a run wi
 stations, `run status` also prints how much of the run's wall clock each
 harness station was busy, counting overlapped calls once
 (see [`concurrency-demo.md`](./concurrency-demo.md#harness-stations-run-one-card-at-a-time-unless-they-declare-overlap-true)).
+For a run whose harness or transform spans carry token usage, it also prints
+each station's cache reads and their share of input, or `no cache figure` for a
+station whose provider reported no cache split. For a transform station the
+figure comes from the gateway's `usage.prompt_tokens_details.cached_tokens`, or,
+when the body has none, its `fireworks-cached-prompt-tokens` header.
 
 Under the operator stack the listener does this for you — it recognises a
 parked child, tells the channel once, and resumes the run itself when the gate

@@ -167,7 +167,7 @@ describe("agent-sdk journey: a plugin agent the CLI does not load holds the card
     expect(status.stdout).toContain(`run ${f.runId}: held (1 held card)`);
     const inspect = await f.journalInspect();
     expect(inspect.stdout).toContain(`[${f.cardId}] entered_lane: research → hold (hold)`);
-    expect(inspect.stdout.match(/research\.harness$/gm)).toHaveLength(1);
+    expect(inspect.stdout.match(/ research\.harness(?: cache read .*)?$/gm)).toHaveLength(1);
   });
 
   test("the CLI was invoked once and the Write never ran", () => {
