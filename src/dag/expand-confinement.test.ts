@@ -283,6 +283,14 @@ describe('validateExpansion compares owned paths canonically (SPEC §9)', () => 
     expect(reject(pair('a/x', 'a/y')).ok).toBe(true);
   });
 
+  it('accepts a dir and a sibling that shares its name as a prefix, `src` vs `src-other`', () => {
+    mkdirSync(join(projectRoot, 'src'));
+    mkdirSync(join(projectRoot, 'src-other'));
+
+    expect(reject(pair('src', 'src-other')).ok).toBe(true);
+    expect(reject(pair('src-other', 'src')).ok).toBe(true);
+  });
+
   it('commitFanOut rejects the relative/absolute overlap and seeds nothing', () => {
     mkdirSync(join(projectRoot, 'evidence', 'c1'), { recursive: true });
 
