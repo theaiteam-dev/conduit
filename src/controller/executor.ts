@@ -99,7 +99,13 @@ import type { FlowGraph } from '../checkpoint/checkpoint';
 import { checkIntegrity } from '../worker/integrity';
 import type { IntegrityResult } from '../worker/integrity';
 import { checkConsumptionAndon, checkLiveness, planDrain, type ConsumptionAndon } from '../control/watchdog';
-import { resolveTokenWeights, weightedModelResponseTokens, weightedUsageTokens } from '../control/token-weights';
+import {
+  isUsableBreakdown,
+  resolveTokenWeights,
+  unaccountedTokens,
+  weightedModelResponseTokens,
+  weightedUsageTokens,
+} from '../control/token-weights';
 import { formatReleaseAt, soonestRateLimitGate } from '../run/run-state';
 import type { WorkerSlot } from '../control/watchdog';
 import { transition } from '../statemachine/transitions';
@@ -241,13 +247,21 @@ export function releaseAtForRateLimit(
  *
  * WITH one, `inputTokens` narrows to UNCACHED input and the other three classes
  * get their own columns. The four then sum to the same total the budget folds.
+ *
+ * Issue #125: any part of the reported total the classes do not account for
+ * (`unaccountedTokens`) is added to `inputTokens`, where it counts at weight 1
+ * as it did in foldHarnessUsage. Without it the journal would hold less than
+ * the executor counted, and every journal-derived budget (a later pass's or a
+ * resume's remaining budget, a subflow roll-up) would come out low. A
+ * breakdown with an unusable class is journaled as no breakdown, which is
+ * also how the budget counts it.
  */
 function harnessJournalUsage(
   reported: KnownUsage,
   effectiveModel: string | undefined,
 ): JournalSpanInput['usage'] {
   const { breakdown } = reported;
-  if (breakdown === undefined) {
+  if (breakdown === undefined || !isUsableBreakdown(breakdown)) {
     return {
       model: reported.model ?? effectiveModel ?? '',
       inputTokens: reported.tokens,
@@ -259,7 +273,7 @@ function harnessJournalUsage(
     // The provider's own label for what it billed beats the station's requested
     // model, which may be an alias.
     model: reported.model ?? effectiveModel ?? '',
-    inputTokens: breakdown.inputTokens,
+    inputTokens: breakdown.inputTokens + unaccountedTokens(reported.tokens, breakdown),
     outputTokens: breakdown.outputTokens,
     costUsd: reported.cost,
     cacheReadInputTokens: breakdown.cacheReadInputTokens,

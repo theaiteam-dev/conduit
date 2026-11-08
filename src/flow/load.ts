@@ -617,12 +617,6 @@ function collectErrors(
   // terminal lanes has no exits (cards can never reach done/scrap/hold), and an
   // empty list also breaks the runnable-card query downstream (`lane NOT IN ()`
   // is a SQL syntax error). Absent is fine — consumers default to done/scrap/hold.
-  // Issue #125 (ADR-0014): budget weights for cache classes. A negative or
-  // non-numeric weight would let a budget count less than the call spent.
-  for (const message of validateTokenWeights((yaml.budgets as { token_weights?: unknown } | undefined)?.token_weights)) {
-    errors.push({ code: 'INVALID_TOKEN_WEIGHTS', message });
-  }
-
   if (Array.isArray(yaml.terminal_lanes) && yaml.terminal_lanes.length === 0) {
     errors.push({
       code: 'EMPTY_TERMINAL_LANES',
@@ -630,6 +624,12 @@ function collectErrors(
         'terminal_lanes is declared but empty — a flow must declare at least one ' +
         'terminal lane (or omit terminal_lanes to default to done/scrap/hold)',
     });
+  }
+
+  // Issue #125 (ADR-0014): budget weights for cache classes. A negative or
+  // non-numeric weight would let a budget count less than the call spent.
+  for (const message of validateTokenWeights((yaml.budgets as { token_weights?: unknown } | undefined)?.token_weights)) {
+    errors.push({ code: 'INVALID_TOKEN_WEIGHTS', message });
   }
 
   // Pre-compute the set of station ids that are targets of at least one back-edge

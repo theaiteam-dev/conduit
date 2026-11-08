@@ -31,8 +31,8 @@
  * five lines that move money into a budget, plus the one line that decides
  * the figure a Claude harness fold receives (issue #108), the term that
  * counts a transform call's cache reads (issue #156), and the two lines that
- * weight a harness call's cache reads and keep its unaccounted remainder
- * (issue #125). A broad mutation run over this
+ * weight a harness call's cache reads and keep its unaccounted remainder,
+ * plus the line that journals that remainder (issue #125). A broad mutation run over this
  * codebase would take a long time and produce mostly equivalent mutants, which
  * is how a check earns a permanent skip. This one runs in seconds and every
  * failure is actionable.
@@ -204,17 +204,34 @@ const MUTANTS: Mutant[] = [
   },
   {
     // Not a fold site: the part of a harness total its breakdown does not
-    // account for. Without it a partial breakdown lowers the count below what
-    // the adapter reported (issue #125, ADR-0014).
+    // account for, which both foldHarnessUsage and harnessJournalUsage add.
+    // Without it a partial breakdown lowers the count below what the adapter
+    // reported, in memory and in every journal-derived budget (issue #125).
     id: 'usage-unaccounted-remainder',
     file: 'src/control/token-weights.ts',
-    find: 'const unaccounted = Math.max(0, tokens - classes);',
-    replace: 'const unaccounted = 0; /* MUTATION-CHECK: remainder deleted */',
+    find: 'return Math.max(0, tokens - classes);',
+    replace: 'return 0; /* MUTATION-CHECK: remainder deleted */',
     guards: ['src/controller/executor-cache-budget.test.ts', 'src/control/token-weights.test.ts'],
     why:
       'a harness call whose breakdown covers only part of its reported total ' +
-      'counts only that part, so missing data makes the budget count less ' +
-      'than the call spent.',
+      'counts only that part, in the run and wave budgets and in the remaining ' +
+      'budget of a later pass or resume, so missing data makes the budget ' +
+      'count less than the call spent.',
+  },
+  {
+    // Not a fold site: the line that journals a harness call's unaccounted
+    // remainder in `input_tokens`. Without it the in-memory budget is right
+    // but the journal holds less, so a later pass's or a resume's remaining
+    // budget, read from the journal, comes out high (issue #125).
+    id: 'journal-unaccounted-remainder',
+    file: 'src/controller/executor.ts',
+    find: 'inputTokens: breakdown.inputTokens + unaccountedTokens(reported.tokens, breakdown),',
+    replace: 'inputTokens: breakdown.inputTokens, /* MUTATION-CHECK: journaled remainder deleted */',
+    guards: ['src/controller/executor-cache-budget.test.ts'],
+    why:
+      'a harness call whose breakdown under-covers its total is journaled ' +
+      'without the remainder, so --append-pass and resume of a run with ' +
+      'passes grant budget the run already spent.',
   },
 ];
 

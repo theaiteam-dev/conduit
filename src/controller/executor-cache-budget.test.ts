@@ -24,6 +24,8 @@ import { ensureCheckpointSchema } from '../checkpoint/checkpoint';
 import { loadFlow } from '../flow/load';
 import type { FlowConfig } from '../types/kernel';
 import { runExecutor } from './executor';
+import { remainingRunTokens } from '../run/run-passes';
+import { DEFAULT_TOKEN_WEIGHTS } from '../control/token-weights';
 import type { RunEngineArgs } from '../cli/main';
 import type { ModelAdapter, ModelResponse } from '../worker/adapter';
 import {
@@ -113,7 +115,7 @@ function makeHarness(
   return { adapter, calls };
 }
 
-function harnessFlow(adapter: HarnessAdapter, budgetsExtra = ''): FlowConfig {
+function harnessFlow(adapter: HarnessAdapter, budgetsExtra = '', maxTokens = MAX_TOKENS): FlowConfig {
   mkdirSync(join(dir, 'prompts'), { recursive: true });
   writeFileSync(join(dir, 'prompts', 'walk.md'), 'TASK: {{task.json}}');
   writeFileSync(join(dir, 'task.json'), '{"task":"walk"}');
@@ -124,7 +126,7 @@ flow: cache-budget
 project_root: .
 flow_version: 1
 budgets:
-  run: { wall_clock_minutes: 10, max_tokens: ${MAX_TOKENS} }
+  run: { wall_clock_minutes: 10, max_tokens: ${maxTokens} }
   per_card: { max_execution_attempts: 1 }
   liveness: { no_progress_minutes: 3 }
 ${budgetsExtra}
@@ -151,8 +153,8 @@ stations:
   return loaded.flow;
 }
 
-async function runHarness(adapter: HarnessAdapter, budgetsExtra = ''): Promise<string[]> {
-  const flow = harnessFlow(adapter, budgetsExtra);
+async function runHarness(adapter: HarnessAdapter, budgetsExtra = '', maxTokens = MAX_TOKENS): Promise<string[]> {
+  const flow = harnessFlow(adapter, budgetsExtra, maxTokens);
   seedCard('walker-1', 'walk', null, ['task.json', 'result.json']);
   seedCard('walker-2', 'walk', null, ['task.json', 'result.json']);
   const { io, lines } = makeIO();
@@ -218,6 +220,33 @@ describe('issue #125: harness cache reads count at the cache_read weight', () =>
 
     expect(andonLines(lines)).toEqual(['andon: run halted — tokens budget exceeded']);
     expect(calls).toHaveLength(1);
+  });
+
+  // Classes sum to 7,020 of a reported 12,020: 1,305 + 5,000 = 6,305 budget
+  // tokens per call, 12,610 for the two walkers.
+  const UNDER_COVERED: KnownUsage = { ...CACHE_HEAVY, tokens: 12_020 };
+
+  it('in memory, two under-covered calls count exactly 12,610: a 12,610 budget trips, 12,611 does not', async () => {
+    const tripped = await runHarness(makeHarness({ returns: UNDER_COVERED }).adapter, '', 12_610);
+    expect(andonLines(tripped)).toEqual(['andon: run halted — tokens budget exceeded']);
+
+    db!.close();
+    db = openConduitDB({ stateDbPath: ':memory:', journalDbPath: ':memory:' });
+    ensureCheckpointSchema(db.getStateDb());
+    const clear = await runHarness(makeHarness({ returns: UNDER_COVERED }).adapter, '', 12_611);
+    expect(andonLines(clear)).toEqual([]);
+  });
+
+  it('a pass or resume remaining budget counts the same 12,610 the executor did', async () => {
+    // The journal-derived budget (remainingRunTokens, used by --append-pass and
+    // by resume of a run with passes) must not lose the 5,000 per call the
+    // breakdown does not cover.
+    const lines = await runHarness(makeHarness({ returns: UNDER_COVERED }).adapter, '', 100_000);
+    expect(andonLines(lines)).toEqual([]);
+
+    expect(remainingRunTokens(db!, DEFAULT_RUN_ID, 100_000, DEFAULT_TOKEN_WEIGHTS)).toBe(100_000 - 12_610);
+    // The raw journal total stays the adapter's reported total.
+    expect(db!.getRunUsageTotals(DEFAULT_RUN_ID).tokens).toBe(2 * 12_020);
   });
 
   it('a billed throw folds at the same weights: two cache-heavy throws stay under budget', async () => {

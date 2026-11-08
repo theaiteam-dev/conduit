@@ -1106,7 +1106,8 @@ anything else with `INVALID_TOKEN_WEIGHTS`. Transform and harness spend, the sub
 roll-up and the journal-derived remaining budget of a run that takes passes all use the
 same weights. Missing data never lowers the count: a call with no cache breakdown counts
 its whole total at 1, and a breakdown that does not account for the whole reported total
-counts the difference at 1. The journal keeps raw figures; `conduit run status` prints
+counts the difference at 1, and the journal records that difference as uncached input so
+a journal-derived budget counts it too. The journal keeps raw figures; `conduit run status` prints
 the budget figure beside the raw one when they differ.
 2. **Liveness watchdog** (rev-1 C5) — "no card has changed lane in `no_progress_minutes`
    AND no worker is active" → **immediate** deadlock alert *with the blocking reason*.

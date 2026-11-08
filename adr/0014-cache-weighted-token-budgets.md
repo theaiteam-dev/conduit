@@ -72,6 +72,14 @@ A call must never count less than its true spend would justify because data is m
 - A breakdown whose classes sum to less than the reported total counts the difference at
   weight 1. A breakdown that sums to more counts each class at its weight; nothing is
   subtracted from it.
+- The journal keeps the same count. `harnessJournalUsage` adds that difference to the span's
+  `input_tokens`, so the four columns still sum to the reported total, and a breakdown with an
+  unusable class is journaled as no breakdown. Every journal-derived budget (a later pass's or
+  a resume's remaining budget, a subflow roll-up, the `run status` figure) therefore counts
+  what the executor counted. Today's adapters report totals their classes cover
+  (`codex-app-server`'s `totalTokens` is input plus output, with reasoning tokens a subset of
+  output), so this guards against a future adapter or a changed upstream shape rather than a
+  known gap.
 - A transform call with no cache split reported counts all of `inputTokens` at weight 1, since
   that figure may include cached tokens (issue #156's convention).
 
@@ -124,11 +132,11 @@ and the issue's run would still halt.
   ceiling and a pass's remaining budget are rounded down, and `run status` rounds the budget
   figure up.
 - `run status` reads the weights from the flow file, so editing `token_weights` after a run
-  changes the figure it prints for that run. The figure is journal-derived and can be lower than
-  the executor's count for a harness call whose breakdown did not cover its whole total, because
-  the journal stores only the classes.
-- `scripts/mutation-check.ts` guards the cache-read weight, the unaccounted remainder and the
-  transform cache term, alongside the five fold sites.
+  changes the figure it prints for that run.
+- A journaled remainder shows up as uncached input in the `run status` cache-share report, which
+  slightly understates that station's cache share.
+- `scripts/mutation-check.ts` guards the cache-read weight, the unaccounted remainder (in the
+  fold and in the journal) and the transform cache term, alongside the five fold sites.
 
 ## References
 

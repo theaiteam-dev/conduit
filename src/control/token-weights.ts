@@ -82,6 +82,24 @@ function isUsableCount(n: unknown): n is number {
   return typeof n === 'number' && Number.isFinite(n) && n >= 0;
 }
 
+/** Every class is a finite, non-negative number; otherwise the breakdown is ignored. */
+export function isUsableBreakdown(breakdown: UsageBreakdown): boolean {
+  const { inputTokens, outputTokens, cacheReadInputTokens, cacheCreationInputTokens } = breakdown;
+  return [inputTokens, outputTokens, cacheReadInputTokens, cacheCreationInputTokens].every(isUsableCount);
+}
+
+/**
+ * The part of a reported total its breakdown does not account for, never
+ * negative. Counted at weight 1 by the budgets, and journaled in the span's
+ * `input_tokens` (executor `harnessJournalUsage`), so a journal-derived budget
+ * counts it too.
+ */
+export function unaccountedTokens(tokens: number, breakdown: UsageBreakdown): number {
+  const classes =
+    breakdown.inputTokens + breakdown.outputTokens + breakdown.cacheReadInputTokens + breakdown.cacheCreationInputTokens;
+  return Math.max(0, tokens - classes);
+}
+
 /**
  * The budget figure for one harness call (or a subflow roll-up), from its raw
  * total and optional per-class breakdown.
@@ -97,13 +115,9 @@ export function weightedUsageTokens(
   breakdown: UsageBreakdown | undefined,
   weights: TokenWeights,
 ): number {
-  if (breakdown === undefined) return tokens;
+  if (breakdown === undefined || !isUsableBreakdown(breakdown)) return tokens;
   const { inputTokens, outputTokens, cacheReadInputTokens, cacheCreationInputTokens } = breakdown;
-  if (![inputTokens, outputTokens, cacheReadInputTokens, cacheCreationInputTokens].every(isUsableCount)) {
-    return tokens;
-  }
-  const classes = inputTokens + outputTokens + cacheReadInputTokens + cacheCreationInputTokens;
-  const unaccounted = Math.max(0, tokens - classes);
+  const unaccounted = unaccountedTokens(tokens, breakdown);
   const cacheRead = weights.cacheRead * cacheReadInputTokens;
   const cacheCreation = weights.cacheCreation * cacheCreationInputTokens;
   return inputTokens + outputTokens + cacheRead + cacheCreation + unaccounted;

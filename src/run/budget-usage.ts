@@ -10,10 +10,9 @@
  * used.
  *
  * The figure is journal-derived, like the remaining budget of a run that takes
- * passes, so it matches what `--append-pass` and `conduit resume` subtract.
- * The executor's in-memory count can be higher for a harness call whose
- * breakdown did not account for its whole total, because the journal records
- * only the classes.
+ * passes, so it matches what `--append-pass` and `conduit resume` subtract. It
+ * also matches the executor's count: a harness call's unaccounted remainder is
+ * journaled in `input_tokens` (executor `harnessJournalUsage`), at weight 1.
  */
 import { readFileSync } from 'node:fs';
 import { parse } from 'yaml';
