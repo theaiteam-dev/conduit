@@ -41,7 +41,7 @@
 import { createHash } from 'node:crypto';
 import type { StationOutput } from '../types/kernel';
 import type { ConduitDB, JournalProvenance } from '../persistence/db';
-import type { ModelAdapter, ModelResponse } from './adapter';
+import { modelResponseTokens, type ModelAdapter, type ModelResponse } from './adapter';
 import type { ImageInput } from './image-input';
 
 // ---------------------------------------------------------------------------
@@ -407,6 +407,11 @@ export async function runTransformStation<T>(
         inputTokens: response.inputTokens,
         outputTokens: response.outputTokens,
         costUsd: response.costUsd,
+        // Issue #156: with a split, inputTokens is uncached input and the cache
+        // reads go in their own column. No split leaves the column NULL.
+        ...(response.cacheReadInputTokens !== undefined && {
+          cacheReadInputTokens: response.cacheReadInputTokens,
+        }),
       },
     });
 
@@ -431,7 +436,7 @@ export async function runTransformStation<T>(
           findings_hash: computeFindingsHash(payload),
           return_to: null, // transform maker always proceeds — no back-edge
           usage: {
-            tokens: response.inputTokens + response.outputTokens,
+            tokens: modelResponseTokens(response),
             cost: response.costUsd,
           },
         };

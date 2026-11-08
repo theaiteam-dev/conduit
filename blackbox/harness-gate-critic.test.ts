@@ -126,7 +126,7 @@ describe("harness journey: agentic critic rejects once, then passes", () => {
     expect(out).toContain(`[${f.cardId}]   summary does not define the term`);
     expect(out).toContain(`[${f.cardId}] gate_verdict: pass`);
     expect(out.match(/research\.harness-critic/g)?.length).toBe(2);
-    expect(out.match(/research\.harness$/gm)?.length).toBe(2);
+    expect(out.match(/ research\.harness(?: cache read .*)?$/gm)?.length).toBe(2);
     expect(out).toContain(`entered_lane: research → done`);
     expect(out).not.toMatch(/→ (scrap|hold)/);
 

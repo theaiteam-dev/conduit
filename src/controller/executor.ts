@@ -37,7 +37,7 @@ import type { RunEngineArgs, SpawnedWorker } from '../cli/main';
 import { deriveSubflowRunId } from '../run/run-id';
 import type { StartWorkMessage } from '../worker/ipc-protocol';
 import { sanitizeStderrTail } from '../worker/ipc-protocol';
-import type { ModelAdapter } from '../worker/adapter';
+import { modelResponseTokens, type ModelAdapter } from '../worker/adapter';
 import { sweepStaleRunScopedDirsOnce } from '../worker/stale-temp-dirs';
 import { DEFAULT_RUN_ID, parseColumn, type ConduitDB, type JournalSpanInput, type JournalProvenance } from '../persistence/db';
 import type { FlowConfig, StationConfig, FanInPolicyConfig, StationOutput, Card } from '../types/kernel';
@@ -567,7 +567,8 @@ export async function runExecutor(args: RunEngineArgs): Promise<void> {
       // ONCE at the top of the tick and can be stale by minutes once a
       // long-running synchronous call (this one) finishes.
       lastAdapterActivityAt = now();
-      const spent = result.inputTokens + result.outputTokens;
+      // Issue #156: cache reads count, so a split call spends what it did unsplit.
+      const spent = modelResponseTokens(result);
       tokensSpent += spent;
       const attributed = attributedCardId();
       if (attributed !== null) {

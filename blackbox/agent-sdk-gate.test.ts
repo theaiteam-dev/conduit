@@ -381,7 +381,7 @@ describe("agent-sdk journey: AskUserQuestion holds the card without spending an 
     expect(inspect.exitCode).toBe(0);
     expect(inspect.stdout).toContain(`[${f.cardId}] entered_lane: research → hold (hold)`);
     expect(inspect.stdout).not.toMatch(/→ (scrap|done)/);
-    expect(inspect.stdout.match(/research\.harness$/gm)).toHaveLength(1);
+    expect(inspect.stdout.match(/ research\.harness(?: cache read .*)?$/gm)).toHaveLength(1);
     expect(decisionsIn(harnessRows(inspect.stdout, f.cardId))).toEqual([
       "gate-decision allow Bash",
       "gate-decision hold AskUserQuestion code=needs_human reason=the tool asks a human",
@@ -490,7 +490,7 @@ describe("agent-sdk journey: an input rewrite by another PreToolUse hook holds t
     const inspect = await f.journalInspect();
     expect(inspect.exitCode).toBe(0);
     expect(inspect.stdout).toContain(`[${f.cardId}] entered_lane: research → hold (hold)`);
-    expect(inspect.stdout.match(/research\.harness$/gm)).toHaveLength(1);
+    expect(inspect.stdout.match(/ research\.harness(?: cache read .*)?$/gm)).toHaveLength(1);
     expect(decisionsIn(harnessRows(inspect.stdout, f.cardId))).toEqual([
       "gate-decision allow Bash",
       "gate-decision allow Bash",

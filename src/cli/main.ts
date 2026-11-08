@@ -46,6 +46,7 @@ import {
   EXIT_RUN_LEASE_CONFLICT,
 } from '../run/run-passes';
 import { getHarnessOccupancy, formatHarnessOccupancy } from '../run/harness-occupancy';
+import { getCacheUsage, formatCacheUsage, formatSpanCacheSplit } from '../run/cache-usage';
 import type { ModelAdapter, ModelCall, ModelResponse } from '../worker/adapter';
 import {
   buildHarnessDefinitionRegistry,
@@ -2419,7 +2420,9 @@ async function cmdJournal(argv: string[], deps: CliDeps): Promise<number> {
   };
 
   for (const span of printable) {
-    deps.io.out(`[${span.cardId}] ${span.station}@${span.attempt} ${span.name}`);
+    // Issue #156: the cache split, on each span that records one.
+    const cacheSplit = formatSpanCacheSplit(span);
+    deps.io.out(`[${span.cardId}] ${span.station}@${span.attempt} ${span.name}${cacheSplit === null ? '' : ` ${cacheSplit}`}`);
     if (span.invocationId != null) printEvents(eventsByInvocation.get(span.invocationId) ?? []);
   }
 
@@ -2814,6 +2817,13 @@ async function cmdRunManage(argv: string[], deps: CliDeps): Promise<number> {
     const occupancy = state.status === 'not_found' ? null : getHarnessOccupancy(deps.db, runId);
     if (occupancy !== null) {
       for (const line of formatHarnessOccupancy(occupancy)) deps.io.out(line);
+    }
+    // Issue #156: a run with usage spans reports cache reads per station, for
+    // harness and transform spans alike. A station whose spans record no split
+    // prints "no cache figure" rather than 0%.
+    const cache = state.status === 'not_found' ? null : getCacheUsage(deps.db, runId);
+    if (cache !== null) {
+      for (const line of formatCacheUsage(cache)) deps.io.out(line);
     }
     // A not_found run is a non-zero (lookup miss) outcome; everything else is 0.
     return state.status === 'not_found' ? 1 : 0;

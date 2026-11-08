@@ -289,7 +289,7 @@ describe("opencode journey: a question holds the card without spending an attemp
     expect(inspect.stdout).toContain(`[${f.cardId}] research@0 research.harness`);
     expect(inspect.stdout).toContain(`[${f.cardId}] entered_lane: research → hold (hold)`);
     expect(inspect.stdout).not.toMatch(/→ (scrap|done)/);
-    expect(inspect.stdout.match(/research\.harness$/gm)).toHaveLength(1);
+    expect(inspect.stdout.match(/ research\.harness(?: cache read .*)?$/gm)).toHaveLength(1);
 
     const rows = harnessRows(inspect.stdout, f.cardId);
     const decisions = rows.filter((r) => r.includes(" gate-decision ")).map((r) => r.slice(r.indexOf(" gate-decision ") + 1));
