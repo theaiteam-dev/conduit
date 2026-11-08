@@ -17,6 +17,7 @@
  * state.
  */
 import type { ConduitDB } from '../persistence/db';
+import { weightedUsageTokens, type TokenWeights } from '../control/token-weights';
 import { isFailedLaunch } from './run-state';
 
 /**
@@ -70,9 +71,20 @@ export function nextPassNumber(db: ConduitDB, runId: string): number {
  * takes passes is one ceiling across all of them, so both `--append-pass` and
  * `conduit resume` of such a run cap the invocation at this figure. May be
  * zero or negative; callers clamp.
+ *
+ * Issue #125: earlier spend counts in budget tokens, cache classes weighted
+ * by the flow's `budgets.token_weights`, as the executor counted it. Rounded
+ * down, so the remainder never exceeds what is left.
  */
-export function remainingRunTokens(db: ConduitDB, runId: string, maxTokens: number): number {
-  return maxTokens - db.getRunUsageTotals(runId).tokens;
+export function remainingRunTokens(db: ConduitDB, runId: string, maxTokens: number, weights: TokenWeights): number {
+  return Math.floor(maxTokens - runBudgetTokens(db, runId, weights));
+}
+
+/** A run's journaled spend in budget tokens (issue #125). */
+export function runBudgetTokens(db: ConduitDB, runId: string, weights: TokenWeights): number {
+  const b = db.getRunUsageBreakdown(runId);
+  const total = b.inputTokens + b.outputTokens + b.cacheReadInputTokens + b.cacheCreationInputTokens;
+  return weightedUsageTokens(total, b, weights);
 }
 
 /** Has runId taken a pass beyond its first (issue #36)? */

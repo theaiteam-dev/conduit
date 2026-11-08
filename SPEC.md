@@ -353,6 +353,9 @@ budgets:
   per_wave:                    # subtree andon keyed by parent_id — all children of one parent card (rev-1 H3)
     max_tokens: 400_000
     max_dispatches: 200
+  token_weights:               # what each cache class counts toward max_tokens (§8, ADR-0014)
+    cache_read: 0.1            # default 0.1, range 0..1
+    cache_creation: 1          # default 1, range 0..2
   per_card:
     max_execution_attempts: 5  # parse/integrity retries before scrap (rev-1 H5)
   liveness:
@@ -831,7 +834,8 @@ express it (this is why Conduit is a state machine, not Airflow). It is bounded 
    tracked by `parent_id` partition and exceeding the cap scraps that subtree without
    halting the whole run — and the global **andon** (wall-clock + tokens) — *plus* the
    separate **liveness watchdog** (§8) that catches a *stalled* flow the consumption
-   budgets miss.
+   budgets miss. The run and wave token budgets count cache classes at the flow's
+   `budgets.token_weights` (§8).
 
 ### Fan-in failure policy (rev-1 C4)
 `fan_in: { policy: all | quorum(k) | best_effort }`. Defines what a scrapped or held child
@@ -1093,6 +1097,17 @@ split is harder and needs this in-transaction reservation.)*
 ### Two distinct andons
 1. **Consumption andon** — wall-clock + tokens at run/wave/card scope. Trips on a
    *busy* runaway.
+
+**Budget tokens (issue #125, ADR-0014).** `max_tokens` at run and wave scope compares
+against a weighted total, not raw tokens: uncached input and output count at 1, cache
+reads at `budgets.token_weights.cache_read` (default 0.1, range 0 to 1) and cache creation
+at `budgets.token_weights.cache_creation` (default 1, range 0 to 2); the loader rejects
+anything else with `INVALID_TOKEN_WEIGHTS`. Transform and harness spend, the subflow
+roll-up and the journal-derived remaining budget of a run that takes passes all use the
+same weights. Missing data never lowers the count: a call with no cache breakdown counts
+its whole total at 1, and a breakdown that does not account for the whole reported total
+counts the difference at 1. The journal keeps raw figures; `conduit run status` prints
+the budget figure beside the raw one when they differ.
 2. **Liveness watchdog** (rev-1 C5) — "no card has changed lane in `no_progress_minutes`
    AND no worker is active" → **immediate** deadlock alert *with the blocking reason*.
    Catches a *stalled* flow (dep scrapped, `hold` with no human, no idle worker) that

@@ -1241,6 +1241,20 @@ export interface ConduitDB {
    */
   getRunUsageTotals(runId: string): { tokens: number; costUsd: number };
   /**
+   * Issue #125: the same spend split by token class, summed over the run's
+   * spans (NULL cache columns count as 0, so a row with no split keeps its
+   * whole figure in `inputTokens`, at budget weight 1). The four classes sum
+   * to getRunUsageTotals' `tokens`. A subflow roll-up and the remaining
+   * budget of a run that takes passes weight cache classes from this.
+   */
+  getRunUsageBreakdown(runId: string): {
+    inputTokens: number;
+    outputTokens: number;
+    cacheReadInputTokens: number;
+    cacheCreationInputTokens: number;
+    costUsd: number;
+  };
+  /**
    * Issue #30: every harness maker (`<station>.harness`) and harness critic
    * (`<station>.harness-critic`) span of a run, with its duration, its
    * `ready_waiting` sample (null on spans written before that attribute
@@ -1952,6 +1966,40 @@ class ConduitDBImpl implements ConduitDB {
       )
       .get({ $run_id: runId }) as { tokens: number; cost_usd: number };
     return { tokens: row.tokens, costUsd: row.cost_usd };
+  }
+
+  getRunUsageBreakdown(runId: string): {
+    inputTokens: number;
+    outputTokens: number;
+    cacheReadInputTokens: number;
+    cacheCreationInputTokens: number;
+    costUsd: number;
+  } {
+    const row = this.journalDb
+      .prepare(
+        `SELECT
+           COALESCE(SUM(COALESCE(input_tokens, 0)), 0) AS input_tokens,
+           COALESCE(SUM(COALESCE(output_tokens, 0)), 0) AS output_tokens,
+           COALESCE(SUM(COALESCE(cache_read_input_tokens, 0)), 0) AS cache_read,
+           COALESCE(SUM(COALESCE(cache_creation_input_tokens, 0)), 0) AS cache_creation,
+           COALESCE(SUM(COALESCE(cost_usd, 0)), 0) AS cost_usd
+         FROM journal
+         WHERE run_id = $run_id`,
+      )
+      .get({ $run_id: runId }) as {
+        input_tokens: number;
+        output_tokens: number;
+        cache_read: number;
+        cache_creation: number;
+        cost_usd: number;
+      };
+    return {
+      inputTokens: row.input_tokens,
+      outputTokens: row.output_tokens,
+      cacheReadInputTokens: row.cache_read,
+      cacheCreationInputTokens: row.cache_creation,
+      costUsd: row.cost_usd,
+    };
   }
 
   getHarnessTimingsForRun(runId: string): HarnessTimings {

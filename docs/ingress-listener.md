@@ -509,7 +509,8 @@ needs no such step: the human's reply resumes it, and its pending pass follows.
 Passes take a run slot like any launch and never bypass `max_concurrent_runs`.
 Their slot is registered per run, so two launches for one run never overlap.
 The run's token budget (`budgets.run.max_tokens`) is a ceiling over all its
-passes: each pass may spend only what earlier passes left, and a run with none
+passes: each pass may spend only what earlier passes left (counted with the
+flow's `budgets.token_weights`, so cache reads weigh 0.1 by default), and a run with none
 left refuses the next pass. `conduit resume` of a run that has taken more than
 one pass applies the same ceiling, and refuses the resume when nothing is left. The wall-clock budget applies to each pass on its
 own. Card, checkpoint, and journal state are per card, so a pass never replays

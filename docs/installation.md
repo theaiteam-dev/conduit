@@ -603,6 +603,19 @@ station whose provider reported no cache split. For a transform station the
 figure comes from the gateway's `usage.prompt_tokens_details.cached_tokens`, or,
 when the body has none, its `fireworks-cached-prompt-tokens` header.
 
+The run and wave token budgets (`budgets.run.max_tokens`,
+`budgets.per_wave.max_tokens`) count cache reads at
+`budgets.token_weights.cache_read`, default 0.1, and cache creation at
+`budgets.token_weights.cache_creation`, default 1; uncached input and output
+count at 1. A call whose provider reports no cache split counts its whole total
+at 1. Set `token_weights: { cache_read: 1 }` to count raw tokens as before
+issue #125. `cache_read` must be from 0 to 1 and `cache_creation` from 0 to 2,
+or the flow fails to load with `INVALID_TOKEN_WEIGHTS`. When the weighting makes
+the run's budget figure differ from its raw tokens, `run status` prints both,
+for example `budget tokens: 2610 of run max_tokens 6000 (raw 14040; cache read
+x0.1, cache creation x1)`. See
+[ADR-0014](../adr/0014-cache-weighted-token-budgets.md).
+
 Under the operator stack the listener does this for you — it recognises a
 parked child, tells the channel once, and resumes the run itself when the gate
 passes (see [`ingress-listener.md`](./ingress-listener.md)).
@@ -628,6 +641,7 @@ the consumed events and their passes, because its input mixes a consumed event
 with new ones. A run's token budget is shared
 by its passes, so `conduit resume` of a run that has taken more than one pass
 gets only what earlier invocations left, and is refused when nothing is left.
+Earlier passes' spend counts with the same cache weights as the run budget.
 
 ### Alternative: run from the engine image during development
 

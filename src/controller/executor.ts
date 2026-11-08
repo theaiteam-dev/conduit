@@ -37,7 +37,7 @@ import type { RunEngineArgs, SpawnedWorker } from '../cli/main';
 import { deriveSubflowRunId } from '../run/run-id';
 import type { StartWorkMessage } from '../worker/ipc-protocol';
 import { sanitizeStderrTail } from '../worker/ipc-protocol';
-import { modelResponseTokens, type ModelAdapter } from '../worker/adapter';
+import type { ModelAdapter } from '../worker/adapter';
 import { sweepStaleRunScopedDirsOnce } from '../worker/stale-temp-dirs';
 import { DEFAULT_RUN_ID, parseColumn, type ConduitDB, type JournalSpanInput, type JournalProvenance } from '../persistence/db';
 import type { FlowConfig, StationConfig, FanInPolicyConfig, StationOutput, Card } from '../types/kernel';
@@ -59,7 +59,7 @@ import { attemptClaim, beginWork, renewLease, reconcile } from '../dispatch/clai
 import { checkCommandAllowed, runDeterministic, deterministicCardEnv } from '../worker/deterministic';
 import { runTransformStation, coerciveParse, computeFindingsHash } from '../worker/transform';
 import type {
-  HarnessRegistry, MountedInput, HarnessResult, KnownUsage, RateLimitSnapshot,
+  HarnessRegistry, MountedInput, HarnessResult, KnownUsage, UsageBreakdown, RateLimitSnapshot,
 } from '../worker/harness-adapter';
 import { usageFromThrow, resolveHarnessAgent, DEFAULT_HARNESS_TIMEOUT_MS } from '../worker/harness-adapter';
 import { HARNESS_GATE_HOLD_CODE, createHarnessToolGate } from '../worker/harness-gate';
@@ -99,6 +99,7 @@ import type { FlowGraph } from '../checkpoint/checkpoint';
 import { checkIntegrity } from '../worker/integrity';
 import type { IntegrityResult } from '../worker/integrity';
 import { checkConsumptionAndon, checkLiveness, planDrain, type ConsumptionAndon } from '../control/watchdog';
+import { resolveTokenWeights, weightedModelResponseTokens, weightedUsageTokens } from '../control/token-weights';
 import { formatReleaseAt, soonestRateLimitGate } from '../run/run-state';
 import type { WorkerSlot } from '../control/watchdog';
 import { transition } from '../statemachine/transitions';
@@ -449,6 +450,10 @@ export async function runExecutor(args: RunEngineArgs): Promise<void> {
     maxDispatches: flow.budgets?.per_wave?.max_dispatches,
   };
   const waveBudgetActive = waveCaps.maxTokens !== undefined || waveCaps.maxDispatches !== undefined;
+  // Issue #125 (ADR-0014): what each cache class counts toward the run and
+  // wave max_tokens. trackingAdapter and foldHarnessUsage both apply it, so
+  // tokensSpent and cardTokens hold budget tokens, not raw tokens.
+  const tokenWeights = resolveTokenWeights(flow.budgets?.token_weights);
 
   // ── Mutable run state ─────────────────────────────────────────────────────
   let tokensSpent = 0;
@@ -567,8 +572,10 @@ export async function runExecutor(args: RunEngineArgs): Promise<void> {
       // ONCE at the top of the tick and can be stale by minutes once a
       // long-running synchronous call (this one) finishes.
       lastAdapterActivityAt = now();
-      // Issue #156: cache reads count, so a split call spends what it did unsplit.
-      const spent = modelResponseTokens(result);
+      // Issue #125: cache reads count at the flow's cache_read weight; a call
+      // with no split counts its whole input at weight 1 (issue #156 kept the
+      // raw sum in modelResponseTokens for the station's own usage).
+      const spent = weightedModelResponseTokens(result, tokenWeights);
       tokensSpent += spent;
       const attributed = attributedCardId();
       if (attributed !== null) {
@@ -583,7 +590,12 @@ export async function runExecutor(args: RunEngineArgs): Promise<void> {
   // SAME accumulators via this sibling closure instead, keyed off the same
   // `currentCardId` the synchronous dispatch path already sets. This is what
   // lets the existing consumptionAndon / wave-budget checks see harness spend.
-  const foldHarnessUsage = (tokens: number): void => {
+  //
+  // Issue #125: it takes the call's usage, not a number, so every fold site
+  // weights cache classes the same way (weightedUsageTokens). A usage with no
+  // breakdown counts its whole total at weight 1.
+  const foldHarnessUsage = (usage: KnownUsage): void => {
+    const tokens = weightedUsageTokens(usage.tokens, usage.breakdown, tokenWeights);
     tokensSpent += tokens;
     const attributed = attributedCardId();
     if (attributed !== null) {
@@ -1812,7 +1824,7 @@ interface ExecuteStationArgs {
    * trackingAdapter directly, so this is the sibling path that makes the
    * consumption andon and wave budget see harness spend.
    */
-  foldHarnessUsage: (tokens: number) => void;
+  foldHarnessUsage: (usage: KnownUsage) => void;
   /**
    * Stamps fresh liveness progress the instant a harness invoke() resolves
    * (WI-567 FR-8 fix) — the sibling of trackingAdapter's lastAdapterActivityAt
@@ -2116,7 +2128,7 @@ interface DeterministicArgs {
    * the same run/wave accumulators the maker path feeds — a deterministic
    * command never calls a harness/model itself, but its gate critic can.
    */
-  foldHarnessUsage: (tokens: number) => void;
+  foldHarnessUsage: (usage: KnownUsage) => void;
   /** Error-surfacing channel threaded through from runExecutor's io.err. */
   err: (msg: string) => void;
 }
@@ -2772,7 +2784,7 @@ interface GateCheckOrAdvanceArgs {
    * deterministic maker), so without this the critic's own spend is invisible
    * to the consumption andon and the wave budget.
    */
-  foldHarnessUsage: (tokens: number) => void;
+  foldHarnessUsage: (usage: KnownUsage) => void;
   err: (msg: string) => void;
 }
 
@@ -3291,9 +3303,9 @@ async function runGateCheckOrAdvance(args: GateCheckOrAdvanceArgs): Promise<bool
       const { adapterName, model, durationMs, usage } = gateDecision.criticUsage;
       const usageKnown = !('unknown' in usage);
       if (usageKnown) {
-        // Budgets fold the TOTAL, mirroring the maker path's foldHarnessUsage
-        // call — never the pieces of a breakdown.
-        foldHarnessUsage(usage.tokens);
+        // Budgets fold the whole usage, mirroring the maker path's
+        // foldHarnessUsage call; the cache weighting happens inside it.
+        foldHarnessUsage(usage);
       }
       // SPAN NAME: '<station>.harness-critic', deliberately NOT '<station>.harness'.
       // countConsecutiveRateLimitParks (~line 4469) walks journal spans
@@ -3598,7 +3610,7 @@ interface TransformArgs {
    * same run/wave accumulators the maker path feeds — a transform maker's own
    * model call already folds via trackingAdapter, but a harness critic does not.
    */
-  foldHarnessUsage: (tokens: number) => void;
+  foldHarnessUsage: (usage: KnownUsage) => void;
   /** Error-surfacing channel threaded through from runExecutor's io.err. */
   err: (msg: string) => void;
 }
@@ -3993,7 +4005,7 @@ interface HarnessArgs {
   onAndonTrip: () => void;
   harnessRegistry?: HarnessRegistry;
   /** Folds harness-reported usage into the run/wave budget accumulators (WI-567). */
-  foldHarnessUsage: (tokens: number) => void;
+  foldHarnessUsage: (usage: KnownUsage) => void;
   /** Stamps fresh liveness progress the instant a harness invoke() resolves (WI-567 FR-8 fix). */
   stampHarnessActivity: () => void;
   /**
@@ -4534,7 +4546,7 @@ async function executeHarnessStationBody(args: HarnessArgs): Promise<boolean> {
           let parkedJournalUsage: JournalSpanInput['usage'];
           if (parkedUsage !== undefined && !('unknown' in parkedUsage)) {
             parkedUsageKnown = true;
-            foldHarnessUsage(parkedUsage.tokens);
+            foldHarnessUsage(parkedUsage);
             parkedJournalUsage = harnessJournalUsage(parkedUsage, effectiveModel);
           }
           db.appendJournalSpan({
@@ -4638,7 +4650,7 @@ async function executeHarnessStationBody(args: HarnessArgs): Promise<boolean> {
         let thrownJournalUsage: JournalSpanInput['usage'];
         if (thrownUsage !== undefined && !('unknown' in thrownUsage)) {
           thrownUsageKnown = true;
-          foldHarnessUsage(thrownUsage.tokens);
+          foldHarnessUsage(thrownUsage);
           thrownJournalUsage = harnessJournalUsage(thrownUsage, effectiveModel);
         }
         db.appendJournalSpan({
@@ -4691,9 +4703,9 @@ async function executeHarnessStationBody(args: HarnessArgs): Promise<boolean> {
         usageKnown = true;
         reportedTokens = reported.tokens;
         reportedCost = reported.cost;
-        // Budgets fold the TOTAL, unchanged by issue #5's column split — the
-        // breakdown below is a reporting concern, not an accounting one.
-        foldHarnessUsage(reportedTokens);
+        // Budgets fold the usage, total and breakdown: since issue #125 the
+        // breakdown weights cache classes (weightedUsageTokens).
+        foldHarnessUsage(reported);
         journalUsage = harnessJournalUsage(reported, effectiveModel);
         rateLimitAttrs = rateLimitAttributes(reported.rateLimit);
       }
@@ -4956,9 +4968,21 @@ export interface SubflowInvocation {
 }
 
 /** Terminal report of one child-flow invocation. */
+/**
+ * Spend fields a child run reports. `tokens` is the raw total; `breakdown`,
+ * when present, is the same spend split by class (summed from the child's
+ * journal), so the parent can weight cache classes with its own
+ * `budgets.token_weights` (issue #125). No breakdown counts `tokens` at 1.
+ */
+export interface SubflowSpend {
+  tokens?: number;
+  costUsd?: number;
+  breakdown?: UsageBreakdown;
+}
+
 export type SubflowOutcome =
-  | { outcome: 'done'; tokens?: number; costUsd?: number }
-  | { outcome: 'scrap' | 'halted' | 'error'; reason: string; tokens?: number; costUsd?: number };
+  | ({ outcome: 'done' } & SubflowSpend)
+  | ({ outcome: 'scrap' | 'halted' | 'error'; reason: string } & SubflowSpend);
 
 export type SubflowSeam = (invocation: SubflowInvocation) => Promise<SubflowOutcome>;
 
@@ -4985,7 +5009,7 @@ interface SubflowArgs {
   /** See ExecuteStationArgs.onAndonTrip. */
   onAndonTrip: () => void;
   harnessRegistry?: HarnessRegistry;
-  foldHarnessUsage: (tokens: number) => void;
+  foldHarnessUsage: (usage: KnownUsage) => void;
   stampHarnessActivity: () => void;
   runSubflow?: SubflowSeam;
   err: (msg: string) => void;
@@ -5105,14 +5129,25 @@ async function executeSubflowStation(args: SubflowArgs): Promise<boolean> {
       // accumulators exactly once, on every outcome that reports it — a failed
       // child still spent real tokens.
       const usageKnown = result.tokens !== undefined;
-      if (result.tokens !== undefined) foldHarnessUsage(result.tokens);
-      // A subflow reports one rolled-up scalar, with no per-class split to
-      // pass on: keep the pre-#5 shape (total in inputTokens, cache columns
-      // left NULL) rather than fabricating a breakdown. getRunUsageTotals
-      // COALESCEs the missing columns, so this still counts exactly once.
-      const journalUsage = usageKnown
-        ? { model: '', inputTokens: result.tokens ?? 0, outputTokens: 0, costUsd: result.costUsd ?? 0 }
-        : undefined;
+      if (result.tokens !== undefined) foldHarnessUsage({ tokens: result.tokens, cost: result.costUsd ?? 0, breakdown: result.breakdown });
+      // With a per-class split from the child's journal (issue #125), the
+      // span records it, so a journal-derived budget (a later pass) weights
+      // the roll-up as the fold above did. Without one, keep the pre-#5 shape
+      // (total in inputTokens, cache columns left NULL) rather than
+      // fabricating a breakdown; getRunUsageTotals COALESCEs the missing
+      // columns, so this still counts exactly once.
+      const journalUsage = !usageKnown
+        ? undefined
+        : result.breakdown !== undefined
+          ? {
+              model: '',
+              inputTokens: result.breakdown.inputTokens,
+              outputTokens: result.breakdown.outputTokens,
+              costUsd: result.costUsd ?? 0,
+              cacheReadInputTokens: result.breakdown.cacheReadInputTokens,
+              cacheCreationInputTokens: result.breakdown.cacheCreationInputTokens,
+            }
+          : { model: '', inputTokens: result.tokens ?? 0, outputTokens: 0, costUsd: result.costUsd ?? 0 };
 
       // Subflow spans record only bindingStamp as provenance: a subflow
       // station has no prompt, so its stamp is computed with an empty

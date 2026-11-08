@@ -345,4 +345,58 @@ stations:
     expect(invocations[0]!.budgetMaxTokens).toBe(1000);
     expect(invocations[1]!.budgetMaxTokens).toBe(900);
   });
+
+  // Issue #125: a child reporting a per-class split folds at the parent's
+  // weights (default cache_read 0.1). 9,000 raw tokens, 8,900 of them cache
+  // reads, count as 100 + 890 = 990 against a 1,000 budget.
+  const CACHE_HEAVY_CHILD = {
+    tokens: 9_000,
+    breakdown: { inputTokens: 100, outputTokens: 0, cacheReadInputTokens: 8_900, cacheCreationInputTokens: 0 },
+  };
+
+  it("weights a child's cache reads: a cache-heavy child under the weighted budget does not trip it", async () => {
+    const flow = setupFlow(1000);
+    seedEntryCard();
+    const { seam } = makeSeam(() => {
+      writeFileSync(join(dir, 'work', 'out.json'), JSON.stringify({ edited: true }));
+      return { outcome: 'done', ...CACHE_HEAVY_CHILD };
+    });
+
+    await runExecutor({ db, flow, now: () => 1000, adapter: stubAdapter, io, runSubflow: seam });
+
+    expect(ioLines.join('\n')).not.toContain('andon');
+    expect(db.getCard(DEFAULT_RUN_ID, 'card-1')?.lane).toBe('done');
+    // The span keeps the raw split.
+    const [span] = db.getSpanTokenUsageForRun(DEFAULT_RUN_ID).filter((sp) => sp.name === 'call-child.subflow');
+    expect(span?.inputTokens).toBe(100);
+    expect(span?.cacheReadInputTokens).toBe(8_900);
+  });
+
+  it('a child of the same raw size with no split counts at weight 1 and trips the budget', async () => {
+    const flow = setupFlow(1000);
+    seedEntryCard();
+    const { seam } = makeSeam(() => {
+      writeFileSync(join(dir, 'work', 'out.json'), JSON.stringify({ edited: true }));
+      return { outcome: 'done', tokens: 9_000 };
+    });
+
+    await runExecutor({ db, flow, now: () => 1000, adapter: stubAdapter, io, runSubflow: seam });
+
+    expect(ioLines.join('\n')).toContain('andon');
+    expect(db.getCard(DEFAULT_RUN_ID, 'card-1')?.lane).not.toBe('done');
+  });
+
+  it('a cache-heavy child just over the weighted budget still trips it', async () => {
+    const flow = setupFlow(989);
+    seedEntryCard();
+    const { seam } = makeSeam(() => {
+      writeFileSync(join(dir, 'work', 'out.json'), JSON.stringify({ edited: true }));
+      return { outcome: 'done', ...CACHE_HEAVY_CHILD };
+    });
+
+    await runExecutor({ db, flow, now: () => 1000, adapter: stubAdapter, io, runSubflow: seam });
+
+    expect(ioLines.join('\n')).toContain('andon');
+    expect(db.getCard(DEFAULT_RUN_ID, 'card-1')?.lane).not.toBe('done');
+  });
 });

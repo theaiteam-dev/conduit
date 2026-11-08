@@ -629,6 +629,16 @@ export interface FlowBudgets {
   liveness?: {
     no_progress_minutes?: number;
   };
+  /**
+   * Issue #125 (ADR-0014): how much each cache class counts toward the run
+   * and wave `max_tokens`. Uncached input and output always count at 1.
+   * Defaults: cache_read 0.1, cache_creation 1. Validated at load:
+   * cache_read in [0, 1], cache_creation in [0, 2].
+   */
+  token_weights?: {
+    cache_read?: number;
+    cache_creation?: number;
+  };
 }
 
 /** A single egress channel entry from flow.yaml. */

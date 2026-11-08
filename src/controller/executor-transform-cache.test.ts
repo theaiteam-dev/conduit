@@ -8,6 +8,10 @@
  * figure and a call that reports it as 4 uncached + 10 cache reads spend the
  * same 20 tokens. The budget assertions here trip or clear the andon on that
  * exact total, which reads the accumulator, not the journal.
+ *
+ * Issue #125 weights cache reads in the budget (default 0.1). These tests set
+ * `cache_read: 1` so the budget is the raw sum they were written against; the
+ * default weighting is tested in executor-cache-budget.test.ts.
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
@@ -50,6 +54,7 @@ project_root: .
 flow_version: 1
 budgets:
   run: { wall_clock_minutes: 10, max_tokens: ${maxTokens} }
+  token_weights: { cache_read: 1 }
   per_card: { max_execution_attempts: 2 }
   liveness: { no_progress_minutes: 3 }
 terminal_lanes: [done, scrap, hold]

@@ -13,7 +13,8 @@
  *   share = cache reads / input
  *
  * A span with NULL cache columns (a journal older than the split, or an
- * adapter that reports none, such as a subflow roll-up) adds no figure: its
+ * adapter that reports none, such as a subflow roll-up written before issue
+ * #125 gave it the child's split) adds no figure: its
  * `input_tokens` may already include cached tokens, so folding it into the
  * denominator would understate the share. A station whose spans all lack a
  * split prints "no cache figure", never 0%.

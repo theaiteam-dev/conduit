@@ -16,6 +16,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import { openConduitDB, type ConduitDB } from '../persistence/db';
 import type { Card } from '../types/kernel';
 import { nextPassNumber, passEntryCardId, checkRunAppendable, remainingRunTokens, hasLaterPasses } from './run-passes';
+import { DEFAULT_TOKEN_WEIGHTS } from '../control/token-weights';
 
 let db: ConduitDB;
 
@@ -94,7 +95,7 @@ describe('remainingRunTokens', () => {
       usage: { model: 'm', inputTokens: 200, outputTokens: 25, costUsd: 0 },
     });
     // 100+50+200+25 = 375 spent.
-    expect(remainingRunTokens(db, 'r', 1_000)).toBe(625);
+    expect(remainingRunTokens(db, 'r', 1_000, DEFAULT_TOKEN_WEIGHTS)).toBe(625);
   });
 
   it('returns a negative figure once prior usage exceeds the ceiling — callers clamp, not this function', () => {
@@ -102,11 +103,41 @@ describe('remainingRunTokens', () => {
       runId: 'r', cardId: 'entry-r', station: 'draft', attempt: 0, name: 'draft.transform',
       usage: { model: 'm', inputTokens: 900, outputTokens: 200, costUsd: 0 },
     });
-    expect(remainingRunTokens(db, 'r', 1_000)).toBe(-100);
+    expect(remainingRunTokens(db, 'r', 1_000, DEFAULT_TOKEN_WEIGHTS)).toBe(-100);
+  });
+
+  it('weights earlier cache reads and cache creation by the flow weights (issue #125)', () => {
+    db.appendJournalSpan({
+      runId: 'r', cardId: 'entry-r', station: 'research', attempt: 0, name: 'research.harness',
+      usage: {
+        model: 'm', inputTokens: 100, outputTokens: 50, costUsd: 0,
+        cacheReadInputTokens: 2_000, cacheCreationInputTokens: 40,
+      },
+    });
+    // A row with no split keeps its whole figure in input_tokens, at weight 1.
+    db.appendJournalSpan({
+      runId: 'r', cardId: 'entry-r-p2', station: 'draft', attempt: 0, name: 'draft.transform',
+      usage: { model: 'm', inputTokens: 300, outputTokens: 0, costUsd: 0 },
+    });
+    // 100 + 50 + 0.1 * 2000 + 1 * 40 + 300 = 690.
+    expect(remainingRunTokens(db, 'r', 1_000, DEFAULT_TOKEN_WEIGHTS)).toBe(310);
+    // Weight 1 everywhere is the raw sum: 2490.
+    expect(remainingRunTokens(db, 'r', 3_000, { cacheRead: 1, cacheCreation: 1 })).toBe(510);
+    // Cache creation at 1.25: 100 + 50 + 200 + 50 + 300 = 700.
+    expect(remainingRunTokens(db, 'r', 1_000, { cacheRead: 0.1, cacheCreation: 1.25 })).toBe(300);
+  });
+
+  it('rounds a fractional remainder down', () => {
+    db.appendJournalSpan({
+      runId: 'r', cardId: 'entry-r', station: 'research', attempt: 0, name: 'research.harness',
+      usage: { model: 'm', inputTokens: 0, outputTokens: 0, costUsd: 0, cacheReadInputTokens: 5, cacheCreationInputTokens: 0 },
+    });
+    // 0.1 * 5 = 0.5 spent.
+    expect(remainingRunTokens(db, 'r', 10, DEFAULT_TOKEN_WEIGHTS)).toBe(9);
   });
 
   it('is the whole ceiling for a run with no recorded usage', () => {
-    expect(remainingRunTokens(db, 'r', 1_000)).toBe(1_000);
+    expect(remainingRunTokens(db, 'r', 1_000, DEFAULT_TOKEN_WEIGHTS)).toBe(1_000);
   });
 });
 

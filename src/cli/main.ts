@@ -47,6 +47,8 @@ import {
 } from '../run/run-passes';
 import { getHarnessOccupancy, formatHarnessOccupancy } from '../run/harness-occupancy';
 import { getCacheUsage, formatCacheUsage, formatSpanCacheSplit } from '../run/cache-usage';
+import { resolveTokenWeights } from '../control/token-weights';
+import { formatBudgetTokens } from '../run/budget-usage';
 import type { ModelAdapter, ModelCall, ModelResponse } from '../worker/adapter';
 import {
   buildHarnessDefinitionRegistry,
@@ -1083,7 +1085,7 @@ function admitAppendPass(
 
   const maxTokens = flow.budgets?.run?.max_tokens;
   if (maxTokens === undefined) return { ok: true, passNumber: nextPassNumber(deps.db, runId) };
-  const remaining = remainingRunTokens(deps.db, runId, maxTokens);
+  const remaining = remainingRunTokens(deps.db, runId, maxTokens, resolveTokenWeights(flow.budgets?.token_weights));
   if (remaining <= 0) {
     return refuse(`the run token budget (${maxTokens}) is spent by earlier passes`);
   }
@@ -1973,7 +1975,9 @@ async function cmdResume(argv: string[], deps: CliDeps): Promise<number> {
     let passBudgetMaxTokens: number | undefined;
     const runMaxTokens = result.flow.budgets?.run?.max_tokens;
     if (runMaxTokens !== undefined && hasLaterPasses(deps.db, runId)) {
-      passBudgetMaxTokens = remainingRunTokens(deps.db, runId, runMaxTokens);
+      passBudgetMaxTokens = remainingRunTokens(
+        deps.db, runId, runMaxTokens, resolveTokenWeights(result.flow.budgets?.token_weights),
+      );
       if (passBudgetMaxTokens <= 0) {
         releaseRunLease(deps.db, runId, process.pid);
         deps.io.err(
@@ -2825,6 +2829,10 @@ async function cmdRunManage(argv: string[], deps: CliDeps): Promise<number> {
     if (cache !== null) {
       for (const line of formatCacheUsage(cache)) deps.io.out(line);
     }
+    // Issue #125: when cache weighting makes the budget figure differ from
+    // raw tokens, say both, with the weights from the run's flow file.
+    const budgetLine = state.status === 'not_found' ? null : formatBudgetTokens(deps.db, runId);
+    if (budgetLine !== null) deps.io.out(budgetLine);
     // A not_found run is a non-zero (lookup miss) outcome; everything else is 0.
     return state.status === 'not_found' ? 1 : 0;
   }
@@ -3096,8 +3104,18 @@ export function buildProductionDeps(): CliDeps {
     runSubflow: async (invocation: SubflowInvocation) => {
       const spawnResult = await spawnConduitRun(buildSubflowRunArgv(invocation));
       const childRun = db.getRun(invocation.runId);
-      const usage = db.getRunUsageTotals(invocation.runId);
-      const spend = { tokens: usage.tokens, costUsd: usage.costUsd };
+      // Issue #125: the split by class lets the parent weight the child's
+      // cache reads with its own budgets.token_weights.
+      const usage = db.getRunUsageBreakdown(invocation.runId);
+      const breakdown = {
+        inputTokens: usage.inputTokens,
+        outputTokens: usage.outputTokens,
+        cacheReadInputTokens: usage.cacheReadInputTokens,
+        cacheCreationInputTokens: usage.cacheCreationInputTokens,
+      };
+      const tokens =
+        breakdown.inputTokens + breakdown.outputTokens + breakdown.cacheReadInputTokens + breakdown.cacheCreationInputTokens;
+      const spend = { tokens, costUsd: usage.costUsd, breakdown };
 
       if (childRun === null) {
         return {

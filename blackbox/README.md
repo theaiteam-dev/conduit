@@ -82,6 +82,16 @@ user or CI consumer actually sees, not internal implementation details.
   "no cache figure" for the third; `journal inspect` appends the split to the
   two spans that have one; the span columns hold uncached input and cache
   reads summing to `prompt_tokens`.
+- `cache-aware-budget.test.ts`: the run token budget counts cache reads at
+  `budgets.token_weights.cache_read`, default 0.1 (issue #125, ADR-0014). Two
+  Claude harness stations each bill 600 uncached input, 70 output and 6,350
+  cache reads against `max_tokens: 6000`: with the default the run completes
+  and `run status` prints `budget tokens: 2610 of run max_tokens 6000 (raw
+  14040; ...)`; with `cache_read: 1`, or the same raw size reported as
+  uncached input, it halts on the tokens andon before the second station. The
+  journal keeps the raw figures, and an out-of-range weight is refused at load
+  with `INVALID_TOKEN_WEIGHTS`. It runs in the `blackbox` job with the rest of
+  the directory.
 - `harness-critic-budget.test.ts`: the run token budget counts the critic's
   spend (issue #26). Maker alone is under budget, maker plus critic is over,
   and the run halts on the tokens andon; a control run with more budget
