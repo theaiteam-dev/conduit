@@ -2,19 +2,23 @@
  * Cache-aware token budgets (issue #125, ADR-0014).
  *
  * `budgets.run.max_tokens` and `budgets.per_wave.max_tokens` compare against a
- * WEIGHTED total: uncached input and output count at 1, cache reads at
- * `budgets.token_weights.cache_read` (default 0.1) and cache creation at
- * `budgets.token_weights.cache_creation` (default 1). The journal keeps the raw
- * figures; only the budget accumulators (`tokensSpent`, the per-card wave
- * tokens, and the journal-derived remaining budget of a run that takes passes)
- * use this weighting.
+ * WEIGHTED total: uncached input and output count at 1, cache reads and cache
+ * creation at weights resolved per call from the adapter that billed it
+ * (worker/adapter-cache-weights.ts), unless the flow's
+ * `budgets.token_weights` sets a class, which then applies to every adapter.
+ * The journal keeps the raw figures; only the budget accumulators
+ * (`tokensSpent`, the per-card wave tokens, and the journal-derived figures in
+ * run/run-passes.ts) use this weighting.
  *
  * Missing data never lowers the count. A call whose adapter reports no cache
- * breakdown counts its whole total at weight 1, and a breakdown whose classes
- * sum to less than the reported total counts the difference at weight 1.
+ * breakdown counts its whole total at weight 1, a breakdown whose classes sum
+ * to less than the reported total counts the difference at weight 1, and a
+ * span whose adapter is unknown gets weight 1 for each class the flow does not
+ * set.
  */
 import type { UsageBreakdown } from '../worker/harness-adapter';
 import type { ModelResponse } from '../worker/adapter';
+import { adapterCacheWeights } from '../worker/adapter-cache-weights';
 
 /** Per-class budget weights. Uncached input and output always weigh 1. */
 export interface TokenWeights {
@@ -22,19 +26,10 @@ export interface TokenWeights {
   cacheCreation: number;
 }
 
-/** Cache reads bill at about a tenth of the input price on Anthropic models. */
-export const DEFAULT_CACHE_READ_WEIGHT = 0.1;
-/** Unchanged from before issue #125: cache creation counts as input. */
-export const DEFAULT_CACHE_CREATION_WEIGHT = 1;
 /** Cache reads never cost more than uncached input. */
 export const MAX_CACHE_READ_WEIGHT = 1;
 /** Anthropic's 1-hour cache writes bill at 2x input; 5-minute writes at 1.25x. */
 export const MAX_CACHE_CREATION_WEIGHT = 2;
-
-export const DEFAULT_TOKEN_WEIGHTS: Readonly<TokenWeights> = Object.freeze({
-  cacheRead: DEFAULT_CACHE_READ_WEIGHT,
-  cacheCreation: DEFAULT_CACHE_CREATION_WEIGHT,
-});
 
 /** The flow.yaml shape: `budgets.token_weights`. */
 export interface FlowTokenWeights {
@@ -42,12 +37,27 @@ export interface FlowTokenWeights {
   cache_creation?: number;
 }
 
-/** The weights a flow's budgets use, defaults filled in. */
-export function resolveTokenWeights(raw: FlowTokenWeights | undefined): TokenWeights {
+/**
+ * The weights for a call billed by `adapterName`: each class the flow sets
+ * overrides the adapter's default, and a class it leaves unset takes the
+ * adapter's default (weight 1 for an unknown adapter).
+ */
+export function resolveTokenWeights(
+  override: FlowTokenWeights | undefined,
+  adapterName: string | null | undefined,
+): TokenWeights {
+  const defaults = adapterCacheWeights(adapterName);
   return {
-    cacheRead: raw?.cache_read ?? DEFAULT_CACHE_READ_WEIGHT,
-    cacheCreation: raw?.cache_creation ?? DEFAULT_CACHE_CREATION_WEIGHT,
+    cacheRead: override?.cache_read ?? defaults.cacheRead,
+    cacheCreation: override?.cache_creation ?? defaults.cacheCreation,
   };
+}
+
+/** One adapter's share of a run's spend, split by class (issue #125). */
+export interface AdapterUsage {
+  /** The adapter that billed it; null when the journal recorded none. */
+  adapter: string | null;
+  breakdown: UsageBreakdown;
 }
 
 /**

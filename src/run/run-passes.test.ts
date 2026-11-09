@@ -15,8 +15,14 @@
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import { openConduitDB, type ConduitDB } from '../persistence/db';
 import type { Card } from '../types/kernel';
-import { nextPassNumber, passEntryCardId, checkRunAppendable, remainingRunTokens, hasLaterPasses } from './run-passes';
-import { DEFAULT_TOKEN_WEIGHTS } from '../control/token-weights';
+import {
+  nextPassNumber,
+  passEntryCardId,
+  checkRunAppendable,
+  remainingRunTokens,
+  hasLaterPasses,
+  runUsageByAdapter,
+} from './run-passes';
 
 let db: ConduitDB;
 
@@ -95,7 +101,7 @@ describe('remainingRunTokens', () => {
       usage: { model: 'm', inputTokens: 200, outputTokens: 25, costUsd: 0 },
     });
     // 100+50+200+25 = 375 spent.
-    expect(remainingRunTokens(db, 'r', 1_000, DEFAULT_TOKEN_WEIGHTS)).toBe(625);
+    expect(remainingRunTokens(db, 'r', 1_000, undefined)).toBe(625);
   });
 
   it('returns a negative figure once prior usage exceeds the ceiling — callers clamp, not this function', () => {
@@ -103,41 +109,83 @@ describe('remainingRunTokens', () => {
       runId: 'r', cardId: 'entry-r', station: 'draft', attempt: 0, name: 'draft.transform',
       usage: { model: 'm', inputTokens: 900, outputTokens: 200, costUsd: 0 },
     });
-    expect(remainingRunTokens(db, 'r', 1_000, DEFAULT_TOKEN_WEIGHTS)).toBe(-100);
+    expect(remainingRunTokens(db, 'r', 1_000, undefined)).toBe(-100);
   });
 
-  it('weights earlier cache reads and cache creation by the flow weights (issue #125)', () => {
+  // Issue #125: each span is weighted for the adapter that billed it.
+  const cacheSpan = (runId: string, adapter: string | undefined, station = 'research'): void => {
     db.appendJournalSpan({
-      runId: 'r', cardId: 'entry-r', station: 'research', attempt: 0, name: 'research.harness',
+      runId, cardId: `card-${station}`, station, attempt: 0, name: `${station}.harness`,
+      ...(adapter !== undefined && { adapter }),
       usage: {
         model: 'm', inputTokens: 100, outputTokens: 50, costUsd: 0,
         cacheReadInputTokens: 2_000, cacheCreationInputTokens: 40,
       },
     });
-    // A row with no split keeps its whole figure in input_tokens, at weight 1.
+  };
+
+  it('weights each span for its own adapter (issue #125)', () => {
+    cacheSpan('r', 'claude-headless', 'walk');   // 150 + 0.1 * 2000 + 2 * 40 = 430
+    cacheSpan('r', 'codex-app-server', 'audit'); // 150 + 0.5 * 2000 + 1 * 40 = 1190
+    cacheSpan('r', 'opencode', 'review');        // 150 + 2000 + 40 = 2190
+    expect(remainingRunTokens(db, 'r', 10_000, undefined)).toBe(10_000 - 430 - 1_190 - 2_190);
+  });
+
+  it('weighs a span with no adapter, or an unknown one, at 1 per class', () => {
+    cacheSpan('r', undefined, 'old');       // 2190
+    cacheSpan('r', 'fake-harness', 'fake'); // 2190
+    expect(remainingRunTokens(db, 'r', 10_000, undefined)).toBe(10_000 - 2 * 2_190);
+  });
+
+  it("a class the flow sets overrides every adapter's default; an unset class falls back", () => {
+    cacheSpan('r', 'claude-headless', 'walk');
+    cacheSpan('r', undefined, 'old');
+    // cache_read 0.2 for both; creation stays 2 (claude) and 1 (unknown):
+    // (150 + 400 + 80) + (150 + 400 + 40) = 1220.
+    expect(remainingRunTokens(db, 'r', 10_000, { cache_read: 0.2 })).toBe(10_000 - 1_220);
+  });
+
+  it("reads a subflow span's child run, each child span under its own adapter, instead of the roll-up", () => {
+    cacheSpan('child-1', 'claude-headless', 'walk'); // 430
+    cacheSpan('child-1', 'codex-exec', 'audit');     // 1190
+    // The parent's roll-up span records the child's summed raw split under a
+    // subflow adapter; weighting it as unknown would give 4380.
     db.appendJournalSpan({
-      runId: 'r', cardId: 'entry-r-p2', station: 'draft', attempt: 0, name: 'draft.transform',
-      usage: { model: 'm', inputTokens: 300, outputTokens: 0, costUsd: 0 },
+      runId: 'r', cardId: 'entry-r', station: 'call', attempt: 0, name: 'call.subflow',
+      adapter: 'subflow:./child/flow.yaml', attributes: { child_run_id: 'child-1', outcome: 'success' },
+      usage: {
+        model: '', inputTokens: 200, outputTokens: 100, costUsd: 0,
+        cacheReadInputTokens: 4_000, cacheCreationInputTokens: 80,
+      },
     });
-    // 100 + 50 + 0.1 * 2000 + 1 * 40 + 300 = 690.
-    expect(remainingRunTokens(db, 'r', 1_000, DEFAULT_TOKEN_WEIGHTS)).toBe(310);
-    // Weight 1 everywhere is the raw sum: 2490.
-    expect(remainingRunTokens(db, 'r', 3_000, { cacheRead: 1, cacheCreation: 1 })).toBe(510);
-    // Cache creation at 1.25: 100 + 50 + 200 + 50 + 300 = 700.
-    expect(remainingRunTokens(db, 'r', 1_000, { cacheRead: 0.1, cacheCreation: 1.25 })).toBe(300);
+    expect(remainingRunTokens(db, 'r', 10_000, undefined)).toBe(10_000 - 430 - 1_190);
+    expect(runUsageByAdapter(db, 'r')).toEqual([
+      { adapter: 'claude-headless', breakdown: { inputTokens: 100, outputTokens: 50, cacheReadInputTokens: 2_000, cacheCreationInputTokens: 40 } },
+      { adapter: 'codex-exec', breakdown: { inputTokens: 100, outputTokens: 50, cacheReadInputTokens: 2_000, cacheCreationInputTokens: 40 } },
+    ]);
+  });
+
+  it('weighs a subflow span whose child run left no spans as unknown', () => {
+    db.appendJournalSpan({
+      runId: 'r', cardId: 'entry-r', station: 'call', attempt: 0, name: 'call.subflow',
+      adapter: 'subflow:./child/flow.yaml', attributes: { child_run_id: 'gone', outcome: 'success' },
+      usage: { model: '', inputTokens: 500, outputTokens: 0, costUsd: 0 },
+    });
+    expect(remainingRunTokens(db, 'r', 1_000, undefined)).toBe(500);
   });
 
   it('rounds a fractional remainder down', () => {
     db.appendJournalSpan({
       runId: 'r', cardId: 'entry-r', station: 'research', attempt: 0, name: 'research.harness',
+      adapter: 'claude-headless',
       usage: { model: 'm', inputTokens: 0, outputTokens: 0, costUsd: 0, cacheReadInputTokens: 5, cacheCreationInputTokens: 0 },
     });
     // 0.1 * 5 = 0.5 spent.
-    expect(remainingRunTokens(db, 'r', 10, DEFAULT_TOKEN_WEIGHTS)).toBe(9);
+    expect(remainingRunTokens(db, 'r', 10, undefined)).toBe(9);
   });
 
   it('is the whole ceiling for a run with no recorded usage', () => {
-    expect(remainingRunTokens(db, 'r', 1_000, DEFAULT_TOKEN_WEIGHTS)).toBe(1_000);
+    expect(remainingRunTokens(db, 'r', 1_000, undefined)).toBe(1_000);
   });
 });
 

@@ -5,24 +5,35 @@
  */
 import { describe, it, expect } from 'bun:test';
 import {
-  DEFAULT_TOKEN_WEIGHTS,
   resolveTokenWeights,
   validateTokenWeights,
   weightedModelResponseTokens,
   weightedUsageTokens,
+  type TokenWeights,
 } from './token-weights';
 
-const W = DEFAULT_TOKEN_WEIGHTS;
+/** Fixed weights for the arithmetic tests below, independent of any adapter default. */
+const W: TokenWeights = { cacheRead: 0.1, cacheCreation: 1 };
 
 describe('resolveTokenWeights', () => {
-  it('defaults to cache_read 0.1 and cache_creation 1', () => {
-    expect(resolveTokenWeights(undefined)).toEqual({ cacheRead: 0.1, cacheCreation: 1 });
-    expect(resolveTokenWeights({})).toEqual({ cacheRead: 0.1, cacheCreation: 1 });
+  it("takes the adapter's defaults when the flow sets nothing", () => {
+    expect(resolveTokenWeights(undefined, 'claude-headless')).toEqual({ cacheRead: 0.1, cacheCreation: 2 });
+    expect(resolveTokenWeights({}, 'codex-app-server')).toEqual({ cacheRead: 0.5, cacheCreation: 1 });
+    expect(resolveTokenWeights(undefined, 'openai-compatible')).toEqual({ cacheRead: 1, cacheCreation: 1 });
   });
 
-  it('takes each declared weight, including 0', () => {
-    expect(resolveTokenWeights({ cache_read: 0 })).toEqual({ cacheRead: 0, cacheCreation: 1 });
-    expect(resolveTokenWeights({ cache_read: 1, cache_creation: 1.25 })).toEqual({ cacheRead: 1, cacheCreation: 1.25 });
+  it('gives an unknown or missing adapter no discount', () => {
+    expect(resolveTokenWeights(undefined, 'some-future-adapter')).toEqual({ cacheRead: 1, cacheCreation: 1 });
+    expect(resolveTokenWeights(undefined, null)).toEqual({ cacheRead: 1, cacheCreation: 1 });
+    expect(resolveTokenWeights(undefined, 'subflow:./child/flow.yaml')).toEqual({ cacheRead: 1, cacheCreation: 1 });
+    expect(resolveTokenWeights(undefined, 'toString')).toEqual({ cacheRead: 1, cacheCreation: 1 });
+  });
+
+  it("a class the flow sets overrides every adapter's default, including 0; an unset class falls back", () => {
+    expect(resolveTokenWeights({ cache_read: 0 }, 'opencode')).toEqual({ cacheRead: 0, cacheCreation: 1 });
+    expect(resolveTokenWeights({ cache_read: 1 }, 'claude-headless')).toEqual({ cacheRead: 1, cacheCreation: 2 });
+    expect(resolveTokenWeights({ cache_creation: 1.25 }, 'agent-sdk')).toEqual({ cacheRead: 0.1, cacheCreation: 1.25 });
+    expect(resolveTokenWeights({ cache_read: 0.2, cache_creation: 0 }, null)).toEqual({ cacheRead: 0.2, cacheCreation: 0 });
   });
 });
 

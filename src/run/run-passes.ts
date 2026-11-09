@@ -17,7 +17,13 @@
  * state.
  */
 import type { ConduitDB } from '../persistence/db';
-import { weightedUsageTokens, type TokenWeights } from '../control/token-weights';
+import {
+  resolveTokenWeights,
+  weightedUsageTokens,
+  type AdapterUsage,
+  type FlowTokenWeights,
+} from '../control/token-weights';
+import type { UsageBreakdown } from '../worker/harness-adapter';
 import { isFailedLaunch } from './run-state';
 
 /**
@@ -72,19 +78,80 @@ export function nextPassNumber(db: ConduitDB, runId: string): number {
  * `conduit resume` of such a run cap the invocation at this figure. May be
  * zero or negative; callers clamp.
  *
- * Issue #125: earlier spend counts in budget tokens, cache classes weighted
- * by the flow's `budgets.token_weights`, as the executor counted it. Rounded
- * down, so the remainder never exceeds what is left.
+ * Issue #125: earlier spend counts in budget tokens, as the executor counted
+ * it (runBudgetTokens). Rounded down, so the remainder never exceeds what is
+ * left.
  */
-export function remainingRunTokens(db: ConduitDB, runId: string, maxTokens: number, weights: TokenWeights): number {
-  return Math.floor(maxTokens - runBudgetTokens(db, runId, weights));
+export function remainingRunTokens(
+  db: ConduitDB,
+  runId: string,
+  maxTokens: number,
+  override: FlowTokenWeights | undefined,
+): number {
+  return Math.floor(maxTokens - runBudgetTokens(db, runId, override));
 }
 
-/** A run's journaled spend in budget tokens (issue #125). */
-export function runBudgetTokens(db: ConduitDB, runId: string, weights: TokenWeights): number {
-  const b = db.getRunUsageBreakdown(runId);
-  const total = b.inputTokens + b.outputTokens + b.cacheReadInputTokens + b.cacheCreationInputTokens;
-  return weightedUsageTokens(total, b, weights);
+/** A journal span's classes, with the adapter that billed it. */
+type LeafRow = ReturnType<ConduitDB['getSpanBudgetRows']>[number];
+
+/**
+ * A run's spans with every `<station>.subflow` span replaced by its child
+ * run's spans, recursively, so each row names the adapter that billed it. A
+ * subflow span whose child run has no spans in the journal stays as it is
+ * (its `subflow:` adapter is unknown, so it weighs 1 per class).
+ */
+function leafRows(db: ConduitDB, runId: string, seen: ReadonlySet<string>): LeafRow[] {
+  const out: LeafRow[] = [];
+  for (const row of db.getSpanBudgetRows(runId)) {
+    const child = row.childRunId;
+    if (row.adapter?.startsWith('subflow:') && child !== null && !seen.has(child)) {
+      const childRows = leafRows(db, child, new Set([...seen, child]));
+      if (childRows.length > 0) {
+        out.push(...childRows);
+        continue;
+      }
+    }
+    out.push(row);
+  }
+  return out;
+}
+
+/**
+ * A run's journaled spend in budget tokens (issue #125): each span weighted
+ * for the adapter that billed it, with the flow's `budgets.token_weights`
+ * overriding any class it sets. A span with no adapter weighs 1 per class the
+ * flow does not set. Matches the executor's count, because the executor
+ * journals a harness call's unaccounted remainder in `input_tokens` and a
+ * subflow child's spans are read here rather than its rolled-up span.
+ */
+export function runBudgetTokens(db: ConduitDB, runId: string, override: FlowTokenWeights | undefined): number {
+  let total = 0;
+  for (const row of leafRows(db, runId, new Set([runId]))) {
+    const classes = row.inputTokens + row.outputTokens + row.cacheReadInputTokens + row.cacheCreationInputTokens;
+    total += weightedUsageTokens(classes, row, resolveTokenWeights(override, row.adapter));
+  }
+  return total;
+}
+
+/**
+ * A run's spend grouped by the adapter that billed it, subflow children
+ * included (issue #125). The subflow runner returns this to the parent, which
+ * weights each adapter's share with its own flow's override, so a child's
+ * Claude and codex spend do not collapse into one breakdown.
+ */
+export function runUsageByAdapter(db: ConduitDB, runId: string): AdapterUsage[] {
+  const byAdapter = new Map<string | null, UsageBreakdown>();
+  for (const row of leafRows(db, runId, new Set([runId]))) {
+    const sum = byAdapter.get(row.adapter) ?? {
+      inputTokens: 0, outputTokens: 0, cacheReadInputTokens: 0, cacheCreationInputTokens: 0,
+    };
+    sum.inputTokens += row.inputTokens;
+    sum.outputTokens += row.outputTokens;
+    sum.cacheReadInputTokens += row.cacheReadInputTokens;
+    sum.cacheCreationInputTokens += row.cacheCreationInputTokens;
+    byAdapter.set(row.adapter, sum);
+  }
+  return [...byAdapter].map(([adapter, breakdown]) => ({ adapter, breakdown }));
 }
 
 /** Has runId taken a pass beyond its first (issue #36)? */

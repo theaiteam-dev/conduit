@@ -27,28 +27,37 @@ function registerRun(budgets: string): void {
   db.insertRun({ run_id: 'r', flow: flowPath, input_fingerprint: 'x', status: 'done' });
 }
 
-function span(usage: { inputTokens: number; outputTokens: number; cacheReadInputTokens?: number; cacheCreationInputTokens?: number }): void {
+function span(
+  usage: { inputTokens: number; outputTokens: number; cacheReadInputTokens?: number; cacheCreationInputTokens?: number },
+  adapter = 'claude-headless',
+): void {
   db.appendJournalSpan({
-    runId: 'r', cardId: 'c', station: 'walk', attempt: 0, name: 'walk.harness',
+    runId: 'r', cardId: 'c', station: 'walk', attempt: 0, name: 'walk.harness', adapter,
     usage: { model: 'm', costUsd: 0, ...usage },
   });
 }
 
 describe('formatBudgetTokens', () => {
-  it('prints the budget figure, the run max_tokens, the raw figure and the weights', () => {
+  it('prints the budget figure, the run max_tokens and the raw figure, weighted per adapter', () => {
     registerRun('budgets:\n  run: { max_tokens: 6000000 }');
+    // claude-headless: 670,000 + 0.1 * 6,350,000 = 1,305,000.
     span({ inputTokens: 670_000, outputTokens: 0, cacheReadInputTokens: 6_350_000, cacheCreationInputTokens: 0 });
+    // codex-app-server: 100,000 + 0.5 * 1,000,000 = 600,000.
+    span({ inputTokens: 100_000, outputTokens: 0, cacheReadInputTokens: 1_000_000, cacheCreationInputTokens: 0 }, 'codex-app-server');
 
     expect(formatBudgetTokens(db, 'r')).toBe(
-      'budget tokens: 1305000 of run max_tokens 6000000 (raw 7020000; cache read x0.1, cache creation x1)',
+      'budget tokens: 1905000 of run max_tokens 6000000 (raw 8120000; cache weights per adapter)',
     );
   });
 
-  it("uses the flow's declared weights", () => {
+  it("names the classes the flow's token_weights sets", () => {
     registerRun('budgets:\n  token_weights: { cache_read: 0.25, cache_creation: 1.25 }');
     span({ inputTokens: 100, outputTokens: 0, cacheReadInputTokens: 1000, cacheCreationInputTokens: 100 });
+    expect(formatBudgetTokens(db, 'r')).toBe('budget tokens: 475 (raw 1200; flow sets cache read x0.25, cache creation x1.25)');
 
-    expect(formatBudgetTokens(db, 'r')).toBe('budget tokens: 475 (raw 1200; cache read x0.25, cache creation x1.25)');
+    writeFileSync(join(dir, 'flow.yaml'), 'flow: f\nflow_version: 1\nbudgets:\n  token_weights: { cache_read: 0.25 }\nstations: []\n');
+    // Creation falls back to claude-headless's 2: 100 + 250 + 200 = 550.
+    expect(formatBudgetTokens(db, 'r')).toBe('budget tokens: 550 (raw 1200; cache weights per adapter, flow sets cache read x0.25)');
   });
 
   it('prints nothing when the budget figure equals the raw figure', () => {
@@ -64,6 +73,7 @@ describe('formatBudgetTokens', () => {
     expect(formatBudgetTokens(db, 'missing')).toBeNull();
 
     span({ inputTokens: 10, outputTokens: 0, cacheReadInputTokens: 100 });
+    expect(formatBudgetTokens(db, 'r')).not.toBeNull();
     writeFileSync(join(dir, 'flow.yaml'), 'budgets:\n  token_weights: { cache_read: 5 }\n');
     expect(formatBudgetTokens(db, 'r')).toBeNull();
     rmSync(join(dir, 'flow.yaml'));

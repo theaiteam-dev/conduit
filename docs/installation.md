@@ -604,16 +604,23 @@ figure comes from the gateway's `usage.prompt_tokens_details.cached_tokens`, or,
 when the body has none, its `fireworks-cached-prompt-tokens` header.
 
 The run and wave token budgets (`budgets.run.max_tokens`,
-`budgets.per_wave.max_tokens`) count cache reads at
-`budgets.token_weights.cache_read`, default 0.1, and cache creation at
-`budgets.token_weights.cache_creation`, default 1; uncached input and output
-count at 1. A call whose provider reports no cache split counts its whole total
-at 1. Set `token_weights: { cache_read: 1 }` to count raw tokens as before
-issue #125. `cache_read` must be from 0 to 1 and `cache_creation` from 0 to 2,
-or the flow fails to load with `INVALID_TOKEN_WEIGHTS`. When the weighting makes
-the run's budget figure differ from its raw tokens, `run status` prints both,
-for example `budget tokens: 2610 of run max_tokens 6000 (raw 14040; cache read
-x0.1, cache creation x1)`. See
+`budgets.per_wave.max_tokens`) count uncached input and output at 1, and cache
+reads and cache creation at weights for the adapter that billed each call:
+
+| adapter | cache read | cache creation |
+|---|---|---|
+| `claude-headless`, `agent-sdk` | 0.1 | 2 |
+| `codex-exec`, `codex-app-server` | 0.5 | 1 |
+| `opencode`, transform stations | 1 | 1 |
+
+A flow's `budgets.token_weights.cache_read` or `.cache_creation`, when set,
+overrides that class for every adapter; set both to 1 to count raw tokens as
+before issue #125. `cache_read` must be from 0 to 1 and `cache_creation` from 0
+to 2, or the flow fails to load with `INVALID_TOKEN_WEIGHTS`. A call whose
+provider reports no cache split counts its whole total at 1. When the weighting
+makes the run's budget figure differ from its raw tokens, `run status` prints
+both, for example `budget tokens: 2610 of run max_tokens 6000 (raw 14040; cache
+weights per adapter)`. See
 [ADR-0014](../adr/0014-cache-weighted-token-budgets.md).
 
 Under the operator stack the listener does this for you — it recognises a
@@ -641,7 +648,7 @@ the consumed events and their passes, because its input mixes a consumed event
 with new ones. A run's token budget is shared
 by its passes, so `conduit resume` of a run that has taken more than one pass
 gets only what earlier invocations left, and is refused when nothing is left.
-Earlier passes' spend counts with the same cache weights as the run budget.
+Earlier passes' spend counts with the same per-adapter cache weights as the run budget.
 
 ### Alternative: run from the engine image during development
 

@@ -3,35 +3,31 @@
  * budget tokens next to its raw tokens, when cache weighting makes them
  * differ (ADR-0014).
  *
- * The weights come from the run's flow file (`runs.flow` holds its resolved
- * path), read fresh: run status has no loaded flow. A flow that cannot be
- * read or parsed, or whose `budgets.token_weights` fails validation, prints
- * no line rather than a figure computed with weights the run may not have
- * used.
+ * Weights are resolved per span for the adapter that billed it, so a mixed
+ * run has no single weight to print. The line says so, and names any class
+ * the flow's `budgets.token_weights` sets for every adapter. The override and
+ * `run.max_tokens` come from the run's flow file (`runs.flow` holds its
+ * resolved path), read fresh: run status has no loaded flow. A flow that
+ * cannot be read or parsed, or whose `budgets.token_weights` fails
+ * validation, prints no line rather than a figure computed with weights the
+ * run may not have used.
  *
- * The figure is journal-derived, like the remaining budget of a run that takes
- * passes, so it matches what `--append-pass` and `conduit resume` subtract. It
- * also matches the executor's count: a harness call's unaccounted remainder is
- * journaled in `input_tokens` (executor `harnessJournalUsage`), at weight 1.
+ * The figure is journal-derived (run-passes.ts `runBudgetTokens`), like the
+ * remaining budget of a run that takes passes, so it matches what
+ * `--append-pass` and `conduit resume` subtract, and the executor's count.
  */
 import { readFileSync } from 'node:fs';
 import { parse } from 'yaml';
 import type { ConduitDB } from '../persistence/db';
-import {
-  formatWeight,
-  resolveTokenWeights,
-  validateTokenWeights,
-  type FlowTokenWeights,
-  type TokenWeights,
-} from '../control/token-weights';
+import { formatWeight, validateTokenWeights, type FlowTokenWeights } from '../control/token-weights';
 import { runBudgetTokens } from './run-passes';
 
 interface FlowBudgetView {
-  weights: TokenWeights;
+  override: FlowTokenWeights | undefined;
   maxTokens?: number;
 }
 
-/** Read the weights and run max_tokens from a flow file, or null. */
+/** Read the weight override and run max_tokens from a flow file, or null. */
 export function readFlowBudgetView(flowPath: string): FlowBudgetView | null {
   let doc: unknown;
   try {
@@ -46,29 +42,35 @@ export function readFlowBudgetView(flowPath: string): FlowBudgetView | null {
   const maxTokens =
     typeof run === 'object' && run !== null ? (run as Record<string, unknown>)['max_tokens'] : undefined;
   return {
-    weights: resolveTokenWeights(block['token_weights'] as FlowTokenWeights | undefined),
+    override: block['token_weights'] as FlowTokenWeights | undefined,
     ...(typeof maxTokens === 'number' && { maxTokens }),
   };
 }
 
+/** "cache weights per adapter" plus the classes the flow sets for all of them. */
+function weightsText(override: FlowTokenWeights | undefined): string {
+  const set: string[] = [];
+  if (override?.cache_read !== undefined) set.push(`cache read x${formatWeight(override.cache_read)}`);
+  if (override?.cache_creation !== undefined) set.push(`cache creation x${formatWeight(override.cache_creation)}`);
+  if (set.length === 2) return `flow sets ${set.join(', ')}`;
+  if (set.length === 1) return `cache weights per adapter, flow sets ${set[0]}`;
+  return 'cache weights per adapter';
+}
+
 /**
- * "budget tokens: B (raw R; cache read x0.1, cache creation x1)[ of run
- * max_tokens M]", or null when the run has no usage, its flow is unreadable,
- * or the budget figure equals the raw one.
+ * "budget tokens: B[ of run max_tokens M] (raw R; cache weights per
+ * adapter[, flow sets ...])", or null when the run has no usage, its flow is
+ * unreadable, or the budget figure equals the raw one.
  */
 export function formatBudgetTokens(db: ConduitDB, runId: string): string | null {
   const run = db.getRun(runId);
   if (run === null) return null;
   const view = readFlowBudgetView(run.flow);
   if (view === null) return null;
-  const b = db.getRunUsageBreakdown(runId);
-  const raw = b.inputTokens + b.outputTokens + b.cacheReadInputTokens + b.cacheCreationInputTokens;
+  const raw = db.getRunUsageTotals(runId).tokens;
   if (raw === 0) return null;
-  const budget = Math.ceil(runBudgetTokens(db, runId, view.weights));
+  const budget = Math.ceil(runBudgetTokens(db, runId, view.override));
   if (budget === raw) return null;
   const max = view.maxTokens === undefined ? '' : ` of run max_tokens ${view.maxTokens}`;
-  return (
-    `budget tokens: ${budget}${max} (raw ${raw}; cache read x${formatWeight(view.weights.cacheRead)}, ` +
-    `cache creation x${formatWeight(view.weights.cacheCreation)})`
-  );
+  return `budget tokens: ${budget}${max} (raw ${raw}; ${weightsText(view.override)})`;
 }

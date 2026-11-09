@@ -1241,19 +1241,20 @@ export interface ConduitDB {
    */
   getRunUsageTotals(runId: string): { tokens: number; costUsd: number };
   /**
-   * Issue #125: the same spend split by token class, summed over the run's
-   * spans (NULL cache columns count as 0, so a row with no split keeps its
-   * whole figure in `inputTokens`, at budget weight 1). The four classes sum
-   * to getRunUsageTotals' `tokens`. A subflow roll-up and the remaining
-   * budget of a run that takes passes weight cache classes from this.
+   * Issue #125: one row per journal span of the run, with the adapter that
+   * billed it (null when the span records none), the child run id a
+   * `<station>.subflow` span carries (null otherwise), and its four token
+   * classes (NULL columns as 0). run/run-passes.ts weights each row by its
+   * adapter and recurses into a subflow span's child run.
    */
-  getRunUsageBreakdown(runId: string): {
+  getSpanBudgetRows(runId: string): Array<{
+    adapter: string | null;
+    childRunId: string | null;
     inputTokens: number;
     outputTokens: number;
     cacheReadInputTokens: number;
     cacheCreationInputTokens: number;
-    costUsd: number;
-  };
+  }>;
   /**
    * Issue #30: every harness maker (`<station>.harness`) and harness critic
    * (`<station>.harness-critic`) span of a run, with its duration, its
@@ -1968,38 +1969,42 @@ class ConduitDBImpl implements ConduitDB {
     return { tokens: row.tokens, costUsd: row.cost_usd };
   }
 
-  getRunUsageBreakdown(runId: string): {
+  getSpanBudgetRows(runId: string): Array<{
+    adapter: string | null;
+    childRunId: string | null;
     inputTokens: number;
     outputTokens: number;
     cacheReadInputTokens: number;
     cacheCreationInputTokens: number;
-    costUsd: number;
-  } {
-    const row = this.journalDb
+  }> {
+    const rows = this.journalDb
       .prepare(
-        `SELECT
-           COALESCE(SUM(COALESCE(input_tokens, 0)), 0) AS input_tokens,
-           COALESCE(SUM(COALESCE(output_tokens, 0)), 0) AS output_tokens,
-           COALESCE(SUM(COALESCE(cache_read_input_tokens, 0)), 0) AS cache_read,
-           COALESCE(SUM(COALESCE(cache_creation_input_tokens, 0)), 0) AS cache_creation,
-           COALESCE(SUM(COALESCE(cost_usd, 0)), 0) AS cost_usd
+        `SELECT adapter,
+                json_extract(attributes_json, '$.child_run_id') AS child_run_id,
+                COALESCE(input_tokens, 0) AS input_tokens,
+                COALESCE(output_tokens, 0) AS output_tokens,
+                COALESCE(cache_read_input_tokens, 0) AS cache_read,
+                COALESCE(cache_creation_input_tokens, 0) AS cache_creation
          FROM journal
-         WHERE run_id = $run_id`,
+         WHERE run_id = $run_id
+         ORDER BY rowid`,
       )
-      .get({ $run_id: runId }) as {
+      .all({ $run_id: runId }) as Array<{
+        adapter: string | null;
+        child_run_id: unknown;
         input_tokens: number;
         output_tokens: number;
         cache_read: number;
         cache_creation: number;
-        cost_usd: number;
-      };
-    return {
-      inputTokens: row.input_tokens,
-      outputTokens: row.output_tokens,
-      cacheReadInputTokens: row.cache_read,
-      cacheCreationInputTokens: row.cache_creation,
-      costUsd: row.cost_usd,
-    };
+      }>;
+    return rows.map((r) => ({
+      adapter: r.adapter,
+      childRunId: typeof r.child_run_id === 'string' ? r.child_run_id : null,
+      inputTokens: r.input_tokens,
+      outputTokens: r.output_tokens,
+      cacheReadInputTokens: r.cache_read,
+      cacheCreationInputTokens: r.cache_creation,
+    }));
   }
 
   getHarnessTimingsForRun(runId: string): HarnessTimings {

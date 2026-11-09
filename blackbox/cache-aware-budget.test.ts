@@ -7,11 +7,12 @@
  * bill 600 uncached input, 70 output and 6,350 cache reads (7,020 raw tokens)
  * against `budgets.run.max_tokens: 6000`.
  *
- *   - default weights (cache_read 0.1): each call counts 1,305, the run
- *     completes, and `conduit run status` prints the budget figure next to the
- *     raw one;
- *   - `token_weights: { cache_read: 1 }`: the raw count, so the run halts on
- *     the tokens andon before `report` runs, as it did before #125;
+ *   - claude-headless's default weights (cache reads 0.1): each call counts
+ *     1,305, the run completes, and `conduit run status` prints the budget
+ *     figure next to the raw one;
+ *   - a flow `token_weights: { cache_read: 1 }` overrides the adapter default:
+ *     the raw count, so the run halts on the tokens andon before `report`
+ *     runs, as it did before #125;
  *   - the same raw size reported as uncached input: counts at weight 1 and
  *     halts the same way.
  *
@@ -95,7 +96,7 @@ function rawSpanTokens(f: HarnessFlow): Record<string, number[]> {
 
 const andonLines = (r: CliResult): string[] => r.stderr.split("\n").filter((l) => l.startsWith("andon:"));
 
-describe("cache-aware budget journey: cache reads count at 0.1 by default", () => {
+describe("cache-aware budget journey: claude-headless cache reads count at 0.1 by default", () => {
   let f: HarnessFlow;
   let run: CliResult;
 
@@ -119,7 +120,7 @@ describe("cache-aware budget journey: cache reads count at 0.1 by default", () =
     expect(status.exitCode).toBe(0);
     expect(status.stdout).toContain(`run ${f.runId}: terminal (outcome=complete)`);
     expect(status.stdout.split("\n")).toContain(
-      "budget tokens: 2610 of run max_tokens 6000 (raw 14040; cache read x0.1, cache creation x1)",
+      "budget tokens: 2610 of run max_tokens 6000 (raw 14040; cache weights per adapter)",
     );
   });
 
@@ -128,7 +129,7 @@ describe("cache-aware budget journey: cache reads count at 0.1 by default", () =
   });
 });
 
-describe("control: cache_read: 1 restores the raw count and the run halts before report", () => {
+describe("control: a flow cache_read: 1 overrides the adapter default and the run halts before report", () => {
   let f: HarnessFlow;
   let run: CliResult;
 

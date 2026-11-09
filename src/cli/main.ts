@@ -42,12 +42,12 @@ import {
   nextPassNumber,
   passEntryCardId,
   remainingRunTokens,
+  runUsageByAdapter,
   EXIT_PASS_REFUSED,
   EXIT_RUN_LEASE_CONFLICT,
 } from '../run/run-passes';
 import { getHarnessOccupancy, formatHarnessOccupancy } from '../run/harness-occupancy';
 import { getCacheUsage, formatCacheUsage, formatSpanCacheSplit } from '../run/cache-usage';
-import { resolveTokenWeights } from '../control/token-weights';
 import { formatBudgetTokens } from '../run/budget-usage';
 import type { ModelAdapter, ModelCall, ModelResponse } from '../worker/adapter';
 import {
@@ -1085,7 +1085,7 @@ function admitAppendPass(
 
   const maxTokens = flow.budgets?.run?.max_tokens;
   if (maxTokens === undefined) return { ok: true, passNumber: nextPassNumber(deps.db, runId) };
-  const remaining = remainingRunTokens(deps.db, runId, maxTokens, resolveTokenWeights(flow.budgets?.token_weights));
+  const remaining = remainingRunTokens(deps.db, runId, maxTokens, flow.budgets?.token_weights);
   if (remaining <= 0) {
     return refuse(`the run token budget (${maxTokens}) is spent by earlier passes`);
   }
@@ -1976,7 +1976,7 @@ async function cmdResume(argv: string[], deps: CliDeps): Promise<number> {
     const runMaxTokens = result.flow.budgets?.run?.max_tokens;
     if (runMaxTokens !== undefined && hasLaterPasses(deps.db, runId)) {
       passBudgetMaxTokens = remainingRunTokens(
-        deps.db, runId, runMaxTokens, resolveTokenWeights(result.flow.budgets?.token_weights),
+        deps.db, runId, runMaxTokens, result.flow.budgets?.token_weights,
       );
       if (passBudgetMaxTokens <= 0) {
         releaseRunLease(deps.db, runId, process.pid);
@@ -3104,18 +3104,12 @@ export function buildProductionDeps(): CliDeps {
     runSubflow: async (invocation: SubflowInvocation) => {
       const spawnResult = await spawnConduitRun(buildSubflowRunArgv(invocation));
       const childRun = db.getRun(invocation.runId);
-      // Issue #125: the split by class lets the parent weight the child's
-      // cache reads with its own budgets.token_weights.
-      const usage = db.getRunUsageBreakdown(invocation.runId);
-      const breakdown = {
-        inputTokens: usage.inputTokens,
-        outputTokens: usage.outputTokens,
-        cacheReadInputTokens: usage.cacheReadInputTokens,
-        cacheCreationInputTokens: usage.cacheCreationInputTokens,
-      };
-      const tokens =
-        breakdown.inputTokens + breakdown.outputTokens + breakdown.cacheReadInputTokens + breakdown.cacheCreationInputTokens;
-      const spend = { tokens, costUsd: usage.costUsd, breakdown };
+      // Issue #125: the child's spend grouped by the adapter that billed it,
+      // grandchildren included, so the parent weights each adapter's share
+      // with its own budgets.token_weights over that adapter's defaults.
+      const usage = db.getRunUsageTotals(invocation.runId);
+      const byAdapter = runUsageByAdapter(db, invocation.runId);
+      const spend = { tokens: usage.tokens, costUsd: usage.costUsd, byAdapter };
 
       if (childRun === null) {
         return {
