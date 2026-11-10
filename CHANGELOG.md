@@ -11,6 +11,34 @@ historical context, not public releases or public repository history.
 
 ## [Unreleased]
 
+### Security
+
+- A harness could read the kernel's full environment
+  ([GHSA-r69q-grh3-2r38](https://github.com/theaiteam-dev/conduit/security/advisories/GHSA-r69q-grh3-2r38)).
+  The harness env allowlist decides which variables a harness child starts
+  with, but the child runs as the same user as the kernel, so it could read
+  `/proc/<kernel pid>/environ` and get every variable the allowlist left out.
+  The kernel and every worker now make themselves non-dumpable at startup
+  (`prctl(PR_SET_DUMPABLE, 0)`), which closes `/proc/<pid>/environ`, `mem`,
+  `maps` and `fd/` to other processes without `CAP_SYS_PTRACE`. Linux only;
+  other platforms have no `/proc/<pid>/environ`. If the call fails (no libc
+  to reach `prctl` through, or the kernel refuses it), the process prints
+  `warning: could not mark this process non-dumpable` on stderr and keeps
+  running with its environment still readable, so treat that warning as an
+  unpatched run. Affects every release up to and including 2.0.0. A deterministic station still inherits the kernel's
+  environment and is readable while it runs; see `docs/harness-containment.md`.
+
+### Added
+
+- Transform calls record a cache split
+  ([#156](https://github.com/theaiteam-dev/conduit/issues/156)). The OpenAI
+  adapter reads `usage.prompt_tokens_details.cached_tokens`, or the
+  `fireworks-cached-prompt-tokens` header when the body has no figure, and
+  `ModelResponse` gains `cacheReadInputTokens`. Budgets are unchanged: a call
+  with a split spends what it did without one. `conduit run status` prints a
+  cache-reads section for harness and transform spans, and `conduit journal
+  inspect` appends the split to each span line that has one.
+
 ### Changed
 
 - `budgets.run.max_tokens` and `budgets.per_wave.max_tokens` now count cache
