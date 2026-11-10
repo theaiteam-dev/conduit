@@ -94,11 +94,19 @@ export function remainingRunTokens(
 /** A journal span's classes, with the adapter that billed it. */
 type LeafRow = ReturnType<ConduitDB['getSpanBudgetRows']>[number];
 
+function rawTokens(row: LeafRow): number {
+  return row.inputTokens + row.outputTokens + row.cacheReadInputTokens + row.cacheCreationInputTokens;
+}
+
 /**
  * A run's spans with every `<station>.subflow` span replaced by its child
  * run's spans, recursively, so each row names the adapter that billed it. A
  * subflow span whose child run has no spans in the journal stays as it is
- * (its `subflow:` adapter is unknown, so it weighs 1 per class).
+ * (its `subflow:` adapter is unknown, so it weighs 1 per class). When the
+ * child's spans hold less than the subflow span recorded, the difference is
+ * kept as a row of uncached input with no adapter, so it counts at 1 as the
+ * executor's roll-up fold counted it (ADR-0014: missing data never lowers
+ * the count).
  */
 function leafRows(db: ConduitDB, runId: string, seen: ReadonlySet<string>): LeafRow[] {
   const out: LeafRow[] = [];
@@ -108,6 +116,13 @@ function leafRows(db: ConduitDB, runId: string, seen: ReadonlySet<string>): Leaf
       const childRows = leafRows(db, child, new Set([...seen, child]));
       if (childRows.length > 0) {
         out.push(...childRows);
+        const uncovered = rawTokens(row) - childRows.reduce((n, r) => n + rawTokens(r), 0);
+        if (uncovered > 0) {
+          out.push({
+            adapter: null, childRunId: null, inputTokens: uncovered, outputTokens: 0,
+            cacheReadInputTokens: 0, cacheCreationInputTokens: 0, cacheSplit: false,
+          });
+        }
         continue;
       }
     }

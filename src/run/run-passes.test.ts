@@ -179,6 +179,25 @@ describe('remainingRunTokens', () => {
     ]);
   });
 
+  it("counts the part of a subflow span's total its child's spans do not cover at 1", () => {
+    cacheSpan('child-1', 'claude-headless', 'walk'); // 2,190 raw, 430 weighted
+    // The roll-up recorded 1,000 more than the child's spans now hold.
+    db.appendJournalSpan({
+      runId: 'r', cardId: 'entry-r', station: 'call', attempt: 0, name: 'call.subflow',
+      adapter: 'subflow:./child/flow.yaml', attributes: { child_run_id: 'child-1', outcome: 'success' },
+      usage: {
+        model: '', inputTokens: 1_100, outputTokens: 50, costUsd: 0,
+        cacheReadInputTokens: 2_000, cacheCreationInputTokens: 40,
+      },
+    });
+    expect(remainingRunTokens(db, 'r', 10_000, undefined)).toBe(10_000 - 430 - 1_000);
+    // The remainder has no adapter and no cache split.
+    expect(runUsageByAdapter(db, 'r')).toEqual([
+      { adapter: 'claude-headless', breakdown: { inputTokens: 100, outputTokens: 50, cacheReadInputTokens: 2_000, cacheCreationInputTokens: 40 }, cacheSplit: true },
+      { adapter: null, breakdown: { inputTokens: 1_000, outputTokens: 0, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 }, cacheSplit: false },
+    ]);
+  });
+
   it('weighs a subflow span whose child run left no spans as unknown', () => {
     db.appendJournalSpan({
       runId: 'r', cardId: 'entry-r', station: 'call', attempt: 0, name: 'call.subflow',

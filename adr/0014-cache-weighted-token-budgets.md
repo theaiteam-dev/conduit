@@ -92,7 +92,8 @@ resolves the weights of the adapter that billed the call:
   `--append-pass` and `conduit resume` of a run with passes, and by the `run status` line): each
   span is weighted for the adapter recorded on it. A `<station>.subflow` span is replaced by its
   child run's spans, found through its `child_run_id`, so the child's adapters are weighted as the
-  executor weighted them; a subflow span whose child left no spans counts at 1. Transform spans
+  executor weighted them; a subflow span whose child left no spans counts at 1, and any part of
+  a subflow span's total its child's spans do not cover counts at 1. Transform spans
   record no adapter and count at the unknown weights, which equal the transform adapter's.
 - **Pooled deterministic workers** report raw tokens with no split; they count at 1.
 
