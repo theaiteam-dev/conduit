@@ -43,15 +43,21 @@ describe('process-group registry: handlers exist only while a group is live', ()
   it('installs the signal and exit handlers on the first tracked group and removes them when the last is untracked', () => {
     const baseline = listenerCounts();
 
-    trackProcessGroup(FAKE_PID);
-    trackProcessGroup(FAKE_PID + 1);
-    expect(listenerCounts()).toEqual(baseline.map((n) => n + 1));
+    try {
+      trackProcessGroup(FAKE_PID);
+      trackProcessGroup(FAKE_PID + 1);
+      expect(listenerCounts()).toEqual(baseline.map((n) => n + 1));
 
-    untrackProcessGroup(FAKE_PID);
-    expect(listenerCounts()).toEqual(baseline.map((n) => n + 1));
+      untrackProcessGroup(FAKE_PID);
+      expect(listenerCounts()).toEqual(baseline.map((n) => n + 1));
 
-    untrackProcessGroup(FAKE_PID + 1);
-    expect(listenerCounts()).toEqual(baseline);
+      untrackProcessGroup(FAKE_PID + 1);
+      expect(listenerCounts()).toEqual(baseline);
+    } finally {
+      // A failed expectation must not leave the fake groups tracked for the next test.
+      untrackProcessGroup(FAKE_PID);
+      untrackProcessGroup(FAKE_PID + 1);
+    }
   });
 
   it('kills live groups and leaves termination to another listener when one exists', async () => {
