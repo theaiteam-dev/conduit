@@ -67,16 +67,45 @@ describe('formatBudgetTokens', () => {
     expect(formatBudgetTokens(db, 'r')).toBeNull();
   });
 
-  it('prints nothing for a run with no usage, an unknown run, or an unreadable or invalid flow', () => {
+  it('prints nothing for a run with no usage', () => {
     registerRun('');
     expect(formatBudgetTokens(db, 'r')).toBeNull();
-    expect(formatBudgetTokens(db, 'missing')).toBeNull();
+  });
 
+  it('prints nothing for an unknown run', () => {
+    expect(formatBudgetTokens(db, 'missing')).toBeNull();
+  });
+
+  it('prints nothing when the flow file is gone', () => {
+    registerRun('');
     span({ inputTokens: 10, outputTokens: 0, cacheReadInputTokens: 100 });
     expect(formatBudgetTokens(db, 'r')).not.toBeNull();
-    writeFileSync(join(dir, 'flow.yaml'), 'budgets:\n  token_weights: { cache_read: 5 }\n');
-    expect(formatBudgetTokens(db, 'r')).toBeNull();
     rmSync(join(dir, 'flow.yaml'));
     expect(formatBudgetTokens(db, 'r')).toBeNull();
+  });
+
+  it('prints nothing when the flow sets an out-of-range weight', () => {
+    // A complete flow whose only fault is the weight, so null can only come
+    // from the token_weights validation. Read at 5, the line would print 510.
+    registerRun('budgets:\n  token_weights: { cache_read: 5 }');
+    span({ inputTokens: 10, outputTokens: 0, cacheReadInputTokens: 100 });
+    expect(formatBudgetTokens(db, 'r')).toBeNull();
+  });
+
+  it("weights a subflow child's spans under their own adapters, not the parent's roll-up span", () => {
+    registerRun('');
+    // The child's claude-headless span: 100 + 0.1 * 1,000 = 200.
+    db.appendJournalSpan({
+      runId: 'child-1', cardId: 'c', station: 'walk', attempt: 0, name: 'walk.harness', adapter: 'claude-headless',
+      usage: { model: 'm', costUsd: 0, inputTokens: 100, outputTokens: 0, cacheReadInputTokens: 1_000, cacheCreationInputTokens: 0 },
+    });
+    // The parent's roll-up of it. Weighed itself (unknown adapter, 1 per
+    // class) it would add 1,100; read with the child it would add 200 twice.
+    db.appendJournalSpan({
+      runId: 'r', cardId: 'c', station: 'call', attempt: 0, name: 'call.subflow', adapter: 'subflow:./child/flow.yaml',
+      attributes: { child_run_id: 'child-1', outcome: 'success' },
+      usage: { model: '', costUsd: 0, inputTokens: 100, outputTokens: 0, cacheReadInputTokens: 1_000, cacheCreationInputTokens: 0 },
+    });
+    expect(formatBudgetTokens(db, 'r')).toBe('budget tokens: 200 (raw 1100; cache weights per adapter)');
   });
 });
