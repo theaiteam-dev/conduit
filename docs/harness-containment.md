@@ -384,6 +384,19 @@ hold it together:
   (trusted), never in `flow.yaml` (validated, untrusted). An allowlisted `HOME` is more
   than a variable: it hands a CLI the operator's home directory, including its config. See
   [The child's configuration surface](#the-childs-configuration-surface).
+  The harness runs as the same user as the kernel, so the allowlist alone would not keep the
+  kernel's environment from it: any process of that user can read `/proc/<pid>/environ`.
+  The kernel and each `__worker` process therefore make themselves non-dumpable at start
+  (`prctl(PR_SET_DUMPABLE, 0)`, `src/cli/non-dumpable.ts`), which leaves that file readable
+  only with `CAP_SYS_PTRACE`. Do not grant the container `CAP_SYS_PTRACE` or run it as root
+  for harness flows. Two limits remain. The flag is reset by `execve`, so a **deterministic
+  station**, which inherits the kernel's full environment, is readable by a harness while
+  both run; a secret meant only for a deterministic station is better passed to it some
+  other way than the kernel's environment (a file the harness cannot read, or a separate
+  container). And a harness reads the allowlisted env of another harness running beside it.
+  Off Linux, or where `prctl` cannot be called, the kernel prints a warning and runs without
+  this protection
+  ([GHSA-r69q-grh3-2r38](https://github.com/theaiteam-dev/conduit/security/advisories/GHSA-r69q-grh3-2r38)).
 - **Process-tree termination.** A timeout, idle timeout or run halt kills everything the
   harness started, not a lone pid, so a harness that has spawned its own subprocesses (a
   shell, a browser, a language server) doesn't leave them running. See
@@ -441,7 +454,8 @@ hold it together:
 What this profile does **not** claim: that the kernel prevents a compromised or
 prompt-injected harness from doing something unwanted *during* its run. It claims the
 blast radius is bounded — by owned-paths (writes that escape are caught before they
-advance the card), by the env allowlist (there's little worth exfiltrating), by the
+advance the card), by the env allowlist and the non-dumpable kernel (there's little worth
+exfiltrating, unless a deterministic station holds a secret while a harness runs), by the
 container (the operator's network/process boundary), and by the adversarial gate
 (corrupted output gets caught before it ships) — and that every attempt is legible in the
 journal (hashes and usage, never raw transcripts).
@@ -712,8 +726,9 @@ search) need to reach the open web — the same `unshare --net`-style denial tha
 `agentic`'s content-processing workers (SPEC §7) would break the harness's own purpose.
 
 This is a deliberate departure from the Law's default-deny posture, made acceptable because
-the rest of the profile holds together: the env allowlist keeps the exfiltratable surface
-to the harness's own auth token, the container is the operator's network-policy boundary if
+the rest of the profile holds together: the env allowlist and the non-dumpable kernel keep
+the exfiltratable surface to the harness's own auth token and whatever a concurrently running
+deterministic station or harness holds in its environment, the container is the operator's network-policy boundary if
 one is wanted, and the journal stores artifact hashes and usage rather than raw
 transcripts. An allowlisted egress proxy is a possible later tier — not a v1 promise.
 
