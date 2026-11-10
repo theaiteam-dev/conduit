@@ -231,49 +231,64 @@ describe('harness runner: cwd confined to project root (AC4)', () => {
 // naturally exited process never carries a SIGKILL signalCode, no matter how the
 // timer and exit interleave. This stress test hammers that boundary so the flag
 // race cannot slip back in as a regression.
+//
+// The deadline follows the host (issue #162). The test used to give a 45ms
+// sleep a fixed 50ms deadline and require every run to exit 0. That assumed the
+// host spawns `sh` and wakes `sleep` within 5ms, which is a property of the
+// host, not of the runner: on the ubuntu-26.04 runner image, whose `sleep` is
+// uutils coreutils, 3 of 300 runs took longer and were killed, and the runner
+// correctly reported each of them as timed out. Now the deadline moves 1ms
+// down after every natural exit and 1ms up after every kill, so it settles
+// where about half the runs are killed, on any host, and the timer keeps
+// firing right around a natural exit. Each run is checked against its own
+// outcome: an exit 0 is never a timeout, and a kill always is.
 // ---------------------------------------------------------------------------
 
 describe('harness runner: timeout/natural-exit boundary race (AC2 regression)', () => {
   it('never reports a naturally-completed run as timed out across 300 boundary iterations', async () => {
     const ITERATIONS = 300;
-    const timeoutMs = 50;
-    // Sleep ~90% of the timeout: the child reliably exits 0, but sits close
-    // enough to the deadline that the timeout timer routinely fires — the exact
-    // interleaving that surfaced the flag-race bug.
-    const sleepSeconds = ((timeoutMs * 0.9) / 1000).toFixed(3); // '0.045'
+    const child = { command: 'sh', args: ['-c', 'sleep 0.045; exit 0'] };
     // Process-group containment: joining a cgroup costs the child 5-20ms
     // before it runs (the kernel waits for an RCU grace period on migration),
-    // which would push a 45ms child past a 50ms deadline and turn this into a
-    // test of that overhead. The labelling logic under test does not depend on
-    // the mechanism.
+    // which would widen the spread of run times and turn this into a test of
+    // that overhead. The labelling logic under test does not depend on the
+    // mechanism.
     const containment = { mechanism: 'process-group', reason: 'boundary-race timing test' } as const;
+    let timeoutMs = 50;
 
     // Collect every violation so a failure names how often and how it broke,
     // rather than aborting on the first (a 1/300 flake vs a systemic regression
     // read very differently).
-    const falseTimeouts: Array<{ iter: number; exitCode: number; durationMs: number }> = [];
-    const nonZeroExits: Array<{ iter: number; exitCode: number; timedOut: boolean }> = [];
+    const falseTimeouts: Array<{ iter: number; timeoutMs: number; durationMs: number }> = [];
+    const mislabeledKills: Array<{ iter: number; timeoutMs: number; exitCode: number; timedOut: boolean; durationMs: number }> = [];
+    let naturalExits = 0;
+    let kills = 0;
 
     for (let iter = 0; iter < ITERATIONS; iter++) {
-      const result = await runHarnessProcess(
-        { command: 'sh', args: ['-c', `sleep ${sleepSeconds}; exit 0`] },
-        config({ timeoutMs, containment }),
-      );
-      // The bug signature: a run that exited 0 but was flagged timedOut.
-      if (result.timedOut) {
-        falseTimeouts.push({ iter, exitCode: result.exitCode, durationMs: result.durationMs });
-      }
-      if (result.exitCode !== 0) {
-        nonZeroExits.push({ iter, exitCode: result.exitCode, timedOut: result.timedOut });
+      const result = await runHarnessProcess(child, config({ timeoutMs, containment }));
+      if (result.exitCode === 0) {
+        naturalExits += 1;
+        // The bug signature: a run that exited 0 but was flagged timedOut.
+        if (result.timedOut) falseTimeouts.push({ iter, timeoutMs, durationMs: result.durationMs });
+        timeoutMs = Math.max(1, timeoutMs - 1);
+      } else {
+        kills += 1;
+        // The child only ever sleeps then exits 0, so any other outcome is the
+        // timer's SIGKILL, and the runner must report it as a timeout.
+        if (result.exitCode !== 137 || !result.timedOut) {
+          mislabeledKills.push({ iter, timeoutMs, exitCode: result.exitCode, timedOut: result.timedOut, durationMs: result.durationMs });
+        }
+        timeoutMs += 1;
       }
     }
 
-    // Every iteration completed naturally (exit 0) — the child only ever sleeps
-    // then `exit 0`, so a non-zero code would mean the timer SIGKILLed a live
-    // process, which must not happen when it finishes under the deadline.
-    expect(nonZeroExits).toEqual([]);
-    // And not one of those natural completions was mislabeled as a timeout.
+    // Not one natural completion was mislabeled as a timeout.
     expect(falseTimeouts).toEqual([]);
+    // Every run the timer killed was reported as timed out.
+    expect(mislabeledKills).toEqual([]);
+    // The deadline sat at the boundary: both outcomes happened, so the checks
+    // above covered the interleaving they exist for.
+    expect({ naturalExits, kills, bothOutcomes: naturalExits > 0 && kills > 0 }).toMatchObject({ bothOutcomes: true });
   }, 180_000);
 });
 
