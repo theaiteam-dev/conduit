@@ -6,9 +6,26 @@
 > **calibration cascade** — and points here for the cascade, the joins, the ingest shapes, and
 > the open questions, flagged at the end.
 
-Conduit *produces*; this is how it *learns*. Quality comes from `work → check → bounded
-rework` (SPEC §6) — but the **check itself gets better over time** if you feed real signal
-back into it. That feedback is what turns a flow-shop into a *self-tuning* one.
+For a proposed implementation sequence, see
+[Building Kaizen from Delivered Outcomes](./kaizen-implementation.md). It starts
+with Nitpick feedback and identifies changes to the earlier sequencing and
+evidence requirements for public review.
+
+Conduit currently uses `work → check → bounded rework` (SPEC §6) to revise
+artifacts within a run. It records findings, human selections, and execution
+history that developers can inspect when changing their flows.
+
+**The learning system below is planned.** It would connect feedback on delivered
+work to its production history, propose improvements, evaluate them, and require
+human approval before promotion. Outcome ingestion, attribution, and automated
+calibration are not built-in capabilities today. A custom flow can fetch external
+data, but its author must supply the collection and analysis logic.
+
+For example, a code-review flow could learn from accepted and dismissed comments;
+a video flow could use views and sales. Those signals need interpretation:
+dismissal does not always mean a comment was wrong, and video performance also
+depends on distribution, audience, and spend. The goal is evidence for evaluated
+changes, not automatic prompt updates from a raw metric.
 
 ---
 
@@ -223,10 +240,11 @@ regardless of how cheap or strong the signal gets.
 
 ## 7. The loop is a flow
 
-The elegant payoff: a feedback loop *is just another flow*. It eats outcome/HITL data,
-analyzes it, emits proposed mutations, and routes them to a `hold` gate — same kernel, a
-`market` / `gate` check, the `hold` lane for human sign-off. The **Analyst isn't special
-infrastructure; it's a flow Conduit runs on itself.** Conduit dogfoods its own kaizen.
+The intended implementation is a feedback flow: ingest outcome or human-review
+data, analyze it, emit proposed mutations, evaluate them, and ask for human
+sign-off. Existing execution primitives could run those steps, but the ingestion,
+attribution, evaluation, and promotion behavior still needs to be built. This is
+a proposed use of Conduit, not a shipped kaizen flow.
 
 ---
 

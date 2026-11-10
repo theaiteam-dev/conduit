@@ -28,19 +28,49 @@ intake → fetch_context → ideate ──(gate verify: pass)──→ done
 | `fixtures/build-fixture.sql` | builds the synthetic, non-sensitive `fixture.duckdb` |
 | `fixtures/fixture.duckdb` | the generated fixture (small; rebuild any time from the script) |
 
-## Run it (against the committed synthetic fixture — no real data needed)
+## Run the Generation and Inspection Loop
 
+This example uses synthetic product data and makes real, billed model calls.
+Install Bun and DuckDB, then configure an OpenAI-compatible endpoint that serves
+both model names in `flow.yaml`. The [gateway setup below](#run-against-a-litellm-gateway-multi-provider-one-endpoint)
+provides one option; you can also change both models to ones your endpoint serves.
+Set `CONDUIT_BASE_URL` and `CONDUIT_API_KEY` for that endpoint in your shell
+before continuing. The gateway section supplies values for the local example.
+
+Run these commands from the repository root after cloning:
+
+```bash
+bun install --frozen-lockfile
+
+export CONDUIT_EXAMPLE_DIR="$(mktemp -d)"
+export CONDUIT_STATE_DB="$CONDUIT_EXAMPLE_DIR/conduit.sqlite"
+export CONDUIT_JOURNAL_DB="$CONDUIT_EXAMPLE_DIR/conduit.journal.sqlite"
+export CONDUIT_PROJECT_ROOT="$PWD/examples/tiktok-shoppable-ideas"
+
+bun run src/cli/main.ts doctor examples/tiktok-shoppable-ideas/flow.yaml
+bun run src/cli/main.ts run examples/tiktok-shoppable-ideas/flow.yaml \
+  --input examples/tiktok-shoppable-ideas/request.example.json --run-id marketing-demo
+
+bun run src/cli/main.ts run status --run marketing-demo
+bun run src/cli/main.ts journal inspect entry-marketing-demo --run marketing-demo
 ```
-# (re)build the fixture — regenerates with fresh, recent dates
-duckdb fixtures/fixture.duckdb -f fixtures/build-fixture.sql
 
-# once the executor (PRD: real-run-path) lands:
-conduit run flow.yaml --input request.example.json
-#   --input is seeded as request.json (the entry station's input), then the flow runs to done
+The entry step seeds `request.json` and fetches `context.json`. The maker writes
+`idea.json`; its critic either passes it or returns findings for revision. The
+maker's prompt includes `{{feedback}}`, which receives those findings. The gate
+allows at most two revisions and can stop sooner when findings repeat. A run
+can finish with rejected work; inspect its status and journal before treating
+`idea.json` as accepted.
 
-# until then, you can exercise the data step directly:
-duckdb -readonly fixtures/fixture.duckdb -f fetch.sql    # reads request.json → writes context.json
+To resume an interrupted run with the same environment and state:
+
+```bash
+bun run src/cli/main.ts resume examples/tiktok-shoppable-ideas/flow.yaml --run marketing-demo
 ```
+
+Use a fresh state directory and run ID for an independent experiment. The example
+writes artifacts into its project directory; use separate project copies for
+concurrent experiments.
 
 The synthetic fixture encodes a deliberate test: **Nebula** is the proven best-seller, **Sunset
 Fade** is a brand-new rising star — but Sunset Fade *already has a recent video*, so a good `ideate`
@@ -68,13 +98,18 @@ pip install 'litellm[proxy]'
 export GEMINI_OPENAI_KEY=...        # Google AI key
 export OPENAI_API_KEY=sk-...        # OpenAI key (for the gpt-4o critic)
 
-litellm --config litellm.config.yaml --port 4000      # one OpenAI-compatible endpoint
+# From the repository root, run the gateway in a separate terminal:
+litellm --config examples/tiktok-shoppable-ideas/litellm.config.yaml --port 4000
+```
 
-# Point Conduit at the gateway and run:
+In the shell where you will run Conduit, set:
+
+```bash
 export CONDUIT_BASE_URL=http://localhost:4000
 export CONDUIT_API_KEY=sk-conduit-local                # = master_key in the config
-conduit run flow.yaml --input request.json
 ```
+
+Then follow the run commands above, keeping the gateway running.
 
 A direct provider endpoint (e.g. Google's) only serves that provider's models, so `gpt-4o` 404s
 against it — the gateway is what makes the mixed-provider flow run. LiteLLM also returns per-call
@@ -153,13 +188,12 @@ anchored to the product's own latest video date, so it stays meaningful even if 
 - The real `arcane.duckdb` carries buyer PII and is ~36 MB → not committed. This example ships a
   small **synthetic** `fixture.duckdb` (and the script that builds it); the DB path in `flow.yaml`
   stays configurable to point at the real database.
-- `clock.today` uses `CURRENT_DATE`, so `fetch_context` is time-varying by design (like the live
-  sales data it reads). Re-running on a later day legitimately changes the context and its checkpoint
-  binding stamp — expected for a live-data station, not a bug.
-- **Open finding (for the executor):** parameterizing a deterministic command's file args (e.g. the
-  DB path) collides with the no-shell-metacharacter allowlist — `${VAR}` contains `$ { }`, which are
-  not in the safe set. This example uses a fixed relative path; a clean fix (config-level arg
-  interpolation resolved *before* the allowlist check) is a real-run-path design item.
+- `clock.today` uses `CURRENT_DATE`. Start an independent run when you want fresh
+  context; resuming an existing run can reuse its completed fetch checkpoint.
+- Parameterizing a deterministic command's file args (e.g. the
+  DB path) requires care with the no-shell-metacharacter allowlist. This example
+  uses a fixed relative path; edit the literal argument in `flow.yaml` when
+  selecting a different database.
 - Prompt rendering uses a simple convention here: `{{<input-file>}}` (e.g. `{{context.json}}`) is
-  replaced with that artifact's contents. The exact templating contract is finalized with the
-  executor (PRD: real-run-path, FR-4a).
+  replaced with that artifact's contents. `{{feedback}}` is supplied by the runtime
+  on revision and is empty on the first attempt.
