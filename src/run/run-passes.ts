@@ -137,21 +137,26 @@ export function runBudgetTokens(db: ConduitDB, runId: string, override: FlowToke
  * A run's spend grouped by the adapter that billed it, subflow children
  * included (issue #125). The subflow runner returns this to the parent, which
  * weights each adapter's share with its own flow's override, so a child's
- * Claude and codex spend do not collapse into one breakdown.
+ * Claude and codex spend do not collapse into one breakdown. A share is
+ * `cacheSplit: false` when any of its spans recorded no cache columns: the
+ * zeros summed for them are "not reported", not a measured zero.
  */
 export function runUsageByAdapter(db: ConduitDB, runId: string): AdapterUsage[] {
-  const byAdapter = new Map<string | null, UsageBreakdown>();
+  const byAdapter = new Map<string | null, { breakdown: UsageBreakdown; cacheSplit: boolean }>();
   for (const row of leafRows(db, runId, new Set([runId]))) {
-    const sum = byAdapter.get(row.adapter) ?? {
-      inputTokens: 0, outputTokens: 0, cacheReadInputTokens: 0, cacheCreationInputTokens: 0,
+    const share = byAdapter.get(row.adapter) ?? {
+      breakdown: { inputTokens: 0, outputTokens: 0, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
+      cacheSplit: true,
     };
+    const sum = share.breakdown;
     sum.inputTokens += row.inputTokens;
     sum.outputTokens += row.outputTokens;
     sum.cacheReadInputTokens += row.cacheReadInputTokens;
     sum.cacheCreationInputTokens += row.cacheCreationInputTokens;
-    byAdapter.set(row.adapter, sum);
+    share.cacheSplit &&= row.cacheSplit;
+    byAdapter.set(row.adapter, share);
   }
-  return [...byAdapter].map(([adapter, breakdown]) => ({ adapter, breakdown }));
+  return [...byAdapter].map(([adapter, share]) => ({ adapter, ...share }));
 }
 
 /** Has runId taken a pass beyond its first (issue #36)? */

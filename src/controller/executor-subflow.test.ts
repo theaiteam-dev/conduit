@@ -439,4 +439,62 @@ stations:
     expect(ioLines.join('\n')).toContain('andon');
     expect(db.getCard(DEFAULT_RUN_ID, 'card-1')?.lane).not.toBe('done');
   });
+
+  // A share with a NaN or negative class is unusable (ADR-0014, "missing data
+  // never lowers the count"): the roll-up then counts the child's raw total
+  // at weight 1, as if it reported no shares. A NaN share would otherwise make
+  // tokensSpent NaN, and a negative one would subtract from the run's spend.
+  for (const [label, bad] of [
+    ['NaN', { inputTokens: 0, outputTokens: 0, cacheReadInputTokens: Number.NaN, cacheCreationInputTokens: 0 }],
+    ['negative', { inputTokens: -8_000, outputTokens: 0, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 }],
+  ] as const) {
+    it(`a child share with a ${label} class drops the shares and counts the raw total at 1`, async () => {
+      // Raw 8,280 at weight 1 trips 2,000. Folding the shares instead counts
+      // NaN, or 900 - 8,000 + an 8,180 remainder = 1,080, and trips nothing.
+      const flow = setupFlow(2000);
+      seedEntryCard();
+      const { seam } = makeSeam(() => {
+        writeFileSync(join(dir, 'work', 'out.json'), JSON.stringify({ edited: true }));
+        return {
+          outcome: 'done',
+          tokens: CACHE_HEAVY_CHILD.tokens,
+          byAdapter: [CACHE_HEAVY_CHILD.byAdapter[0]!, { adapter: 'codex-exec', breakdown: { ...bad } }],
+        };
+      });
+
+      await runExecutor({ db, flow, now: () => 1000, adapter: stubAdapter, io, runSubflow: seam });
+
+      expect(ioLines.join('\n')).toContain('andon');
+      // The span records the raw total with no split, like a child with no shares.
+      const [span] = db.getSpanTokenUsageForRun(DEFAULT_RUN_ID).filter((sp) => sp.name === 'call-child.subflow');
+      expect(span?.inputTokens).toBe(8_280);
+      expect(span?.cacheReadInputTokens).toBeNull();
+    });
+  }
+
+  it("records no cache split on the roll-up span when a child share has none", async () => {
+    // A share whose spans recorded no cache columns may hold cached tokens in
+    // its input, so the roll-up span must say "no cache figure", not 0%.
+    const flow = setupFlow(100_000);
+    seedEntryCard();
+    const { seam } = makeSeam(() => {
+      writeFileSync(join(dir, 'work', 'out.json'), JSON.stringify({ edited: true }));
+      return {
+        outcome: 'done',
+        tokens: 500,
+        byAdapter: [{
+          adapter: 'codex-exec',
+          breakdown: { inputTokens: 500, outputTokens: 0, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
+          cacheSplit: false,
+        }],
+      };
+    });
+
+    await runExecutor({ db, flow, now: () => 1000, adapter: stubAdapter, io, runSubflow: seam });
+
+    const [span] = db.getSpanTokenUsageForRun(DEFAULT_RUN_ID).filter((sp) => sp.name === 'call-child.subflow');
+    expect(span?.inputTokens).toBe(500);
+    expect(span?.cacheReadInputTokens).toBeNull();
+    expect(span?.cacheCreationInputTokens).toBeNull();
+  });
 });

@@ -79,10 +79,15 @@ resolves the weights of the adapter that billed the call:
   reads the child's journal and recurses into grandchildren), and the parent folds each adapter's
   share with its own flow's override over that adapter's defaults. One summed breakdown would lose
   which share was Claude and which codex, and would have to count at the least favourable weight.
-  A share the parts do not account for, or a roll-up with no per-adapter shares, counts at 1. The
-  child enforces the ceiling the parent passed down with the child's own override; when the two
-  flows' overrides differ the parent can see the child overshoot its remaining budget by one
-  roll-up, and trips then.
+  A share the parts do not account for, or a roll-up with no per-adapter shares, counts at 1, and
+  so does the whole roll-up when any share has a negative or non-numeric class. The
+  `<station>.subflow` span records the shares' summed split, or, when a share's spans recorded no
+  cache split, the total as uncached input with no cache columns, so `run status` prints no cache
+  figure for it rather than 0%. The child enforces the ceiling the parent passed down with the
+  child's own override. When the two flows' overrides differ, the child can stop short of the
+  parent's remaining budget (its weights count the same spend higher) or overshoot it by one
+  roll-up (they count it lower), and the parent trips then. Checking the parent's ceiling with the
+  parent's weights inside the child is issue #165.
 - **Journal-derived figures** (`runBudgetTokens`, used by `remainingRunTokens` for
   `--append-pass` and `conduit resume` of a run with passes, and by the `run status` line): each
   span is weighted for the adapter recorded on it. A `<station>.subflow` span is replaced by its

@@ -160,8 +160,22 @@ describe('remainingRunTokens', () => {
     });
     expect(remainingRunTokens(db, 'r', 10_000, undefined)).toBe(10_000 - 430 - 1_190);
     expect(runUsageByAdapter(db, 'r')).toEqual([
-      { adapter: 'claude-headless', breakdown: { inputTokens: 100, outputTokens: 50, cacheReadInputTokens: 2_000, cacheCreationInputTokens: 40 } },
-      { adapter: 'codex-exec', breakdown: { inputTokens: 100, outputTokens: 50, cacheReadInputTokens: 2_000, cacheCreationInputTokens: 40 } },
+      { adapter: 'claude-headless', breakdown: { inputTokens: 100, outputTokens: 50, cacheReadInputTokens: 2_000, cacheCreationInputTokens: 40 }, cacheSplit: true },
+      { adapter: 'codex-exec', breakdown: { inputTokens: 100, outputTokens: 50, cacheReadInputTokens: 2_000, cacheCreationInputTokens: 40 }, cacheSplit: true },
+    ]);
+  });
+
+  it("marks an adapter's share unsplit when any of its spans recorded no cache columns", () => {
+    cacheSpan('r', 'claude-headless', 'walk');
+    // A span with NULL cache columns: its input may include cached tokens.
+    db.appendJournalSpan({
+      runId: 'r', cardId: 'card-audit', station: 'audit', attempt: 0, name: 'audit.harness',
+      adapter: 'codex-exec', usage: { model: 'm', inputTokens: 300, outputTokens: 0, costUsd: 0 },
+    });
+    cacheSpan('r', 'codex-exec', 'audit');
+    expect(runUsageByAdapter(db, 'r')).toEqual([
+      { adapter: 'claude-headless', breakdown: { inputTokens: 100, outputTokens: 50, cacheReadInputTokens: 2_000, cacheCreationInputTokens: 40 }, cacheSplit: true },
+      { adapter: 'codex-exec', breakdown: { inputTokens: 400, outputTokens: 50, cacheReadInputTokens: 2_000, cacheCreationInputTokens: 40 }, cacheSplit: false },
     ]);
   });
 

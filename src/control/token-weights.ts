@@ -58,6 +58,13 @@ export interface AdapterUsage {
   /** The adapter that billed it; null when the journal recorded none. */
   adapter: string | null;
   breakdown: UsageBreakdown;
+  /**
+   * False when some span in this share recorded no cache columns, so its
+   * `inputTokens` may include cached tokens and the share has no cache-read
+   * figure to report. Budgets ignore it; only the subflow roll-up span's
+   * reported split does not. Absent counts as true.
+   */
+  cacheSplit?: boolean;
 }
 
 /**

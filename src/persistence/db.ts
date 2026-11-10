@@ -1244,8 +1244,9 @@ export interface ConduitDB {
    * Issue #125: one row per journal span of the run, with the adapter that
    * billed it (null when the span records none), the child run id a
    * `<station>.subflow` span carries (null otherwise), and its four token
-   * classes (NULL columns as 0). run/run-passes.ts weights each row by its
-   * adapter and recurses into a subflow span's child run.
+   * classes (NULL columns as 0), and whether it recorded a cache split
+   * (`cache_read_input_tokens` not NULL). run/run-passes.ts weights each row
+   * by its adapter and recurses into a subflow span's child run.
    */
   getSpanBudgetRows(runId: string): Array<{
     adapter: string | null;
@@ -1254,6 +1255,7 @@ export interface ConduitDB {
     outputTokens: number;
     cacheReadInputTokens: number;
     cacheCreationInputTokens: number;
+    cacheSplit: boolean;
   }>;
   /**
    * Issue #30: every harness maker (`<station>.harness`) and harness critic
@@ -1976,6 +1978,7 @@ class ConduitDBImpl implements ConduitDB {
     outputTokens: number;
     cacheReadInputTokens: number;
     cacheCreationInputTokens: number;
+    cacheSplit: boolean;
   }> {
     const rows = this.journalDb
       .prepare(
@@ -1984,7 +1987,8 @@ class ConduitDBImpl implements ConduitDB {
                 COALESCE(input_tokens, 0) AS input_tokens,
                 COALESCE(output_tokens, 0) AS output_tokens,
                 COALESCE(cache_read_input_tokens, 0) AS cache_read,
-                COALESCE(cache_creation_input_tokens, 0) AS cache_creation
+                COALESCE(cache_creation_input_tokens, 0) AS cache_creation,
+                cache_read_input_tokens IS NOT NULL AS cache_split
          FROM journal
          WHERE run_id = $run_id
          ORDER BY rowid`,
@@ -1996,6 +2000,7 @@ class ConduitDBImpl implements ConduitDB {
         output_tokens: number;
         cache_read: number;
         cache_creation: number;
+        cache_split: number;
       }>;
     return rows.map((r) => ({
       adapter: r.adapter,
@@ -2004,6 +2009,7 @@ class ConduitDBImpl implements ConduitDB {
       outputTokens: r.output_tokens,
       cacheReadInputTokens: r.cache_read,
       cacheCreationInputTokens: r.cache_creation,
+      cacheSplit: r.cache_split === 1,
     }));
   }
 

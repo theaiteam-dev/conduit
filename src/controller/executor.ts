@@ -5011,14 +5011,25 @@ export interface SubflowSpend {
 }
 
 /**
+ * The child's per-adapter shares, or none when any share has a negative or
+ * non-numeric class (ADR-0014: such a breakdown is ignored). Folding a NaN
+ * share would make tokensSpent NaN, and a negative one would subtract from
+ * the run's spend; with no shares the roll-up counts `tokens` at weight 1.
+ */
+function usableSubflowShares(result: SubflowSpend): AdapterUsage[] {
+  const shares = result.byAdapter ?? [];
+  return shares.every(({ breakdown }) => isUsableBreakdown(breakdown)) ? shares : [];
+}
+
+/**
  * What the subflow roll-up folds (issue #125): one part per adapter in the
  * child's `byAdapter`, each weighted for its own adapter, plus the part of
- * `tokens` the parts do not account for at weight 1. With no `byAdapter`,
- * the whole of `tokens` under an unknown adapter, at weight 1.
+ * `tokens` the parts do not account for at weight 1. With no usable
+ * `byAdapter`, the whole of `tokens` under an unknown adapter, at weight 1.
  */
 function subflowFoldParts(result: SubflowSpend): Array<{ usage: KnownUsage; adapter: string | null }> {
   const tokens = result.tokens ?? 0;
-  const parts: Array<{ usage: KnownUsage; adapter: string | null }> = (result.byAdapter ?? []).map(({ adapter, breakdown }) => ({
+  const parts: Array<{ usage: KnownUsage; adapter: string | null }> = usableSubflowShares(result).map(({ adapter, breakdown }) => ({
     adapter,
     usage: {
       tokens:
@@ -5032,11 +5043,16 @@ function subflowFoldParts(result: SubflowSpend): Array<{ usage: KnownUsage; adap
   return parts;
 }
 
-/** The child's per-adapter shares summed into one breakdown, for its span. */
+/**
+ * The child's per-adapter shares summed into one breakdown, for its span. None
+ * when a share is unusable, or when one recorded no cache split: its zeros are
+ * "not reported", and a span with a split would print a measured cache share.
+ */
 function subflowJournalBreakdown(result: SubflowSpend): UsageBreakdown | undefined {
-  if (result.byAdapter === undefined || result.byAdapter.length === 0) return undefined;
+  const shares = usableSubflowShares(result);
+  if (shares.length === 0 || shares.some(({ cacheSplit }) => cacheSplit === false)) return undefined;
   const sum: UsageBreakdown = { inputTokens: 0, outputTokens: 0, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 };
-  for (const { breakdown } of result.byAdapter) {
+  for (const { breakdown } of shares) {
     sum.inputTokens += breakdown.inputTokens;
     sum.outputTokens += breakdown.outputTokens;
     sum.cacheReadInputTokens += breakdown.cacheReadInputTokens;
@@ -5195,9 +5211,10 @@ async function executeSubflowStation(args: SubflowArgs): Promise<boolean> {
       // child still spent real tokens.
       const usageKnown = result.tokens !== undefined;
       if (result.tokens !== undefined) for (const part of subflowFoldParts(result)) foldHarnessUsage(part.usage, part.adapter);
-      // With the child's per-adapter shares (issue #125), the span records
-      // their summed split for reporting, plus any part of the total they do
-      // not cover as uncached input. A journal-derived budget does not weight
+      // With the child's per-adapter shares (issue #125), each usable and
+      // each with a cache split, the span records their summed split for
+      // reporting, plus any part of the total they do not cover as uncached
+      // input. A journal-derived budget does not weight
       // this span: it reads the child run's own spans through the span's
       // child_run_id (run/run-passes.ts), each under its own adapter. Without
       // shares, keep the pre-#5 shape (total in inputTokens, cache columns
