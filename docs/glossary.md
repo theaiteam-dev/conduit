@@ -285,9 +285,9 @@ reason. Available for inspection today and intended as input to planned kaizen w
 inspect runs through the CLI and configured channels.
 
 **tagging** *(planned)* — stamping delivered assets with stable IDs so external
-outcomes can be joined to their production history. `output.tag_assets` is a
-proposed configuration field in the design, not a supported runtime option.
-(SPEC §13)
+outcomes can be joined to their production history. SPEC §13 specifies
+`output.tag_assets`; the runtime does not implement it yet, and the flow loader
+does not read it. (SPEC §13)
 
 ---
 

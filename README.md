@@ -9,9 +9,9 @@ side effects from happening twice, and records every model call with its
 prompt version, model, and cost.
 
 Every completed station is checkpointed under a stamp of the model, prompt
-version, inputs, and flow version. Kill a run and resume it, and no finished
-model call is billed again. Bump a station's `prompt_version`, and only that
-station and the ones downstream of it re-run.
+version, inputs, and flow version. Kill a run and resume it, and no model call
+whose station checkpoint was written is billed again. Bump a station's
+`prompt_version`, and only that station and the ones downstream of it re-run.
 
 ## A Flow With a Loop Inside a Loop
 
@@ -52,7 +52,7 @@ stations:
         prompt_file: prompts/prd-critic.md
         prompt_version: "1"
       on_reject: draft-prd         # back-edge; the loader rejects a target that is not in the flow
-      rework_cap: 2                # after two rejections the cap policy applies
+      rework_cap: 2                # two reworks; a third rejection applies the cap policy
 ```
 
 What happens at run time:
@@ -62,7 +62,8 @@ What happens at run time:
 - On reject, the findings go back into the maker's prompt and it runs again.
   A gate can also stop early when the findings stop changing
   (`progress_signal: findings_hash`).
-- The second rejection past the cap ends the card: `scrap`, or
+- A third rejection, after the two reworks `rework_cap: 2` allows, ends the
+  card: `scrap`, or
   `proceed_with_findings` if the flow says so. The run's token and wall-clock
   budgets halt the whole run. A pending side effect with an unknown outcome,
   or an agent that asks a human a question, moves the card to `hold`.
@@ -137,8 +138,9 @@ deployment paths, continue with the [installation guide](./docs/installation.md)
   positive allowlist of Bash executables, file writes confined to the card's
   owned paths, and no web tools. Every decision is journaled. The
   [containment profile](./docs/harness-containment.md) states what each adapter
-  enforces and what it does not. Landlock write confinement for overlapped
-  harness calls is in progress
+  enforces and what it does not. Overlapped harness calls (`overlap: true`)
+  also run under Landlock write confinement to the card's owned paths; a host
+  without Landlock ABI 3 runs them serially instead
   ([#129](https://github.com/theaiteam-dev/conduit/pull/129)).
 - **Budgets stop runaway loops.** Rework caps per gate, execution-attempt caps
   per card, token and dispatch caps per fan-out wave, token and wall-clock caps
@@ -148,9 +150,12 @@ deployment paths, continue with the [installation guide](./docs/installation.md)
 ### Replay
 
 - **Checkpoints carry a binding stamp.** Each completed station is stored
-  under `hash(model, prompt version, input artifact hashes, flow version)`.
-  The prompt version folds in the content hash of every injected skill and, for
-  a named harness agent, the SHA-256 of its agent definition.
+  under `hash(model, prompt version, input artifact hashes, flow version)`,
+  plus the adapter name on a harness station. The prompt version folds in the
+  content hash of every injected skill, the SHA-256 of the prompt template, and,
+  for a named harness agent, the SHA-256 of its agent definition. Editing a
+  prompt file re-runs that station and its dependents without a
+  `prompt_version` bump.
 - **Resume reuses what still matches.** `conduit resume` skips a station whose
   stamp matches and re-runs the ones whose inputs changed, with invalidation
   cascading downstream. Bump one station's `prompt_version` and only that

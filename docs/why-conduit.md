@@ -47,8 +47,6 @@ The aim is to reduce the custom orchestration code needed for an inspected
 production flow. Whether that is easier for your team depends on the flow and
 the infrastructure you already operate.
 
-## Why Not Temporal?" -->
-
 ## Why Not Temporal?
 
 [Temporal](https://docs.temporal.io/) gives application code durable execution:
@@ -59,15 +57,17 @@ spans services, with timers, signals, and schedules, it is the mature answer and
 Conduit does not compete with it there.
 
 Run LLM work on Temporal and the history does one thing well: a crash never
-re-bills a completed activity. What the history does not hold is anything about
-the model call itself. It records that an activity returned a value, not which
-prompt version, model, or inputs produced it, so when you change a prompt
-Temporal has no way to say which steps are now stale. You reset the workflow to
-an event ID by hand, or you build the dependency tracking in your own code.
+re-bills a completed activity. The history stores each activity's input and
+result payloads, so a prompt or model your code passes to an activity is in it.
+Temporal does not derive a stamp from those values or track which later steps
+used a result, so when you change a prompt Temporal has no way to say which
+steps are now stale. You reset the workflow to an event ID by hand, or you
+build the dependency tracking in your own code.
 
 Conduit keys each checkpoint by a binding stamp:
-`hash(model, prompt version, input artifact hashes, flow version)`, where the
-prompt version includes the injected skills and the harness agent definition.
+`hash(model, prompt version, input artifact hashes, flow version)`, plus the
+adapter name on a harness station, where the prompt version includes the
+injected skills, the prompt template's content, and the harness agent definition.
 On resume a station runs again only if its stamp changed, and the invalidation
 cascades to the stations that consume its output. Bump one `prompt_version` and
 only that station and its dependents re-run. The upstream model calls are
