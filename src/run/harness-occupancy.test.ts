@@ -274,16 +274,166 @@ describe('issue #30: getHarnessOccupancy', () => {
     expect(report).not.toBeNull();
     expect(report!.wallClockMs).toBe(100_000);
     expect(report!.stations).toEqual([
-      { station: 'research', makerCalls: 2, criticCalls: 1, busyMs: 60_000, waitedCardMs: 70_000, unsampledCalls: 0 },
-      { station: 'write', makerCalls: 1, criticCalls: 0, busyMs: 15_000, waitedCardMs: 0, unsampledCalls: 1 },
+      { station: 'research', makerCalls: 2, criticCalls: 1, overlappedCalls: 0, busyMs: 60_000, waitedCardMs: 70_000, unsampledCalls: 0 },
+      { station: 'write', makerCalls: 1, criticCalls: 0, overlappedCalls: 0, busyMs: 15_000, waitedCardMs: 0, unsampledCalls: 1 },
     ]);
 
     expect(formatHarnessOccupancy(report!)).toEqual([
-      'harness occupancy (serial under any --concurrency; run wall clock 100.0s):',
+      'harness occupancy (run wall clock 100.0s):',
       '  research: 2 maker + 1 critic call(s), busy 60.0s (60.0% of wall clock), other ready cards waited 70.0 card-s',
       '  write: 1 maker + 0 critic call(s), busy 15.0s (15.0% of wall clock), other ready cards waited 0.0 card-s, 1 call(s) not sampled',
       '  total: busy 75.0s (75.0% of wall clock)',
     ]);
+  });
+});
+
+/** A span of an overlapped call (ADR-0012): `concurrent` plus its start. */
+function overlappedSpan(
+  runId: string,
+  station: string,
+  cardId: string,
+  startedAtMs: number,
+  durationMs: number,
+  readyWaiting?: number,
+): void {
+  db.appendJournalSpan({
+    runId,
+    cardId,
+    station,
+    attempt: 0,
+    name: `${station}.harness`,
+    adapter: 'fake-harness',
+    durationMs,
+    usageUnknown: true,
+    attributes: {
+      outcome: 'success',
+      concurrent: true,
+      started_at_ms: startedAtMs,
+      ...(readyWaiting === undefined ? {} : { ready_waiting: readyWaiting }),
+    },
+  });
+}
+
+describe('issue #30, ADR-0012: occupancy with overlapped calls', () => {
+  it('reports busy time as the union of overlapping call intervals, per station and in total', () => {
+    insertRun('ov');
+    const t0 = 1_700_000_000_000;
+    // walk: three calls, two overlapping [0,30s) and [10s,40s), one alone [100s,120s).
+    overlappedSpan('ov', 'walk', 'w1', t0, 30_000, 1);
+    overlappedSpan('ov', 'walk', 'w2', t0 + 10_000, 30_000, 1);
+    overlappedSpan('ov', 'walk', 'w3', t0 + 100_000, 20_000, 0);
+    // A serial span on another station adds its duration.
+    span('ov', 'summarize', 'maker', 5_000, 2);
+    setWallClock('ov', 200);
+
+    const report = getHarnessOccupancy(db, 'ov')!;
+    expect(report.stations).toEqual([
+      // 5 s * 2 waiting cards
+      { station: 'summarize', makerCalls: 1, criticCalls: 0, overlappedCalls: 0, busyMs: 5_000, waitedCardMs: 10_000, unsampledCalls: 0 },
+      // busy: [0,40s) + [100s,120s) = 60 s, not the 80 s the durations sum to.
+      // waited: one card for the 40 s the first two ran, counted once, not twice.
+      { station: 'walk', makerCalls: 3, criticCalls: 0, overlappedCalls: 3, busyMs: 60_000, waitedCardMs: 40_000, unsampledCalls: 0 },
+    ]);
+    expect(report.totalBusyMs).toBe(65_000);
+    expect(formatHarnessOccupancy(report)).toEqual([
+      'harness occupancy (run wall clock 200.0s):',
+      '  summarize: 1 maker + 0 critic call(s), busy 5.0s (2.5% of wall clock), other ready cards waited 10.0 card-s',
+      '  walk: 3 maker + 0 critic call(s), 3 overlapped, busy 60.0s (30.0% of wall clock), other ready cards waited 40.0 card-s',
+      '  total: busy 65.0s (32.5% of wall clock)',
+    ]);
+  });
+
+  it('charges each moment the largest ready_waiting among the overlapping calls', () => {
+    insertRun('mx');
+    const t0 = 1_700_000_000_000;
+    // A [0,40s) waiting 1, B [10s,40s) waiting 3: 1 for 10 s, then 3 for 30 s.
+    // Min, first, last or a sum of the samples would each give a different figure.
+    overlappedSpan('mx', 'walk', 'm1', t0, 40_000, 1);
+    overlappedSpan('mx', 'walk', 'm2', t0 + 10_000, 30_000, 3);
+    setWallClock('mx', 100);
+    const report = getHarnessOccupancy(db, 'mx')!;
+    expect(report.stations[0]!.waitedCardMs).toBe(100_000);
+    expect(report.stations[0]!.busyMs).toBe(40_000);
+  });
+
+  it('drops to the next largest ready_waiting when the largest holder ends first', () => {
+    insertRun('drop');
+    const t0 = 1_700_000_000_000;
+    // A [0,40s) waiting 3, B [10s,50s) waiting 1: 3 for 40 s, then 1 for the
+    // 10 s B runs alone. Keeping the stale 3 would give 150, dropping to 0
+    // would give 120.
+    overlappedSpan('drop', 'walk', 'd1', t0, 40_000, 3);
+    overlappedSpan('drop', 'walk', 'd2', t0 + 10_000, 40_000, 1);
+    setWallClock('drop', 100);
+    const report = getHarnessOccupancy(db, 'drop')!;
+    expect(report.stations[0]!.waitedCardMs).toBe(130_000);
+    expect(report.stations[0]!.busyMs).toBe(50_000);
+  });
+
+  it('ends an interval before starting one at the same instant when charging waited time', () => {
+    insertRun('tie');
+    const t0 = 1_700_000_000_000;
+    // A [0,10s) waiting 5 and B [10s,20s) waiting 2 touch at 10 s, where A has
+    // ended: 5 x 10 s + 2 x 10 s, not 5 x 20 s.
+    overlappedSpan('tie', 'walk', 't1', t0, 10_000, 5);
+    overlappedSpan('tie', 'walk', 't2', t0 + 10_000, 10_000, 2);
+    setWallClock('tie', 100);
+    const report = getHarnessOccupancy(db, 'tie')!;
+    expect(report.stations[0]!.waitedCardMs).toBe(70_000);
+    expect(report.stations[0]!.busyMs).toBe(20_000);
+  });
+
+  it('charges nothing for a zero-length call, before or after it', () => {
+    insertRun('zero');
+    const t0 = 1_700_000_000_000;
+    // Z is [10s,10s) waiting 9; A [0,30s) waiting 1. Z covers no time, so the
+    // waited figure is A's alone: 1 x 30 s.
+    overlappedSpan('zero', 'walk', 'z1', t0 + 10_000, 0, 9);
+    overlappedSpan('zero', 'walk', 'z2', t0, 30_000, 1);
+    setWallClock('zero', 100);
+    const report = getHarnessOccupancy(db, 'zero')!;
+    expect(report.stations[0]!.waitedCardMs).toBe(30_000);
+    expect(report.stations[0]!.busyMs).toBe(30_000);
+  });
+
+  it('takes the union across stations for the total when calls of two stations overlap', () => {
+    insertRun('two');
+    const t0 = 1_700_000_000_000;
+    overlappedSpan('two', 'a', 'a1', t0, 20_000);
+    overlappedSpan('two', 'b', 'b1', t0 + 5_000, 20_000);
+    setWallClock('two', 100);
+    const report = getHarnessOccupancy(db, 'two')!;
+    expect(report.stations.map((s) => s.busyMs)).toEqual([20_000, 20_000]);
+    expect(report.totalBusyMs).toBe(25_000);
+    // No ready_waiting sample on either: reported as unsampled, not as zero waiting.
+    expect(report.stations.map((s) => s.unsampledCalls)).toEqual([1, 1]);
+  });
+
+  it('counts an overlapped span without ready_waiting in busy time but not in waited card-time', () => {
+    insertRun('uns');
+    const t0 = 1_700_000_000_000;
+    // A [0,20s) sampled, waiting 2. B [10s,40s) unsampled, extends past A.
+    overlappedSpan('uns', 'walk', 'u1', t0, 20_000, 2);
+    overlappedSpan('uns', 'walk', 'u2', t0 + 10_000, 30_000);
+    setWallClock('uns', 100);
+    const report = getHarnessOccupancy(db, 'uns')!;
+    // busy: the union [0,40s) includes B's tail, which A alone would not cover.
+    expect(report.stations[0]!.busyMs).toBe(40_000);
+    expect(report.totalBusyMs).toBe(40_000);
+    // waited: only A's sample counts, 2 cards for A's 20 s. B adds nothing, not even 0 samples averaged in.
+    expect(report.stations[0]!.waitedCardMs).toBe(40_000);
+    expect(report.stations[0]!.unsampledCalls).toBe(1);
+    expect(report.stations[0]!.overlappedCalls).toBe(2);
+  });
+
+  it('still reports a journal written before ADR-0012 (no started_at_ms or concurrent)', () => {
+    insertRun('old');
+    span('old', 'research', 'maker', 30_000, 1);
+    span('old', 'research', 'maker', 30_000, 1);
+    setWallClock('old', 100);
+    const report = getHarnessOccupancy(db, 'old')!;
+    expect(report.stations[0]).toMatchObject({ busyMs: 60_000, waitedCardMs: 60_000, overlappedCalls: 0 });
+    expect(report.totalBusyMs).toBe(60_000);
   });
 });
 
@@ -307,7 +457,7 @@ describe('issue #30: conduit run status prints harness occupancy', () => {
     expect(await main(['run', 'status', '--run', 'job-h'], deps(lines))).toBe(0);
     expect(lines[0]).toBe('run job-h: terminal (outcome=complete)');
     expect(lines.slice(1)).toEqual([
-      'harness occupancy (serial under any --concurrency; run wall clock 80.0s):',
+      'harness occupancy (run wall clock 80.0s):',
       '  research: 1 maker + 0 critic call(s), busy 40.0s (50.0% of wall clock), other ready cards waited 40.0 card-s',
       '  total: busy 40.0s (50.0% of wall clock)',
     ]);

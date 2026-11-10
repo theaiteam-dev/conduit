@@ -16,6 +16,7 @@
 
 import { lstatSync, realpathSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
+import { lexBashCommand } from './bash-lexer';
 import { checkCommandAllowed } from './deterministic';
 import { isContainedIn, resolveOwnedPath } from './integrity';
 
@@ -25,7 +26,7 @@ export type GateDenyCode =
   | 'tool_not_allowed'
   /** Bash: the executable is not on the positive allowlist. */
   | 'not_allowlisted'
-  /** Bash: the command string carries a shell metacharacter. */
+  /** Bash: the command uses shell syntax the gate does not accept (see bash-lexer.ts), or a program word that is quoted or an assignment. */
   | 'shell_metacharacter'
   /** A write resolves outside the card's owned paths (symlinks resolved). */
   | 'path_escape'
@@ -36,7 +37,19 @@ export type GateDenyCode =
   /** The gate itself threw or returned garbage. Always a deny. */
   | 'gate_error'
   /** The tool asks a human (AskUserQuestion). Held, never auto-answered. */
-  | 'needs_human';
+  | 'needs_human'
+  /**
+   * The input that ran differs from the input the gate approved: another
+   * PreToolUse hook rewrote it. Never returned by the gate. The agent-sdk
+   * adapter detects it after the call ran and holds (issue #109).
+   */
+  | 'input_rewritten'
+  /**
+   * The CLI ran a different agent than the one the kernel resolved and hashed.
+   * Never returned by the gate. The agent-sdk adapter detects it from the init
+   * message or a main-thread call's `agent_type` and holds (issue #109).
+   */
+  | 'agent_not_loaded';
 
 /** One tool call, as the harness is about to run it. */
 export interface GateToolCall {
@@ -83,8 +96,8 @@ export interface HarnessGateConfig {
   /**
    * The card's owned paths. Write, Edit and NotebookEdit inputs must resolve
    * inside them. Absent: owned paths are not enforced for this flow
-   * (`defaults.enforce_owned_paths` is off), and write paths are not checked.
-   * Present and empty: every write is denied.
+   * (`defaults.enforce_owned_paths` is off), and write paths must resolve
+   * inside the project root instead. Present and empty: every write is denied.
    */
   ownedPaths?: readonly string[];
 }
@@ -145,22 +158,55 @@ function parseTools(tools: readonly string[]): ParsedTools {
   return { names, bashExecutables };
 }
 
+/**
+ * The built-in tool names a station's `tools` list lets the gate allow: the
+ * names the gate's allowlist check accepts, without MCP tools (`mcp__*`),
+ * which come from MCP servers rather than the built-in set. An adapter offers
+ * the model only these, so it is never shown a built-in the gate would refuse.
+ */
+export function gateBuiltinToolNames(tools: readonly string[]): string[] {
+  return [...parseTools(tools).names].filter((name) => !name.startsWith('mcp__'));
+}
+
+/**
+ * Decide a Bash call. The command runs in a shell, so it is read by
+ * `lexBashCommand`, which accepts plain words, literal quoting and a pipe
+ * between programs, and refuses every other construct: separators, redirects,
+ * expansions, globs and control characters. Every segment's program must be an
+ * unquoted word, not an assignment, and on the allowlist.
+ *
+ * Checks run in two passes so the verdict reveals nothing about the allowlist
+ * when the syntax is refused: first the whole command's syntax and every
+ * program word's shape, then each program against the allowlist.
+ *
+ * Arguments are not checked. An allowlisted program that runs code or writes
+ * files from its arguments (`sh`, `xargs`, `tee`, `curl -o`, ...) does so; the
+ * MARK_DONE integrity check is the backstop for such a write.
+ */
 function checkBash(input: unknown, executables: readonly string[]): GateDecision {
   const command = (input as { command?: unknown } | null | undefined)?.command;
   if (typeof command !== 'string') return deny('malformed_input', 'Bash input has no string command');
-  // Split on plain spaces only. Newline, tab and every other separator stay
-  // inside a token, where the metacharacter check refuses them.
-  const tokens = command.split(' ').filter((t) => t !== '');
-  if (tokens.length === 0) return deny('malformed_input', 'Bash command is empty');
-  const verdict = checkCommandAllowed(
-    { command: tokens[0], args: tokens.slice(1) },
-    { allowlist: executables },
-  );
-  if (verdict.allowed) return { decision: 'allow' };
-  if (verdict.reason === 'shell_metacharacter') {
-    return deny('shell_metacharacter', 'Bash command contains a shell metacharacter');
+  const lexed = lexBashCommand(command);
+  if (!lexed.ok) return deny(lexed.kind === 'empty' ? 'malformed_input' : 'shell_metacharacter', lexed.reason);
+
+  const programs = lexed.segments.map((segment) => segment[0]!);
+  for (const program of programs) {
+    if (program.quoted) return deny('shell_metacharacter', 'Bash program name must be an unquoted word');
+    if (program.text.includes('=')) {
+      return deny('shell_metacharacter', 'Bash command starts with a variable assignment, which is not allowed');
+    }
   }
-  return deny('not_allowlisted', `Bash executable ${JSON.stringify(tokens[0])} is not allowlisted`);
+  for (const program of programs) {
+    // The program check is the deterministic rule's, unchanged: safe
+    // characters, then an exact match against the allowlist.
+    const verdict = checkCommandAllowed({ command: program.text, args: [] }, { allowlist: executables });
+    if (verdict.allowed) continue;
+    if (verdict.reason === 'shell_metacharacter') {
+      return deny('shell_metacharacter', 'Bash program name contains a shell metacharacter');
+    }
+    return deny('not_allowlisted', `Bash executable ${JSON.stringify(program.text.slice(0, 64))} is not allowlisted`);
+  }
+  return { decision: 'allow' };
 }
 
 /**
@@ -188,24 +234,25 @@ function hasDanglingSymlink(abs: string): boolean {
   }
 }
 
-function checkWritePath(
-  toolName: string,
-  input: unknown,
-  projectRoot: string,
-  canonicalOwned: readonly string[] | undefined,
-): GateDecision {
+/** Where a write may land: the card's owned paths, or the whole project root when they are not enforced. */
+interface WriteBoundary {
+  roots: readonly string[];
+  /** Ends the deny reason: "the owned paths" or "the project root". */
+  label: string;
+}
+
+function checkWritePath(toolName: string, input: unknown, projectRoot: string, boundary: WriteBoundary): GateDecision {
   const fields = input as { file_path?: unknown; notebook_path?: unknown } | null | undefined;
   const path = toolName === 'NotebookEdit' ? fields?.notebook_path : fields?.file_path;
   if (typeof path !== 'string' || path === '' || path.includes('\0')) {
     return deny('malformed_input', `${toolName} input has no usable path`);
   }
-  if (canonicalOwned === undefined) return { decision: 'allow' };
 
   const abs = resolve(projectRoot, path);
-  const escape = deny('path_escape', `${toolName} path ${JSON.stringify(path.slice(0, 120))} is outside the owned paths`);
+  const escape = deny('path_escape', `${toolName} path ${JSON.stringify(path.slice(0, 120))} is outside ${boundary.label}`);
   if (hasDanglingSymlink(abs)) return escape;
   const target = resolveOwnedPath(abs);
-  const inside = canonicalOwned.some((owned) => isContainedIn(target, owned));
+  const inside = boundary.roots.some((root) => isContainedIn(target, root));
   return inside ? { decision: 'allow' } : escape;
 }
 
@@ -218,8 +265,10 @@ function checkWritePath(
  *
  * Owned paths are canonicalized once here, at build time, so a call resolves
  * only its own candidate path. A symlink re-pointed after the gate is built
- * does not move the owned boundary. Absent `ownedPaths` stays absent (not
- * enforced) and an empty array stays empty (every write denied).
+ * does not move the owned boundary. Absent `ownedPaths` (ownership not
+ * enforced) confines writes to the canonical project root, since a flow that
+ * does not enforce ownership has still not granted the host, and an empty
+ * array stays empty (every write denied).
  *
  * Reads are not confined to the project root here. Write ownership, the Bash
  * allowlist and the tool allowlist are enforced; read confinement is a later
@@ -227,7 +276,13 @@ function checkWritePath(
  */
 export function createHarnessToolGate(config: HarnessGateConfig): HarnessToolGate {
   const { names, bashExecutables } = parseTools(config.tools);
-  const canonicalOwned = config.ownedPaths?.map((owned) => resolveOwnedPath(resolve(config.projectRoot, owned)));
+  const writeBoundary: WriteBoundary =
+    config.ownedPaths === undefined
+      ? { roots: [resolveOwnedPath(resolve(config.projectRoot))], label: 'the project root' }
+      : {
+          roots: config.ownedPaths.map((owned) => resolveOwnedPath(resolve(config.projectRoot, owned))),
+          label: 'the owned paths',
+        };
   return (call) => {
     try {
       const toolName: unknown = call.toolName;
@@ -243,7 +298,7 @@ export function createHarnessToolGate(config: HarnessGateConfig): HarnessToolGat
       }
       if (toolName === 'Bash') return checkBash(call.input, bashExecutables);
       if (WRITE_TOOLS.has(toolName)) {
-        return checkWritePath(toolName, call.input, config.projectRoot, canonicalOwned);
+        return checkWritePath(toolName, call.input, config.projectRoot, writeBoundary);
       }
       return { decision: 'allow' };
     } catch {

@@ -24,7 +24,7 @@
  *   export interface ProposedChild { id: string; depends_on: string[]; owned_paths: string[] }
  *   export interface ArchitectProposal { children: ProposedChild[] }
  *   export interface ValidatedChild { id: string; depends_on: string[]; owned_paths: string[] }
- *   export interface ExpandOptions { onPathConflict: 'reject' | 'serialize' }
+ *   export interface ExpandOptions { onPathConflict: 'reject' | 'serialize'; projectRoot: string }
  *
  *   export type ExpansionError =
  *     | { code: 'dependency_cycle'; cycle: string[] }
@@ -52,7 +52,7 @@
  *   export interface FanInState { childIds: string[]; terminalOutcomes: Array<{ id: string; lane: string }> }
  *   export type FanInDecision =
  *     | { action: 'proceed'; dropped: string[] }
- *     | { action: 'hold_parent'; reason: 'child_scrapped' | 'quorum_unmet' }
+ *     | { action: 'hold_parent'; reason: 'child_scrapped' | 'child_held' | 'quorum_unmet' }
  *     | { action: 'wait' };
  *   export function evaluateFanIn(policy: FanInPolicy, state: FanInState): FanInDecision;
  *
@@ -61,6 +61,9 @@
  * while commitFanOut persists parent_id + owned_paths via ConduitDB.insertCard.
  * REUSE findCycleNodes — do NOT reimplement a separate DFS.
  */
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import type { Card } from '../types/kernel';
 import { openConduitDB, type ConduitDB, DEFAULT_RUN_ID } from '../persistence/db';
@@ -81,16 +84,25 @@ import type {
   FanInPolicy,
 } from './expand';
 
+/**
+ * The project root commitFanOut confines owned_paths to; these proposals use
+ * relative paths. A fresh dir per test, so nothing left in the shared temp
+ * root can change how a path canonicalizes.
+ */
+let FANOUT_PROJECT_ROOT: string;
+
 const TERMINAL = ['done', 'scrap', 'hold'] as const;
 
 let db: ConduitDB;
 
 beforeEach(() => {
   db = openConduitDB({ stateDbPath: ':memory:', journalDbPath: ':memory:' });
+  FANOUT_PROJECT_ROOT = mkdtempSync(join(tmpdir(), 'conduit-fanout-'));
 });
 
 afterEach(() => {
   db.close();
+  rmSync(FANOUT_PROJECT_ROOT, { recursive: true, force: true });
 });
 
 function parentCard(id: string): Card {
@@ -123,7 +135,7 @@ describe('commitFanOut (AC1)', () => {
   it('persists N child cards with parent_id set and surfaces their depends_on edges', () => {
     db.insertCard(parentCard('epic'));
 
-    const result = expectOk(commitFanOut(db, DEFAULT_RUN_ID, 'epic', proposal, { onPathConflict: 'reject' }));
+    const result = expectOk(commitFanOut(db, DEFAULT_RUN_ID, 'epic', proposal, { onPathConflict: 'reject', projectRoot: FANOUT_PROJECT_ROOT }));
 
     // The returned child set carries the proposed depends_on edges.
     expect(result.children.map((c) => c.id)).toEqual(['c1', 'c2', 'c3']);
@@ -150,7 +162,7 @@ describe('commitFanOut child-id collision', () => {
     expectOk(
       commitFanOut(db, DEFAULT_RUN_ID, 'entry-pass1', {
         children: [{ id: 'c1', depends_on: [], owned_paths: ['out/c1.json'] }],
-      }, { onPathConflict: 'reject' }),
+      }, { onPathConflict: 'reject', projectRoot: FANOUT_PROJECT_ROOT }),
     );
     db.insertCard(parentCard('entry-pass2'));
 
@@ -160,7 +172,7 @@ describe('commitFanOut child-id collision', () => {
           { id: 'c0', depends_on: [], owned_paths: ['out/c0.json'] },
           { id: 'c1', depends_on: [], owned_paths: ['out/c1.json'] },
         ],
-      }, { onPathConflict: 'reject' }),
+      }, { onPathConflict: 'reject', projectRoot: FANOUT_PROJECT_ROOT }),
     );
 
     expect(err.error).toEqual({ code: 'child_id_collision', child: 'c1', owner: 'entry-pass1' });
@@ -174,7 +186,7 @@ describe('commitFanOut child-id collision', () => {
     const err = expectErr(
       commitFanOut(db, DEFAULT_RUN_ID, 'entry-pass2', {
         children: [{ id: 'entry-pass1', depends_on: [], owned_paths: ['out/x.json'] }],
-      }, { onPathConflict: 'reject' }),
+      }, { onPathConflict: 'reject', projectRoot: FANOUT_PROJECT_ROOT }),
     );
     expect(err.error.code).toBe('child_id_collision');
   });
@@ -183,8 +195,8 @@ describe('commitFanOut child-id collision', () => {
     db.insertCard({ ...parentCard('p'), run_id: 'run-a' });
     db.insertCard({ ...parentCard('p'), run_id: 'run-b' });
     const proposal = { children: [{ id: 'c1', depends_on: [], owned_paths: ['out/c1.json'] }] };
-    expectOk(commitFanOut(db, 'run-a', 'p', proposal, { onPathConflict: 'reject' }));
-    expectOk(commitFanOut(db, 'run-b', 'p', proposal, { onPathConflict: 'reject' }));
+    expectOk(commitFanOut(db, 'run-a', 'p', proposal, { onPathConflict: 'reject', projectRoot: FANOUT_PROJECT_ROOT }));
+    expectOk(commitFanOut(db, 'run-b', 'p', proposal, { onPathConflict: 'reject', projectRoot: FANOUT_PROJECT_ROOT }));
   });
 
   // Two children in the same proposal sharing an id both
@@ -202,7 +214,7 @@ describe('commitFanOut child-id collision', () => {
             { id: 'c1', depends_on: [], owned_paths: ['out/c1-dup.json'] },
           ],
         },
-        { onPathConflict: 'reject' },
+        { onPathConflict: 'reject', projectRoot: FANOUT_PROJECT_ROOT },
       ),
     );
     expect(err.error).toEqual({ code: 'child_id_collision', child: 'c1', owner: null });
@@ -217,7 +229,7 @@ describe('commitFanOut child-id collision', () => {
           { id: 'c1', depends_on: [], owned_paths: ['out/c1.json'] },
           { id: 'c1', depends_on: [], owned_paths: ['out/c1-dup.json'] },
         ],
-      }, { onPathConflict: 'reject' }),
+      }, { onPathConflict: 'reject', projectRoot: FANOUT_PROJECT_ROOT }),
     );
 
     expect(err.error).toEqual({ code: 'child_id_collision', child: 'c1', owner: null });
@@ -238,7 +250,7 @@ describe('cycle detection (AC2)', () => {
   };
 
   it('rejects a proposal whose depends_on contains a cycle, naming the cycle', () => {
-    const err = expectErr(validateExpansion(cyclic, { onPathConflict: 'reject' })).error;
+    const err = expectErr(validateExpansion(cyclic, { onPathConflict: 'reject', projectRoot: FANOUT_PROJECT_ROOT })).error;
     expect(err.code).toBe('dependency_cycle');
     if (err.code !== 'dependency_cycle') throw new Error('unreachable');
     expect(new Set(err.cycle)).toEqual(new Set(['a', 'b']));
@@ -246,7 +258,7 @@ describe('cycle detection (AC2)', () => {
 
   it('commits NO child cards when the proposal is cyclic', () => {
     db.insertCard(parentCard('epic'));
-    expectErr(commitFanOut(db, DEFAULT_RUN_ID, 'epic', cyclic, { onPathConflict: 'reject' }));
+    expectErr(commitFanOut(db, DEFAULT_RUN_ID, 'epic', cyclic, { onPathConflict: 'reject', projectRoot: FANOUT_PROJECT_ROOT }));
 
     expect(db.getCard(DEFAULT_RUN_ID, 'a')).toBeNull();
     expect(db.getCard(DEFAULT_RUN_ID, 'b')).toBeNull();
@@ -265,7 +277,7 @@ describe('dangling depends_on detection (#13)', () => {
         { id: 'c2', depends_on: ['ghost'], owned_paths: ['out/c2'] },
       ],
     };
-    const err = expectErr(validateExpansion(proposal, { onPathConflict: 'reject' })).error;
+    const err = expectErr(validateExpansion(proposal, { onPathConflict: 'reject', projectRoot: FANOUT_PROJECT_ROOT })).error;
     expect(err.code).toBe('unknown_dependency');
     if (err.code !== 'unknown_dependency') throw new Error('unreachable');
     expect(err.child).toBe('c2');
@@ -279,7 +291,7 @@ describe('dangling depends_on detection (#13)', () => {
         { id: 'c1', depends_on: ['ghost'], owned_paths: ['out/c1'] },
       ],
     };
-    expectErr(commitFanOut(db, DEFAULT_RUN_ID, 'epic', proposal, { onPathConflict: 'reject' }));
+    expectErr(commitFanOut(db, DEFAULT_RUN_ID, 'epic', proposal, { onPathConflict: 'reject', projectRoot: FANOUT_PROJECT_ROOT }));
     expect(db.getCard(DEFAULT_RUN_ID, 'c1')).toBeNull();
   });
 
@@ -290,7 +302,7 @@ describe('dangling depends_on detection (#13)', () => {
         { id: 'c2', depends_on: ['c1'], owned_paths: ['out/c2'] },
       ],
     };
-    expect(validateExpansion(proposal, { onPathConflict: 'reject' }).ok).toBe(true);
+    expect(validateExpansion(proposal, { onPathConflict: 'reject', projectRoot: FANOUT_PROJECT_ROOT }).ok).toBe(true);
   });
 });
 
@@ -334,7 +346,7 @@ describe('disjoint-ownership invariant (AC4)', () => {
   };
 
   it('rejects overlapping owned_paths when onPathConflict=reject, naming the two stations and the path', () => {
-    const err = expectErr(validateExpansion(conflicting, { onPathConflict: 'reject' })).error;
+    const err = expectErr(validateExpansion(conflicting, { onPathConflict: 'reject', projectRoot: FANOUT_PROJECT_ROOT })).error;
     expect(err.code).toBe('overlapping_owned_paths');
     if (err.code !== 'overlapping_owned_paths') throw new Error('unreachable');
     expect(new Set(err.stations)).toEqual(new Set(['c1', 'c2']));
@@ -342,7 +354,7 @@ describe('disjoint-ownership invariant (AC4)', () => {
   });
 
   it('forces a depends_on serialization edge when onPathConflict=serialize', () => {
-    const result = expectOk(validateExpansion(conflicting, { onPathConflict: 'serialize' }));
+    const result = expectOk(validateExpansion(conflicting, { onPathConflict: 'serialize', projectRoot: FANOUT_PROJECT_ROOT }));
     // A forced edge now orders the two children so they are no longer concurrent.
     expect(result.forcedEdges).toHaveLength(1);
     const edge = result.forcedEdges[0];
@@ -360,7 +372,7 @@ describe('disjoint-ownership invariant (AC4)', () => {
       ],
     };
     // Not concurrently eligible → no conflict.
-    expect(validateExpansion(ordered, { onPathConflict: 'reject' }).ok).toBe(true);
+    expect(validateExpansion(ordered, { onPathConflict: 'reject', projectRoot: FANOUT_PROJECT_ROOT }).ok).toBe(true);
   });
 });
 
@@ -382,6 +394,16 @@ describe('evaluateFanIn — policy=all (AC5)', () => {
   it('waits while not all children are terminal yet', () => {
     const state = { childIds: ['a', 'b'], terminalOutcomes: [{ id: 'a', lane: 'done' }] };
     expect(evaluateFanIn({ kind: 'all' }, state)).toEqual({ action: 'wait' });
+  });
+
+  it('holds the parent (child_held) when a child is in the hold lane', () => {
+    const state = { childIds: ['a', 'b'], terminalOutcomes: [{ id: 'a', lane: 'done' }, { id: 'b', lane: 'hold' }] };
+    expect(evaluateFanIn({ kind: 'all' }, state)).toEqual({ action: 'hold_parent', reason: 'child_held' });
+  });
+
+  it('reports child_scrapped when one child scrapped and another is held', () => {
+    const state = { childIds: ['a', 'b'], terminalOutcomes: [{ id: 'a', lane: 'scrap' }, { id: 'b', lane: 'hold' }] };
+    expect(evaluateFanIn({ kind: 'all' }, state)).toEqual({ action: 'hold_parent', reason: 'child_scrapped' });
   });
 });
 
@@ -447,6 +469,59 @@ describe('evaluateFanIn — policy=quorum(k count) (AC5, AC6)', () => {
       terminalOutcomes: [{ id: 'a', lane: 'done' }, { id: 'b', lane: 'scrap' }, { id: 'c', lane: 'scrap' }],
     };
     expect(evaluateFanIn(quorum, state)).toEqual({ action: 'hold_parent', reason: 'quorum_unmet' });
+  });
+});
+
+describe('evaluateFanIn — a held child holds the parent under every policy', () => {
+  it('quorum: holds the parent (child_held) even when the quorum is met without the held child', () => {
+    const state = {
+      childIds: ['a', 'b', 'c'],
+      terminalOutcomes: [{ id: 'a', lane: 'done' }, { id: 'b', lane: 'done' }, { id: 'c', lane: 'hold' }],
+    };
+    expect(evaluateFanIn({ kind: 'quorum', k: 2 }, state)).toEqual({ action: 'hold_parent', reason: 'child_held' });
+  });
+
+  it('quorum: reports child_held, not quorum_unmet, when the held child was needed for the quorum', () => {
+    const state = {
+      childIds: ['a', 'b'],
+      terminalOutcomes: [{ id: 'a', lane: 'done' }, { id: 'b', lane: 'hold' }],
+    };
+    expect(evaluateFanIn({ kind: 'quorum', k: 2 }, state)).toEqual({ action: 'hold_parent', reason: 'child_held' });
+  });
+
+  it('best_effort: holds the parent (child_held)', () => {
+    const state = {
+      childIds: ['a', 'b'],
+      terminalOutcomes: [{ id: 'a', lane: 'done' }, { id: 'b', lane: 'hold' }],
+    };
+    expect(evaluateFanIn({ kind: 'best_effort' }, state)).toEqual({ action: 'hold_parent', reason: 'child_held' });
+  });
+
+  it('quorum and best_effort hold as soon as a held child is seen, without waiting for in-flight siblings', () => {
+    const state = {
+      childIds: ['a', 'b', 'c'],
+      terminalOutcomes: [{ id: 'a', lane: 'done' }, { id: 'b', lane: 'hold' }],
+    };
+    expect(evaluateFanIn({ kind: 'quorum', k: 2 }, state)).toEqual({ action: 'hold_parent', reason: 'child_held' });
+    expect(evaluateFanIn({ kind: 'best_effort' }, state)).toEqual({ action: 'hold_parent', reason: 'child_held' });
+  });
+
+  it('quorum and best_effort still proceed with a scrapped child dropped when none is held', () => {
+    const state = {
+      childIds: ['a', 'b', 'c'],
+      terminalOutcomes: [{ id: 'a', lane: 'done' }, { id: 'b', lane: 'done' }, { id: 'c', lane: 'scrap' }],
+    };
+    expect(evaluateFanIn({ kind: 'quorum', k: 2 }, state)).toEqual({ action: 'proceed', dropped: ['c'] });
+    expect(evaluateFanIn({ kind: 'best_effort' }, state)).toEqual({ action: 'proceed', dropped: ['c'] });
+  });
+
+  it('quorum and best_effort hold on a held child even when another child is scrapped', () => {
+    const state = {
+      childIds: ['a', 'b', 'c'],
+      terminalOutcomes: [{ id: 'a', lane: 'done' }, { id: 'b', lane: 'scrap' }, { id: 'c', lane: 'hold' }],
+    };
+    expect(evaluateFanIn({ kind: 'quorum', k: 1 }, state)).toEqual({ action: 'hold_parent', reason: 'child_held' });
+    expect(evaluateFanIn({ kind: 'best_effort' }, state)).toEqual({ action: 'hold_parent', reason: 'child_held' });
   });
 });
 

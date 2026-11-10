@@ -59,7 +59,9 @@ runs the same check as an advisory `docs` job.
    gate, and `--list` explains each site. If you move or rename a fold site,
    update the manifest in `scripts/mutation-check.ts` in the same change — a
    stale entry fails the check rather than skipping it.
-7. Update documentation and `CHANGELOG.md` when behavior changes.
+7. Update documentation and `CHANGELOG.md` when behavior changes. Add entries
+   under `## [Unreleased]`; maintainers cut releases from it as described in
+   [docs/releasing.md](docs/releasing.md).
 8. If `drift check` reports a stale anchor, re-read the section it names and
    either correct the prose or re-stamp it with
    `drift link <doc> --doc-is-still-accurate`. Re-stamping asserts you read it.

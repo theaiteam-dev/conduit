@@ -28,7 +28,9 @@
  * --------------
  * Not a general mutation-testing run (no operator zoo, no mutation score, no
  * whole-file coverage). The manifest is hand-written and deliberately small:
- * five lines that move money into a budget. A broad mutation run over this
+ * five lines that move money into a budget, plus the one line that decides
+ * the figure a Claude harness fold receives (issue #108) and the sum that
+ * counts a transform call's cache reads (issue #156). A broad mutation run over this
  * codebase would take a long time and produce mostly equivalent mutants, which
  * is how a check earns a permanent skip. This one runs in seconds and every
  * failure is actionable.
@@ -132,6 +134,9 @@ const MUTANTS: Mutant[] = [
       'src/controller/executor-harness-journal.test.ts',
       'src/controller/executor-harness.test.ts',
       'src/controller/executor-harness-liveness.test.ts',
+      // Issue #30: the same fold under an overlap batch, where it must also
+      // credit the right card (the wave budget scraps only the costly subtree).
+      'src/controller/executor-harness-overlap.test.ts',
     ],
     why:
       'the ordinary successful harness maker call — the single largest line ' +
@@ -146,6 +151,39 @@ const MUTANTS: Mutant[] = [
     why:
       "a child subflow's entire rolled-up spend is invisible to the parent " +
       'run, so a parent budget bounds only the work it does directly (FR-18).',
+  },
+  {
+    // Not a fold site: the line that decides the figure every Claude harness
+    // fold receives. Without it the count falls back to the last result's
+    // `usage`, which breaks no type and no journal row (issue #108).
+    id: 'claude-model-usage-sum',
+    file: 'src/worker/harness-events-claude.ts',
+    find: 'if (usable) return sum;',
+    replace: '/* MUTATION-CHECK: modelUsage sum deleted */',
+    guards: [
+      'src/controller/executor-harness-claude-usage.test.ts',
+      'src/worker/harness-adapter-claude.test.ts',
+      'src/worker/harness-events-claude.test.ts',
+    ],
+    why:
+      'a Claude harness call that ran a background subagent, or billed the ' +
+      'side-task model, reaches the run and wave budgets at the last result ' +
+      "message's `usage`, which can be a quarter of the session's tokens.",
+  },
+  {
+    // Not a fold site: the sum trackingAdapter adds to tokensSpent for every
+    // transform call. With a cache split, `inputTokens` is uncached input, so
+    // dropping the cache term breaks no type and no journal row (the span
+    // still records the column) and only the budget comes out low (issue #156).
+    id: 'transform-cache-read-sum',
+    file: 'src/worker/adapter.ts',
+    find: 'return response.inputTokens + (response.cacheReadInputTokens ?? 0) + response.outputTokens;',
+    replace: 'return response.inputTokens + response.outputTokens; /* MUTATION-CHECK: cache term deleted */',
+    guards: ['src/controller/executor-transform-cache.test.ts'],
+    why:
+      'a transform call against a provider that reports cache reads reaches ' +
+      'the run and wave budgets without them, which on a cached prompt is ' +
+      'most of its input.',
   },
 ];
 

@@ -41,7 +41,7 @@
 import { createHash } from 'node:crypto';
 import type { StationOutput } from '../types/kernel';
 import type { ConduitDB, JournalProvenance } from '../persistence/db';
-import type { ModelAdapter, ModelResponse } from './adapter';
+import { modelResponseTokens, type ModelAdapter, type ModelResponse } from './adapter';
 import type { ImageInput } from './image-input';
 
 // ---------------------------------------------------------------------------
@@ -106,6 +106,14 @@ export type TransformResult<T> =
       status: 'scrapped';
       reason: 'model-incompatible' | 'vision-unsupported' | 'output-truncated';
       attempts: number;
+      /**
+       * Issue #42: on a `model-incompatible` scrap, the schema validator's
+       * error for the most recent response that parsed. Absent when no
+       * response parsed. The transform gate critic names its scrap from it.
+       * Untrusted: a validator error may quote model output, so a consumer
+       * that journals or prints it must allowlist it first.
+       */
+      validationError?: string;
     };
 
 // ---------------------------------------------------------------------------
@@ -336,12 +344,16 @@ export function computeFindingsHash(payload: unknown): string {
  *   4. Validate against the station output schema.
  *   5. On success: return the StationOutput wrapped in TransformResult.
  *   6. On parse/validate failure: retry if under the execution-attempt cap.
- *   7. On cap exhaustion: scrap with reason 'model-incompatible'.
+ *   7. On cap exhaustion: scrap with reason 'model-incompatible', carrying
+ *      the most recent validation error when a response parsed (issue #42).
  */
 export async function runTransformStation<T>(
   ctx: TransformContext<T>,
 ): Promise<TransformResult<T>> {
   let callsMade = 0;
+  // Issue #42: the validator error of the most recent response that parsed,
+  // reported on the model-incompatible scrap.
+  let validationError: string | undefined;
 
   // Transport-level parse/validate retry. Bounded by the SAME durable budget
   // value (ctx.maxExecutionAttempts) so it cannot out-spend the Guard-2 cap; the
@@ -395,6 +407,11 @@ export async function runTransformStation<T>(
         inputTokens: response.inputTokens,
         outputTokens: response.outputTokens,
         costUsd: response.costUsd,
+        // Issue #156: with a split, inputTokens is uncached input and the cache
+        // reads go in their own column. No split leaves the column NULL.
+        ...(response.cacheReadInputTokens !== undefined && {
+          cacheReadInputTokens: response.cacheReadInputTokens,
+        }),
       },
     });
 
@@ -405,22 +422,28 @@ export async function runTransformStation<T>(
     // reasoning output it prefers the LAST embedded object — the answer — while
     // still falling back to an earlier object if the trailing one is not schema-
     // valid. A candidate that fails validation is skipped, not scrapped.
+    // The first (highest-priority) candidate's error is the one kept for this
+    // response, since that candidate is the one the model most likely meant.
+    let responseError: string | undefined;
     for (const candidate of coerciveParseCandidates(response.text)) {
       const validated = ctx.schema.validate(candidate);
-      if (validated.ok) {
+      if (!validated.ok) {
+        responseError ??= validated.error;
+      } else {
         const payload = validated.value;
         const output: StationOutput<T> = {
           payload,
           findings_hash: computeFindingsHash(payload),
           return_to: null, // transform maker always proceeds — no back-edge
           usage: {
-            tokens: response.inputTokens + response.outputTokens,
+            tokens: modelResponseTokens(response),
             cost: response.costUsd,
           },
         };
         return { status: 'complete', output, attempts: callsMade };
       }
     }
+    if (responseError !== undefined) validationError = responseError;
 
     // ── Truncation fast-scrap (the original reasoning-response parsing work review) ─────────────────────────────
     // finish_reason === 'length' with NO recoverable schema-valid answer means
@@ -444,5 +467,6 @@ export async function runTransformStation<T>(
     status: 'scrapped',
     reason: 'model-incompatible',
     attempts: callsMade,
+    ...(validationError !== undefined ? { validationError } : {}),
   };
 }

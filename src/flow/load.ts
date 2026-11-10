@@ -47,6 +47,8 @@ import type {
 } from '../types/kernel';
 import { findCycleNodes } from './dag-utils';
 import { FEEDBACK_INPUT } from './render';
+import { harnessOutputInputOverlap } from './resolve-output';
+import { flowHarnesses } from './station-harnesses';
 import { resolveSkill, type ResolveSkillResult } from '../skills/resolve';
 import type { ParsedSkill } from '../skills/parse';
 import { detectExecutionSurface, type ExecutionSurfaceWarning } from '../skills/detect-surface';
@@ -198,6 +200,11 @@ interface RawStation {
   effectful?: boolean;
   /** Untrusted: validated to an integer >= 1 in collectErrors. */
   wip?: unknown;
+  /**
+   * Issue #30, ADR-0012: opt a harness station in to overlapping calls under
+   * `--concurrency`. Untrusted: validated by validateOverlap in collectErrors.
+   */
+  overlap?: unknown;
   inputs?: string[];
   outputs?: string[];
   check?: RawCheckConfig;
@@ -387,6 +394,12 @@ function buildStationConfig(
     fan_in: buildFanIn(raw.fan_in),
     fan_out: raw.fan_out as number | undefined,
   };
+
+  // Issue #30: validateOverlap has already rejected the key on any station that
+  // is not kind: harness, and every non-boolean value. On a harness station,
+  // `overlap: false` is accepted and, like an absent key, leaves today's config
+  // shape: the field is set only when true.
+  if (raw.overlap === true) config.overlap = true;
 
   // WI-351: real-run config surface (populated when present in the YAML).
   if (raw.next !== undefined) config.next = raw.next;
@@ -774,9 +787,12 @@ function collectErrors(
         });
       }
     }
-    // v10: output_scope — enum-valued, transform-only (the engine only writes
-    // declared outputs for transform stations; deterministic/harness stations
-    // write their own files), and meaningless without declared outputs.
+    // v10: output_scope — enum-valued, and meaningless without declared
+    // outputs. Allowed on the two kinds whose declared outputs the kernel
+    // resolves: a transform (the kernel writes them) and, since issue #98, a
+    // harness (the agent writes them and the kernel collects them). A
+    // deterministic or subflow station's outputs still resolve from the
+    // project root.
     if (station.output_scope !== undefined) {
       if (station.output_scope !== 'project_root' && station.output_scope !== 'owned_dir') {
         errors.push({
@@ -785,13 +801,12 @@ function collectErrors(
             `Station '${station.id}' has invalid output_scope '${String(station.output_scope)}' — ` +
             `must be 'project_root' or 'owned_dir'`,
         });
-      } else if (station.worker?.kind !== 'transform') {
+      } else if (station.worker?.kind !== 'transform' && station.worker?.kind !== 'harness') {
         errors.push({
           code: 'INVALID_OUTPUT_SCOPE',
           message:
             `Station '${station.id}' sets output_scope but its worker kind is ` +
-            `'${String(station.worker?.kind)}' — output_scope applies only to transform stations ` +
-            `(the engine writes declared outputs only for transforms)`,
+            `'${String(station.worker?.kind)}' — output_scope applies only to transform and harness stations`,
         });
       } else if (!Array.isArray(station.outputs) || station.outputs.length === 0) {
         errors.push({
@@ -800,6 +815,30 @@ function collectErrors(
             `Station '${station.id}' sets output_scope but declares no outputs — ` +
             `the scope only governs where declared outputs are written`,
         });
+      } else if (station.worker?.kind === 'harness') {
+        // issue #98: the kernel removes a card-scoped harness output before
+        // every attempt (the freshness rule), so an output that is also a
+        // card-scoped input, or the reserved seed, would be deleted unread.
+        const rawInputScope = station.input_scope as { owned_dir?: unknown } | null | undefined;
+        const ownedDirInputs =
+          rawInputScope !== null && typeof rawInputScope === 'object' && Array.isArray(rawInputScope.owned_dir)
+            ? rawInputScope.owned_dir.filter((n): n is string => typeof n === 'string')
+            : [];
+        const overlap = harnessOutputInputOverlap({
+          outputs: station.outputs.filter((n): n is string => typeof n === 'string'),
+          output_scope: station.output_scope,
+          input_scope: { owned_dir: ownedDirInputs },
+        });
+        if (overlap.length > 0) {
+          errors.push({
+            code: 'INVALID_OUTPUT_SCOPE',
+            message:
+              `Station '${station.id}' declares ${overlap.map((n) => `'${n}'`).join(', ')} as a card-scoped ` +
+              `harness output and a card-scoped input (or the reserved seed). The kernel removes a card-scoped ` +
+              `harness output before each attempt, so the input would be deleted before the agent reads it. ` +
+              `Give the output a different name.`,
+          });
+        }
       }
     }
     // issue #51: input_scope — which declared inputs are READ from the card's
@@ -807,10 +846,9 @@ function collectErrors(
     // surfaces here rather than as a card-scoped read that silently falls back
     // to a project-root file (or an opaque render throw mid-run).
     //
-    // Deliberately NOT transform-only, unlike output_scope: that one is scoped
-    // to transforms because the engine writes declared outputs only for
-    // transforms, but a HARNESS station reads (and mounts) its declared inputs
-    // the same way a transform does, so both kinds may scope them.
+    // Allowed on transform and harness stations, the same kinds as
+    // output_scope: a HARNESS station reads (and mounts) its declared inputs the
+    // same way a transform does, so both kinds may scope them.
     if (station.input_scope !== undefined) {
       const rawScope = station.input_scope;
       const ownedDir =
@@ -1956,6 +1994,79 @@ function collectErrors(
   // ── skip_when predicates (issue #32) ──────────────────────────────────────
   errors.push(...validateSkipWhen(stations));
 
+  // ── overlap: true (issue #30, ADR-0012) ───────────────────────────────────
+  errors.push(...validateOverlap(stations, yaml.defaults?.enforce_owned_paths === true, harnessRegistry));
+
+  return errors;
+}
+
+/**
+ * Validate every station's `overlap` (issue #30, ADR-0012). The static
+ * admission conditions are checked here, so a station that could never overlap
+ * fails at load instead of running serially without notice:
+ *
+ *   - the value is a boolean, and the station is `kind: harness`;
+ *   - for `overlap: true`: no `check:` block (this covers `rank`), not
+ *     effectful, not a fan-out station (any fan-out field declared), no
+ *     `deliver:` block, and the flow sets `defaults.enforce_owned_paths: true`,
+ *     so the per-call gate confines file-tool writes to the card's owned paths;
+ *   - with a registry injected, the adapter has `canGatePerCall`. Without one
+ *     the executor re-checks the adapter at dispatch and runs a card whose
+ *     adapter cannot gate per call on the serial path.
+ */
+function validateOverlap(
+  stations: readonly RawStation[],
+  enforceOwnedPaths: boolean,
+  harnessRegistry?: HarnessRegistry,
+): FlowValidationError[] {
+  const errors: FlowValidationError[] = [];
+  for (const station of stations) {
+    if (station.overlap === undefined) continue;
+    const reject = (why: string): void => {
+      errors.push({ code: 'INVALID_OVERLAP', message: `Station '${station.id}' sets overlap but ${why}` });
+    };
+    if (typeof station.overlap !== 'boolean') {
+      reject(`its value '${String(station.overlap)}' is not true or false`);
+      continue;
+    }
+    if (resolveStationKind(station) !== 'harness') {
+      reject(
+        `is kind=${String(station.worker?.kind ?? 'transform')}; overlap applies only to a kind: harness station ` +
+          `(a transform overlaps under --concurrency without declaring anything)`,
+      );
+      continue;
+    }
+    if (station.overlap !== true) continue;
+    if (station.check !== undefined) {
+      reject('declares a check: block; a gated harness station runs one card at a time (ADR-0012)');
+    }
+    if (station.effectful === true) {
+      reject('is effectful; an effectful station runs one card at a time');
+    }
+    if (station.fan_out !== undefined || station.child_entry !== undefined) {
+      reject('is a fan-out station; set overlap on the station its children run at instead');
+    }
+    if (station.deliver !== undefined) {
+      reject('declares a deliver: block; a delivering station runs one card at a time');
+    }
+    if (!enforceOwnedPaths) {
+      reject(
+        'the flow does not set defaults.enforce_owned_paths: true; overlapped calls need it so the per-call ' +
+          "gate confines each card's file-tool writes to its own owned_paths",
+      );
+    }
+    const adapterName = station.worker?.harness;
+    if (harnessRegistry !== undefined && adapterName !== undefined) {
+      const resolved = harnessRegistry.resolve(adapterName);
+      // An unresolved adapter is already reported as UNKNOWN_HARNESS_ADAPTER.
+      if (resolved.ok && resolved.adapter.canGatePerCall !== true) {
+        reject(
+          `uses adapter '${resolved.adapter.name}', which cannot gate each tool call; overlap needs an adapter ` +
+            'with canGatePerCall (agent-sdk, codex-app-server or opencode)',
+        );
+      }
+    }
+  }
   return errors;
 }
 
@@ -2481,29 +2592,31 @@ export function loadFlow(
 // ---------------------------------------------------------------------------
 
 /**
- * Probe every `kind: harness` station's configured binary for presence/
- * executability. A SEPARATE async pass over an already-loaded FlowConfig —
- * HarnessAdapter.probeBinary() is async (WI-560) and cannot run inside the
- * synchronous collectErrors/loadFlow. FR-10: caught at load/startup, never at
- * first dispatch. Never invokes the adapter — probe only. Non-harness
- * stations and stations whose adapter is unresolvable (already reported by
- * loadFlow's UNKNOWN_HARNESS_ADAPTER) are skipped.
+ * Probe the configured binary of every harness the flow uses for presence/
+ * executability: each `kind: harness` maker and each `check.critic.harness`
+ * gate critic, whatever the critic's station kind (issue #35; the list comes
+ * from `flowHarnesses`). A SEPARATE async pass over an already-loaded
+ * FlowConfig — HarnessAdapter.probeBinary() is async (WI-560) and cannot run
+ * inside the synchronous collectErrors/loadFlow. FR-10: caught at
+ * load/startup, never at first dispatch. Never invokes the adapter — probe
+ * only. Adapters that do not resolve (already reported by loadFlow's
+ * UNKNOWN_HARNESS_ADAPTER) are skipped.
  */
 export async function probeHarnessBinaries(
   flow: FlowConfig,
   registry: HarnessRegistry,
 ): Promise<FlowValidationError[]> {
   const errors: FlowValidationError[] = [];
-  for (const [stationId, station] of Object.entries(flow.stations)) {
-    if (station.kind !== 'harness' || station.harness === undefined) continue;
-    const resolved = registry.resolve(station.harness);
+  for (const use of flowHarnesses(flow)) {
+    const resolved = registry.resolve(use.adapter);
     if (!resolved.ok) continue;
     const probe = await resolved.adapter.probeBinary();
     if (!probe.present) {
+      const which = use.role === 'critic' ? 'critic harness' : 'harness';
       errors.push({
         code: 'HARNESS_BINARY_NOT_FOUND',
         message:
-          `Station '${stationId}' harness adapter '${resolved.adapter.name}' binary not found` +
+          `Station '${use.stationId}' ${which} adapter '${resolved.adapter.name}' binary not found` +
           (probe.detail !== undefined ? ` at '${probe.detail}'` : ''),
       });
     }

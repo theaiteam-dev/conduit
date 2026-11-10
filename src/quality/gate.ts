@@ -18,7 +18,7 @@ import type { Lane, StationOutput } from '../types/kernel';
 import { DEFAULT_RUN_ID, type ConduitDB } from '../persistence/db';
 import type { ModelAdapter } from '../worker/adapter';
 import { resolveInputPath, SEED_INPUT } from '../flow/resolve-input';
-import { runTransformStation, coerciveParse, type OutputSchema } from '../worker/transform';
+import { runTransformStation, coerciveParse, type OutputSchema, type TransformResult } from '../worker/transform';
 import type { HarnessAdapter, HarnessResult, MountedInput, UsageReport } from '../worker/harness-adapter';
 import type { HarnessEventSink } from '../worker/harness-events';
 import { usageFromThrow } from '../worker/harness-adapter';
@@ -102,9 +102,10 @@ export type GateDecision =
   | { action: 'invalid_verdict'; reason: 'invalid_return_to'; criticUsage?: CriticUsage }
   /**
    * a pre-public engine review (@queso, findings 1 + 2a): `reason` is a NAMED failure class,
-   * not a single catch-all. `runGateCheck` (transform critic) still always
-   * reports the transform convention 'model-incompatible' (SPEC §7 rev-1 H5,
-   * unchanged). `runHarnessGateCheck` (agentic critic) reports one of its own
+   * not a single catch-all. `runGateCheck` (transform critic) reports one of
+   * the `critic-*` reasons in `transformCriticScrapReason` (issue #42); the
+   * maker convention 'model-incompatible' is not used for a critic.
+   * `runHarnessGateCheck` (agentic critic) reports one of its own
    * distinct `harness-critic-*` reasons below, each carrying a `: <detail>`
    * suffix (mirrors the harness MAKER path's `harness-output-invalid: ...`
    * convention in executor.ts) so a failure names its own suspect instead of
@@ -154,20 +155,36 @@ function isRejectWithoutFindings(v: Record<string, unknown>): boolean {
   return v.verdict === 'reject' && (!Array.isArray(v.findings) || v.findings.length === 0);
 }
 
+const EXPECTED_OBJECT_ERROR = 'expected object';
+const VERDICT_VALUE_ERROR = 'verdict must be "pass" or "reject"';
+const FINDINGS_ARRAY_ERROR = 'findings must be an array';
+
+/**
+ * Every error gateCriticSchema returns. transformCriticScrapReason interpolates
+ * a validator error only when it is in this set, so a validator error that
+ * quotes model output cannot reach the journal.
+ */
+const CRITIC_SCHEMA_ERRORS: ReadonlySet<string> = new Set([
+  EXPECTED_OBJECT_ERROR,
+  VERDICT_VALUE_ERROR,
+  REJECT_WITHOUT_FINDINGS_ERROR,
+  FINDINGS_ARRAY_ERROR,
+]);
+
 const gateCriticSchema: OutputSchema<GateCriticVerdict> = {
   validate(value) {
     if (value === null || typeof value !== 'object' || Array.isArray(value)) {
-      return { ok: false, error: 'expected object' };
+      return { ok: false, error: EXPECTED_OBJECT_ERROR };
     }
     const v = value as Record<string, unknown>;
     if (v.verdict !== 'pass' && v.verdict !== 'reject') {
-      return { ok: false, error: 'verdict must be "pass" or "reject"' };
+      return { ok: false, error: VERDICT_VALUE_ERROR };
     }
     if (isRejectWithoutFindings(v)) {
       return { ok: false, error: REJECT_WITHOUT_FINDINGS_ERROR };
     }
     if (!Array.isArray(v.findings)) {
-      return { ok: false, error: 'findings must be an array' };
+      return { ok: false, error: FINDINGS_ARRAY_ERROR };
     }
     return {
       ok: true,
@@ -185,11 +202,56 @@ const gateCriticSchema: OutputSchema<GateCriticVerdict> = {
 // ---------------------------------------------------------------------------
 
 /**
+ * Issue #42: name a transform critic's scrap by its failure class, as the
+ * harness critic does with its `harness-critic-*` reasons, instead of passing
+ * on the maker convention `model-incompatible`:
+ *
+ *   - `critic-reject-without-findings: <REJECT_WITHOUT_FINDINGS_ERROR>`: a
+ *     reject verdict with missing or empty findings
+ *   - `critic-verdict-invalid: <validator error>`: no attempt passed the
+ *     schema and at least one parsed. The error is the one from the last
+ *     attempt that parsed, so a parsed-but-invalid attempt followed by an
+ *     unparseable one still reports this reason with the earlier error. An
+ *     error outside CRITIC_SCHEMA_ERRORS gives a bare `critic-verdict-invalid`
+ *   - `critic-verdict-unparseable`: no attempt produced parseable JSON
+ *   - `critic-output-truncated`: finish_reason `length` with no valid verdict
+ *   - `critic-vision-unsupported`: the adapter refused image input
+ *
+ * The `harness-critic-` prefix stays distinct, so the journal tells the two
+ * critic kinds apart.
+ *
+ * The reason is journaled and printed by `conduit run` and `journal inspect`,
+ * so it must carry no model output. TransformResult.validationError is
+ * untrusted; only an error in the CRITIC_SCHEMA_ERRORS allowlist is
+ * interpolated. gate-transform-scrap-reason.test.ts pins this. Exported for
+ * that test.
+ */
+export function transformCriticScrapReason(
+  result: Extract<TransformResult<GateCriticVerdict>, { status: 'scrapped' }>,
+): string {
+  // No default branch on purpose: with a `string` return type, a reason added
+  // to TransformResult that has no case here fails tsc with TS2366.
+  switch (result.reason) {
+    case 'output-truncated':
+      return 'critic-output-truncated';
+    case 'vision-unsupported':
+      return 'critic-vision-unsupported';
+    case 'model-incompatible':
+      if (result.validationError === undefined) return 'critic-verdict-unparseable';
+      if (result.validationError === REJECT_WITHOUT_FINDINGS_ERROR) {
+        return `critic-reject-without-findings: ${REJECT_WITHOUT_FINDINGS_ERROR}`;
+      }
+      if (!CRITIC_SCHEMA_ERRORS.has(result.validationError)) return 'critic-verdict-invalid';
+      return `critic-verdict-invalid: ${result.validationError}`;
+  }
+}
+
+/**
  * Run one gate QC check through the injected kernel adapter (pure station).
  *
  * Routing logic:
  *   1. The transform runtime handles retries up to maxExecutionAttempts.
- *   2. On scrapped: propagate model-incompatible.
+ *   2. On scrapped: return a named `critic-*` reason (transformCriticScrapReason).
  *   3. On pass: rebuild StationOutput with findings_hash([]) and return_to: null.
  *   4. On reject:
  *      a. Resolve returnTo = verdict.return_to ?? config.onReject.
@@ -213,7 +275,7 @@ export async function runGateCheck(config: GateConfig): Promise<GateDecision> {
   });
 
   if (result.status === 'scrapped') {
-    return { action: 'scrapped', reason: 'model-incompatible' };
+    return { action: 'scrapped', reason: transformCriticScrapReason(result) };
   }
 
   const { payload, usage } = result.output;
@@ -353,8 +415,8 @@ function criticAgentProvenance(config: HarnessGateConfig): Pick<CriticUsage, 'ag
  * Unlike `runGateCheck` (which delegates retry to `runTransformStation`), this
  * is a SINGLE bounded invocation — the harness adapter's own invoke() already
  * enforces a wall-clock timeout; a malformed/missing verdict scraps rather
- * than silently passing, the same fail-closed shape a transform's
- * 'model-incompatible' scrap has, but (a pre-public engine review, @queso finding 1) under
+ * than silently passing, the same fail-closed shape a transform critic's
+ * `critic-*` scrap has, but (a pre-public engine review, @queso finding 1) under
  * its own distinct `harness-critic-*` reason per failure class — see the
  * `scrapped` branches below — rather than one shared label.
  */

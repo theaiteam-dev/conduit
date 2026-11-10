@@ -1,4 +1,20 @@
+# Issue #122: the Landlock write-confinement helper (native/llexec/llexec.c),
+# built statically against musl so the binary runs in the Debian-based runtime
+# image below without any library from this stage. Pinned by the digest of
+# the multi-arch index (issue #132) so every build compiles llexec with the
+# same toolchain. To move it, read the new index digest with
+# `docker buildx imagetools inspect alpine:<tag>` and update this line and
+# the matching row in docs/installation.md §1.
+FROM alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc AS llexec
+RUN apk add --no-cache gcc musl-dev
+COPY native/llexec/llexec.c /src/llexec.c
+RUN gcc -static -O2 -Wall -Wextra -Werror -o /llexec /src/llexec.c
+
 FROM oven/bun:1.3.11-slim
+
+# The helper the executor runs each overlapped harness call under (ADR-0013).
+# On PATH, where src/worker/landlock-confinement.ts looks for it.
+COPY --from=llexec /llexec /usr/local/bin/llexec
 
 # Create a non-root system group and user for least-privilege execution.
 # All container processes run as `conduit` — never as root.

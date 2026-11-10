@@ -23,3 +23,13 @@ export const SETSID_SID_FILE = 'containment.setsid.sid';
 export function setsidContainmentRequired(containment: Containment): boolean {
   return containment.mechanism === 'cgroup' || process.env.CONDUIT_REQUIRE_CGROUP_CONTAINMENT === '1';
 }
+
+/**
+ * Whether the suites must prove Landlock write confinement (issue #122) rather
+ * than skip it on a host where the probe fails. CI sets
+ * CONDUIT_REQUIRE_LANDLOCK=1 after building the helper, so a runner that lost
+ * the mechanism fails instead of skipping.
+ */
+export function writeConfinementRequired(): boolean {
+  return process.env.CONDUIT_REQUIRE_LANDLOCK === '1';
+}

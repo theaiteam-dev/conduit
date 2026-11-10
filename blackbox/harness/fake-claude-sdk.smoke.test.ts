@@ -1,0 +1,239 @@
+/**
+ * fake-claude-sdk: smoke test.
+ *
+ * Drives the fake with the real `@anthropic-ai/claude-agent-sdk` `query()`
+ * and a PreToolUse hook, without conduit, so a journey failure can be told
+ * apart from a fake that does not speak the SDK's control protocol: the SDK
+ * registers its hook at initialize, the fake calls it once per tool call, an
+ * allowed write happens, a denied one does not, and `continue: false` ends the
+ * turn with a result message that still carries the usage. With a stub sink
+ * (harness-flow's `stubSink`), the call number and log line go over HTTP and
+ * a barrier releases two calls only when both are running.
+ *
+ * BLACK-BOX RULE: zero imports from src/. The SDK is a third-party package.
+ */
+
+import { afterAll, describe, expect, test } from "bun:test";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { query, type HookCallback, type SDKMessage } from "@anthropic-ai/claude-agent-sdk";
+import type { FakeClaudeSdkCall, FakeClaudeSdkLogEntry } from "./fake-claude-sdk";
+import { startStubSink } from "./harness-flow";
+
+const FAKE = join(import.meta.dir, "fake-claude-sdk.ts");
+
+describe("fake-claude-sdk", () => {
+  const root = mkdtempSync(join(tmpdir(), "conduit-bb-fake-claude-sdk-"));
+  let runs = 0;
+
+  afterAll(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  /** One query() against the fake, with a hook that answers per tool call from `decide`. */
+  async function drive(
+    call: FakeClaudeSdkCall,
+    decide: (toolName: string) => "allow" | "deny" | "stop",
+    sink?: { url: string; logPath: string },
+  ) {
+    runs += 1;
+    const dir = join(root, `run-${runs}`);
+    const cwd = join(dir, "project");
+    mkdirSync(cwd, { recursive: true });
+    const logPath = sink?.logPath ?? join(dir, "invocations.ndjson");
+    const scenarioPath = join(dir, "scenario.json");
+    writeFileSync(
+      scenarioPath,
+      JSON.stringify({
+        stateDir: join(dir, "counters"),
+        logPath,
+        ...(sink !== undefined ? { sinkUrl: sink.url } : {}),
+        roles: [{ name: "maker", promptIncludes: "ROLE:MAKER", calls: [call] }],
+      }),
+    );
+    // Same wrapper shape as harness-flow.ts: no script extension, so the SDK runs it directly.
+    const wrapper = join(dir, "claude");
+    writeFileSync(wrapper, `#!/bin/sh\nexec '${process.execPath}' '${FAKE}' "$@"\n`);
+    chmodSync(wrapper, 0o755);
+
+    const hookCalls: string[] = [];
+    const hook: HookCallback = async (input) => {
+      if (input.hook_event_name !== "PreToolUse") return { continue: true };
+      hookCalls.push(input.tool_name);
+      const d = decide(input.tool_name);
+      if (d === "allow") return { continue: true };
+      const deny = { hookEventName: "PreToolUse" as const, permissionDecision: "deny" as const, permissionDecisionReason: `no ${input.tool_name}` };
+      return d === "stop" ? { continue: false, stopReason: "held", hookSpecificOutput: deny } : { hookSpecificOutput: deny };
+    };
+    const messages: SDKMessage[] = [];
+    for await (const m of query({
+      prompt: "ROLE:MAKER go",
+      options: {
+        cwd,
+        env: { PATH: process.env.PATH ?? "/usr/bin:/bin", FAKE_CLAUDE_SDK_SCENARIO: scenarioPath },
+        pathToClaudeCodeExecutable: wrapper,
+        settingSources: [],
+        hooks: { PreToolUse: [{ hooks: [hook] }] },
+      },
+    })) {
+      messages.push(m);
+    }
+    const log = readFileSync(logPath, "utf8").trim().split("\n").map((l) => JSON.parse(l) as FakeClaudeSdkLogEntry);
+    return { cwd, hookCalls, messages, log };
+  }
+
+  test("the SDK's hook decides each call: an allowed write happens, a denied one does not", async () => {
+    const { cwd, hookCalls, messages, log } = await drive(
+      {
+        steps: [
+          { label: "yes", tool: "Write", input: { file_path: "a.txt", content: "a" } },
+          { label: "no", tool: "Bash", input: { command: "touch b.txt" } },
+        ],
+        usage: { input_tokens: 10, output_tokens: 2 },
+        costUsd: 0.0002,
+      },
+      (tool) => (tool === "Write" ? "allow" : "deny"),
+    );
+    expect(hookCalls).toEqual(["Write", "Bash"]);
+    expect(readFileSync(join(cwd, "a.txt"), "utf8")).toBe("a");
+    expect(existsSync(join(cwd, "b.txt"))).toBe(false);
+
+    expect(log).toHaveLength(1);
+    expect(log[0]!.sdkRequests[0]).toBe("initialize");
+    expect(log[0]!.preToolUseCallbackIds).toHaveLength(1);
+    expect(log[0]!.ungated).toBe(false);
+    expect(log[0]!.answers.map((a) => [a.label, a.decision, a.performed])).toEqual([
+      ["yes", "allow", true],
+      ["no", "deny", false],
+    ]);
+    expect(log[0]!.answers[1]!.reason).toBe("no Bash");
+    expect(log[0]!.argv).toEqual(expect.arrayContaining(["--input-format", "stream-json", "--output-format"]));
+
+    const result = messages.find((m) => m.type === "result") as Record<string, any> | undefined;
+    expect(result?.usage).toMatchObject({ input_tokens: 10, output_tokens: 2 });
+    expect(result?.total_cost_usd).toBe(0.0002);
+  }, 30_000);
+
+  test("continue: false stops the turn after that call, and the result still arrives", async () => {
+    const { cwd, hookCalls, messages, log } = await drive(
+      {
+        steps: [
+          { label: "ask", tool: "AskUserQuestion", input: { questions: [] } },
+          { label: "after", tool: "Write", input: { file_path: "after.txt", content: "x" } },
+        ],
+        usage: { input_tokens: 7, output_tokens: 3 },
+      },
+      (tool) => (tool === "AskUserQuestion" ? "stop" : "allow"),
+    );
+    expect(hookCalls).toEqual(["AskUserQuestion"]);
+    expect(existsSync(join(cwd, "after.txt"))).toBe(false);
+    expect(log[0]!.stopped).toBe(true);
+    expect(log[0]!.answers.map((a) => [a.label, a.decision, a.continue])).toEqual([["ask", "deny", false]]);
+    const result = messages.find((m) => m.type === "result") as Record<string, any> | undefined;
+    expect(result?.usage).toMatchObject({ input_tokens: 7, output_tokens: 3 });
+  }, 30_000);
+
+  test("every result's modelUsage entries carry costUSD and canonicalModel, as the real CLI's do", async () => {
+    const { messages } = await drive(
+      {
+        earlierResults: [
+          { usage: { input_tokens: 10, output_tokens: 5 }, modelUsage: { "claude-a": { inputTokens: 10, outputTokens: 5, costUSD: 0.01 } } },
+        ],
+        modelUsage: {
+          "claude-a": { inputTokens: 20, outputTokens: 10, costUSD: 0.02 },
+          "claude-b": { inputTokens: 3, outputTokens: 1, canonicalModel: "claude-b-canonical" },
+        },
+      },
+      () => "allow",
+    );
+    const results = messages.filter((m) => m.type === "result") as Record<string, any>[];
+    expect(results.map((r) => r.modelUsage)).toEqual([
+      { "claude-a": expect.objectContaining({ costUSD: 0.01, canonicalModel: "claude-a" }) },
+      {
+        "claude-a": expect.objectContaining({ costUSD: 0.02, canonicalModel: "claude-a" }),
+        "claude-b": expect.objectContaining({ costUSD: 0, canonicalModel: "claude-b-canonical" }),
+      },
+    ]);
+  }, 30_000);
+
+  test("the default modelUsage entry carries canonicalModel", async () => {
+    const { messages } = await drive({ usage: { input_tokens: 4, output_tokens: 2 } }, () => "allow");
+    const result = messages.find((m) => m.type === "result") as Record<string, any> | undefined;
+    expect(result?.modelUsage).toEqual({ "claude-fake": expect.objectContaining({ inputTokens: 4, costUSD: 0.001, canonicalModel: "claude-fake" }) });
+  }, 30_000);
+
+  test("with a stub sink, a barrier releases two calls only once both are running, and both log through the sink", async () => {
+    const sinkDir = join(root, "sink");
+    mkdirSync(sinkDir, { recursive: true });
+    const logPath = join(sinkDir, "invocations.ndjson");
+    const server = startStubSink(join(sinkDir, "counters"), logPath);
+    try {
+      const sink = { url: `http://127.0.0.1:${server.port}`, logPath };
+      const meet: FakeClaudeSdkCall = { barrier: { name: "pair", parties: 2, timeoutMs: 10_000 } };
+      await Promise.all([drive(meet, () => "allow", sink), drive(meet, () => "allow", sink)]);
+      const log = readFileSync(logPath, "utf8").trim().split("\n").map((l) => JSON.parse(l) as FakeClaudeSdkLogEntry);
+      // The sink's counter numbered the two calls, and both were released by the other's arrival.
+      expect(log.map((e) => e.call).sort()).toEqual([1, 2]);
+      expect(log.map((e) => e.barrierReleased)).toEqual([true, true]);
+
+      // A barrier no second call reaches times out, and the call still completes.
+      const alone = await drive({ barrier: { name: "alone", parties: 2, timeoutMs: 200 } }, () => "allow", sink);
+      expect(alone.log.at(-1)!.barrierReleased).toBe(false);
+      expect(alone.messages.some((m) => m.type === "result")).toBe(true);
+    } finally {
+      server.stop(true);
+    }
+  }, 30_000);
+
+  test("a malformed call number from the sink fails the call instead of selecting a scenario", async () => {
+    // Number() would coerce true to 1, [3] to 3 and "3\n" to 3, so each would run a real call.
+    for (const claim of [true, [3], "3", "3\n", 0, 1.5, null]) {
+      const sinkDir = join(root, "bad-sink");
+      mkdirSync(sinkDir, { recursive: true });
+      const paths: string[] = [];
+      const server = Bun.serve({
+        port: 0,
+        hostname: "127.0.0.1",
+        fetch: (req) => {
+          paths.push(new URL(req.url).pathname);
+          return Response.json({ call: claim });
+        },
+      });
+      try {
+        const sink = { url: `http://127.0.0.1:${server.port}`, logPath: join(sinkDir, "invocations.ndjson") };
+        await expect(drive({ usage: { input_tokens: 1, output_tokens: 1 } }, () => "allow", sink)).rejects.toThrow();
+        // The fake stopped at the claim: a call that ran would also have posted its log line.
+        expect({ claim, paths }).toEqual({ claim, paths: ["/call"] });
+      } finally {
+        server.stop(true);
+      }
+    }
+  }, 60_000);
+
+  test("a malformed barrier answer from the sink fails the call instead of reading as a timeout", async () => {
+    for (const answer of [{}, { released: "true" }, { released: 1 }, { released: null }]) {
+      const sinkDir = join(root, "bad-barrier-sink");
+      mkdirSync(sinkDir, { recursive: true });
+      const paths: string[] = [];
+      const server = Bun.serve({
+        port: 0,
+        hostname: "127.0.0.1",
+        fetch: (req) => {
+          const path = new URL(req.url).pathname;
+          paths.push(path);
+          return Response.json(path === "/call" ? { call: 1 } : answer);
+        },
+      });
+      try {
+        const sink = { url: `http://127.0.0.1:${server.port}`, logPath: join(sinkDir, "invocations.ndjson") };
+        const call: FakeClaudeSdkCall = { barrier: { name: "pair", parties: 2, timeoutMs: 1_000 }, usage: { input_tokens: 1, output_tokens: 1 } };
+        await expect(drive(call, () => "allow", sink)).rejects.toThrow();
+        // The fake stopped at the barrier: a call that carried on would also have posted its log line.
+        expect({ answer, paths }).toEqual({ answer, paths: ["/call", "/barrier"] });
+      } finally {
+        server.stop(true);
+      }
+    }
+  }, 60_000);
+});

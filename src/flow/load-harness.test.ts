@@ -61,6 +61,8 @@ import {
   type FlowValidationError,
 } from './load';
 import {
+  bindHarnessDefinitionsForIntrospection,
+  buildHarnessDefinitionRegistry,
   createHarnessRegistry,
   makeFakeHarnessAdapter,
   type HarnessAdapter,
@@ -431,6 +433,70 @@ describe('issue #21 — a per-call gating adapter needs a tools list (HARNESS_GA
   });
 });
 
+describe('issue #21: the shipped codex-app-server adapter is a per-call gating adapter at load', () => {
+  const shipped = (): HarnessRegistry =>
+    bindHarnessDefinitionsForIntrospection(
+      buildHarnessDefinitionRegistry([{ name: 'codex-app-server', envAllowlist: [] }]),
+    );
+  const harness = 'harness: codex-app-server';
+
+  it('rejects a station with no tools list and one that waives it', () => {
+    expect(errorCodes(loadHarness(harnessFlow({ harnessLine: harness, toolsLine: '' }), { registry: shipped(), extraFiles: CODER_PROMPT }))).toContain(
+      'HARNESS_GATED_ADAPTER_NEEDS_TOOLS',
+    );
+    expect(
+      errorCodes(
+        loadHarness(harnessFlow({ harnessLine: harness, toolsLine: 'tools: [Write]', waiverLine: 'unrestricted_tools: true' }), {
+          registry: shipped(),
+          extraFiles: CODER_PROMPT,
+        }),
+      ),
+    ).toContain('HARNESS_GATED_ADAPTER_NEEDS_TOOLS');
+  });
+
+  it('accepts a station that lists Bash executables and the write tools', () => {
+    const flow = expectOk(
+      loadHarness(harnessFlow({ harnessLine: harness, toolsLine: 'tools: [Write, Edit, "Bash(cat:*)"]' }), {
+        registry: shipped(),
+        extraFiles: CODER_PROMPT,
+      }),
+    );
+    expect(flow.stations.coder!.tools).toEqual(['Write', 'Edit', 'Bash(cat:*)']);
+  });
+});
+
+describe('issue #21: the shipped opencode adapter is a per-call gating adapter at load', () => {
+  const shipped = (): HarnessRegistry =>
+    bindHarnessDefinitionsForIntrospection(
+      buildHarnessDefinitionRegistry([{ name: 'opencode', envAllowlist: [] }]),
+    );
+  const harness = 'harness: opencode';
+
+  it('rejects a station with no tools list and one that waives it', () => {
+    expect(errorCodes(loadHarness(harnessFlow({ harnessLine: harness, toolsLine: '' }), { registry: shipped(), extraFiles: CODER_PROMPT }))).toContain(
+      'HARNESS_GATED_ADAPTER_NEEDS_TOOLS',
+    );
+    expect(
+      errorCodes(
+        loadHarness(harnessFlow({ harnessLine: harness, toolsLine: 'tools: [Write]', waiverLine: 'unrestricted_tools: true' }), {
+          registry: shipped(),
+          extraFiles: CODER_PROMPT,
+        }),
+      ),
+    ).toContain('HARNESS_GATED_ADAPTER_NEEDS_TOOLS');
+  });
+
+  it('accepts a station that lists Bash executables and the write tools', () => {
+    const flow = expectOk(
+      loadHarness(harnessFlow({ harnessLine: harness, toolsLine: 'tools: [Write, Edit, "Bash(cat:*)"]' }), {
+        registry: shipped(),
+        extraFiles: CODER_PROMPT,
+      }),
+    );
+    expect(flow.stations.coder!.tools).toEqual(['Write', 'Edit', 'Bash(cat:*)']);
+  });
+});
+
 // ---------------------------------------------------------------------------
 // WI-595 — the GATE CRITIC's tools allowlist is threaded into its harness
 // invocation (gate.ts), so a critic adapter that cannot restrict tools must
@@ -603,6 +669,76 @@ describe('WI-563 AC4 — harness binary presence probe (FR-10)', () => {
 
     // No harness station → nothing to probe → no errors.
     expect(errors).toEqual([]);
+  });
+});
+
+describe('issue #35 — the binary probe covers a gate critic harness', () => {
+  const criticGate = (criticHarness: string): StationConfig['gateCheck'] => ({
+    criticModel: '',
+    criticPromptFile: '/tmp/verify.md',
+    criticPromptVersion: '1',
+    onReject: 'draft',
+    reworkCap: 2,
+    criticInputScope: [],
+    criticHarness,
+    criticTools: ['Read'],
+  });
+
+  it('fails a missing critic binary on a kind: transform station, naming the station and the critic', async () => {
+    const registry = createHarnessRegistry([missingBinaryAdapter('codex-exec', '/usr/local/bin/codex')]);
+    const flow = flowWith({
+      draft: {
+        kind: 'transform',
+        effectful: false,
+        wip: 1,
+        inputs: [],
+        outputs: [],
+        model: 'm',
+        gateCheck: criticGate('codex-exec'),
+      },
+    });
+
+    const errors = await probeHarnessBinaries(flow, registry);
+
+    expect(errors).toHaveLength(1);
+    expect(errors[0]!.code).toBe('HARNESS_BINARY_NOT_FOUND');
+    expect(errors[0]!.message).toBe(
+      "Station 'draft' critic harness adapter 'codex-exec' binary not found at '/usr/local/bin/codex'",
+    );
+  });
+
+  it('reports the maker and the critic separately when a station has both on different adapters', async () => {
+    const registry = createHarnessRegistry([
+      missingBinaryAdapter('claude-headless', '/usr/local/bin/claude'),
+      missingBinaryAdapter('codex-exec', '/usr/local/bin/codex'),
+    ]);
+    const flow = flowWith({
+      coder: { ...harnessStation('claude-headless'), gateCheck: criticGate('codex-exec') },
+    });
+
+    const errors = await probeHarnessBinaries(flow, registry);
+
+    expect(errors.map((e) => e.message)).toEqual([
+      "Station 'coder' harness adapter 'claude-headless' binary not found at '/usr/local/bin/claude'",
+      "Station 'coder' critic harness adapter 'codex-exec' binary not found at '/usr/local/bin/codex'",
+    ]);
+  });
+
+  it('passes a present critic binary', async () => {
+    const registry = registryOf([{ name: 'codex-exec', binaryPresent: true }]);
+    const flow = flowWith({
+      draft: {
+        kind: 'transform',
+        effectful: false,
+        wip: 1,
+        inputs: [],
+        outputs: [],
+        model: 'm',
+        gateCheck: criticGate('codex-exec'),
+      },
+    });
+
+    expect(await probeHarnessBinaries(flow, registry)).toEqual([]);
   });
 });
 

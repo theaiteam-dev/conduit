@@ -137,7 +137,7 @@ describe("harness journey: idle timeout kills and retries a silent harness call"
   test("journal inspect names the idle timeout as the terminal reason", async () => {
     const inspect = await f.journalInspect();
     expect(inspect.exitCode).toBe(0);
-    expect(inspect.stdout.match(/research\.harness$/gm)?.length).toBe(ATTEMPTS);
+    expect(inspect.stdout.match(/ research\.harness(?: cache read .*)?$/gm)?.length).toBe(ATTEMPTS);
     expect(inspect.stdout).toContain(`[${f.cardId}] entered_lane: research → scrap (scrap)`);
     expect(inspect.stdout).toContain(`[${f.cardId}] terminal: harness-idle-timeout`);
     expect(inspect.stdout).not.toMatch(/→ done/);

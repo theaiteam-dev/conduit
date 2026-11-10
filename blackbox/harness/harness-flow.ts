@@ -17,7 +17,18 @@
  * type-only import of fake-claude's scenario shapes.
  */
 
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  appendFileSync,
+  chmodSync,
+  closeSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  openSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { Database } from "bun:sqlite";
@@ -50,9 +61,42 @@ export interface JournalSpanRow {
   adapter: string | null;
   duration_ms: number | null;
   usage_unknown: number;
+  /** The checkpoint binding stamp of a stamped station span (SPEC §5), else null. */
+  binding_stamp: string | null;
+  /** The effective prompt_template_version folded into that stamp, else null. */
+  prompt_template_version: string | null;
 }
 
-export interface HarnessFlowOptions {
+/**
+ * The agent-CLI stand-in a journey runs behind a shipped harness adapter.
+ * Default: fake-claude behind `claude-headless`.
+ */
+export interface HarnessStub {
+  /** Shipped adapter name, e.g. `codex-app-server`. Sets CONDUIT_HARNESS_ADAPTERS and its `_COMMAND`/`_ENV`. */
+  adapter: string;
+  /** Absolute path of the bun script the generated wrapper execs. */
+  script: string;
+  /** Wrapper file name, as the adapter would find the real binary (`claude`, `codex`, `opencode`). */
+  binName: string;
+  /** Env var the stub reads its scenario path from. It is added to the adapter's env allowlist. */
+  scenarioVar: string;
+  /** Further names for the adapter's env allowlist, besides PATH and `scenarioVar`. */
+  allowlist?: string[];
+}
+
+export const FAKE_CLAUDE_STUB: HarnessStub = {
+  adapter: "claude-headless",
+  script: FAKE_CLAUDE,
+  binName: "claude",
+  scenarioVar: "FAKE_CLAUDE_SCENARIO",
+};
+
+/** `CONDUIT_HARNESS_<NAME>_`, the engine-config prefix for an adapter name. */
+export function harnessEnvPrefix(adapter: string): string {
+  return `CONDUIT_HARNESS_${adapter.toUpperCase().replace(/-/g, "_")}_`;
+}
+
+export interface HarnessFlowOptions<R = FakeClaudeRole> {
   /** Full flow.yaml text. `project_root: .` resolves to the scaffolded project dir. */
   flowYaml: string;
   /** Files written under the project root before the run (prompts, inputs). */
@@ -64,9 +108,22 @@ export interface HarnessFlowOptions {
    * receives the scratch dir, for scenarios that name files outside the
    * project root (pid files).
    */
-  roles: FakeClaudeRole[] | ((ctx: { scratchDir: string }) => FakeClaudeRole[]);
+  roles: R[] | ((ctx: { scratchDir: string }) => R[]);
+  /** The agent CLI stand-in. Default: FAKE_CLAUDE_STUB. */
+  stub?: HarnessStub;
   /** Extra kernel env, e.g. `CONDUIT_HARNESS_CLAUDE_HEADLESS_MODEL`. */
   env?: Record<string, string>;
+  /**
+   * Serve the stub's call counter, log and barriers over HTTP on 127.0.0.1
+   * instead of the stub writing them to files. A write-confined call (issue
+   * #122) can write only inside its writable set, which never holds this
+   * workspace's stub dir, so a confined stub reports here. Landlock as the
+   * kernel applies it handles no network rights, so the connection is
+   * allowed. The server appends to the same log file, so `stubLog()` reads it
+   * unchanged. fake-claude-sdk, fake-codex-app-server and fake-opencode read
+   * the scenario's `sinkUrl`.
+   */
+  stubSink?: boolean;
 }
 
 export interface HarnessFlow {
@@ -81,14 +138,16 @@ export interface HarnessFlow {
   env: Readonly<Record<string, string>>;
   /** A directory OUTSIDE the project root, for files a test wants the stub to drop (pid files). */
   scratchDir: string;
+  /** The generated wrapper the adapter runs as its binary. */
+  stubCommand: string;
   /** `conduit run <flow> --input <entry> --run-id <runId> [extra]`, awaited to exit. */
   run(extraArgs?: string[], opts?: { timeoutMs?: number }): Promise<CliResult>;
   /** `conduit <args>` against this workspace's DBs and env. */
   conduit(args: string[], opts?: { timeoutMs?: number }): Promise<CliResult>;
   runStatus(): Promise<CliResult>;
   journalInspect(cardId?: string): Promise<CliResult>;
-  /** Every fake-claude invocation so far, in order. */
-  stubLog(): FakeClaudeLogEntry[];
+  /** Every stub invocation so far, in order. `L` is the stub's log entry type (fake-claude's by default). */
+  stubLog<L = FakeClaudeLogEntry>(): L[];
   /**
    * Journal rows for this run, read straight from the journal DB (read-only).
    * No CLI prints a span's token usage or attributes: `journal inspect`
@@ -101,6 +160,83 @@ export interface HarnessFlow {
 }
 
 let runCounter = 0;
+
+/** Claim the next call number for `role` by exclusive create, as the fakes do, so concurrent calls never share one. */
+export function claimCallNumber(stateDir: string, role: string): number {
+  mkdirSync(stateDir, { recursive: true });
+  for (let n = 1; ; n++) {
+    try {
+      closeSync(openSync(join(stateDir, `${role}.${n}`), "wx"));
+      return n;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+    }
+  }
+}
+
+/**
+ * The HTTP side of `stubSink`. `POST /call {role}` answers `{call}`,
+ * `POST /log` appends its body as one log line, and `POST /barrier
+ * {name, parties, timeoutMs}` answers `{released: true}` once `parties`
+ * requests for `name` have arrived, or `{released: false}` after
+ * `timeoutMs`.
+ */
+export function startStubSink(stateDir: string, logPath: string): ReturnType<typeof Bun.serve> {
+  const barriers = new Map<string, { arrived: number; release: Array<() => void> }>();
+  return Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    // A barrier request waits for its siblings; keep the connection open past Bun's 10 s default.
+    idleTimeout: 120,
+    async fetch(req) {
+      const path = new URL(req.url).pathname;
+      if (req.method !== "POST") return new Response("method", { status: 405 });
+      if (path === "/log") {
+        appendFileSync(logPath, (await req.text()).trimEnd() + "\n");
+        return Response.json({ ok: true });
+      }
+      const body = (await req.json()) as Record<string, unknown>;
+      if (path === "/call") return Response.json({ call: claimCallNumber(stateDir, String(body.role)) });
+      if (path === "/barrier") {
+        const name = String(body.name);
+        const parties = body.parties;
+        if (typeof parties !== "number" || !Number.isInteger(parties) || parties < 1) {
+          return new Response("barrier: parties must be a positive integer", { status: 400 });
+        }
+        const timeoutMs = body.timeoutMs ?? 15_000;
+        if (typeof timeoutMs !== "number" || !Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+          return new Response("barrier: timeoutMs must be a positive finite number", { status: 400 });
+        }
+        const b = barriers.get(name) ?? { arrived: 0, release: [] };
+        barriers.set(name, b);
+        b.arrived += 1;
+        if (b.arrived >= parties) {
+          for (const r of b.release.splice(0)) r();
+          // Drop the entry so a later use of the same name starts from zero.
+          barriers.delete(name);
+          return Response.json({ released: true });
+        }
+        const released = await new Promise<boolean>((res) => {
+          const onRelease = (): void => {
+            clearTimeout(timer);
+            res(true);
+          };
+          const timer = setTimeout(() => {
+            // A party that gave up no longer counts toward the barrier.
+            b.arrived -= 1;
+            const i = b.release.indexOf(onRelease);
+            if (i >= 0) b.release.splice(i, 1);
+            if (b.arrived <= 0 && barriers.get(name) === b) barriers.delete(name);
+            res(false);
+          }, timeoutMs);
+          b.release.push(onRelease);
+        });
+        return Response.json({ released });
+      }
+      return new Response("not found", { status: 404 });
+    },
+  });
+}
 
 export async function waitFor(
   cond: () => boolean | Promise<boolean>,
@@ -132,15 +268,16 @@ export function pidAlive(pid: number): boolean {
  * Should cleanup() reap `pid`? Only a live process whose cmdline names
  * fake-claude, so a pid the OS recycled for something else is left alone.
  */
-export function isOrphanedStub(pid: number): boolean {
+export function isOrphanedStub(pid: number, script: string = FAKE_CLAUDE): boolean {
   try {
-    return pidAlive(pid) && readFileSync(`/proc/${pid}/cmdline`, "utf8").includes(FAKE_CLAUDE);
+    return pidAlive(pid) && readFileSync(`/proc/${pid}/cmdline`, "utf8").includes(script);
   } catch {
     return false;
   }
 }
 
-export function startHarnessFlow(opts: HarnessFlowOptions): HarnessFlow {
+export function startHarnessFlow<R = FakeClaudeRole>(opts: HarnessFlowOptions<R>): HarnessFlow {
+  const stub = opts.stub ?? FAKE_CLAUDE_STUB;
   if (process.platform !== "linux") {
     throw new Error(`blackbox harness-flow journeys require Linux (got '${process.platform}'; see blackbox/README.md)`);
   }
@@ -159,18 +296,30 @@ export function startHarnessFlow(opts: HarnessFlowOptions): HarnessFlow {
   writeFileSync(flowPath, opts.flowYaml);
 
   const logPath = join(stubDir, "invocations.ndjson");
+  const stateDir = join(stubDir, "counters");
   const roles = typeof opts.roles === "function" ? opts.roles({ scratchDir }) : opts.roles;
+  const sink = opts.stubSink === true ? startStubSink(stateDir, logPath) : undefined;
   const scenarioPath = join(stubDir, "scenario.json");
-  writeFileSync(
-    scenarioPath,
-    JSON.stringify({ stateDir: join(stubDir, "counters"), logPath, roles }, null, 2),
-  );
+  const wrapper = join(stubDir, stub.binName);
+  // Nothing stops the sink until the flow is returned, so a setup failure stops it here.
+  try {
+    writeFileSync(
+      scenarioPath,
+      JSON.stringify(
+        { stateDir, logPath, ...(sink !== undefined ? { sinkUrl: `http://127.0.0.1:${sink.port}` } : {}), roles },
+        null,
+        2,
+      ),
+    );
 
-  // The adapter scrubs the child env to its allowlist, so `bun` may not be on
-  // the child's PATH. The wrapper names the running bun binary absolutely.
-  const wrapper = join(stubDir, "claude");
-  writeFileSync(wrapper, `#!/bin/sh\nexec '${process.execPath}' '${FAKE_CLAUDE}' "$@"\n`);
-  chmodSync(wrapper, 0o755);
+    // The adapter scrubs the child env to its allowlist, so `bun` may not be on
+    // the child's PATH. The wrapper names the running bun binary absolutely.
+    writeFileSync(wrapper, `#!/bin/sh\nexec '${process.execPath}' '${stub.script}' "$@"\n`);
+    chmodSync(wrapper, 0o755);
+  } catch (err) {
+    sink?.stop(true);
+    throw err;
+  }
 
   runCounter += 1;
   const runId = `bbh-${process.pid}-${runCounter}`;
@@ -181,6 +330,7 @@ export function startHarnessFlow(opts: HarnessFlowOptions): HarnessFlow {
   const ambient = Object.entries(process.env).filter(
     (e): e is [string, string] => !e[0].startsWith("CONDUIT_") && e[1] !== undefined,
   );
+  const prefix = harnessEnvPrefix(stub.adapter);
   const env: Record<string, string> = {
     ...Object.fromEntries(ambient),
     CONDUIT_STATE_DB: join(root, "state.db"),
@@ -190,11 +340,11 @@ export function startHarnessFlow(opts: HarnessFlowOptions): HarnessFlow {
     // harness-only flow; nothing ever calls it.
     CONDUIT_API_KEY: "blackbox-harness-unused",
     CONDUIT_BASE_URL: "http://127.0.0.1:9",
-    CONDUIT_HARNESS_ADAPTERS: "claude-headless",
-    CONDUIT_HARNESS_CLAUDE_HEADLESS_COMMAND: wrapper,
-    // PATH so the stub can find `setsid`/`sh`; FAKE_CLAUDE_SCENARIO carries the scenario.
-    CONDUIT_HARNESS_CLAUDE_HEADLESS_ENV: "PATH,FAKE_CLAUDE_SCENARIO",
-    FAKE_CLAUDE_SCENARIO: scenarioPath,
+    CONDUIT_HARNESS_ADAPTERS: stub.adapter,
+    [`${prefix}COMMAND`]: wrapper,
+    // PATH so the stub can find `setsid`/`sh`; the scenario var carries the scenario.
+    [`${prefix}ENV`]: ["PATH", stub.scenarioVar, ...(stub.allowlist ?? [])].join(","),
+    [stub.scenarioVar]: scenarioPath,
     ...opts.env,
   };
 
@@ -223,24 +373,24 @@ export function startHarnessFlow(opts: HarnessFlowOptions): HarnessFlow {
     }
   }
 
-  function stubLog(): FakeClaudeLogEntry[] {
+  function stubLog<L = FakeClaudeLogEntry>(): L[] {
     if (!existsSync(logPath)) return [];
     // fake-claude appends from its own process, so a read can race a write
     // and see a truncated final line; only that line may fail to parse. A
     // malformed line before it is a real logging failure and throws.
     const lines = readFileSync(logPath, "utf8").split("\n");
     const last = lines.pop()!;
-    const entries: FakeClaudeLogEntry[] = [];
+    const entries: L[] = [];
     lines.forEach((l, i) => {
       if (l.length === 0) return;
       try {
-        entries.push(JSON.parse(l) as FakeClaudeLogEntry);
+        entries.push(JSON.parse(l) as L);
       } catch (err) {
-        throw new Error(`fake-claude invocations.ndjson line ${i + 1} is malformed: ${(err as Error).message}`);
+        throw new Error(`stub invocations.ndjson line ${i + 1} is malformed: ${(err as Error).message}`);
       }
     });
     try {
-      if (last.length > 0) entries.push(JSON.parse(last) as FakeClaudeLogEntry);
+      if (last.length > 0) entries.push(JSON.parse(last) as L);
     } catch {
       /* partial write */
     }
@@ -255,6 +405,7 @@ export function startHarnessFlow(opts: HarnessFlowOptions): HarnessFlow {
     cardId,
     env,
     scratchDir,
+    stubCommand: wrapper,
     run: (extraArgs = [], o) =>
       conduit(["run", flowPath, "--input", join(projectRoot, opts.entryInput), "--run-id", runId, ...extraArgs], o),
     conduit,
@@ -270,7 +421,8 @@ export function startHarnessFlow(opts: HarnessFlowOptions): HarnessFlow {
         const rows = db
           .query(
             `SELECT card_id, station, attempt, name, attributes_json, model, input_tokens, output_tokens,
-                    cache_read_input_tokens, cache_creation_input_tokens, cost_usd, adapter, duration_ms, usage_unknown
+                    cache_read_input_tokens, cache_creation_input_tokens, cost_usd, adapter, duration_ms, usage_unknown,
+                    binding_stamp, prompt_template_version
                FROM journal WHERE run_id = ? AND card_id = ? ORDER BY id`,
           )
           .all(runId, card) as Array<Omit<JournalSpanRow, "attributes"> & { attributes_json: string }>;
@@ -289,6 +441,7 @@ export function startHarnessFlow(opts: HarnessFlowOptions): HarnessFlow {
           /* already gone */
         }
       }
+      sink?.stop(true);
       try {
         // A stub still running here was orphaned by a conduit process the
         // timeout above killed (its own group kill never ran). The reap is
@@ -301,7 +454,7 @@ export function startHarnessFlow(opts: HarnessFlowOptions): HarnessFlow {
         }
         for (const { pid } of logged) {
           try {
-            if (isOrphanedStub(pid)) process.kill(-pid, "SIGKILL");
+            if (isOrphanedStub(pid, stub.script)) process.kill(-pid, "SIGKILL");
           } catch {
             /* already gone */
           }

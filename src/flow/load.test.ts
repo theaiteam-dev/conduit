@@ -1313,8 +1313,61 @@ describe('loadFlow — output_scope validation (v10 owned-dir outputs)', () => {
     expect(errorCodes(loadInline(scoped('card_dir'), FILES))).toContain('INVALID_OUTPUT_SCOPE');
   });
 
-  it('rejects output_scope on a non-transform station', () => {
+  it('rejects output_scope on a deterministic station', () => {
     expect(errorCodes(loadInline(scoped('owned_dir', { kind: 'deterministic' })))).toContain('INVALID_OUTPUT_SCOPE');
+  });
+
+  // issue #98: a harness station may scope its declared outputs to the card dir.
+  function harnessScoped(value: string, opts: { outputs?: string; inputs?: string; inputScope?: string } = {}): string {
+    return (
+      [
+        'flow: scope',
+        'flow_version: 1',
+        'terminal_lanes: [done, scrap, hold]',
+        'stations:',
+        '  - id: w',
+        '    worker:',
+        '      kind: harness',
+        '      harness: claude-code',
+        '      prompt_file: prompts/w.md',
+        '      prompt_version: "1"',
+        `    inputs: ${opts.inputs ?? '[]'}`,
+        ...(opts.inputScope !== undefined ? ['    input_scope:', `      owned_dir: ${opts.inputScope}`] : []),
+        `    outputs: ${opts.outputs ?? '[result.json]'}`,
+        `    output_scope: ${value}`,
+      ].join('\n') + '\n'
+    );
+  }
+
+  it('accepts owned_dir on a harness station with outputs (issue #98)', () => {
+    expect(expectOk(loadInline(harnessScoped('owned_dir'), FILES)).stations.w!.output_scope).toBe('owned_dir');
+  });
+
+  it('rejects a card-scoped harness output that is also a card-scoped input (issue #98)', () => {
+    // The kernel removes a card-scoped harness output before each attempt, so
+    // the same name as a card-scoped input would delete the input unread.
+    const result = loadInline(
+      harnessScoped('owned_dir', { inputs: '[draft.md]', inputScope: '[draft.md]', outputs: '[draft.md]' }),
+      FILES,
+    );
+    expect(errorCodes(result)).toContain('INVALID_OUTPUT_SCOPE');
+    expect(expectErrors(result).map((e) => e.message).join(' ')).toMatch(/draft\.md/);
+  });
+
+  it('rejects seed.json as a card-scoped harness output (issue #98)', () => {
+    expect(errorCodes(loadInline(harnessScoped('owned_dir', { outputs: '[seed.json]' }), FILES))).toContain(
+      'INVALID_OUTPUT_SCOPE',
+    );
+  });
+
+  it('allows a project-root harness output with the same name as a card-scoped input (issue #98)', () => {
+    // Different files: the input reads <owned>/draft.md, the output is <root>/draft.md.
+    expectOk(
+      loadInline(
+        harnessScoped('project_root', { inputs: '[draft.md]', inputScope: '[draft.md]', outputs: '[draft.md]' }),
+        FILES,
+      ),
+    );
   });
 
   it('rejects output_scope with no declared outputs', () => {

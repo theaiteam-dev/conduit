@@ -61,8 +61,18 @@ export interface ModelCall {
 export interface ModelResponse {
   /** Raw model output text (may contain fences, prose, etc.). */
   text: string;
-  /** Number of input/prompt tokens billed for this call. */
+  /**
+   * Input/prompt tokens billed for this call. When `cacheReadInputTokens` is
+   * set, this is UNCACHED input only (issue #5 convention, issue #156), and
+   * the call's prompt total is `inputTokens + cacheReadInputTokens`. Anything
+   * computing a total must add both.
+   */
   inputTokens: number;
+  /**
+   * Cache-read input tokens, when the provider reported a usable figure
+   * (issue #156). Undefined means no split was reported, not zero.
+   */
+  cacheReadInputTokens?: number;
   /** Number of output/completion tokens billed for this call. */
   outputTokens: number;
   /** Monetary cost in USD for this single call. */
@@ -74,6 +84,15 @@ export interface ModelResponse {
    * from an ordinary parse failure (the original reasoning-response parsing work).
    */
   finishReason?: string;
+}
+
+/**
+ * Every token a model call billed: uncached input, cache reads and output
+ * (issue #156). The one sum the budgets and station usage use, so a cache
+ * split cannot change a total.
+ */
+export function modelResponseTokens(response: ModelResponse): number {
+  return response.inputTokens + (response.cacheReadInputTokens ?? 0) + response.outputTokens;
 }
 
 /**

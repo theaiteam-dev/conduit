@@ -31,11 +31,21 @@ stamps) without building an in-kernel loop first.
 ## A middle claim: supervised adapters
 
 An adapter that sets `canGatePerCall` runs the harness loop with a callback into the
-kernel, and the kernel decides every tool call before it runs. `agent-sdk` is the shipped
-one: it drives the Claude Code CLI through `@anthropic-ai/claude-agent-sdk` `query()` and
-calls the kernel's gate from `hooks.PreToolUse`
-([#21](https://github.com/theaiteam-dev/conduit/issues/21)). The hook fires for the main
-agent and for subagents, and an `allowedTools` rule does not bypass it.
+kernel, and the kernel decides every tool call before it runs. Three are shipped
+([#21](https://github.com/theaiteam-dev/conduit/issues/21)):
+
+- `agent-sdk` drives the Claude Code CLI through `@anthropic-ai/claude-agent-sdk` `query()`
+  and calls the kernel's gate from `hooks.PreToolUse`. The hook fires for the main agent and
+  for subagents, and an `allowedTools` rule does not bypass it. The adapter also passes the
+  SDK's `tools` option, set to the built-in tools the station's `tools` list allows
+  (`Bash(curl:*)` gives `Bash`), so the model is not offered a built-in the gate would refuse
+  and each request carries fewer tool definitions. A waived `unrestricted_tools` station is
+  offered every built-in.
+- `codex-app-server` drives `codex app-server` and answers Codex's approval requests from the
+  gate. See [the Codex adapter](#the-codex-app-server-adapter) below for how Codex's tools
+  map onto the gate, and for what is not gated.
+- `opencode` drives `opencode serve` over HTTP and answers its `permission.asked` events from
+  the gate. See [the opencode adapter](#the-opencode-adapter) below.
 
 The claim is a pre-execution decision on each call. It is not the Tool-Bridge: the CLI
 still owns the loop, and the kernel sees one call at a time. The gate
@@ -44,12 +54,31 @@ still owns the loop, and the kernel sees one call at a time. The gate
 - **Tool allowlist.** A tool not in the station's `tools` is denied.
 - **Bash positive allowlist.** Executables come only from `Bash(<exe>)` and
   `Bash(<exe>:*)` entries. A bare `Bash` entry allows the tool and no executable. A
-  narrower rule such as `Bash(git status:*)` is not widened to `git`. A command
-  containing a shell metacharacter is denied before the allowlist is consulted.
+  narrower rule such as `Bash(git status:*)` is not widened to `git`. The gate reads the
+  command with a small shell lexer (`src/worker/bash-lexer.ts`) and refuses anything it
+  does not recognise, before the allowlist is consulted (code `shell_metacharacter`). It
+  accepts:
+  - plain words made of letters, digits and `_ . / : = @ , + % -` (a word may not start
+    with `=`, which zsh expands to a path);
+  - single-quoted text, taken literally;
+  - double-quoted text that contains no `$`, backtick, `\` or `!`, also literal;
+  - quoted and plain parts joined into one word (`-H'Accept: x'`);
+  - `|` between commands. Every segment's program must be on the allowlist.
+
+  It refuses `;`, `&&`, `||`, `&`, `|&`, parentheses, every redirect (`>`, `>>`, `<`, `2>`,
+  `&>`, here-docs, `<(...)`), `$` and backticks outside single quotes, `\` outside single
+  quotes, unquoted `* ? [ ] { } ~ # ! ^`, an unterminated quote, any control character
+  (newline and tab included, quoted or not), and an empty command or pipeline segment. A
+  program name must be an unquoted word and must not be an assignment, so `FOO=bar curl x`
+  and `'curl' x` are denied. So `psql -c 'SELECT id FROM "Job"'` and
+  `curl -s URL | jq '.items[0]'` pass when `psql`, `curl` and `jq` are listed, and
+  `psql -c "SELECT id FROM \"Job\""` does not, because it uses `\` inside double quotes.
 - **Write ownership.** Write, Edit, MultiEdit and NotebookEdit targets must resolve inside
   the card's owned paths, with symlinks resolved on both sides, including a write through
-  a dangling symlink. This applies only where the flow sets `defaults.enforce_owned_paths`
-  and the card declares owned paths, the same condition as the other integrity checks.
+  a dangling symlink, where the flow sets `defaults.enforce_owned_paths` and the card
+  declares owned paths, the same condition as the other integrity checks. Otherwise the
+  targets must resolve inside the project root, by the same rules: not enforcing ownership
+  opens the project root to the file tools, not the host.
 - **No network tools.** `WebFetch` and `WebSearch` are always denied.
 - **Human questions hold.** `AskUserQuestion` moves the card to `hold`: the adapter ends
   the harness process and the executor holds the card without spending an execution
@@ -62,11 +91,25 @@ deny every tool, so the loader rejects both (`HARNESS_GATED_ADAPTER_NEEDS_TOOLS`
 What it does not cover:
 
 - The arguments of an allowlisted executable. `git -C / ...` and `git config` pass, and a
-  script the agent wrote can then be run.
-- A Bash write that bypasses the path check. The MARK_DONE owned-paths integrity check
-  stays mandatory as the backstop.
+  script the agent wrote can then be run. Some programs run arbitrary code or write files
+  from their arguments: `sh`, `bash`, `env`, `xargs`, `find` (`-exec`), `psql` (`\!`),
+  `curl -o`, `tee`, `sed -i`, `awk` (`system()`). Listing one of them allows what it can
+  do, so the Bash allowlist constrains only what the flow author chooses to list.
+- A Bash write that bypasses the path check. Redirects are refused, but a write by an
+  allowlisted program to a path in its arguments is not. The MARK_DONE owned-paths
+  integrity check stays mandatory as the backstop on both paths and holds the card after
+  the call. It sees files created, changed and deleted, so an `rm` outside the owned paths
+  holds the card too. An overlapped call (`overlap: true`) also runs under Landlock write
+  confinement, which refuses such a write at the syscall when it targets anything outside
+  the call's writable set, including the owned paths of a card whose call overlapped this
+  one. Metadata changes and writes an unconfined process makes on the call's behalf are not
+  refused (see the "Not covered" list under
+  [Write confinement of overlapped calls](#write-confinement-of-overlapped-calls)).
 - Reads outside the project root, and a symlink swapped between the check and the write.
 - The input of `Agent` and of any other listed tool that is not a file tool.
+- On `agent-sdk`, an input rewritten by another `PreToolUse` hook after the gate approved
+  it. The adapter detects the rewrite after the call runs and holds the card (below). It
+  does not prevent it.
 
 The SDK reports a hook denial nowhere (`result.permission_denials` stays empty), so the
 adapter emits a `gate-decision` event for every call the gate sees. It is journaled in
@@ -77,13 +120,253 @@ result message (about 15 ms in a live run), and the thrown error carries that ca
 and cost. Every later call is denied without asking the gate. If no result arrives within 5
 seconds the process is killed, and the error then carries no usage.
 
-Every invocation is a fresh session: `agent-sdk` does not resume one, and it does not run
-named agents (`agent`, `pluginDirs`).
+On `agent-sdk`, hooks other than the gate's run beside it: plugin hooks load with their
+plugin (`settingSources: []` does not stop them), and an agent file can declare hooks in
+its frontmatter. A deny from either the gate or another hook wins. Hooks that block or
+observe are allowed. A `PreToolUse` hook that returns `updatedInput` is different: it
+replaces the tool input after the gate approved the original, and the gate cannot pin the
+approved input, because the hook that answers last wins
+([#109](https://github.com/theaiteam-dev/conduit/issues/109)). The adapter detects the
+rewrite instead. It records the input the gate approved for each `tool_use_id`, and its own
+`PostToolUse` and `PostToolUseFailure` hooks, which receive the same `tool_use_id` and the
+input that ran, compare the two as JSON values. On a mismatch it journals a `gate-decision`
+hold with code `input_rewritten` and ends the call as a gate hold does: the executor holds
+the card without spending an execution attempt, and the call's usage is billed. This
+applies to subagent calls too. The rewritten call has already run, so this is a backstop
+like the MARK_DONE integrity check, not a pre-execution control. Other calls the model
+issued in the same turn also run before the hold stops the CLI (observed live with two Bash
+calls in one turn, both rewritten). A call that reaches `PreToolUse` and never reports a
+post event is not treated as a rewrite.
+
+Every invocation is a fresh session: `agent-sdk` does not resume one.
+
+#### Named agents and plugin dirs on `agent-sdk`
+
+`agent-sdk` runs named agents and loads plugin dirs from the same engine config as
+`claude-headless`: `CONDUIT_HARNESS_AGENT_SDK_AGENT` and
+`CONDUIT_HARNESS_AGENT_SDK_PLUGIN_DIRS`, a station's `agent:` and a critic's
+`check.critic.agent` ([#109](https://github.com/theaiteam-dev/conduit/issues/109)). The
+adapter passes the agent to the SDK as `agent` and each plugin dir as a local plugin, and the
+SDK hands the CLI `--agent` and `--plugin-dir`. The kernel hashes the same definition file
+into the binding stamp that it hashes for `claude-headless`, and holds a card whose agent it
+cannot locate, at load and at dispatch.
+
+On this path the CLI does not fail on an agent it cannot find. It runs its default agent and
+reports success (observed with `claude` 2.1.290; `claude -p` exits 1 instead). So the
+adapter checks that the CLI loaded the agent the kernel hashed:
+
+- every `system`/`init` message must list the agent in `agents`, and
+- every main-thread tool call (no `agent_id`) must carry the agent as `agent_type`.
+
+A miss on either ends the call and holds the card without spending an execution attempt, as
+a gate hold does. A miss at init ends the call before the first assistant message. A miss on a tool call
+denies that call with `continue: false`, journals a `gate-decision` hold with code
+`agent_not_loaded`, and bills the result the CLI emits. A subagent's call carries its own
+`agent_type` and an `agent_id`, so the check does not apply to it; the gate still does.
+
+Plugin hooks load with the plugin and run alongside the gate, on the main thread and in
+subagents, as described above: a deny from either side wins, and a `PreToolUse` hook that
+rewrites the input is detected after the call runs and holds the card.
+
+### The `codex-app-server` adapter
+
+Codex has no hook that runs before a tool. It has an approval policy instead: under
+`untrusted`, `codex app-server` sends the client a request before every shell command and
+every patch, including the commands a subagent runs and the nested commands issued by its
+`exec` code-mode tool, and it waits for the answer. The adapter sets `untrusted` on the
+thread and again on every turn (the policy can be overridden per turn), answers each request
+from the gate, and never sends `acceptForSession` or an amendment decision, since those let
+later calls skip the gate. It answers only `accept`, `decline` or `cancel`.
+
+How each request reaches the gate:
+
+- **Shell commands** go to the gate as a `Bash` call. Codex shows the command as a string such
+  as `/usr/bin/zsh -lc 'cat a.txt'`. The adapter removes the shell wrapper and gates the
+  script, but only when the shell is a bare name or lives in `/bin`, `/usr/bin` or
+  `/usr/local/bin`; a wrapper at any other path is gated as the raw string. A station
+  lists `Bash(cat:*)` for `cat a.txt`. Codex has no Read, Glob or Grep tool: it reads files through shell commands, and those entries in `tools` have no effect
+  here. A string the adapter cannot read as a word list is declined. A working directory
+  outside the project root is declined before the gate is asked, because the gate does not
+  see it.
+- **Patches** carry no paths in the request. The adapter takes them from the `fileChange` item
+  Codex announced just before, and gates every path: an added file as `Write`, an updated
+  file as `Edit`, a delete as `Write`, and a move as `Edit` on the source and `Write` on the
+  destination. One denied path declines the whole patch. A request with no announced item, an
+  add or delete that carries a `move_path`, or one that asks for a session-wide write grant, is declined. A station that lets the model
+  patch files lists `Write` and `Edit`.
+- **MCP tool approvals** go to the gate as `mcp__<server>__<tool>`, which the gate always
+  denies.
+- **Any other request** (`item/permissions/requestApproval`, `item/tool/requestUserInput`,
+  a dynamic tool call, a token refresh) is answered with a JSON-RPC error and journaled as a
+  deny. The adapter never leaves a request waiting and never accepts one it does not
+  understand. `AskUserQuestion` has no Codex counterpart, so with the shipped gate a Codex
+  call is never held: `hold` is reachable only through a custom gate.
+
+A decline gives the model no reason, and it tries other ways. Every retry is gated again.
+After the first hold, every request is declined without asking the gate, and the hold is
+answered with `cancel`, which denies the call and interrupts the turn. Codex reports no token
+usage for an interrupted call, so the usage on a held call is what Codex had reported before
+it, and the model call in flight when the hold began is not counted. If the turn has not ended
+5 seconds after a hold, the process is killed.
+
+What it does not cover, beyond the gaps listed above for every gated adapter:
+
+- **The sandbox does not confine anything on a host without `bwrap`.** The adapter sends
+  `workspace-write` (read-only would stop a station from writing its output, and
+  `danger-full-access` is never sent). On the host where this was checked, `bwrap` was not
+  installed, and a command the gate had allowed wrote a file outside the project root. The gate
+  and the MARK_DONE integrity check are the enforcement there. Behavior with `bwrap` present was
+  not observed.
+- **Ungated built-in tools.** Web search runs without an approval request, so the adapter
+  passes `-c web_search="disabled"`. It also turns off the other built-ins that do not ask
+  (`apps`, `browser_use`, `computer_use`, `image_generation`, `view_image` and the plugin
+  features, listed in `CODEX_APP_SERVER_ARGS`). With those flags a model asked to list its tools
+  named neither `list_mcp_resources` nor `read_mcp_resource`, which ran ungated without them.
+  That is the model's own report from one codex version. A tool that a newer Codex adds without an
+  approval request would not be gated. The list was checked against codex-cli 0.159.1, and
+  `conduit doctor` shows the installed version and notes when it differs. The adapter also
+  reads the version on the first invoke for each binary path and writes one stderr line when it
+  differs from 0.159.1. A version it cannot read is reported once per path and probed again on
+  the next invoke. It still runs.
+- **Subagent creation** is not asked. The commands a subagent runs are, and carry the
+  subagent's thread id as `agentId`.
+- **Usage carries no cost.** Codex reports tokens only, so `cost` is 0, as for `codex-exec`.
+
+The app-server starts detached, in its own cgroup where the host allows it, and is killed with
+`killContained` on a timeout, an idle timeout, a hold and every other exit. Codex starts each
+command in its own session, so the group kill alone would leave one running. The child gets a
+run-scoped `CODEX_HOME` holding an empty `config.toml` and a link to the operator's
+`auth.json`, so the operator's Codex configuration, skills, plugins and MCP servers do not
+reach it. The directory is removed on every exit path. The child's env is the allowlist plus
+`PATH` and `CODEX_HOME`. Every invocation is a fresh, ephemeral thread.
+
+The run-scoped directory is created by `mkdtemp` with mode 0700, as
+`conduit-codex-home-<pid>-<start time>-*` in the temp dir. `removeRunScopedCodexHome` removes it
+on every exit path; a kernel killed by SIGKILL or a crash between creation and removal leaves
+it behind, and the next `runExecutor` in any kernel removes it (see "Stale run-scoped temp
+dirs" below). What remains until then is an empty `config.toml` and a link to `auth.json`,
+not a copy of the credentials.
+
+### The `opencode` adapter
+
+The adapter runs one `opencode serve` per invocation and starts it with the permission
+`{"*":"ask"}`, so every builtin tool call raises a `permission.asked` event and waits for a
+reply. It reads the event stream (SSE) and answers each ask from the gate. It uses raw HTTP,
+not the `@opencode-ai/sdk` package, because that package's types differ from the 1.15.10
+server (`permission.updated` there, `permission.asked` here). It sends `once` or `reject` and
+nothing else. `always` would persist for the rest of the server's life, so no code path can
+send it. A reject carries the gate's reason as its message, so the model can try another way.
+
+An ask names a category (`bash`, `edit`, `read`, ...), not a tool, and not the absolute path.
+The real tool name and input are on the matching `message.part.updated` tool part, joined by
+`callID`, which can arrive after the ask. The adapter waits up to 3 seconds for it, re-fetches
+the message once, and rejects the ask if the part is still missing. How each category reaches
+the gate:
+
+- **`bash`** goes to the gate as `Bash` with the command from the tool part. The ask's
+  `patterns` are the parsed sub-commands (`ls && echo hi` gives `["ls","echo hi"]`), so they
+  are only a cross-check: one pattern must equal the command, several must all appear in it.
+  A mismatch is rejected. A `workdir` outside the project root is rejected.
+- **`edit`** covers write, edit, multiedit and apply_patch. `write` is `Write`, `edit` and
+  `multiedit` are `Edit`. A patch is gated once per file from the ask's `metadata.files`
+  (add: `Write`, update: `Edit`, delete: `Write`, move: `Edit` on the source and `Write` on the
+  destination), and one denied path rejects the whole patch. A patch with no file list, or an
+  unknown file type, is rejected. A move needs a `movePath`.
+- **`read`** is `Read`, **`glob`** is `Glob`, **`grep`** is `Grep`. **`list`** is gated as
+  `Glob`; the `list` tool was not in the live tool set, so its ask shape is assumed. Every path
+  must resolve, symlinks followed, inside the project root, or the ask is rejected before the
+  gate sees it. The gate itself does not confine reads.
+- **`webfetch`** is `WebFetch`, **`websearch`** and `codesearch` are `WebSearch`. The gate
+  denies all three.
+- **`task`** is `Agent`. **`todowrite`** is `TodoWrite` and **`skill`** is `Skill`: the gate
+  allows them only when the station's `tools` list names them.
+- **`external_directory`** is always rejected and the gate is not asked. It is the route to
+  files outside the project root, and nothing in `tools` can open it.
+- **`question`** is always a hold. **`lsp`**, **`doom_loop`** and any category the adapter does
+  not know, an MCP tool included, are rejected as `tool_not_allowed` without asking the gate.
+  MCP tools were not run: no MCP server is configured, so none should exist.
+
+A station's `tools` list is the gate's allowlist, as for `agent-sdk`: list `Read`, `Glob`,
+`Grep`, `Write`, `Edit` and `Bash(<exe>:*)` entries, and `Agent` for subagents. `unrestricted_tools`
+and an empty list are refused at load.
+
+Subagents. The `task` tool creates a child session (`session.created` with a `parentID`). The
+adapter tracks the session tree from that event. Asks from a child arrive on the same stream
+and get the same checks, with the child's session id as `agentId` (observed live). An ask from a
+session outside the tree is rejected.
+
+Hold. Aborting at the ask loses the usage of the step in flight, so the order is: reject the
+ask, deny every later ask without asking the gate, wait until the message that owns the call
+reports tokens or the session goes idle (at most 5 seconds), then `POST /session/:id/abort`
+for every session in the tree and end. The server is killed on every exit path. The thrown
+error carries the usage summed so far, and a live hold returned non-zero usage. The question
+tool exists only with `OPENCODE_ENABLE_QUESTION_TOOL`, which is never set. A `question.asked`
+that arrives anyway is rejected (`POST /question/:id/reject`) and held.
+
+Usage is the last value per assistant message id, summed over every session in the tree. Cost
+is what opencode reports: it was present for OpenAI and was not looked at for other providers.
+A model or provider opencode has no price for reports 0.
+
+Errors. A 401 or a `ProviderAuthError` is a `harness-nonzero-exit` classified as an
+authentication failure. An `APIError` with status 429, or rate-limit wording on a retryable
+error, or a `session.status` of type `retry` with rate-limit wording, is `harness-rate-limited`;
+the adapter aborts every session in the tree on the retry status instead of waiting out
+opencode's backoff.
+That rate-limit shape is inferred from the schema: no live run hit a provider limit. HTTP 426
+(free `opencode/*` models need opencode 1.18 or newer) and a server that dies before the session
+is idle are `harness-nonzero-exit`. An abort the adapter sent is not an error. The wall-clock
+timeout and an idle timeout (no event other than a heartbeat) kill the server and throw
+`harness-timeout` and `harness-idle-timeout`.
+
+What it does not cover, beyond the gaps listed above for every gated adapter:
+
+- **An approved Bash command can bypass later asks.** It runs as the same user as the server, so
+  it can read the server's password (from its environment or `/proc/<pid>/environ`), find the
+  loopback port and answer later `permission.asked` events with `once`. Allowlisting an executable
+  that can make HTTP requests (curl, python, node, ...) allowlists that bypass. The container is
+  the boundary for that case.
+- **Allowlisted `OPENCODE_*` variables are dropped** from the child env, since
+  `OPENCODE_PERMISSION` or `OPENCODE_CONFIG` could override the ask rules and
+  `OPENCODE_SERVER_USERNAME` would break the Basic auth.
+- **Tool asks are the only gate.** A builtin that raised no ask would run ungated. None was
+  seen with `"*":"ask"`.
+- **A model call opencode makes for itself** (a title, for instance) is not a tool call.
+- **`tool.execute.before`.** A plugin hook that runs inside the server would be stricter and
+  fires in subagents, but it needs `OPENCODE_PURE` off, so the adapter does not use it.
+- **`always` persistence** is mitigated by never sending it and by the fresh run-scoped data
+  directory, not by the server.
+- **A free-text tool result** is opencode's, not the gate's. The journal keeps the tool name,
+  the path and an error flag or exit code, never the body.
+
+The server starts detached, in its own cgroup where the host allows it, and is killed with
+`killContained` on a timeout, an idle timeout, a hold and every other exit. opencode runs bash
+commands in their own session, which survives a group kill, so the cgroup is the boundary that
+reaches them. The server binds `127.0.0.1` on a random port and requires HTTP Basic auth with a
+random per-invocation password on every request, the event stream included. The adapter refuses
+a server that reports any other address.
+
+The child gets a run-scoped, empty `HOME` and four run-scoped XDG directories (config, data,
+state, cache), all removed on every exit path, and `OPENCODE_DISABLE_PROJECT_CONFIG`,
+`OPENCODE_DISABLE_CLAUDE_CODE`, `OPENCODE_DISABLE_EXTERNAL_SKILLS`,
+`OPENCODE_DISABLE_DEFAULT_PLUGINS` and `OPENCODE_PURE` set to 1. With these, `AGENTS.md` in the project, project
+MCP servers and project plugins did not load. Its env is the allowlist plus `PATH` and those
+variables. An allowlisted `HOME` is replaced by the run-scoped one: opencode loads
+`~/.opencode/` (config, agents, commands, MCP servers) from `os.homedir()` whatever the XDG
+roots say, falling back to the passwd entry when `HOME` is unset, and an `allow` rule there is
+merged after the adapter's `"*":"ask"` and wins, so no ask reaches the gate. With the operator's
+`HOME`, a `~/.opencode/opencode.json` holding `bash: allow` left `bash → allow` as the last
+matching rule; with the run-scoped one it did not (opencode 1.15.10). Bash commands the agent
+runs see the same empty `HOME`, so they do not read the operator's git or shell config either.
+Credentials are the `auth.json`
+entry for the model's provider only, passed as `OPENCODE_AUTH_CONTENT`, and never logged or
+journaled. A call fails before spawning if that provider has no entry and no allowlisted
+provider variable. An OAuth entry is copied, so a token the child refreshes is discarded with
+the directory. Every invocation is a fresh session. The model must be set as `provider/model`.
 
 ## The containment profile
 
 Because the kernel can't gate what happens inside the harness's own loop, containment is a
-**documented profile at the process boundary** instead of per-call enforcement. Five things
+**documented profile at the process boundary** instead of per-call enforcement. These
 hold it together:
 
 - **Mandatory owned-paths integrity gate.** Every write the harness makes is checked against
@@ -92,7 +375,9 @@ hold it together:
   during its run, but a write outside `owned_paths` hard-pauses the card to `hold` rather
   than advancing it. For harness stations this check is **mandatory, not opt-in** — it
   cannot be disabled via `defaults.enforce_owned_paths: false` the way it can for other
-  station kinds.
+  station kinds. Under `overlap: true` (ADR-0012) a touched path inside the owned paths of a
+  card whose call overlapped this one is attributed to that card instead of failing the
+  check; every other path is checked as above.
 - **Secrets by explicit allowlist only.** The harness child process's environment contains
   only variables named in engine configuration (e.g. the harness's own auth token) — never
   the kernel's environment inherited wholesale. Allowlisted names live in engine config
@@ -125,11 +410,19 @@ hold it together:
   Deployment guidance additionally recommends running the container as a dedicated non-root
   user for agentic/harness flows. [`deployment-hardening.md`](deployment-hardening.md) is
   that guidance in full.
+- **Write confinement of overlapped calls.** A call that runs as a member of a harness
+  overlap batch runs under Landlock, which refuses a write outside the card's owned paths,
+  the call's own temp and config dirs, and `/dev` before it happens. Serial calls are not
+  confined.
+  See [Write confinement of overlapped calls](#write-confinement-of-overlapped-calls).
 - **Optional idle timeout.** `timeout_seconds` bounds the whole invocation, so a harness
   stuck on a hung tool call runs until that bound. `idle_timeout_seconds` adds a second
   bound, reset by every stdout line: if no line arrives for that long, the runner kills the
   process group as it does on the wall-clock timeout
-  ([#31](https://github.com/theaiteam-dev/conduit/issues/31)). It applies only to
+  ([#31](https://github.com/theaiteam-dev/conduit/issues/31)). `codex-app-server` and
+  `opencode` run a server rather than a one-shot process and keep their own idle timer:
+  codex resets it on every stdout JSON-RPC line, opencode on every SSE event except
+  `server.heartbeat`. It applies only to
   `kind: harness` stations and must be a positive integer below the wall-clock timeout
   that applies (`timeout_seconds`, or the 300-second default). An idle kill fails as
   `harness-idle-timeout` rather than `harness-timeout`, and is retried the same way: it
@@ -235,6 +528,115 @@ fallback. The kernel's own tests require the cgroup mechanism in CI
 (`CONDUIT_REQUIRE_CGROUP_CONTAINMENT=1`); on a development host without it, the tests that
 need it are reported as skipped with the reason.
 
+## Write confinement of overlapped calls
+
+A station that declares `overlap: true` runs several cards' harness calls at once
+([ADR-0012](../adr/0012-overlapping-ungated-harness-calls.md)). Their integrity diffs
+attribute a touched path inside a sibling's owned paths to that sibling, so on its own the
+diff cannot tell a sibling's own write from one another member made there. Each member of an
+overlap batch therefore runs its whole process tree under Landlock, an unprivileged Linux
+security module ([ADR-0013](../adr/0013-os-enforced-write-confinement-of-overlapped-harness-calls.md),
+[#122](https://github.com/theaiteam-dev/conduit/issues/122)).
+
+**Mechanism.** The adapter's spawn runs the CLI through `llexec`
+([`native/llexec/llexec.c`](../native/llexec/llexec.c)), a small static helper, after the
+cgroup wrapper: the shell joins the invocation's cgroup and execs `llexec <writable
+paths> -- <cli>`, and `llexec` creates a Landlock ruleset that handles the write-type file
+rights of the highest ABI the kernel reports, grants them beneath each writable directory,
+and only write and truncate on a writable path that is a file, sets `no_new_privs`,
+restricts itself, and execs the CLI. Reads and executes are not handled, so they stay
+allowed everywhere. The ruleset is inherited by every descendant and cannot be
+removed, so a Bash-tool command that calls `setsid()` stays confined. A write outside the
+set fails with `EACCES` (`Permission denied`) and changes nothing. `llexec` never runs the
+CLI unconfined: if it cannot open a writable path or apply the ruleset, it prints a line
+starting with `llexec:` and exits 121 before the exec, and the call fails as a spawn failure
+does.
+
+**The writable set** of one call is the card's canonical `owned_paths` (each must exist
+when the batch is admitted, or the card runs on the serial path), a per-call temp dir,
+the adapter's run-scoped config dirs, and `/dev`. Per adapter:
+
+| Adapter | Run-scoped dirs granted | Env pointed into the per-call temp dir | How the set was established |
+|---|---|---|---|
+| `agent-sdk` | `CLAUDE_CONFIG_DIR`, created for every confined call whatever `_ISOLATE_CONFIG` says | `TMPDIR`, `TMPPREFIX`, `XDG_CACHE_HOME`, `XDG_STATE_HOME` | strace of `claude -p` 2.1.296, then a live confined call through the adapter |
+| `codex-app-server` | `CODEX_HOME` (run-scoped on every call) | `TMPDIR`, `TMPPREFIX`, `XDG_CACHE_HOME`, `XDG_STATE_HOME` | a live confined call through the adapter (codex 0.161.0) under strace |
+| `opencode` | the run-scoped root holding `HOME` and the four XDG dirs | `TMPDIR`, `TMPPREFIX` | a live confined call through the adapter (opencode 1.15.10, `openai/gpt-4.1-mini`) under strace |
+
+In each live call the agent wrote its own output file with its file tool and then ran
+`cp` into a sibling's dir; the copy failed with `Permission denied`, and strace showed no
+other refused write except the ones below. What the Claude Code CLI writes outside its
+config dir: version locks under `$XDG_STATE_HOME/claude/locks` and logs under
+`$XDG_CACHE_HOME/claude-cli-nodejs`, which default to the operator's home, hence the XDG
+variables; here-document files from its zsh, named with the filename prefix `$TMPPREFIX`
+(default `/tmp/zsh`, so `/tmp/zshXXXXXX`; the adapters set it to `<per-call temp dir>/zsh`,
+a prefix and not a directory);
+and a unix socket under `/tmp/cc-socks-<uid>`, which is refused, and the call works without
+it. The `.credentials.json` in a run-scoped config dir is a link to the operator's file, so a
+refreshed OAuth token written through the link would be refused. No refresh happened in the
+verification runs.
+
+**Detection.** The kernel decides once per process whether confinement is available. It
+finds the helper (`CONDUIT_LLEXEC`, which must name an executable file; else
+`native/llexec/build/llexec` in a source checkout, built by `bun run build:llexec`; else
+`llexec` on `PATH`, where the engine image installs it), asks it for the Landlock ABI, and
+runs a real write test through it: a write inside the writable path must succeed, and
+creating a file outside it, truncating an existing file outside it, and hardlinking that
+file into the writable path must each be refused. The same commands first run unconfined
+and must all succeed, so a refusal comes from Landlock and not from an unwritable scratch
+dir. `conduit doctor` reports the result as the `write-confinement`
+probe. When the probe fails, every card of an `overlap: true` station runs on the serial
+path, its spans carry `overlap_fallback: "write confinement unavailable: <reason>"`, and the
+run warns once. No overlapped call runs unconfined. An adapter without `canConfineWrites`
+is treated the same way, with its own reason.
+
+This requires Linux 6.2 or later (Landlock ABI 3) with `landlock` in the active LSM list
+(`/sys/kernel/security/lsm`). ABI 3 is the first that checks `truncate(2)`; on ABI 1 or 2 a
+confined member could empty a sibling's file and the diff would attribute it to the
+sibling, so the probe reports confinement unavailable there ("the kernel reports Landlock
+ABI 2, and overlap needs ABI 3 (Linux 6.2 or later)") and the cards run serially. `llexec`
+itself works from ABI 1 (Linux 5.13); under ABI 1 it refuses every cross-directory rename or
+link, even inside the writable paths. A default Docker container allows the Landlock syscalls: the engine image
+probe passes in one (Docker on a 6.8 host kernel). Docker Desktop's VM kernel was not
+checked. CI builds the helper and sets `CONDUIT_REQUIRE_LANDLOCK=1`, so the
+write-confinement tests fail rather than skip if the runner loses Landlock; on a
+development host without it they are reported as skipped with the reason.
+
+**Evidence.** The containment conformance suite runs a write-confinement case for every
+adapter with `canConfineWrites`, through its real spawn path, with a stand-in binary
+([`src/worker/landlock-write-fixture.sh`](../src/worker/landlock-write-fixture.sh)) that
+tries `cp`, `mv` and a symlink into a sibling's dir, a `setsid` child writing there, and an
+append to a shared project file. Every one must be refused while the call's own dir, its
+`TMPDIR` and its run-scoped config dirs stay writable; a control case runs the fixture
+unconfined and requires the sibling writes to land.
+
+**Not covered:**
+
+- Metadata. `chmod`, `chown`, `utimes` and extended attributes are not Landlock write
+  rights, so a member can change a sibling's file modes or times, though not its contents.
+- Writes made on the call's behalf by a process that is not confined, such as a daemon
+  reached over a socket.
+- Network egress (see [Network posture](#network-posture-full-egress-in-v1)).
+- Reads. Everything the kernel's user can read stays readable.
+- `/dev`. The whole of `/dev` is writable, so a member can write `/dev/shm` entries a
+  sibling created and any device file the kernel's user can open. None of it is a
+  sibling's `owned_paths` (ADR-0013 records why `/dev` is not narrowed).
+- Serial calls, gate critics and deterministic stations. They run as before, with the
+  integrity diff as the backstop.
+
+**Stale run-scoped temp dirs.** The per-call temp dir (`conduit-call-tmp-`) and the
+adapters' run-scoped dirs (`conduit-claude-config-`, `conduit-codex-home-`,
+`conduit-opencode-`) live in the OS temp dir, and the last three can hold a link to the
+operator's credentials. Each adapter removes them on every exit path, but a kernel that is
+SIGKILLed or crashes runs no cleanup. Each dir is therefore named
+`<prefix><pid>-<start time>-<random>` after the kernel that made it, the same owner tag the
+cgroups carry, and the first `runExecutor` in each kernel process removes the dirs under
+those prefixes whose owner is gone, by the same rule as the cgroup sweep
+(`worker/stale-temp-dirs.ts` `sweepStaleRunScopedDirsOnce`, which runs
+`sweepStaleRunScopedDirs` once per process). It keeps this kernel's own dirs, a
+live owner's, an owner it cannot decide about, and untagged names, which is what a host
+without `/proc` produces. Removal drops a credentials link without touching its target, and
+a dir it cannot remove, such as another user's, is skipped.
+
 ## The child's configuration surface
 
 A harness CLI assembles its behaviour from configuration it finds, not only from the
@@ -287,8 +689,19 @@ What isolation does **not** fence, stated so the claim stays narrow:
   not follow the symlink, so a token refreshed inside the child is discarded with the
   run-scoped dir and the operator's file keeps the old token. A long-lived
   `CLAUDE_CODE_OAUTH_TOKEN` on the allowlist avoids this.
-- **`codex-exec`.** No equivalent fence exists for codex yet; its allowlisted `HOME`
+- **`codex-exec`.** No equivalent fence exists for codex-exec yet; its allowlisted `HOME`
   still exposes the operator's codex configuration.
+- **`codex-app-server`.** It is always constructed, with no opt-out: every invocation gets a
+  `CODEX_HOME` holding an empty `config.toml` and a symlink to the operator's `auth.json`, and
+  `HOME` reaches the child only when the allowlist names it. The link is used instead of a copy
+  so that a refreshed login token is written to the operator's file if Codex rewrites
+  `auth.json` in place. Whether it does was not observed, because no token refresh happened in
+  any run. If Codex replaces the file instead, the link is lost with the directory, as for
+  Claude above. An allowlisted `OPENAI_API_KEY` or `CODEX_API_KEY` avoids the question.
+- **`opencode`.** It is always constructed, with no opt-out: the four XDG directories are
+  run-scoped and only the model provider's credential entry is passed in, as
+  `OPENCODE_AUTH_CONTENT`. A credential the child refreshes is not written back to the
+  operator's `auth.json`.
 
 ## Network posture: full egress in v1
 
@@ -334,6 +747,15 @@ model, duration, artifact hashes, usage, and the binding stamp, effective
 liveness-watchdog integration so an in-flight attempt counts as progress, and the outbox +
 idempotency discipline for effectful stations. The tool loop is the only new freedom; the
 contract around it is unchanged.
+
+Declared outputs resolve the way a transform's do. By default they are collected from the
+project root. With `output_scope: owned_dir`, which fan-out children use so that siblings
+sharing one station definition do not overwrite one file, they are collected from the
+card's `owned_paths[0]`: the kernel lists each destination path at the end of the prompt,
+holds the card before running the harness if that directory is missing, outside the
+project root, or escaped by an output name, and removes each declared output before every
+attempt so that only a file the current call wrote is collected. SPEC §4 ("Card scope")
+has the full rules.
 
 ## Recommended deployment
 

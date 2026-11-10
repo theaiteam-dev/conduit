@@ -11,6 +11,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Options, SDKMessage } from '@anthropic-ai/claude-agent-sdk';
 import { describeHarnessContainmentConformance } from './harness-containment.conformance';
+import { withFailingCallTempDir } from './harness-call-temp-dir.test-helper';
 import { createAgentSdkHarnessAdapter, type AgentSdkHarnessAdapterConfig, type AgentSdkQueryFn } from './harness-adapter-agent-sdk';
 import {
   bindHarnessDefinitionsForIntrospection, buildHarnessDefinitionRegistry, shippedHarnessAdapterNames,
@@ -19,8 +20,15 @@ import {
 import type { HarnessEvent } from './harness-events';
 import { HARNESS_GATE_HOLD_CODE, type GateToolCall, type HarnessToolGate } from './harness-gate';
 
+// The API key is a dummy: a write-confined call always builds a run-scoped config dir (issue #122), which
+// needs a credential source, and the stand-in binary never authenticates.
 describeHarnessContainmentConformance('agent-sdk', (opts) =>
-  createAgentSdkHarnessAdapter({ ...opts, envAllowlist: [] }),
+  createAgentSdkHarnessAdapter({
+    ...opts,
+    envAllowlist: ['ANTHROPIC_API_KEY'],
+    sourceEnv: { PATH: process.env.PATH, ANTHROPIC_API_KEY: 'sk-conformance' },
+  }),
+  { confinedEnv: ['TMPDIR', 'CLAUDE_CONFIG_DIR', 'XDG_CACHE_HOME', 'XDG_STATE_HOME'] },
 );
 
 const ROOT = tmpdir();
@@ -47,6 +55,8 @@ interface Ctx {
   options: Options;
   /** Run the PreToolUse hook the adapter registered, as the CLI would. */
   hook(input: Record<string, unknown>): Promise<unknown>;
+  /** Run the adapter's post hook for `PostToolUse` or `PostToolUseFailure`, as the CLI would after the tool ran. */
+  post(event: 'PostToolUse' | 'PostToolUseFailure', input: Record<string, unknown>): Promise<unknown>;
   /** Start a real child through the adapter's spawn hook. */
   spawn(command: string, args: string[], signal?: AbortSignal): ChildProcess;
 }
@@ -60,9 +70,20 @@ function scripted(script: (ctx: Ctx) => AsyncGenerator<Msg, void>): { query: Age
       options,
       hook: (input) => {
         const fn = options.hooks!.PreToolUse![0]!.hooks[0]!;
+        const id = typeof input.tool_use_id === 'string' ? input.tool_use_id : 'tu-1';
         return fn(
-          { hook_event_name: 'PreToolUse', session_id: 's', transcript_path: '', cwd: '', tool_use_id: 'tu-1', ...input } as never,
-          'tu-1',
+          { hook_event_name: 'PreToolUse', session_id: 's', transcript_path: '', cwd: '', tool_use_id: id, ...input } as never,
+          id,
+          { signal: new AbortController().signal },
+        );
+      },
+      post: (event, input) => {
+        const fn = options.hooks![event]![0]!.hooks[0]!;
+        const id = typeof input.tool_use_id === 'string' ? input.tool_use_id : 'tu-1';
+        const extra = event === 'PostToolUse' ? { tool_response: 'ok' } : { error: 'Exit code 1' };
+        return fn(
+          { hook_event_name: event, session_id: 's', transcript_path: '', cwd: '', tool_use_id: id, ...extra, ...input } as never,
+          id,
           { signal: new AbortController().signal },
         );
       },
@@ -134,7 +155,8 @@ describe('agent-sdk adapter: capabilities', () => {
     expect(adapter.reportsUsage).toBe(true);
     expect(adapter.canRestrictTools).toBe(true);
     expect(adapter.canGatePerCall).toBe(true);
-    expect(adapter.resolveAgentDefinition).toBeUndefined();
+    // Named agents (issue #109): see harness-adapter-agent-sdk-agent.test.ts.
+    expect(typeof adapter.resolveAgentDefinition).toBe('function');
   });
 
   it('probes the resolved binary, and reports a missing one', async () => {
@@ -265,6 +287,26 @@ describe('agent-sdk adapter: options handed to the SDK', () => {
     const b = ok();
     await makeAdapter(b.query).invoke(invocation({ gate: allowAll, tools: [] }));
     expect(b.seen[0]!.allowedTools).toBeUndefined();
+    expect(b.seen[0]!.tools).toBeUndefined();
+  });
+
+  it('offers the model only the built-in tools the gate allows', async () => {
+    const a = ok();
+    await makeAdapter(a.query).invoke(invocation({ gate: allowAll, tools: ['Bash(curl:*)', 'Read'] }));
+    expect(a.seen[0]!.tools).toEqual(['Bash', 'Read']);
+    // One Bash entry per rule form collapses to one tool; Task is the subagent tool's other name;
+    // an MCP tool is not a built-in, and a form the gate does not recognise is not offered.
+    const b = ok();
+    await makeAdapter(b.query).invoke(
+      invocation({
+        gate: allowAll,
+        tools: ['Bash(git)', 'Bash(jq:*)', 'Bash(git status:*)', 'Task', 'mcp__db__query', 'Read(./x)'],
+      }),
+    );
+    expect(b.seen[0]!.tools).toEqual(['Bash', 'Agent']);
+    const c = ok();
+    await makeAdapter(c.query).invoke(invocation({ gate: allowAll, tools: ['mcp__db__query'] }));
+    expect(c.seen[0]!.tools).toEqual([]);
   });
 
   it('lets the call model win over the adapter default, and omits it when neither is set', async () => {
@@ -349,6 +391,21 @@ describe('agent-sdk adapter: isolateConfig', () => {
       rmSync(scratch, { recursive: true, force: true });
       rmSync(h, { recursive: true, force: true });
     }
+  });
+
+  it('removes the run-scoped config dir when the per-call temp dir cannot be created, before anything is spawned', async () => {
+    const { query, seen } = scripted(async function* () { yield RESULT_OK; });
+    const { live, leftBehind } = await withFailingCallTempDir('conduit-claude-config-', async () => {
+      const err = await rejection(
+        makeAdapter(query, { sourceEnv: { ANTHROPIC_API_KEY: 'sk-test' }, envAllowlist: ['ANTHROPIC_API_KEY'] }).invoke(
+          invocation({ gate: allowAll, confinement: { helper: '/nonexistent/helper', writable: [ROOT] } }),
+        ),
+      );
+      expect(err.message).toBe('simulated call temp dir failure');
+    });
+    expect(seen).toEqual([]);
+    expect(live.length).toBe(1);
+    expect(leftBehind).toEqual([]);
   });
 
   it('fails before spawning when there is nothing to authenticate with', async () => {
@@ -592,6 +649,176 @@ describe('agent-sdk adapter: hold', () => {
     expect(err.code).toBe(HARNESS_GATE_HOLD_CODE);
     expect(isDead(state.child!.pid!)).toBe(true);
     expect(Date.now() - started).toBeLessThan(20_000);
+  });
+});
+
+describe('agent-sdk adapter: an input rewrite by another PreToolUse hook', () => {
+  // The gate approved `echo hi`; a plugin hook answering after it replaced the input, and the
+  // rewrite ran. PostToolUse reports the input that ran under the same tool_use_id.
+  const approved = { command: 'echo hi', description: 'say hi' };
+  const rewritten = { command: 'touch e_rewritten.txt', description: 'say hi' };
+  const decisionsOf = (events: HarnessEvent[]) => events.filter((e) => e.type === 'gate-decision');
+
+  it('does not hold when the input that ran is the input the gate approved', async () => {
+    let answer: unknown;
+    const { query } = scripted(async function* (ctx) {
+      await ctx.hook({ tool_name: 'Bash', tool_input: approved });
+      // The same JSON value, keys in another order.
+      answer = await ctx.post('PostToolUse', { tool_name: 'Bash', tool_input: { description: 'say hi', command: 'echo hi' } });
+      yield RESULT_OK;
+    });
+    const { events, onEvent } = collect();
+    const out = await makeAdapter(query).invoke(invocation({ gate: allowAll, onEvent }));
+    expect(answer).toEqual({ continue: true });
+    expect((out.usage as KnownUsage).tokens).toBe(100);
+    expect(decisionsOf(events)).toHaveLength(1);
+    expect(decisionsOf(events)[0]).toMatchObject({ decision: 'allow' });
+  });
+
+  it('holds the card when the input that ran differs, journals the rewrite, and still bills the call', async () => {
+    let answer: unknown;
+    const { query } = scripted(async function* (ctx) {
+      await ctx.hook({ tool_name: 'Bash', tool_input: approved });
+      answer = await ctx.post('PostToolUse', { tool_name: 'Bash', tool_input: rewritten });
+      yield RESULT_OK;
+    });
+    const { events, onEvent } = collect();
+    const err = await rejection(makeAdapter(query, { holdStopWaitMs: 60_000 }).invoke(invocation({ gate: allowAll, onEvent })));
+    expect(err.code).toBe(HARNESS_GATE_HOLD_CODE);
+    expect(err.message).toContain('Bash (input_rewritten)');
+    expect(usageFromThrow(err)).toMatchObject({ tokens: 100, cost: 0.0123 });
+    expect(answer).toMatchObject({ continue: false });
+    const decisions = decisionsOf(events);
+    expect(decisions).toHaveLength(2);
+    expect(decisions[1]).toMatchObject({
+      toolName: 'Bash',
+      toolCallId: 'tu-1',
+      decision: 'hold',
+      code: 'input_rewritten',
+    });
+    // Neither input is journaled.
+    expect(JSON.stringify(events)).not.toContain('e_rewritten');
+  });
+
+  it('holds on a rewrite inside a subagent, and journals the subagent id', async () => {
+    const sub = { tool_use_id: 'tu-sub', agent_id: 'sub-7', agent_type: 'helper' };
+    const { query } = scripted(async function* (ctx) {
+      await ctx.hook({ tool_name: 'Bash', tool_input: approved, ...sub });
+      await ctx.post('PostToolUse', { tool_name: 'Bash', tool_input: rewritten, ...sub });
+      yield RESULT_OK;
+    });
+    const { events, onEvent } = collect();
+    const err = await rejection(makeAdapter(query).invoke(invocation({ gate: allowAll, onEvent })));
+    expect(err.code).toBe(HARNESS_GATE_HOLD_CODE);
+    expect(decisionsOf(events)[1]).toMatchObject({
+      toolCallId: 'tu-sub',
+      decision: 'hold',
+      code: 'input_rewritten',
+      agentId: 'sub-7',
+    });
+  });
+
+  it('holds on a rewrite reported by PostToolUseFailure', async () => {
+    let answer: unknown;
+    const { query } = scripted(async function* (ctx) {
+      await ctx.hook({ tool_name: 'Bash', tool_input: approved });
+      answer = await ctx.post('PostToolUseFailure', { tool_name: 'Bash', tool_input: rewritten });
+      yield RESULT_OK;
+    });
+    const { events, onEvent } = collect();
+    const err = await rejection(makeAdapter(query).invoke(invocation({ gate: allowAll, onEvent })));
+    expect(err.code).toBe(HARNESS_GATE_HOLD_CODE);
+    expect(answer).toMatchObject({ continue: false });
+    expect(decisionsOf(events)[1]).toMatchObject({ decision: 'hold', code: 'input_rewritten' });
+  });
+
+  it('does not hold on a failed call that ran the approved input', async () => {
+    const { query } = scripted(async function* (ctx) {
+      await ctx.hook({ tool_name: 'Bash', tool_input: approved });
+      await ctx.post('PostToolUseFailure', { tool_name: 'Bash', tool_input: approved });
+      yield RESULT_OK;
+    });
+    const out = await makeAdapter(query).invoke(invocation({ gate: allowAll }));
+    expect((out.usage as KnownUsage).tokens).toBe(100);
+  });
+
+  it('does not hold on a call that reached PreToolUse and never reported a post event', async () => {
+    const { query } = scripted(async function* (ctx) {
+      await ctx.hook({ tool_name: 'Bash', tool_input: approved });
+      yield RESULT_OK;
+    });
+    const { events, onEvent } = collect();
+    const out = await makeAdapter(query).invoke(invocation({ gate: allowAll, onEvent }));
+    expect((out.usage as KnownUsage).tokens).toBe(100);
+    expect(decisionsOf(events)).toHaveLength(1);
+  });
+
+  it('compares each post event with its own call, by tool_use_id', async () => {
+    const { query } = scripted(async function* (ctx) {
+      await ctx.hook({ tool_name: 'Bash', tool_input: approved, tool_use_id: 'tu-a' });
+      await ctx.hook({ tool_name: 'Bash', tool_input: rewritten, tool_use_id: 'tu-b' });
+      await ctx.post('PostToolUse', { tool_name: 'Bash', tool_input: rewritten, tool_use_id: 'tu-b' });
+      await ctx.post('PostToolUse', { tool_name: 'Bash', tool_input: approved, tool_use_id: 'tu-a' });
+      yield RESULT_OK;
+    });
+    const out = await makeAdapter(query).invoke(invocation({ gate: allowAll }));
+    expect((out.usage as KnownUsage).tokens).toBe(100);
+  });
+
+  it('does not compare a call the gate denied, since nothing was approved', async () => {
+    const gate: HarnessToolGate = () => ({ decision: 'deny', code: 'not_allowlisted', reason: 'no' });
+    const { query } = scripted(async function* (ctx) {
+      await ctx.hook({ tool_name: 'Bash', tool_input: approved });
+      await ctx.post('PostToolUseFailure', { tool_name: 'Bash', tool_input: rewritten });
+      yield RESULT_OK;
+    });
+    const out = await makeAdapter(query).invoke(invocation({ gate }));
+    expect((out.usage as KnownUsage).tokens).toBe(100);
+  });
+
+  it('denies every later call after a rewrite hold, without asking the gate', async () => {
+    let asked = 0;
+    const gate: HarnessToolGate = () => {
+      asked += 1;
+      return { decision: 'allow' };
+    };
+    let later: unknown;
+    const { query } = scripted(async function* (ctx) {
+      await ctx.hook({ tool_name: 'Bash', tool_input: approved });
+      await ctx.post('PostToolUse', { tool_name: 'Bash', tool_input: rewritten });
+      later = await ctx.hook({ tool_name: 'Read', tool_input: { file_path: 'a' }, tool_use_id: 'tu-2' });
+      yield RESULT_OK;
+    });
+    const err = await rejection(makeAdapter(query).invoke(invocation({ gate })));
+    expect(err.code).toBe(HARNESS_GATE_HOLD_CODE);
+    expect(asked).toBe(1);
+    expect(later).toMatchObject({ hookSpecificOutput: { permissionDecision: 'deny' } });
+  });
+
+  it('kills the process after the bounded wait when no result follows the rewrite hold', async () => {
+    const state: { child?: ChildProcess } = {};
+    const { query } = scripted(async function* (ctx) {
+      state.child = ctx.spawn('/bin/sleep', ['30']);
+      await ctx.hook({ tool_name: 'Bash', tool_input: approved });
+      await ctx.post('PostToolUse', { tool_name: 'Bash', tool_input: rewritten });
+      await new Promise((r) => state.child!.once('exit', r));
+      throw new Error('Claude Code process terminated by signal SIGKILL');
+    });
+    const err = await rejection(makeAdapter(query, { holdStopWaitMs: 100 }).invoke(invocation({ gate: allowAll })));
+    expect(err.code).toBe(HARNESS_GATE_HOLD_CODE);
+    expect(isDead(state.child!.pid!)).toBe(true);
+  });
+
+  it('registers both post hooks for every tool, with no matcher', async () => {
+    const { query, seen } = scripted(async function* () {
+      yield RESULT_OK;
+    });
+    await makeAdapter(query).invoke(invocation({ gate: allowAll }));
+    for (const event of ['PostToolUse', 'PostToolUseFailure'] as const) {
+      const matchers = seen[0]!.hooks![event]!;
+      expect(matchers).toHaveLength(1);
+      expect(matchers[0]!.matcher).toBeUndefined();
+    }
   });
 });
 
@@ -881,12 +1108,5 @@ describe('agent-sdk adapter: registration', () => {
     expect(() =>
       buildHarnessDefinitionRegistry([{ name: 'agent-sdk', envAllowlist: ['HOME'], isolateConfig: true }]),
     ).not.toThrow();
-  });
-
-  it.each([
-    ['agent', { agent: 'team:coder' }, 'AGENT'],
-    ['pluginDirs', { pluginDirs: ['/opt/plugins'] }, 'PLUGIN_DIRS'],
-  ])('rejects %s, since named agents are not implemented for this adapter', (_option, extra, suffix) => {
-    expect(() => buildHarnessDefinitionRegistry([{ name: 'agent-sdk', envAllowlist: ['HOME'], ...extra }])).toThrow(suffix);
   });
 });

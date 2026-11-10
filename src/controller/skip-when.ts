@@ -17,8 +17,8 @@
 
 import type { Database } from 'bun:sqlite';
 import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
 import { readLatestCheckpoint } from '../checkpoint/checkpoint';
+import { resolveInputPath, SEED_INPUT } from '../flow/resolve-input';
 import type { SkipWhenConfig, SkipWhenScalar } from '../types/kernel';
 
 export type SkipDecision =
@@ -32,6 +32,8 @@ export interface SkipEvalContext {
   runId: string;
   /** Checkpoint `flow` key: the flow version as a string. */
   flowVersion: string;
+  /** The run's project root; a relative owned_paths[0] resolves against it, not the cwd. */
+  projectRoot: string;
   card: { id: string; owned_paths: readonly string[] };
 }
 
@@ -48,7 +50,15 @@ function readSeed(ctx: SkipEvalContext): DocumentRead {
   if (ownedDir === undefined) {
     return { ok: false, reason: `card '${ctx.card.id}' has no owned_paths, so it has no seed.json` };
   }
-  const path = join(ownedDir, 'seed.json');
+  // The same resolver the transform render and binding stamp use for the
+  // reserved seed.json (issue #124): relative to the project root, and
+  // confined to the owned dir.
+  let path: string;
+  try {
+    path = resolveInputPath(SEED_INPUT, ctx.projectRoot, ctx.card.owned_paths);
+  } catch (e) {
+    return { ok: false, reason: `cannot resolve seed.json for card '${ctx.card.id}': ${(e as Error).message}` };
+  }
   let text: string;
   try {
     text = readFileSync(path, 'utf-8');

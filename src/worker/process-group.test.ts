@@ -19,9 +19,7 @@ import {
   expectGrandchildReaped,
   hostContainment,
   killRecordedGrandchild,
-  recordedPid,
-  recordedSetsidPid,
-  requiresSetsidContainment,
+  waitForGrandchildrenRunning,
 } from './harness-containment.conformance';
 
 const RUNNER_SCRIPT = join(import.meta.dir, 'containment-signal-runner.ts');
@@ -45,15 +43,21 @@ describe('process-group registry: handlers exist only while a group is live', ()
   it('installs the signal and exit handlers on the first tracked group and removes them when the last is untracked', () => {
     const baseline = listenerCounts();
 
-    trackProcessGroup(FAKE_PID);
-    trackProcessGroup(FAKE_PID + 1);
-    expect(listenerCounts()).toEqual(baseline.map((n) => n + 1));
+    try {
+      trackProcessGroup(FAKE_PID);
+      trackProcessGroup(FAKE_PID + 1);
+      expect(listenerCounts()).toEqual(baseline.map((n) => n + 1));
 
-    untrackProcessGroup(FAKE_PID);
-    expect(listenerCounts()).toEqual(baseline.map((n) => n + 1));
+      untrackProcessGroup(FAKE_PID);
+      expect(listenerCounts()).toEqual(baseline.map((n) => n + 1));
 
-    untrackProcessGroup(FAKE_PID + 1);
-    expect(listenerCounts()).toEqual(baseline);
+      untrackProcessGroup(FAKE_PID + 1);
+      expect(listenerCounts()).toEqual(baseline);
+    } finally {
+      // A failed expectation must not leave the fake groups tracked for the next test.
+      untrackProcessGroup(FAKE_PID);
+      untrackProcessGroup(FAKE_PID + 1);
+    }
   });
 
   it('kills live groups and leaves termination to another listener when one exists', async () => {
@@ -112,12 +116,15 @@ describe('process-group registry: the kernel takes live station groups with it',
 
   /**
    * Spawn the stand-in kernel and wait until every grandchild `expectGrandchildReaped`
-   * will later assert on has recorded its pid: the plain one always, and the
-   * setsid one too wherever this host requires cgroup containment. Signalling
-   * (or, in 'exit' mode, letting the runner exit) any earlier risks catching
-   * the fixture before it reaches its `setsid -f` line, in which case the
-   * setsid grandchild is never spawned at all rather than merely reaped late
-   * (issue #77 flake: "setsid grandchild: no pid recorded").
+   * will later assert on has recorded its pid and created its sentinel: the
+   * plain one always, and the setsid one too wherever this host requires
+   * cgroup containment. Signalling (or, in 'exit' mode, letting the runner
+   * exit) any earlier risks catching the fixture before it reaches its
+   * `setsid -f` line, in which case the setsid grandchild is never spawned at
+   * all rather than merely reaped late (issue #77 flake: "setsid grandchild:
+   * no pid recorded"). The pid files alone are not enough: the fixture writes
+   * each one before that grandchild's first touch, so a signal in that gap
+   * kills it with no sentinel (issue #143 flake: "sentinel was never created").
    */
   async function startKernel(runner: 'deterministic' | 'harness', mode?: 'exit'): Promise<void> {
     kernel = Bun.spawn(['bun', RUNNER_SCRIPT, runner, projectRoot, ...(mode ? [mode] : [])], {
@@ -125,17 +132,7 @@ describe('process-group registry: the kernel takes live station groups with it',
       stdout: 'pipe',
       stderr: 'pipe',
     });
-    const deadline = Date.now() + READY_BUDGET_MS;
-    const grandchildrenRecorded = () =>
-      recordedPid(projectRoot) !== undefined &&
-      (!requiresSetsidContainment || recordedSetsidPid(projectRoot) !== undefined);
-    while (!grandchildrenRecorded() && Date.now() < deadline) {
-      await sleep(20);
-    }
-    expect(recordedPid(projectRoot)).toBeDefined();
-    if (requiresSetsidContainment) {
-      expect(recordedSetsidPid(projectRoot)).toBeDefined();
-    }
+    await waitForGrandchildrenRunning(projectRoot, READY_BUDGET_MS);
   }
 
   async function waitForKernelExit(): Promise<void> {

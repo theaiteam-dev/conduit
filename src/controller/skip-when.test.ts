@@ -17,7 +17,7 @@
  */
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import { Database } from 'bun:sqlite';
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ensureCheckpointSchema, writeCheckpoint } from '../checkpoint/checkpoint';
@@ -46,6 +46,7 @@ function ctx(overrides: Partial<SkipEvalContext['card']> = {}): SkipEvalContext 
     stateDb,
     runId: 'run-1',
     flowVersion: '1',
+    projectRoot: dir,
     card: { id: 'c1', owned_paths: [dir], ...overrides },
   };
 }
@@ -136,6 +137,42 @@ describe('source: seed', () => {
     const pred: SkipWhenConfig = { source: 'seed', field: 'constructor', equals: 'x' };
     writeSeed(JSON.stringify({}));
     expect(evaluateSkipWhen(pred, ctx()).action).toBe('hold');
+  });
+});
+
+describe('source: seed resolves against the project root (issue #124)', () => {
+  let elsewhere: string;
+  let originalCwd: string;
+
+  beforeEach(() => {
+    originalCwd = process.cwd();
+    elsewhere = mkdtempSync(join(tmpdir(), 'conduit-skip-when-cwd-'));
+    process.chdir(elsewhere);
+  });
+
+  afterEach(() => {
+    process.chdir(originalCwd);
+    rmSync(elsewhere, { recursive: true, force: true });
+  });
+
+  it('reads a relative owned dir from the project root when cwd is elsewhere', () => {
+    mkdirSync(join(dir, 'evidence', 'c1'), { recursive: true });
+    writeFileSync(join(dir, 'evidence', 'c1', 'seed.json'), JSON.stringify({ no_test_needed: true }));
+    // A decoy at the cwd-relative location carries the opposite value.
+    mkdirSync(join(elsewhere, 'evidence', 'c1'), { recursive: true });
+    writeFileSync(join(elsewhere, 'evidence', 'c1', 'seed.json'), JSON.stringify({ no_test_needed: false }));
+
+    expect(evaluateSkipWhen(SEED_PRED, ctx({ owned_paths: ['evidence/c1'] }))).toEqual({ action: 'skip', value: true });
+  });
+
+  it('holds when seed.json in the owned dir is a symlink out of it', () => {
+    mkdirSync(join(dir, 'c1'));
+    writeFileSync(join(elsewhere, 'seed.json'), JSON.stringify({ no_test_needed: true }));
+    symlinkSync(join(elsewhere, 'seed.json'), join(dir, 'c1', 'seed.json'));
+
+    const decision = evaluateSkipWhen(SEED_PRED, ctx({ owned_paths: [join(dir, 'c1')] }));
+    expect(decision.action).toBe('hold');
+    expect(decision.action === 'hold' && decision.reason).toContain('resolves outside the owned directory');
   });
 });
 

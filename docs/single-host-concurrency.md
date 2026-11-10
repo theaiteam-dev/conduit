@@ -44,7 +44,11 @@ per-run advisory lease:
   lease conflict while another live process holds the lease.
 - A second process invoked against the **same run id** fails fast — exit code 1, with a clear
   message naming the run id and the holding pid — instead of racing the first process or
-  silently corrupting shared run state.
+  silently corrupting shared run state. This holds when the two launches start at the same
+  moment, as duplicate webhook deliveries can: registration reads and inserts the run row in
+  one transaction, so exactly one launch creates the row and takes the lease, and the other
+  reads that row. If the first launch has already finished by then, the second reports the
+  run's state and exits 0.
 - A stale lease left by a **dead** holder is reclaimed automatically — a crashed holder doesn't
   permanently wedge the run. The holder is identified by pid and process start time, so a pid
   the kernel has since given to another process does not count as the holder.

@@ -14,7 +14,7 @@
  * forwards them, which keeps this function stateless.
  */
 
-import type { RateLimitWindow } from './harness-adapter';
+import type { RateLimitWindow, UsageBreakdown } from './harness-adapter';
 import type { HarnessEventBody } from './harness-events';
 
 /** The rate_limit_info fields read here; see ClaudeRateLimitEvent in the adapter. */
@@ -108,15 +108,55 @@ function mapUser(event: Json): HarnessEventBody[] {
   }));
 }
 
-function mapResult(event: Json): HarnessEventBody[] {
+const MODEL_USAGE_CLASSES = ['inputTokens', 'outputTokens', 'cacheReadInputTokens', 'cacheCreationInputTokens'] as const;
+
+/**
+ * The four token classes a Claude `result` message accounts for (issue #108).
+ *
+ * Read from `modelUsage`, summed across every entry, because it is the only
+ * cumulative token figure on the message. `usage` covers only the turns since
+ * the previous result message and leaves out the side-task model Claude Code
+ * bills alongside the main one, so with a background subagent (two result
+ * messages) the last `usage` can be a quarter of the session's tokens.
+ * `total_cost_usd` is cumulative too, so tokens and cost now describe the same
+ * span.
+ *
+ * Falls back to `usage` only when `modelUsage` is absent or has no entry that
+ * carries a numeric class. Undefined when neither is an object. A non-numeric
+ * class counts as zero. Shared by buildKnownUsage (the figure the budgets fold)
+ * and the journal's `usage` event, so the two cannot disagree.
+ */
+export function claudeResultBreakdown(event: unknown): UsageBreakdown | undefined {
+  if (!isObject(event)) return undefined;
+  const modelUsage = event.modelUsage;
+  if (isObject(modelUsage)) {
+    const sum: UsageBreakdown = { inputTokens: 0, outputTokens: 0, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 };
+    let usable = false;
+    for (const entry of Object.values(modelUsage)) {
+      if (!isObject(entry)) continue;
+      for (const cls of MODEL_USAGE_CLASSES) {
+        if (typeof entry[cls] !== 'number') continue;
+        usable = true;
+        sum[cls] += entry[cls];
+      }
+    }
+    if (usable) return sum;
+  }
   const usage = event.usage;
-  if (!isObject(usage)) return [];
-  const breakdown = {
+  if (!isObject(usage)) return undefined;
+  return {
     inputTokens: num(usage.input_tokens),
     outputTokens: num(usage.output_tokens),
     cacheReadInputTokens: num(usage.cache_read_input_tokens),
     cacheCreationInputTokens: num(usage.cache_creation_input_tokens),
   };
+}
+
+function mapResult(event: Json): HarnessEventBody[] {
+  // No usage object, no event: the same condition under which buildKnownUsage
+  // reports no figure.
+  if (!isObject(event.usage)) return [];
+  const breakdown = claudeResultBreakdown(event)!;
   return [
     {
       type: 'usage',

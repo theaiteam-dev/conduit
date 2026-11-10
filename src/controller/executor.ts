@@ -27,8 +27,8 @@
  *   - halt/escalation reasons — io.out / io.err
  */
 
-import { readFileSync, writeFileSync, existsSync, realpathSync, readdirSync, statSync, readlinkSync, mkdirSync, unlinkSync } from 'node:fs';
-import { join, resolve, sep, dirname } from 'node:path';
+import { readFileSync, writeFileSync, existsSync, realpathSync, readdirSync, statSync, readlinkSync, mkdirSync, unlinkSync, rmSync, type Dirent } from 'node:fs';
+import { join, resolve, sep, dirname, relative } from 'node:path';
 import { createHash } from 'node:crypto';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import type { Database } from 'bun:sqlite';
@@ -37,11 +37,24 @@ import type { RunEngineArgs, SpawnedWorker } from '../cli/main';
 import { deriveSubflowRunId } from '../run/run-id';
 import type { StartWorkMessage } from '../worker/ipc-protocol';
 import { sanitizeStderrTail } from '../worker/ipc-protocol';
-import type { ModelAdapter } from '../worker/adapter';
+import { modelResponseTokens, type ModelAdapter } from '../worker/adapter';
+import { sweepStaleRunScopedDirsOnce } from '../worker/stale-temp-dirs';
 import { DEFAULT_RUN_ID, parseColumn, type ConduitDB, type JournalSpanInput, type JournalProvenance } from '../persistence/db';
 import type { FlowConfig, StationConfig, FanInPolicyConfig, StationOutput, Card } from '../types/kernel';
 import { planTick } from './tick';
 import { evaluateSkipWhen, describeSkipWhen } from './skip-when';
+import {
+  OverlapWindows,
+  canonicalOwnedPaths,
+  classifyOverlapTouched,
+  isOverlapHarnessStation,
+  ownedPathSetsIntersect,
+} from './harness-overlap';
+import {
+  createWriteConfinementResolver,
+  resolveWriteConfinement,
+  type WriteConfinement,
+} from '../worker/landlock-confinement';
 import { attemptClaim, beginWork, renewLease, reconcile } from '../dispatch/claim';
 import { checkCommandAllowed, runDeterministic, deterministicCardEnv } from '../worker/deterministic';
 import { runTransformStation, coerciveParse, computeFindingsHash } from '../worker/transform';
@@ -57,12 +70,21 @@ import { loadImageInput, hashImageInputs, assertImagePayloadWithinLimits } from 
 import type { ImageInput } from '../worker/image-input';
 import { renderPrompt } from '../flow/render';
 import { resolveInputPath, SEED_INPUT } from '../flow/resolve-input';
+import {
+  cardScopedArtifactNames,
+  describeOutputDestinations,
+  isOutputCardScoped,
+  resolveDeclaredOutputs,
+  resolveDeliverFile,
+  type ResolvedOutput,
+} from '../flow/resolve-output';
 import { buildOutputSchema } from '../flow/schema';
 import { runGateRework } from './gate-rework';
 import {
   computeBindingStamp,
   computeSkillAwarePromptTemplateVersion,
   computeAgentAwarePromptTemplateVersion,
+  computePromptContentAwarePromptTemplateVersion,
   writeCheckpoint,
   readCheckpoint,
   invalidateCheckpoint,
@@ -85,6 +107,7 @@ import { commitFanOut, evaluateFanIn } from '../dag/expand';
 import type { ArchitectProposal, FanInPolicy, FanInState } from '../dag/expand';
 import { runRankCheck, decideFromCandidates, parseCandidatesArtifact, type RankDecision } from '../quality/rank';
 import { aggregateByWave, checkWaveBudget, countGateReworks, decideExecutionRetry } from '../quality/rework';
+import { allSettledOrThrow } from './settle-all';
 import type { CardUsage, BudgetCaps } from '../quality/rework';
 import {
   egressSend,
@@ -100,6 +123,15 @@ import {
 } from '../channels/slack';
 import type { OnTimeout } from '../channels/slack';
 import { resolveDeliveryChannel } from '../flow/load';
+
+/**
+ * Reports a batch member's throw that `allSettledOrThrow` does not rethrow, so
+ * a halt caused by several members failing at once names each of them.
+ */
+function reportOtherBatchThrow(err: (msg: string) => void): (reason: unknown) => void {
+  return (reason) =>
+    err(`batch: another member also threw: ${reason instanceof Error ? reason.message : String(reason)}`);
+}
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -264,13 +296,32 @@ function rateLimitAttributes(snapshot: RateLimitSnapshot | undefined): Record<st
  * call, and it counts cards a station `wip` cap would have held back anyway.
  */
 function countReadyWaiting(stateDb: Database, runId: string, cardId: string, nowSeconds: number): number {
+  return countReadyNotAdmitted(stateDb, runId, new Set([cardId]), nowSeconds);
+}
+
+/**
+ * Issue #30, ADR-0012: the cards dispatchable now (status 'ready', release
+ * gate passed, planTick's rule) that are not in `memberIds`. The one query for
+ * `ready_waiting`: an overlapped harness call passes its batch, so a sibling
+ * running alongside is not counted as waiting even before its own claim has
+ * moved it off `ready`, and `countReadyWaiting` passes the one card.
+ */
+export function countReadyNotAdmitted(
+  stateDb: Database,
+  runId: string,
+  memberIds: ReadonlySet<string>,
+  nowSeconds: number,
+): number {
+  // The member ids go in as one JSON array, so the count stays in SQL whatever
+  // the batch size (at most K).
   const row = stateDb
     .prepare(
       `SELECT COUNT(*) AS n FROM cards
-       WHERE run_id = $runId AND id != $cardId AND status = 'ready'
-         AND (release_at IS NULL OR release_at <= $now)`,
+       WHERE run_id = $runId AND status = 'ready'
+         AND (release_at IS NULL OR release_at <= $now)
+         AND id NOT IN (SELECT value FROM json_each($members))`,
     )
-    .get({ $runId: runId, $cardId: cardId, $now: nowSeconds }) as { n: number };
+    .get({ $runId: runId, $now: nowSeconds, $members: JSON.stringify([...memberIds]) }) as { n: number };
   return row.n;
 }
 
@@ -328,6 +379,8 @@ export async function runExecutor(args: RunEngineArgs): Promise<void> {
     onMessage,
     sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)),
   } = args;
+  // Drop run-scoped temp dirs (credential links) a SIGKILLed kernel left behind.
+  sweepStaleRunScopedDirsOnce();
   const runId = args.runId ?? DEFAULT_RUN_ID;
   const stateDb = db.getStateDb();
 
@@ -475,6 +528,20 @@ export async function runExecutor(args: RunEngineArgs): Promise<void> {
   const attributedCardId = (): string | null =>
     attributionStore.getStore()?.cardId ?? currentCardId;
 
+  // Issue #30: `overlap: true` stations whose adapter turned out at dispatch
+  // not to gate per call, so the operator is told once per station, not once
+  // per card.
+  const overlapAdapterWarned = new Set<string>();
+  // Issue #122: told once per run when the host cannot write-confine an
+  // overlapped call, so every overlap candidate runs on the serial path.
+  let overlapConfinementWarned = false;
+  // Detection runs on the first pass with an overlap candidate, then never
+  // again this run, whatever resolver was injected.
+  const resolveRunWriteConfinement =
+    args.resolveWriteConfinement !== undefined
+      ? createWriteConfinementResolver(args.resolveWriteConfinement)
+      : resolveWriteConfinement;
+
   // Wrap the adapter to track cumulative token spend (NFR-3: adapter is the
   // ONLY model surface; the control loop itself never calls it).
   const trackingAdapter: ModelAdapter = {
@@ -500,7 +567,8 @@ export async function runExecutor(args: RunEngineArgs): Promise<void> {
       // ONCE at the top of the tick and can be stale by minutes once a
       // long-running synchronous call (this one) finishes.
       lastAdapterActivityAt = now();
-      const spent = result.inputTokens + result.outputTokens;
+      // Issue #156: cache reads count, so a split call spends what it did unsplit.
+      const spent = modelResponseTokens(result);
       tokensSpent += spent;
       const attributed = attributedCardId();
       if (attributed !== null) {
@@ -735,7 +803,7 @@ export async function runExecutor(args: RunEngineArgs): Promise<void> {
     // re-enter the loop: the promote step readies a skipped card at its next
     // lane, and planning now would find nothing to dispatch for it and read
     // the run as stalled.
-    if (applySkipWhen({ db, stateDb, runId, flow, happyPathNext, terminalLanes, maxExecutionAttempts, now: currentNow, err: io.err, runMemo: skipWhenRunMemo })) {
+    if (applySkipWhen({ db, stateDb, runId, flow, happyPathNext, terminalLanes, maxExecutionAttempts, now: currentNow, err: io.err, runMemo: skipWhenRunMemo, projectRoot })) {
       lastLaneChangeAt = currentNow;
       continue;
     }
@@ -1019,6 +1087,138 @@ export async function runExecutor(args: RunEngineArgs): Promise<void> {
     // v10: transform siblings collected during this pass for concurrent execution
     // afterwards (the fan-out reviewer case). Empty at concurrency===1.
     const concurrentBatch: Array<{ cardId: string; station: string }> = [];
+    // Issue #30, ADR-0012: cards of `overlap: true` harness stations collected
+    // during this pass. Admitted to a harness overlap batch, or sent to the
+    // serial path, after the transform batch has finished. Empty at
+    // concurrency===1.
+    const harnessCandidates: Array<{ cardId: string; station: string }> = [];
+
+    // Issue #30: the arguments every executeStation call in this pass shares,
+    // for the harness overlap batch and its serial fallback below.
+    const stationArgs = (cardId: string, station: string): ExecuteStationArgs => ({
+      db,
+      stateDb,
+      runId,
+      flow,
+      stationConfig: flow.stations[station]!,
+      stationId: station,
+      cardId,
+      trackingAdapter,
+      commandAllowlist,
+      happyPathNext,
+      terminalLanes,
+      maxExecutionAttempts,
+      projectRoot,
+      currentNow,
+      now,
+      runStartedAt,
+      wallClockSeconds,
+      maxTokens,
+      getTokensSpent: () => tokensSpent,
+      onAndonTrip: haltOnStationAndon,
+      err: io.err,
+      harnessRegistry: args.harnessRegistry,
+      foldHarnessUsage,
+      stampHarnessActivity,
+      sleep,
+      runSubflow: args.runSubflow,
+    });
+
+    // Issue #30, ADR-0012: apply the dynamic admission conditions to this
+    // pass's harness overlap candidates, in plan order. A card is admitted
+    // when its adapter gates per call (re-checked here, since the registry is
+    // engine configuration), it declares owned_paths, they are disjoint from
+    // every member already admitted, and the batch is under the run's K
+    // ceiling and the station's wip. A card failing one of the first three
+    // runs on the serial path, with the reason journaled; a card over a cap
+    // stays ready for a later pass.
+    const admitHarnessOverlap = (
+      candidates: ReadonlyArray<{ cardId: string; station: string }>,
+      writeConfinement: WriteConfinement,
+    ): {
+      admitted: Array<{ cardId: string; station: string; ownedCanonical: string[]; confinementHelper: string }>;
+      serial: Array<{ cardId: string; station: string; reason?: string }>;
+      deferred: boolean;
+    } => {
+      const admitted: Array<{ cardId: string; station: string; ownedCanonical: string[]; confinementHelper: string }> = [];
+      const serial: Array<{ cardId: string; station: string; reason?: string }> = [];
+      let deferred = false;
+      const { n: inFlight } = stateDb
+        .prepare('SELECT COUNT(*) AS n FROM active_workers WHERE run_id = $runId')
+        .get({ $runId: runId }) as { n: number };
+      const slots = Math.max(0, concurrency - inFlight);
+      const perStation = new Map<string, number>();
+      for (const item of candidates) {
+        const sc = flow.stations[item.station]!;
+        const resolved =
+          sc.harness !== undefined && args.harnessRegistry !== undefined
+            ? args.harnessRegistry.resolve(sc.harness)
+            : undefined;
+        if (resolved === undefined || !resolved.ok) {
+          // The serial path holds the card with the resolution error.
+          serial.push(item);
+          continue;
+        }
+        if (resolved.adapter.canGatePerCall !== true) {
+          if (!overlapAdapterWarned.has(item.station)) {
+            overlapAdapterWarned.add(item.station);
+            io.err(
+              `overlap: station '${item.station}' declares overlap: true but adapter '${resolved.adapter.name}' ` +
+                `cannot gate each tool call; its cards run one at a time`,
+            );
+          }
+          serial.push({ ...item, reason: `adapter '${resolved.adapter.name}' cannot gate each tool call` });
+          continue;
+        }
+        // Issue #122, ADR-0013: an overlapped call runs only write-confined.
+        // An adapter that cannot run its process tree under the helper, or a
+        // host where the probe failed, sends the card to the serial path.
+        if (resolved.adapter.canConfineWrites !== true) {
+          serial.push({ ...item, reason: `adapter '${resolved.adapter.name}' cannot confine writes` });
+          continue;
+        }
+        if (!writeConfinement.available) {
+          if (!overlapConfinementWarned) {
+            overlapConfinementWarned = true;
+            io.err(
+              `overlap: write confinement is unavailable (${writeConfinement.reason}); ` +
+                'cards of overlap: true stations run one at a time',
+            );
+          }
+          serial.push({ ...item, reason: `write confinement unavailable: ${writeConfinement.reason}` });
+          continue;
+        }
+        const ownedPaths = db.getCard(runId, item.cardId)?.owned_paths ?? [];
+        if (ownedPaths.length === 0) {
+          serial.push({ ...item, reason: 'card declares no owned_paths' });
+          continue;
+        }
+        const ownedCanonical = canonicalOwnedPaths(projectRoot, ownedPaths);
+        // A Landlock rule is attached to an existing file or directory, so an
+        // owned path the call would create cannot be granted.
+        const missing = ownedCanonical.find((p) => !existsSync(p));
+        if (missing !== undefined) {
+          serial.push({
+            ...item,
+            reason: `owned path '${relative(projectRoot, missing) || '.'}' does not exist, and write confinement needs it before the call`,
+          });
+          continue;
+        }
+        const clash = admitted.find((m) => ownedPathSetsIntersect(m.ownedCanonical, ownedCanonical));
+        if (clash !== undefined) {
+          serial.push({ ...item, reason: `owned_paths overlap those of card '${clash.cardId}' in the same batch` });
+          continue;
+        }
+        const stationCount = perStation.get(item.station) ?? 0;
+        if (admitted.length >= slots || stationCount >= sc.wip) {
+          deferred = true;
+          continue;
+        }
+        perStation.set(item.station, stationCount + 1);
+        admitted.push({ ...item, ownedCanonical, confinementHelper: writeConfinement.helper });
+      }
+      return { admitted, serial, deferred };
+    };
 
     for (const action of plan.actions) {
       if (action.kind === 'reclaim') continue; // handled in second pass below
@@ -1181,6 +1381,14 @@ export async function runExecutor(args: RunEngineArgs): Promise<void> {
             }
           }
         }
+      } else if (concurrency > 1 && isOverlapHarnessStation(stationConfig, flow.defaults?.enforceOwnedPaths === true)) {
+        // ── Harness overlap candidates (issue #30, ADR-0012) ─────────────────
+        // A harness station that declared `overlap: true` and meets the static
+        // conditions (re-checked here; the loader rejects a station that fails
+        // them). The dynamic conditions are applied once the pass is collected,
+        // below, because the disjointness condition compares cards with each
+        // other.
+        harnessCandidates.push({ cardId: action.cardId, station: action.station });
       } else if (
         concurrency > 1 &&
         stationConfig.kind === 'transform' &&
@@ -1263,7 +1471,7 @@ export async function runExecutor(args: RunEngineArgs): Promise<void> {
       if (concurrentBatch.length > toRun.length) capBlocked = true;
       if (toRun.length > 0) dispatchedThisTick = true;
 
-      const laneChanges = await Promise.all(
+      const laneChanges = await allSettledOrThrow(
         toRun.map((item) => {
           cardDispatches.set(item.cardId, (cardDispatches.get(item.cardId) ?? 0) + 1);
           return attributionStore.run({ cardId: item.cardId }, () =>
@@ -1297,8 +1505,63 @@ export async function runExecutor(args: RunEngineArgs): Promise<void> {
             }),
           );
         }),
+        reportOtherBatchThrow(io.err),
       );
       if (laneChanges.some((changed) => changed)) lastLaneChangeAt = currentNow;
+    }
+
+    // ── Harness overlap batch (issue #30, ADR-0012) ───────────────────────
+    // Runs after the transform batch, never with it: a transform member's
+    // kernel-written output under the project root would show up in a harness
+    // member's diff and could be attributed to no member.
+    if (harnessCandidates.length > 0 && !halted) {
+      currentCardId = null;
+      const writeConfinement = await resolveRunWriteConfinement();
+      const overlapPlan = admitHarnessOverlap(harnessCandidates, writeConfinement);
+      if (overlapPlan.deferred) capBlocked = true;
+
+      const windows = new OverlapWindows();
+      const memberIds = new Set(overlapPlan.admitted.map((m) => m.cardId));
+      if (overlapPlan.admitted.length > 1) {
+        dispatchedThisTick = true;
+        const laneChanges = await allSettledOrThrow(
+          overlapPlan.admitted.map((member) => {
+            cardDispatches.set(member.cardId, (cardDispatches.get(member.cardId) ?? 0) + 1);
+            return attributionStore.run({ cardId: member.cardId }, () =>
+              executeStation({
+                ...stationArgs(member.cardId, member.station),
+                overlap: {
+                  windows,
+                  memberIds,
+                  ownedCanonical: member.ownedCanonical,
+                  confinementHelper: member.confinementHelper,
+                },
+              }),
+            );
+          }),
+          reportOtherBatchThrow(io.err),
+        );
+        if (laneChanges.some((changed) => changed)) lastLaneChangeAt = currentNow;
+      } else {
+        // A batch of one has nothing to overlap with: it runs on the serial
+        // path, whose integrity rule is the same when no window intersects.
+        overlapPlan.serial.unshift(...overlapPlan.admitted.map((m) => ({ cardId: m.cardId, station: m.station })));
+      }
+
+      // Cards a dynamic condition kept out of the batch run one at a time
+      // under the serial rule, exactly as a station without `overlap` does.
+      for (const item of overlapPlan.serial) {
+        if (halted) break;
+        dispatchedThisTick = true;
+        currentCardId = item.cardId;
+        cardDispatches.set(item.cardId, (cardDispatches.get(item.cardId) ?? 0) + 1);
+        const laneChanged = await executeStation({
+          ...stationArgs(item.cardId, item.station),
+          ...(item.reason !== undefined ? { overlapFallback: item.reason } : {}),
+        });
+        currentCardId = null;
+        if (laneChanged) lastLaneChangeAt = currentNow;
+      }
     }
 
     // ── Consumption andon (block new claims when budget is exhausted) ──────
@@ -1564,6 +1827,34 @@ interface ExecuteStationArgs {
    * escalate to hold (configuration failure, never a silent skip).
    */
   runSubflow?: SubflowSeam;
+  /**
+   * Issue #30, ADR-0012: set when this card is a member of a harness overlap
+   * batch. The harness station then records its call's window, takes its
+   * snapshots with snapshotTreeAsync, and applies the overlap integrity rule.
+   * Absent on every other dispatch.
+   */
+  overlap?: HarnessOverlapMember;
+  /**
+   * Issue #30: why a card of an `overlap: true` station runs on the serial
+   * path instead (a dispatch condition failed). Journaled as `overlap_fallback`
+   * on its harness spans. Absent otherwise.
+   */
+  overlapFallback?: string;
+}
+
+/** Issue #30, ADR-0012: one member's view of its harness overlap batch. */
+interface HarnessOverlapMember {
+  /** The batch's recorded windows, shared by every member. */
+  windows: OverlapWindows;
+  /** Every card admitted to the batch. */
+  memberIds: ReadonlySet<string>;
+  /** This card's owned paths, canonical (canonicalOwnedPaths). */
+  ownedCanonical: readonly string[];
+  /**
+   * Issue #122: the llexec helper the call runs under. The call's writable set
+   * is `ownedCanonical` plus the adapter's own dirs.
+   */
+  confinementHelper: string;
 }
 
 /**
@@ -1727,6 +2018,8 @@ async function executeStation(args: ExecuteStationArgs): Promise<boolean> {
       stampHarnessActivity,
       sleep,
       err,
+      ...(args.overlap !== undefined ? { overlap: args.overlap } : {}),
+      ...(args.overlapFallback !== undefined ? { overlapFallback: args.overlapFallback } : {}),
     });
   }
 
@@ -1883,7 +2176,7 @@ function cascadeInvalidateDownstream(
  * and hashing adds roughly 10ms on a 33k-file tree, which is acceptable for a
  * once-per-station integrity gate.
  */
-function snapshotTree(root: string): Map<string, string> {
+export function snapshotTree(root: string): Map<string, string> {
   const snap = new Map<string, string>();
   const walk = (dir: string): void => {
     let entries;
@@ -1896,30 +2189,8 @@ function snapshotTree(root: string): Map<string, string> {
       const full = join(dir, e.name);
       if (e.isDirectory()) {
         walk(full);
-      } else if (e.isFile()) {
-        try {
-          snap.set(full, createHash('sha256').update(readFileSync(full)).digest('hex'));
-        } catch {
-          /* race: file removed between readdir and read — skip */
-        }
-      } else if (e.isSymbolicLink()) {
-        // WI-568 rework: a symlink dirent is NEITHER isDirectory() NOR isFile()
-        // (readdir's withFileTypes reports the link itself, not its target), so
-        // it was previously invisible to this snapshot entirely — a harness
-        // laundering an owned_paths escape through a freshly-created symlink
-        // would never appear in diffTouched's touched-set. Record a hash of the
-        // symlink's OWN target string (readlinkSync — do NOT follow the link,
-        // both to detect the symlink's creation/retargeting and to avoid a
-        // cycle) so its creation or retargeting is itself a touched-path event;
-        // checkIntegrity resolves the link's real target via resolveOwnedPath
-        // when the touched path is later validated. the integrity-hash work: hash the target
-        // string rather than record mtime, for the same forgeability reason as
-        // the file case above.
-        try {
-          snap.set(full, `symlink:${createHash('sha256').update(readlinkSync(full)).digest('hex')}`);
-        } catch {
-          /* race: link removed between readdir and readlink — skip */
-        }
+      } else {
+        recordSnapshotEntry(snap, full, e);
       }
     }
   };
@@ -1927,13 +2198,107 @@ function snapshotTree(root: string): Map<string, string> {
   return snap;
 }
 
-/** Absolute paths of files created or modified between two tree snapshots. */
-function diffTouched(before: Map<string, string>, after: Map<string, string>): string[] {
+/**
+ * Record one non-directory entry in a tree snapshot. Shared by snapshotTree
+ * and snapshotTreeAsync, so the two cannot disagree on what a signature is.
+ */
+function recordSnapshotEntry(snap: Map<string, string>, full: string, e: Dirent): void {
+  if (e.isFile()) {
+    try {
+      snap.set(full, createHash('sha256').update(readFileSync(full)).digest('hex'));
+    } catch {
+      /* race: file removed between readdir and read — skip */
+    }
+  } else if (e.isSymbolicLink()) {
+    // WI-568 rework: a symlink dirent is NEITHER isDirectory() NOR isFile()
+    // (readdir's withFileTypes reports the link itself, not its target), so
+    // it was previously invisible to this snapshot entirely — a harness
+    // laundering an owned_paths escape through a freshly-created symlink
+    // would never appear in diffTouched's touched-set. Record a hash of the
+    // symlink's OWN target string (readlinkSync — do NOT follow the link,
+    // both to detect the symlink's creation/retargeting and to avoid a
+    // cycle) so its creation or retargeting is itself a touched-path event;
+    // checkIntegrity resolves the link's real target via resolveOwnedPath
+    // when the touched path is later validated. the integrity-hash work: hash the target
+    // string rather than record mtime, for the same forgeability reason as
+    // the file case above.
+    try {
+      snap.set(full, `symlink:${createHash('sha256').update(readlinkSync(full)).digest('hex')}`);
+    } catch {
+      /* race: link removed between readdir and readlink — skip */
+    }
+  }
+}
+
+/**
+ * How long snapshotTreeAsync reads before it yields to the event loop. Well
+ * under any idle timeout a station can declare (whole seconds), so a sibling's
+ * stdout handler, which resets that timeout, runs at least this often.
+ */
+const SNAPSHOT_YIELD_MS = 10;
+
+/**
+ * snapshotTree for an overlapped harness call (issue #30, ADR-0012). Same walk,
+ * same signatures (recordSnapshotEntry), same result; it yields to the event
+ * loop whenever it has read for SNAPSHOT_YIELD_MS, so one member's snapshot
+ * does not hold up the other members' stdout handling, idle timers and
+ * per-call gate answers for the whole walk. A single large file is still read
+ * and hashed in one synchronous step. The serial path keeps snapshotTree.
+ * `yieldEveryMs` exists for tests; production uses SNAPSHOT_YIELD_MS.
+ */
+export async function snapshotTreeAsync(
+  root: string,
+  yieldEveryMs: number = SNAPSHOT_YIELD_MS,
+): Promise<Map<string, string>> {
+  const snap = new Map<string, string>();
+  let sliceStart = Date.now();
+  const maybeYield = async (): Promise<void> => {
+    if (Date.now() - sliceStart >= yieldEveryMs) {
+      // A timer, not setImmediate: a sibling's idle timeout is a timer, and
+      // the timers phase must get its turn, not only the I/O poll.
+      await new Promise<void>((r) => setTimeout(r, 0));
+      sliceStart = Date.now();
+    }
+  };
+  const walk = async (dir: string): Promise<void> => {
+    let entries;
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return; // dir vanished or unreadable — nothing to record
+    }
+    for (const e of entries) {
+      const full = join(dir, e.name);
+      if (e.isDirectory()) {
+        await walk(full);
+      } else {
+        recordSnapshotEntry(snap, full, e);
+      }
+      await maybeYield();
+    }
+  };
+  await walk(root);
+  return snap;
+}
+
+/**
+ * Absolute paths of files created or modified (`touched`) and of files removed
+ * (`deleted`) between two tree snapshots. A delete is a write (SPEC §7), so the
+ * integrity gate checks both sets against owned_paths.
+ */
+function diffTouched(
+  before: Map<string, string>,
+  after: Map<string, string>,
+): { touched: string[]; deleted: string[] } {
   const touched: string[] = [];
   for (const [path, sig] of after) {
     if (before.get(path) !== sig) touched.push(path);
   }
-  return touched;
+  const deleted: string[] = [];
+  for (const path of before.keys()) {
+    if (!after.has(path)) deleted.push(path);
+  }
+  return { touched, deleted };
 }
 
 /**
@@ -1952,12 +2317,14 @@ function runOwnedPathsIntegrity(
   projectRoot: string,
   ownedPaths: readonly string[],
   touchedPaths: readonly string[],
+  deletedPaths: readonly string[],
 ): IntegrityResult | null {
   if (ownedPaths.length === 0) return null;
   return checkIntegrity({
     projectRoot,
     ownedPaths,
     touchedPaths,
+    deletedPaths,
     declaredArtifacts: [],
     output: null,
     validateOutput: () => true,
@@ -2002,6 +2369,23 @@ function persistStdoutToSingleDeclaredOutput(
   const outputPath = join(projectRoot, outputs[0]);
   if (existsSync(outputPath)) return; // station already wrote its own file — never clobber
   writeFileSync(outputPath, stdout);
+}
+
+/**
+ * Remove each declared output that exists, before a harness attempt (issue #98
+ * freshness rule). A missing file is the normal case. Returns null on success,
+ * or a description of the first output that could not be removed (a directory
+ * at the output path, a permission error), which the caller turns into a hold.
+ */
+function removeStaleOutputs(outputs: readonly ResolvedOutput[]): string | null {
+  for (const output of outputs) {
+    try {
+      rmSync(output.path, { force: true });
+    } catch (rmErr) {
+      return `'${output.name}' at '${output.path}': ${(rmErr as Error).message}`;
+    }
+  }
+  return null;
 }
 
 /**
@@ -2156,8 +2540,8 @@ async function executeDeterministicStation(args: DeterministicArgs): Promise<boo
       : null;
   const checkDeterministicIntegrity = (): IntegrityResult | null => {
     if (!integrityBaseline) return null;
-    const touched = diffTouched(integrityBaseline, snapshotTree(projectRoot));
-    const result = runOwnedPathsIntegrity(projectRoot, card.owned_paths, touched);
+    const { touched, deleted } = diffTouched(integrityBaseline, snapshotTree(projectRoot));
+    const result = runOwnedPathsIntegrity(projectRoot, card.owned_paths, touched, deleted);
     return result && !result.ok ? result : null;
   };
 
@@ -2632,7 +3016,23 @@ async function performStationDelivery(args: {
       ? resolveThreadAddress(db, { run_id: runId }, deliver.thread_from)
       : undefined;
 
-  for (const file of deliver.files) {
+  for (const declaredFile of deliver.files) {
+    // Issue #98: an entry naming one of this station's card-scoped declared
+    // outputs is delivered from the card's own directory, resolved by the same
+    // resolver that wrote or collected it. Every other entry is a
+    // project-root-relative path, unchanged. A card whose directory cannot be
+    // resolved holds rather than delivering a project-root file of that name.
+    let file: string;
+    try {
+      file = resolveDeliverFile(declaredFile, stationConfig, projectRoot, card.owned_paths);
+    } catch (resolveErr) {
+      escalateToHold(
+        stateDb, db, cardId, stationId, card,
+        `station '${stationId}' deliver.files declares '${declaredFile}', a card-scoped output that could not be resolved: ${(resolveErr as Error).message}`,
+        err, runId,
+      );
+      return { ok: false };
+    }
     // UNCONDITIONAL project-root containment (symlink-resolved) — delivery is
     // an EGRESS surface that reads and ships bytes to an external service, so
     // it must be contained regardless of the enforce_owned_paths write-gate
@@ -2857,9 +3257,12 @@ async function runGateCheckOrAdvance(args: GateCheckOrAdvanceArgs): Promise<bool
         harnessOnEvent: criticEvents.onEvent,
         projectRoot,
         // The critic judges THIS child's work, so it resolves the same
-        // card-scoped inputs the maker did (issue #51).
+        // card-scoped inputs the maker did (issue #51), and its scope's
+        // declared OUTPUTS from where the maker wrote them: the card's own dir
+        // under output_scope: owned_dir (issue #98), which resolve-output.ts
+        // and resolve-input.ts both put at resolve(projectRoot, owned_paths[0]).
         ownedPaths: card.owned_paths,
-        ownedDirInputs: stationConfig.input_scope?.owned_dir ?? [],
+        ownedDirInputs: cardScopedArtifactNames(stationConfig),
         validBackEdges: flow.back_edges ?? [],
         // Pass the flow-level cap policy so gate-rework can signal 'rework' for
         // proceed_with_findings (rather than 'scrap') when the rework cap trips.
@@ -2993,6 +3396,7 @@ async function runGateCheckOrAdvance(args: GateCheckOrAdvanceArgs): Promise<bool
             flow,
             err,
             now: currentNow,
+            projectRoot,
           });
         }
 
@@ -3048,7 +3452,7 @@ async function runGateCheckOrAdvance(args: GateCheckOrAdvanceArgs): Promise<bool
       case 'scrap': {
         // Direct scrap decisions from gate-rework (rework_cap with capPolicy=scrap,
         // no_progress, invalid_verdict, or a propagated gate-check reason —
-        // 'model-incompatible' for a transform critic, a distinct
+        // a 'critic-*' reason for a transform critic (issue #42), a distinct
         // 'harness-critic-*' reason for an agentic one, a pre-public engine review) bypass
         // the FSM.
         //
@@ -3092,6 +3496,7 @@ async function runGateCheckOrAdvance(args: GateCheckOrAdvanceArgs): Promise<bool
       flow,
       err,
       now: currentNow,
+      projectRoot,
     });
   }
 
@@ -3118,6 +3523,40 @@ async function runGateCheckOrAdvance(args: GateCheckOrAdvanceArgs): Promise<bool
   const resolvedNoGateStatus = isNoGateTerminal ? 'complete' : noGateNext.status;
   advanceCard(stateDb, db, cardId, stationId, card.lane, card.attempt, noGateNext.lane, resolvedNoGateStatus, 0, undefined, runId);
   return true;
+}
+
+// ---------------------------------------------------------------------------
+// Prompt template + its stamp input (SPEC §5), shared by transform and harness
+// ---------------------------------------------------------------------------
+
+/**
+ * The prompt template a transform or harness station renders: a worker.uses
+ * station's composed prompt_content (skills in order, then the local prompt,
+ * WI-555), otherwise its prompt_file read now. The caller hashes this string
+ * into the stamp and renders the same string, so the stamp describes the
+ * prompt that was sent even if the file changes between the two.
+ */
+function readStationPromptTemplate(stationConfig: StationConfig): string {
+  return stationConfig.prompt_content ?? readFileSync(stationConfig.prompt_file!, 'utf-8');
+}
+
+/**
+ * The promptTemplateVersion a transform or harness station folds into its
+ * binding stamp, before any named agent: the declared prompt_version, then
+ * the ordered content hash of each worker.uses skill (WI-557, issue #93 for
+ * harness stations), then the SHA-256 of the rendered template (issue #131).
+ * Each layer combines with the one before it, so a prompt_version bump, a
+ * skill edit, a skill reorder and a prompt edit each move the stamp.
+ */
+function stationPromptTemplateVersion(stationConfig: StationConfig, promptTemplate: string): string {
+  const skillHashes = stationConfig.skill_content_hashes;
+  const versioned =
+    skillHashes !== undefined && skillHashes.length > 0
+      ? computeSkillAwarePromptTemplateVersion(stationConfig.prompt_version ?? '', skillHashes)
+      : stationConfig.prompt_version ?? '';
+  return computePromptContentAwarePromptTemplateVersion(
+    versioned, createHash('sha256').update(promptTemplate).digest('hex'),
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -3269,16 +3708,27 @@ async function executeTransformStation(args: TransformArgs): Promise<boolean> {
   // image surfaces immediately, not as an opaque gateway 400.
   assertImagePayloadWithinLimits(images);
 
-  // WI-557 (FR-4): a worker.uses station's promptTemplateVersion combines the
-  // declared prompt_version with each injected skill's content hash, in
-  // worker.uses order — so editing a skill body/references file invalidates
-  // this station's checkpoint (and cascades) on resume. A non-uses station is
-  // unaffected: skill_content_hashes is absent and the stamp input is the bare
-  // prompt_version, exactly as before this item.
-  const promptTemplateVersion =
-    stationConfig.skill_content_hashes !== undefined && stationConfig.skill_content_hashes.length > 0
-      ? computeSkillAwarePromptTemplateVersion(stationConfig.prompt_version ?? '', stationConfig.skill_content_hashes)
-      : stationConfig.prompt_version ?? '';
+  // promptTemplateVersion folds prompt_version, each worker.uses skill's
+  // content hash in order (WI-557) and the template's own content (issue #131),
+  // so editing a skill or the prompt file invalidates this station's
+  // checkpoint (and cascades) on resume. The template read here is the one
+  // rendered below. The read runs before the checkpoint check, because the
+  // stamp cannot be computed without it, so a template that cannot be read
+  // holds the card, as on the harness path, even when a checkpoint exists:
+  // without the template that checkpoint cannot be confirmed as current. It
+  // runs before any outbox intent is written, so the hold leaves none behind.
+  let promptTemplate: string;
+  try {
+    promptTemplate = readStationPromptTemplate(stationConfig);
+  } catch (readErr) {
+    escalateToHold(
+      stateDb, db, cardId, stationId, card,
+      `transform station '${stationId}' could not read its prompt template: ${(readErr as Error).message}`,
+      err, runId,
+    );
+    return false;
+  }
+  const promptTemplateVersion = stationPromptTemplateVersion(stationConfig, promptTemplate);
 
   const bindingStamp = computeBindingStamp({
     modelId: stationConfig.model!,
@@ -3370,11 +3820,7 @@ async function executeTransformStation(args: TransformArgs): Promise<boolean> {
     : null;
 
   if (stationOutput === null) {
-    // ── Render prompt from template ─────────────────────────────────────────
-    // A worker.uses station's composed prompt_content (skills-in-order, then
-    // the local prompt) is preferred over the raw prompt_file (WI-555, D1
-    // carrier option A) — the one allowed touch to this render path.
-    const promptTemplate = stationConfig.prompt_content ?? readFileSync(stationConfig.prompt_file!, 'utf-8');
+    // ── Render prompt from the template the stamp hashed ────────────────────
     const prompt = renderPrompt(promptTemplate, stationConfig.inputs, projectRoot, feedbackString, (stationConfig.image_inputs ?? []).map((d) => d.path), card.owned_paths, stationConfig.input_scope?.owned_dir);
 
     // ── Build output schema ─────────────────────────────────────────────────
@@ -3459,97 +3905,26 @@ async function executeTransformStation(args: TransformArgs): Promise<boolean> {
 
   // ── Write output artifacts to disk ────────────────────────────────────────
   // Gate critics read these artifacts — they must exist before renderPrompt runs.
-  // Issue C: guard each output path against traversal outside the project root.
   //
-  // Two roots are needed for the two branches of the guard:
-  //   resolvedProjectRoot — realpath'd (symlink-resolved). Used on the normal
-  //     branch where the parent dir exists and realpathSync succeeds. This is
-  //     the symlink-escape defense — a malicious ancestor symlink cannot launder
-  //     an escape.
-  //   lexicalProjectRoot — lexically normalised (resolve(), no realpathSync). Used
-  //     on the fallback branch when the parent dir does not exist yet (ENOENT).
-  //     A not-yet-created subdir cannot be symlink-resolved; comparing the lexical
-  //     target against the lexical root is the correct and sufficient check here.
-  // v10 output_scope: 'owned_dir' writes declared outputs into the card's
-  // owned_paths[0] directory (the same card-scoped location seed.json lives in)
-  // instead of project root, so N homogeneous fan-out children each produce
-  // their OWN artifacts rather than clobbering one shared name (SPEC §9:
-  // outputs are disjoint across concurrent cards). Fail-closed: a scoped card
-  // whose owned_paths[0] is not an existing directory is a config violation —
-  // thrown, matching the escape-guard convention below.
-  const outputBase = (() => {
-    if (stationConfig.output_scope !== 'owned_dir') return projectRoot;
-    const owned = card.owned_paths?.[0];
-    if (owned === undefined) {
-      throw new Error(
-        `Station '${stationId}' declares output_scope: owned_dir but card '${cardId}' has no ` +
-          `owned_paths — cannot resolve an owned output directory`,
-      );
-    }
-    const ownedDir = resolve(projectRoot, owned);
-    let isDir = false;
+  // Where each one goes is decided by flow/resolve-output.ts, the resolver the
+  // harness collector, the gate critic and deliver.files also use (issue #98).
+  // `output_scope: owned_dir` puts them in the card's owned_paths[0] instead of
+  // project root, so N fan-out children each write their own files (SPEC §9).
+  // Both failure modes are thrown config violations, as they were before the
+  // resolver existed: a scoped card whose owned_paths[0] is not an existing
+  // directory, and an output name that escapes its base (Issue C: lexically,
+  // or through a symlinked ancestor).
+  const declaredOutputs = (() => {
     try {
-      isDir = statSync(ownedDir).isDirectory();
-    } catch {
-      isDir = false;
-    }
-    if (!isDir) {
-      throw new Error(
-        `Station '${stationId}' declares output_scope: owned_dir but card '${cardId}' ` +
-          `owned_paths[0] '${owned}' is not an existing directory — create it before fan-out ` +
-          `(same rule as the per-child seed)`,
-      );
-    }
-    return ownedDir;
-  })();
-
-  const resolvedProjectRoot = (() => {
-    try {
-      return realpathSync(outputBase);
-    } catch {
-      return resolve(outputBase);
+      return resolveDeclaredOutputs(stationConfig, projectRoot, card.owned_paths);
+    } catch (resolveErr) {
+      throw new Error(`Station '${stationId}' card '${cardId}': ${(resolveErr as Error).message}`);
     }
   })();
-  const lexicalProjectRoot = resolve(outputBase);
 
   const payload = stationOutput.payload;
-  for (const outputName of stationConfig.outputs) {
-    // Guard: lexically normalize (catches `../` traversal).
-    const lexicalTarget = resolve(join(outputBase, outputName));
-
-    // Guard: symlink-aware check on the parent directory so a malicious
-    // ancestor symlink cannot launder an escape into a false allow.
-    // If the parent doesn't exist yet (first write into a new subdir), fall back
-    // to the LEXICAL root check — comparing the lexical target against the lexical
-    // project root avoids the false-reject that occurs when the project root is
-    // reached through a symlink and the output dir has not been created yet.
-    const parentDir = join(lexicalTarget, '..');
-    let resolvedTarget: string;
-    let parentExists = false;
-    try {
-      const resolvedParent = realpathSync(parentDir);
-      // join(resolvedParent, basename(lexicalTarget)) reassembles the canonical path.
-      const fileName = lexicalTarget.slice(parentDir.length).replace(/^[\\/]+/, '');
-      resolvedTarget = join(resolvedParent, fileName);
-      parentExists = true;
-    } catch {
-      resolvedTarget = lexicalTarget;
-    }
-
-    // Choose the appropriate root for the confinement check:
-    //   - Parent exists → use realpath-based root (full symlink-escape defense).
-    //   - Parent ENOENT  → use lexical root (safe for new subdirs under a symlinked root).
-    const rootForCheck = parentExists ? resolvedProjectRoot : lexicalProjectRoot;
-
-    if (!resolvedTarget.startsWith(rootForCheck + sep) && resolvedTarget !== rootForCheck) {
-      // Output would escape the project root — throw to surface as a fatal config violation.
-      throw new Error(
-        `Output path '${outputName}' resolves outside the project root '${rootForCheck}'. ` +
-          `Station '${stationId}' output paths must not traverse above the project root.`,
-      );
-    }
-
-    writeFileSync(join(outputBase, outputName), JSON.stringify(payload, null, 2), 'utf-8');
+  for (const output of declaredOutputs) {
+    writeFileSync(output.path, JSON.stringify(payload, null, 2), 'utf-8');
   }
 
   // ── MARK_DONE integrity gate (SPEC §5/§6) ─────────────────────────────────
@@ -3559,15 +3934,16 @@ async function executeTransformStation(args: TransformArgs): Promise<boolean> {
   // (so a resume never skip-replays the out-of-bounds output) and hard-pause to
   // hold for a human.
   if (flow.defaults?.enforceOwnedPaths === true) {
-    // Under output_scope: owned_dir the outputs were written into owned_paths[0],
-    // so the touched set must be the owned-dir-joined paths — checking the bare
-    // names would test project-root locations nothing wrote to (a false violation
-    // for scoped stations, a false pass for the actual writes).
-    const touchedOutputs =
-      stationConfig.output_scope === 'owned_dir' && card.owned_paths?.[0] !== undefined
-        ? stationConfig.outputs.map((name) => join(card.owned_paths![0]!, name))
-        : stationConfig.outputs;
-    const violation = runOwnedPathsIntegrity(projectRoot, card.owned_paths ?? [], touchedOutputs);
+    // The touched set is the paths the writer above actually wrote, from the
+    // same resolver. Under output_scope: owned_dir the bare names would test
+    // project-root locations nothing wrote to (a false violation for scoped
+    // stations, a false pass for the actual writes).
+    const touchedOutputs = declaredOutputs.map((output) => output.path);
+    const violation = runOwnedPathsIntegrity(
+      projectRoot, card.owned_paths ?? [], touchedOutputs,
+      // The transform writer only writes its declared outputs: there is no snapshot and nothing it can delete.
+      [],
+    );
     if (violation && !violation.ok) {
       invalidateCheckpoint(stateDb, { run: runId, flow: String(flow.version), card: cardId, station: stationId, attempt: card.attempt });
       escalateToHold(stateDb, db, cardId, stationId, card, `integrity violation (owned_paths): project root modified during transform station '${stationId}' by an undeclared write — either the station escaped its owned_paths, or another process wrote to the project root while it ran: ${describeIntegrity(violation)}`, err, runId);
@@ -3627,6 +4003,10 @@ interface HarnessArgs {
    */
   sleep: (ms: number) => Promise<void>;
   err: (msg: string) => void;
+  /** See ExecuteStationArgs.overlap. */
+  overlap?: HarnessOverlapMember;
+  /** See ExecuteStationArgs.overlapFallback. */
+  overlapFallback?: string;
 }
 
 /**
@@ -3641,7 +4021,8 @@ interface HarnessArgs {
  *     one bounded `adapter.invoke` call.
  *   - COLLECTS OUTPUTS FROM DISK like a deterministic station — the harness
  *     writes its declared output files itself during invoke; this reads them
- *     back (findMissingDeclaredOutputs, then coerciveParse + buildOutputSchema,
+ *     back from the paths `flow/resolve-output.ts` resolves (presence, then
+ *     coerciveParse + buildOutputSchema,
  *     mirroring the transform coercive-parse contract) rather than serializing
  *     a returned payload as the transform path does.
  *
@@ -3663,10 +4044,26 @@ interface HarnessArgs {
  * outbox discipline.
  */
 async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
+  // Issue #30, ADR-0012: whatever happens inside an attempt, including an error
+  // thrown between opening the overlap window and the post-invoke
+  // classification, the member's windows are closed on the way out. A window
+  // left open would count as intersecting every later one, widening the
+  // attribution for siblings. The normal close points inside the body stay in
+  // place (close is idempotent, the first end wins) so the window ends before
+  // `intersecting()` is computed.
+  try {
+    return await executeHarnessStationBody(args);
+  } finally {
+    if (args.overlap !== undefined) args.overlap.windows.closeOpenFor(args.cardId);
+  }
+}
+
+async function executeHarnessStationBody(args: HarnessArgs): Promise<boolean> {
   const {
     db, stateDb, runId, stationConfig, stationId, cardId, trackingAdapter, happyPathNext, terminalLanes,
     maxExecutionAttempts, projectRoot, flow, currentNow, now, runStartedAt, wallClockSeconds, maxTokens,
     getTokensSpent, onAndonTrip, harnessRegistry, foldHarnessUsage, stampHarnessActivity, sleep, err,
+    overlap, overlapFallback,
   } = args;
 
   const card = db.getCard(runId, cardId);
@@ -3711,7 +4108,23 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
   // than stamping on the name alone, which would let an edited agent replay
   // from a stale checkpoint.
   const effectiveAgent = stationConfig.agent ?? harnessAdapter.agent;
-  let promptTemplateVersion = stationConfig.prompt_version ?? '';
+  // The template is read once, here, and both hashed into the stamp and
+  // rendered below, as on the transform path: prompt_version, then the
+  // worker.uses skill hashes (issue #93), then the template content (issue
+  // #131), then the agent. A template that cannot be read holds the card, as a
+  // render failure does, rather than stamping without it.
+  let promptTemplate: string;
+  try {
+    promptTemplate = readStationPromptTemplate(stationConfig);
+  } catch (readErr) {
+    escalateToHold(
+      stateDb, db, cardId, stationId, card,
+      `harness station '${stationId}' could not read its prompt template: ${(readErr as Error).message}`,
+      err, runId, true,
+    );
+    return false;
+  }
+  let promptTemplateVersion = stationPromptTemplateVersion(stationConfig, promptTemplate);
   let agentSha256: string | undefined;
   if (effectiveAgent !== undefined) {
     const definition = resolveHarnessAgent(harnessAdapter, effectiveAgent);
@@ -3770,7 +4183,8 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
 
   const bindingStamp = computeBindingStamp({
     modelId: effectiveModel ?? '',
-    // prompt_version, with the effective agent folded in when there is one.
+    // prompt_version, skills and template content, with the effective agent
+    // folded in when there is one.
     promptTemplateVersion,
     inputArtifactHashes: inputHashes,
     flowVersion: flow.version,
@@ -3873,8 +4287,8 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
     // unknown outcome, since nothing was actually invoked yet.
     let prompt: string;
     let mountedInputs: MountedInput[];
+    let declaredOutputs: ResolvedOutput[];
     try {
-      const promptTemplate = stationConfig.prompt_content ?? readFileSync(stationConfig.prompt_file!, 'utf-8');
       prompt = renderPrompt(
         promptTemplate, stationConfig.inputs, projectRoot, feedbackString, [], card.owned_paths,
         stationConfig.input_scope?.owned_dir,
@@ -3908,6 +4322,39 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
       return false;
     }
 
+    // ── Resolve declared outputs BEFORE the invoke (issue #98) ───────────────
+    // flow/resolve-output.ts is the one resolver for every use of these paths
+    // below: the destinations the agent is told, the stale-file removal, the
+    // presence check, the JSON/schema read and the artifact hashes. Resolving
+    // here, before anything is invoked, is the fail-closed check the issue #51
+    // input side already has: a card-scoped station whose card has no owned
+    // dir, a dir that does not exist or lies outside the project root (the
+    // integrity snapshot below sees only the project root), or an output name
+    // that escapes its dir, holds the card instead of running an agent whose
+    // result could not be collected or checked.
+    try {
+      declaredOutputs = resolveDeclaredOutputs(stationConfig, projectRoot, card.owned_paths, {
+        requireWithinProjectRoot: true,
+      });
+    } catch (resolveErr) {
+      if (pendingIntentKey !== null) {
+        discardIntent(stateDb, pendingIntentKey);
+      }
+      escalateToHold(
+        stateDb, db, cardId, stationId, card,
+        `harness station '${stationId}' could not resolve its declared outputs: ${(resolveErr as Error).message}`,
+        err, runId, true,
+      );
+      return false;
+    }
+    const outputsCardScoped = isOutputCardScoped(stationConfig);
+    // A card-scoped station's prompt names each destination, so the flow's
+    // template need not know the card's directory. The default scope adds
+    // nothing, which keeps every existing prompt byte-identical.
+    if (outputsCardScoped) {
+      prompt += describeOutputDestinations(declaredOutputs);
+    }
+
     const timeoutMs =
       stationConfig.timeout_seconds !== undefined
         ? stationConfig.timeout_seconds * 1000
@@ -3924,7 +4371,7 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
     // card SCRAPS (never holds) with a reason that NAMES which class exhausted
     // it — distinct from a transform's 'model-incompatible' scrap.
     const schema = buildOutputSchema(stationConfig.output_schema?.fields ?? []);
-    const outputFile = stationConfig.outputs[0];
+    const outputFile = declaredOutputs[0];
     let callsMade = 0;
     let scrapReason = 'harness-invocation-failed';
     // Issue #71: the journal sink for this station's harness events. Each
@@ -3952,11 +4399,57 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
       // by owned_paths, so declared-outputs alone is not a complete touched-set
       // for this station kind (unlike transform, where the executor itself
       // performs the only write, from the model's structured response).
-      const integrityBaseline = snapshotTree(projectRoot);
+      //
+      // Issue #98 freshness rule: a card-scoped declared output is REMOVED before
+      // every attempt, ahead of the baseline, so a file found after the invoke
+      // was written by this invoke. A file from a prior failed attempt, or from
+      // an earlier run of this card, cannot be collected as this attempt's
+      // result. A sibling's file is never at this path at all (disjoint owned
+      // dirs), and the shared project-root name is never read. The removal is
+      // limited to card-scoped outputs because those paths belong to this card
+      // alone; a project-root output may be shared state the flow relies on, so
+      // the default scope keeps its pre-#98 behaviour (presence only).
+      if (outputsCardScoped) {
+        const removeErr = removeStaleOutputs(declaredOutputs);
+        if (removeErr !== null) {
+          // Only the first attempt has invoked nothing yet; after a failed
+          // attempt the pending intent's outcome is unknown and stays for a human.
+          if (pendingIntentKey !== null && callsMade === 0) {
+            discardIntent(stateDb, pendingIntentKey);
+          }
+          escalateToHold(
+            stateDb, db, cardId, stationId, card,
+            `harness station '${stationId}' could not remove a stale declared output before invoking: ${removeErr}`,
+            err, runId, true,
+          );
+          return false;
+        }
+      }
+      // Issue #30, ADR-0012: an overlapped call records its window, opened
+      // before the baseline snapshot starts reading the tree, and takes both
+      // snapshots without blocking the other members' calls. The serial path
+      // takes them synchronously, as before.
+      const overlapWindow = overlap !== undefined ? overlap.windows.open(cardId, overlap.ownedCanonical) : -1;
+      const integrityBaseline =
+        overlap !== undefined ? await snapshotTreeAsync(projectRoot) : snapshotTree(projectRoot);
 
       // Issue #30: read the clock fresh, since a retry runs after this loop's
-      // backoff sleep. Written on every span this attempt produces.
-      const readyWaiting = countReadyWaiting(stateDb, runId, cardId, now());
+      // backoff sleep. Written on every span this attempt produces. An
+      // overlapped call counts the ready cards not admitted to its batch.
+      const readyWaiting =
+        overlap !== undefined
+          ? countReadyNotAdmitted(stateDb, runId, overlap.memberIds, now())
+          : countReadyWaiting(stateDb, runId, cardId, now());
+      // Issue #30: an overlapped call's spans say so, and carry the call's
+      // start so `conduit run status` can take the union of call intervals. A
+      // card that a dispatch condition sent to the serial path says why.
+      // Absent on every other span, so the serial journal is unchanged.
+      const overlapAttrs: Record<string, unknown> =
+        overlap !== undefined
+          ? { concurrent: true, started_at_ms: invokeStartedAt, write_confinement: 'landlock' }
+          : overlapFallback !== undefined
+            ? { overlap_fallback: overlapFallback }
+            : {};
 
       // Issue #71: one invocation id per invoke(), stamped on every event row
       // it produces and on every `<station>.harness` span below that reports
@@ -3973,6 +4466,7 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
         invokeResult = await harnessAdapter.invoke({
           prompt,
           inputs: mountedInputs,
+          declaredOutputs: declaredOutputs.map((o) => ({ name: o.name, path: o.path })),
           tools: stationConfig.tools ?? [],
           timeoutMs,
           model: effectiveModel,
@@ -3980,6 +4474,11 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
           onEvent,
           ...(idleTimeoutMs !== undefined ? { idleTimeoutMs } : {}),
           ...(effectiveAgent !== undefined ? { agent: effectiveAgent } : {}),
+          // Issue #122, ADR-0013: an overlapped call runs write-confined to the
+          // card's owned paths (plus the adapter's temp and config dirs).
+          ...(overlap !== undefined
+            ? { confinement: { helper: overlap.confinementHelper, writable: overlap.ownedCanonical } }
+            : {}),
           // Issue #21: an adapter that gates per call gets this invocation's gate. Owned paths are
           // enforced by the gate only where the flow opted in AND the card declares some, the same
           // condition as runOwnedPathsIntegrity (empty owned_paths is an opt-out there, so passing []
@@ -3998,6 +4497,9 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
             : {}),
         });
       } catch (invokeErr) {
+        // Issue #30: the adapter has ended the call's process tree, so this
+        // member writes nothing more in this attempt.
+        if (overlap !== undefined) overlap.windows.close(overlapWindow);
         // WI-567 FR-8 fix: stamp fresh liveness progress even on a thrown
         // attempt (timeout/nonzero-exit/untagged) — the invoke() call still
         // consumed real wall-clock time and must count as progress.
@@ -4045,6 +4547,7 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
               // its spend is unrecorded" without inferring it from duration.
               outcome: 'harness-rate-limited',
               ready_waiting: readyWaiting,
+              ...overlapAttrs,
               rate_limit_release_at: releaseAt,
               rate_limit_reset_reported: resetAtMs ?? null,
               ...rateLimitAttributes((invokeErr as { rateLimit?: RateLimitSnapshot }).rateLimit),
@@ -4142,7 +4645,7 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
           runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.harness`, ...provenance, invocationId,
           adapter: harnessAdapter.name, durationMs: Date.now() - invokeStartedAt,
           usageUnknown: !thrownUsageKnown, usage: thrownJournalUsage,
-          attributes: { outcome: scrapReason, ready_waiting: readyWaiting },
+          attributes: { outcome: scrapReason, ready_waiting: readyWaiting, ...overlapAttrs },
         });
         if (gateHeld) {
           // The pending outbox intent of an effectful station is left as it is: the call was ended
@@ -4221,19 +4724,42 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
       // for the deterministic path, which this must not change), but for a harness
       // nothing is a legal write target, so ANY touched file is a breach; only a
       // harness that touched nothing at all proceeds.
+      //
+      // Issue #30, ADR-0012 (SPEC §7, "Overlapping harness calls"): for an
+      // overlapped call, a touched path inside the owned paths of a member
+      // whose window intersected this one is attributed to that member and
+      // left out of the check; the count per member is journaled on this
+      // attempt's span. Every other path is checked exactly as above.
       const ownedPaths = card.owned_paths ?? [];
-      const touchedPaths = diffTouched(integrityBaseline, snapshotTree(projectRoot));
+      let { touched: touchedPaths, deleted: deletedPaths } = diffTouched(
+        integrityBaseline,
+        overlap !== undefined ? await snapshotTreeAsync(projectRoot) : snapshotTree(projectRoot),
+      );
+      if (overlap !== undefined) {
+        overlap.windows.close(overlapWindow);
+        // Created, modified and deleted paths are disjoint (a deleted path is
+        // absent from the after-snapshot), so one classification serves both.
+        const classified = classifyOverlapTouched(
+          projectRoot, overlap.ownedCanonical, [...touchedPaths, ...deletedPaths], overlap.windows.intersecting(overlapWindow),
+        );
+        const deletedSet = new Set(deletedPaths);
+        touchedPaths = classified.remaining.filter((p) => !deletedSet.has(p));
+        deletedPaths = classified.remaining.filter((p) => deletedSet.has(p));
+        // An array of {card, paths, sample}: the journal's secret-key filter
+        // would drop an object keyed by a name containing "token" or "auth".
+        if (classified.attributed.length > 0) overlapAttrs['overlap_attributed'] = classified.attributed;
+      }
       const integrityViolation: IntegrityResult | null =
         ownedPaths.length === 0
-          ? touchedPaths.length > 0
-            ? { ok: false, failures: touchedPaths.map((p) => ({ code: 'path_escape' as const, path: p })) }
+          ? touchedPaths.length + deletedPaths.length > 0
+            ? { ok: false, failures: [...touchedPaths, ...deletedPaths].map((p) => ({ code: 'path_escape' as const, path: p })) }
             : null
-          : runOwnedPathsIntegrity(projectRoot, ownedPaths, touchedPaths);
+          : runOwnedPathsIntegrity(projectRoot, ownedPaths, touchedPaths, deletedPaths);
       if (integrityViolation && !integrityViolation.ok) {
         db.appendJournalSpan({
           runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.harness`, ...provenance, invocationId,
           adapter: harnessAdapter.name, durationMs, usageUnknown: !usageKnown, usage: journalUsage,
-          attributes: { outcome: `integrity_violation: ${describeIntegrity(integrityViolation)}`, ready_waiting: readyWaiting },
+          attributes: { outcome: `integrity_violation: ${describeIntegrity(integrityViolation)}`, ready_waiting: readyWaiting, ...overlapAttrs },
         });
         escalateToHold(
           stateDb, db, cardId, stationId, card,
@@ -4244,16 +4770,24 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
       }
 
       // ── Collect declared outputs FROM DISK (hybrid: like deterministic) ────
-      // "validated present" == the declared output file exists on disk — the
-      // harness wrote it itself during invoke.
-      const missingOutputs = findMissingDeclaredOutputs(projectRoot, stationConfig);
+      // "validated present" == the declared output file exists on disk at its
+      // resolved path — the harness wrote it itself during invoke. A directory
+      // at the path is not an output: it could not be hashed below.
+      const isFile = (p: string): boolean => {
+        try {
+          return statSync(p).isFile();
+        } catch {
+          return false;
+        }
+      };
+      const missingOutputs = declaredOutputs.filter((o) => !isFile(o.path)).map((o) => o.name);
       if (missingOutputs.length > 0) {
         callsMade++;
         scrapReason = `harness-output-missing: ${missingOutputs.join(', ')}`;
         db.appendJournalSpan({
           runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.harness`, ...provenance, invocationId,
           adapter: harnessAdapter.name, durationMs, usageUnknown: !usageKnown, usage: journalUsage,
-          attributes: { outcome: scrapReason, ready_waiting: readyWaiting },
+          attributes: { outcome: scrapReason, ready_waiting: readyWaiting, ...overlapAttrs },
         });
         continue;
       }
@@ -4264,18 +4798,18 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
       let payload: unknown = null;
       if (outputFile !== undefined) {
         try {
-          payload = coerciveParse(readFileSync(join(projectRoot, outputFile), 'utf-8'));
+          payload = coerciveParse(readFileSync(outputFile.path, 'utf-8'));
         } catch {
           payload = null;
         }
       }
       if (payload === null) {
         callsMade++;
-        scrapReason = `harness-output-unparseable: station '${stationId}' output '${outputFile ?? '(none declared)'}' is not valid JSON`;
+        scrapReason = `harness-output-unparseable: station '${stationId}' output '${outputFile?.name ?? '(none declared)'}' is not valid JSON`;
         db.appendJournalSpan({
           runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.harness`, ...provenance, invocationId,
           adapter: harnessAdapter.name, durationMs, usageUnknown: !usageKnown, usage: journalUsage,
-          attributes: { outcome: scrapReason, ready_waiting: readyWaiting },
+          attributes: { outcome: scrapReason, ready_waiting: readyWaiting, ...overlapAttrs },
         });
         continue;
       }
@@ -4286,7 +4820,7 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
         db.appendJournalSpan({
           runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.harness`, ...provenance, invocationId,
           adapter: harnessAdapter.name, durationMs, usageUnknown: !usageKnown, usage: journalUsage,
-          attributes: { outcome: scrapReason, ready_waiting: readyWaiting },
+          attributes: { outcome: scrapReason, ready_waiting: readyWaiting, ...overlapAttrs },
         });
         continue;
       }
@@ -4313,9 +4847,9 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
       // name + sha256, never raw bytes, mirroring the containment profile's
       // "hashes, never transcripts" posture.
       const artifactHashes: Record<string, string> = {};
-      for (const name of stationConfig.outputs) {
+      for (const { name, path } of declaredOutputs) {
         try {
-          artifactHashes[name] = createHash('sha256').update(readFileSync(join(projectRoot, name))).digest('hex');
+          artifactHashes[name] = createHash('sha256').update(readFileSync(path)).digest('hex');
         } catch {
           /* best-effort — presence of this exact file was already confirmed above */
         }
@@ -4326,7 +4860,7 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
         // Issue #5: the capacity snapshot rides along on the priced row, so
         // "what did this run draw against the plan" is a query rather than an
         // inference from interactive usage bars.
-        attributes: { artifact_hashes: artifactHashes, outcome: 'success', ready_waiting: readyWaiting, ...rateLimitAttrs },
+        attributes: { artifact_hashes: artifactHashes, outcome: 'success', ready_waiting: readyWaiting, ...rateLimitAttrs, ...overlapAttrs },
       });
 
       // ── Write checkpoint (binding stamp) ───────────────────────────────────
@@ -4995,6 +5529,8 @@ interface ApplySkipWhenArgs {
   maxExecutionAttempts: number;
   now: number;
   err: (msg: string) => void;
+  /** The run's project root: `source: seed` reads resolve against it, not the cwd (issue #124). */
+  projectRoot: string;
   /**
    * 'run' decisions memoized for the lifetime of the runExecutor call, keyed
    * by `${cardId}\0${lane}\0${attempt}` (issue #32). A card whose predicate
@@ -5077,7 +5613,7 @@ function withVerifiedReadyCard(
  * the write-lock re-check below) does not count.
  */
 function applySkipWhen(args: ApplySkipWhenArgs): boolean {
-  const { db, stateDb, runId, flow, happyPathNext, terminalLanes, maxExecutionAttempts, now, err, runMemo } = args;
+  const { db, stateDb, runId, flow, happyPathNext, terminalLanes, maxExecutionAttempts, now, err, runMemo, projectRoot } = args;
   const skipStations = Object.keys(flow.stations).filter((id) => flow.stations[id]!.skip_when !== undefined);
   if (skipStations.length === 0) return false;
 
@@ -5144,6 +5680,7 @@ function applySkipWhen(args: ApplySkipWhenArgs): boolean {
       stateDb,
       runId,
       flowVersion: String(flow.version),
+      projectRoot,
       card: { id, owned_paths: ownedPaths },
     });
 
@@ -5915,6 +6452,8 @@ interface FanOutCompleteArgs {
   err: (msg: string) => void;
   /** Injected epoch seconds — used to stamp the fan-out cache-warming stagger. */
   now: number;
+  /** The run's project root: proposed owned_paths resolve against it and must stay inside it (#73, #124). */
+  projectRoot: string;
 }
 
 /**
@@ -5931,7 +6470,8 @@ interface FanOutCompleteArgs {
  * Failure modes (parent escalated to held, no children seeded):
  *   - Structurally non-conforming payload (children not array / child not object)
  *   - commitFanOut ExpansionError (dependency_cycle / overlapping_owned_paths /
- *     unknown_dependency) — the whole proposal is rejected, never partially applied
+ *     unknown_dependency / child_id_collision / seed_path_out_of_bounds /
+ *     seed_path_conflict / owned_path_out_of_bounds) — the whole proposal is rejected, never partially applied
  *   - FSM illegal_transition on FAN_OUT (contradictory card state)
  *
  * Extension seams:
@@ -5956,6 +6496,7 @@ function handleFanOutComplete(args: FanOutCompleteArgs): boolean {
     flow,
     err,
     now,
+    projectRoot,
   } = args;
 
   // ── Structural validation ────────────────────────────────────────────────
@@ -5989,18 +6530,31 @@ function handleFanOutComplete(args: FanOutCompleteArgs): boolean {
   // ── Validate + seed children (WIRE, don't reimplement — dag/expand.ts) ───
   // commitFanOut runs validateExpansion (cycle detection + disjoint ownership)
   // atomically with insertCard — either all children are inserted or none are.
-  const expansion = commitFanOut(db, runId, cardId, proposal, { onPathConflict: 'reject' });
+  // Owned paths resolve against the run's project root, not the kernel's cwd,
+  // and an entry outside it rejects the proposal (issues #73, #124).
+  const expansion = commitFanOut(db, runId, cardId, proposal, { onPathConflict: 'reject', projectRoot });
 
   if (!expansion.ok) {
-    // Dependency cycle, overlapping paths, or unknown dependency — reject whole
-    // proposal. Never seed partial expansions; they leave orphaned cards.
+    // Dependency cycle, overlapping paths, unknown dependency, or an owned path
+    // out of bounds: reject the whole proposal. Never seed partial expansions;
+    // they leave orphaned cards.
+    const e = expansion.error;
+    // Child ids and paths come from the model's proposal. Escape control
+    // characters so a newline in them cannot forge a line in the hold reason.
+    const q = (text: string): string => JSON.stringify(text).slice(1, -1);
+    const where =
+      e.code === 'owned_path_out_of_bounds' || e.code === 'seed_path_out_of_bounds'
+        ? ` (child '${q(e.child)}', path '${q(e.path)}')`
+        : e.code === 'seed_path_conflict'
+          ? ` (children '${q(e.children[0])}' and '${q(e.children[1])}', path '${q(e.path)}')`
+          : '';
     escalateToHold(
       stateDb,
       db,
       cardId,
       stationId,
       card,
-      `fan-out station '${stationId}' proposal rejected: ${expansion.error.code}`,
+      `fan-out station '${stationId}' proposal rejected: ${e.code}${where}`,
       err,
       runId,
     );
@@ -6178,7 +6732,7 @@ function pollAwaitingChildren(
         .immediate();
       anyAdvanced = true;
     } else {
-      // decision.action === 'hold_parent': quorum unmet or a child scrapped.
+      // decision.action === 'hold_parent': quorum unmet, or a child scrapped or held.
       // Set status='held' — NOT left in awaiting_children which would deadlock.
       db.appendCardLog({
         runId,
@@ -6212,7 +6766,7 @@ function pollAwaitingChildren(
  * Convert the flow-config fan_in declaration (number | FanInPolicyConfig | undefined)
  * to the dag/expand.ts FanInPolicy shape that evaluateFanIn expects.
  *
- * - undefined  → 'all' (every child must reach a non-scrap terminal lane)
+ * - undefined  → 'all' (every child must reach a terminal lane other than scrap or hold)
  * - number k   → quorum(k) shorthand
  * - structured → map policy field to kind field
  */

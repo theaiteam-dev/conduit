@@ -2,6 +2,7 @@
 node_modules
 dist
 build
+native/llexec/build
 .next
 
 # Version-control and local agent metadata — not needed in the image

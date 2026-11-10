@@ -169,6 +169,55 @@ describe('conduit doctor — registered harness adapter listing (AC1)', () => {
   });
 });
 
+describe('conduit doctor: per-call gating adapters (issue #21)', () => {
+  it('lists codex-app-server with its probe result and gatesPerCall=yes, and no other adapter grows the token', async () => {
+    const registry = defRegistry([
+      { name: 'codex-app-server', envAllowlist: ['HOME', 'PATH'] },
+      { name: 'claude-headless', envAllowlist: ['HOME', 'PATH'] },
+    ]);
+    const code = await main(['doctor'], makeDeps(registry));
+
+    expect(code).toBe(0);
+    const gatedLine = io.lines.find((l) => l.includes("harness 'codex-app-server'"));
+    const plainLine = io.lines.find((l) => l.includes("harness 'claude-headless'"));
+    expect(gatedLine).toContain('gatesPerCall=yes');
+    expect(gatedLine).toContain('reportsUsage=true');
+    expect(gatedLine).toContain('/opt/bin/agent');
+    expect(plainLine).not.toContain('gatesPerCall');
+  });
+
+  it('lists opencode with its probe result and gatesPerCall=yes', async () => {
+    const registry = defRegistry([{ name: 'opencode', envAllowlist: ['HOME', 'PATH'] }]);
+    const code = await main(['doctor'], makeDeps(registry));
+
+    expect(code).toBe(0);
+    const line = io.lines.find((l) => l.includes("harness 'opencode'"));
+    expect(line).toContain('gatesPerCall=yes');
+    expect(line).toContain('reportsUsage=true');
+    expect(line).toContain('/opt/bin/agent');
+  });
+
+  it('reports a missing opencode binary as a failure', async () => {
+    const registry = defRegistry(
+      [{ name: 'opencode', envAllowlist: ['HOME', 'PATH'] }],
+      async () => ({ present: false, detail: "'opencode' was not found on PATH" }),
+    );
+    const code = await main(['doctor'], makeDeps(registry));
+    expect(code).toBe(1);
+    expect(allOutput()).toContain("'opencode' was not found on PATH");
+  });
+
+  it('reports a missing codex binary as a failure', async () => {
+    const registry = defRegistry(
+      [{ name: 'codex-app-server', envAllowlist: ['HOME', 'PATH'] }],
+      async () => ({ present: false, detail: "'codex' was not found on PATH" }),
+    );
+    const code = await main(['doctor'], makeDeps(registry));
+    expect(code).toBe(1);
+    expect(allOutput()).toContain("'codex' was not found on PATH");
+  });
+});
+
 describe('conduit doctor — env allowlist warnings (AC2, FR-7/FR-11)', () => {
   it('warns, naming HOME, when the allowlist omits HOME', async () => {
     const registry = defRegistry([{ name: 'claude-headless', envAllowlist: ['PATH', 'ANTHROPIC_API_KEY'] }]);

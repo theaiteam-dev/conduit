@@ -62,6 +62,7 @@ import {
   buildFlowPrereqsProbe,
   buildModelEndpointProbe,
   buildProcessContainmentProbe,
+  buildWriteConfinementProbe,
   type CliDeps,
   type CliIO,
   type PrereqProbe,
@@ -510,5 +511,23 @@ describe('buildProcessContainmentProbe — containment mechanism (issue #77)', (
     const result = await probe.check();
     expect(result.ok).toBe(true);
     expect(result.detail).toStartWith('warning: process group only (cannot create a cgroup under /sys/fs/cgroup (EROFS))');
+  });
+});
+
+describe('buildWriteConfinementProbe — Landlock write confinement (issue #122)', () => {
+  it('reports the ABI and helper and passes when confinement is available', async () => {
+    const probe = buildWriteConfinementProbe(async () => ({ available: true, helper: '/usr/local/bin/llexec', abi: 4 }));
+    expect(probe.name).toBe('write-confinement');
+    expect(await probe.check()).toEqual({
+      ok: true,
+      detail: 'Landlock ABI 4 via /usr/local/bin/llexec; overlapped harness calls run write-confined',
+    });
+  });
+
+  it('passes when confinement is unavailable but warns that overlap runs serially, with the reason', async () => {
+    const probe = buildWriteConfinementProbe(async () => ({ available: false, reason: 'the llexec helper was not found' }));
+    const result = await probe.check();
+    expect(result.ok).toBe(true);
+    expect(result.detail).toStartWith('warning: unavailable (the llexec helper was not found); cards of overlap: true stations run one at a time');
   });
 });

@@ -1,6 +1,6 @@
 # Harness Adapter Registration — Operator Setup Guide
 
-How to register `kind: harness` adapters (`claude-headless`, `codex-exec`, `agent-sdk`) via
+How to register `kind: harness` adapters (`claude-headless`, `codex-exec`, `agent-sdk`, `codex-app-server`, `opencode`) via
 `CONDUIT_HARNESS_*` engine config, for Docker and bare-metal deployments, with
 the recommended minimal env allowlist per adapter and per claude credential
 mode, and how to verify the result with `conduit doctor`.
@@ -41,13 +41,15 @@ warnings `doctor` gives you when something's off.
 | `CONDUIT_HARNESS_<NAME>_ENV` | Yes, per registered adapter | Comma-separated env var **names** the harness child process may see. Explicit-only — the engine never injects a baseline; `HOME`/`PATH` are not assumed. An empty string is legal (an intentionally empty allowlist); an *absent* var for a registered adapter is a hard config error at engine boot. |
 | `CONDUIT_HARNESS_<NAME>_COMMAND` | No | Overrides the binary invoked (default: the adapter's own name, e.g. `claude`, `codex`). See [Use absolute paths](#_command-use-absolute-paths) below. |
 | `CONDUIT_HARNESS_<NAME>_MODEL` | No | The adapter's deployment-default model. A station's own `model:` in `flow.yaml` **wins** when both are set — see [Model precedence](#model-precedence-station-wins-over-_model). |
-| `CONDUIT_HARNESS_<NAME>_AGENT` | No, `claude-headless` only | The adapter's default named agent (`<plugin>:<agent>`), passed as `--agent`. A station's own `agent:` wins. The value is trimmed; setting it to an empty or whitespace-only string is a boot error naming the variable, not a silently empty default. See [Named agents and plugin dirs](#named-agents-and-plugin-dirs). |
-| `CONDUIT_HARNESS_<NAME>_PLUGIN_DIRS` | No, `claude-headless` only | Comma-separated **absolute** plugin directories, one `--plugin-dir` each. Absent or empty: no flag. A relative entry is a boot error; a missing or non-directory entry fails when the adapter is built. |
+| `CONDUIT_HARNESS_<NAME>_AGENT` | No, `claude-headless` and `agent-sdk` only | The adapter's default named agent (`<plugin>:<agent>`), passed as `--agent`. A station's own `agent:` wins. The value is trimmed; setting it to an empty or whitespace-only string is a boot error naming the variable, not a silently empty default. See [Named agents and plugin dirs](#named-agents-and-plugin-dirs). |
+| `CONDUIT_HARNESS_<NAME>_PLUGIN_DIRS` | No, `claude-headless` and `agent-sdk` only | Comma-separated **absolute** plugin directories, one `--plugin-dir` each. Absent or empty: no flag. A relative entry is a boot error; a missing or non-directory entry fails when the adapter is built. |
 | `CONDUIT_HARNESS_<NAME>_ISOLATE_CONFIG` | No, `claude-headless` and `agent-sdk` only | `1`/`true` gives the child a run-scoped config dir instead of the operator's `~/.claude`; `0`/`false` or absent keeps today's behaviour. Any other value is a boot error. See [Isolating the child's Claude config](#isolating-the-childs-claude-config-_isolate_config). |
 
 Setting `_AGENT`, `_PLUGIN_DIRS` or `_ISOLATE_CONFIG` for an adapter that does
-not act on it (e.g. `codex-exec`) fails registry construction at boot, naming
-the adapter and the variable, rather than being ignored.
+not act on it (e.g. `codex-exec`, or `codex-app-server` and `opencode`, which
+always run with run-scoped state and so have nothing to switch) fails registry
+construction at boot, naming the adapter and the variable, rather than being
+ignored.
 
 ### Deriving `<NAME>` from an adapter name
 
@@ -59,6 +61,8 @@ underscore**:
 | `claude-headless` | `CONDUIT_HARNESS_CLAUDE_HEADLESS_ENV` |
 | `codex-exec` | `CONDUIT_HARNESS_CODEX_EXEC_ENV` |
 | `agent-sdk` | `CONDUIT_HARNESS_AGENT_SDK_ENV` |
+| `codex-app-server` | `CONDUIT_HARNESS_CODEX_APP_SERVER_ENV` |
+| `opencode` | `CONDUIT_HARNESS_OPENCODE_ENV` |
 | `my-cool-agent` | `CONDUIT_HARNESS_MY_COOL_AGENT_ENV` |
 
 Because the mapping collapses hyphens and underscores together, two
@@ -228,6 +232,10 @@ failure, not a containment change — but it's easy to get right:
 | `claude-headless`, **subscription auth** | `HOME,PATH` | Credentials live under `$HOME/.claude` — no separate credential variable needed. This is the mode the Phase-1 exit-criterion evidence run (below) exercises. |
 | `claude-headless`, **API-key auth** | `HOME,PATH,ANTHROPIC_API_KEY` | |
 | `codex-exec` | **Assumed — verify in your deployment.** `HOME,PATH` is a reasonable starting point, but codex's exact minimum has not been verified against a live run in this mission (no consumer currently depends on it). |
+| `codex-app-server`, **subscription login** | `PATH` | The adapter links `auth.json` from `$CODEX_HOME` or `$HOME/.codex` (read from the engine's own env) into a run-scoped `CODEX_HOME`, so `HOME` is not needed. It is not injected either: add it only if the model's commands need it. `PATH` is the engine's own when the allowlist omits it. A live run with `PATH` alone passed. |
+| `codex-app-server`, **API key** | `PATH,OPENAI_API_KEY` (or `CODEX_API_KEY`) | Only when there is no `auth.json`. The key is not run against a live call here. |
+| `opencode`, **`opencode auth login`** | `PATH` | The adapter reads the model provider's entry from `$XDG_DATA_HOME/opencode/auth.json` (else `$HOME/.local/share/opencode/auth.json`, from the engine's own env) and passes only that entry to the child, so `HOME` is not needed. Live calls with `PATH` alone passed, using an OpenAI API key entry. |
+| `opencode`, **provider variable** | `PATH,OPENAI_API_KEY` (or the provider's own) | Recognised for `openai`, `anthropic`, `google` and `openrouter` when there is no `auth.json` entry. Not run against a live call here. |
 
 **`conduit doctor`'s binary probe does NOT validate your allowlist.** The
 probe resolves the configured command against the *engine's own* `PATH`
@@ -339,6 +347,23 @@ $ conduit doctor examples/research-flow.yaml
   harness 'claude-headless' (station 'research') at '/usr/local/bin/claude': ok
 ```
 
+A gate critic that runs on a harness (`check.critic.harness`) gets its own
+line, marked `critic`, whatever the station's own `kind`. A station with a
+harness maker and a harness critic gets one line for each:
+
+```
+  harness 'claude-headless' (station 'research') at '/usr/local/bin/claude': ok
+  harness 'codex-exec' (station 'research' critic) at '/usr/local/bin/codex': ok
+```
+
+A missing critic binary fails `doctor`, and `conduit run`/`resume` refuse to
+start with `HARNESS_BINARY_NOT_FOUND` naming the station and the critic. A
+usage-blind critic adapter prints
+`harness '<name>' (station '<id>' critic) is usage-blind (cannot report token/cost usage)`.
+`conduit explain` lists the critic's adapter, model, agent, tools and
+usage-blind flag with a `critic ` prefix (`critic harness=codex-exec`), next to
+the maker's unprefixed `harness=`.
+
 The allowlist/`_COMMAND` warnings, however, fire in **both** modes — a broken
 allowlist is broken regardless of which flow is probed, so `doctor
 <flow.yaml>` surfaces the same `HOME`/`PATH`-floor and relative-`_COMMAND`
@@ -374,11 +399,12 @@ default changed correctly re-invokes rather than silently skipping.
 
 ## Named agents and plugin dirs
 
-Only `claude-headless` runs named agents. An `agent:` (or `check.critic.agent`) on an
-`agent-sdk` or `codex-exec` station is refused at load, and holds the card if it
-reaches dispatch, rather than being ignored.
+`claude-headless` and `agent-sdk` run named agents. An `agent:` (or `check.critic.agent`) on a
+`codex-exec`, `codex-app-server` or `opencode` station is refused at load, and holds the card if it
+reaches dispatch, rather than being ignored. The rules below apply to both adapters, with
+`CONDUIT_HARNESS_AGENT_SDK_` in place of `CONDUIT_HARNESS_CLAUDE_HEADLESS_` for `agent-sdk`.
 
-A `claude-headless` station can run a named Claude Code agent out of a plugin
+A `claude-headless` or `agent-sdk` station can run a named Claude Code agent out of a plugin
 directory the deployment supplies, without that plugin being installed in
 anyone's user config:
 
@@ -431,8 +457,12 @@ A gate critic takes the same field as `check.critic.agent`, next to
   again at dispatch, where the card hard-pauses to `hold` without invoking the
   harness. `agent:` on a station that is not `kind: harness`, or on a critic
   with no `harness`, is `INVALID_HARNESS_AGENT`. A name the CLI itself does
-  not know makes `claude` exit 1 naming it, which the adapter reports as a
-  `harness-nonzero-exit` attempt failure.
+  not know makes `claude -p` exit 1 naming it, which `claude-headless` reports
+  as a `harness-nonzero-exit` attempt failure. Through the Agent SDK the CLI
+  runs its default agent instead and reports success, so `agent-sdk` checks
+  the agents the CLI lists at init and the `agent_type` on each main-thread
+  tool call, and holds the card on a miss without spending an attempt (see
+  [the containment profile](harness-containment.md#named-agents-and-plugin-dirs-on-agent-sdk)).
 
 ## Isolating the child's Claude config: `_ISOLATE_CONFIG`
 
@@ -548,6 +578,18 @@ failure mode scraps under its own named reason
 `model-incompatible` label — each names the specific thing that went wrong
 in `gate_verdict` / journal output.
 
+A transform critic (`check.critic.model`, no `harness`) returns the same
+verdict shape as its response text and is retried up to
+`max_execution_attempts`. When no attempt yields a valid verdict, it scraps
+under the matching `critic-*` reason: `critic-verdict-invalid: <validator
+error>` when the response parsed but failed the shape on the last attempt
+that parsed (only a known schema error is quoted; any other gives a bare
+`critic-verdict-invalid`, so model output never reaches the journal),
+`critic-reject-without-findings`, `critic-verdict-unparseable`
+when no attempt parsed, `critic-output-truncated` when the model stopped at
+`max_tokens`, and `critic-vision-unsupported` when the model refused image
+input. `model-incompatible` stays the reason for a transform maker.
+
 [`examples/prompts/research-critic.md`](../examples/prompts/research-critic.md)
 is the reference critic prompt that instructs the model to write exactly this
 shape — see [`examples/research-flow.yaml`](../examples/research-flow.yaml)
@@ -654,10 +696,78 @@ can gate every tool call ([containment profile](harness-containment.md#a-middle-
 - It runs the `claude` on `PATH`, resolved to a file, not the binary bundled with the SDK.
   Set `CONDUIT_HARNESS_AGENT_SDK_COMMAND` to an absolute path to use another. The env
   allowlist needs `PATH`, and `HOME` for subscription auth unless `_ISOLATE_CONFIG` is on.
-- It supports `_ENV`, `_COMMAND`, `_MODEL` and `_ISOLATE_CONFIG`. `_AGENT` and
-  `_PLUGIN_DIRS` fail registry construction at boot, as they do for `codex-exec`.
+- It supports `_ENV`, `_COMMAND`, `_MODEL`, `_ISOLATE_CONFIG`, `_AGENT` and `_PLUGIN_DIRS`.
+  Named agents work as on `claude-headless` ([Named agents and plugin dirs](#named-agents-and-plugin-dirs)).
+  Plugin hooks run alongside the gate, and a deny from either wins. The gate cannot stop a
+  plugin hook's `updatedInput` from replacing an input it approved: the adapter detects the
+  rewritten input after the call runs and holds the card with code `input_rewritten`
+  ([containment profile](harness-containment.md#a-middle-claim-supervised-adapters)).
 - A station's `tools` list is the gate's allowlist: `Bash` alone allows no executable, so
-  list `Bash(git:*)` style entries for the commands it may run.
+  list `Bash(git:*)` style entries for the commands it may run. The gate accepts literal
+  quoting and a pipe between listed programs, and refuses redirects, expansions and command
+  separators ([Bash rule](harness-containment.md#a-middle-claim-supervised-adapters)). Some
+  programs run code or write files from their arguments (`sh`, `xargs`, `tee`, `curl -o`, ...):
+  listing one allows that.
+- Its usage, like `claude-headless`'s, comes from the last `result` message: the cost is
+  `total_cost_usd`, and the tokens are the four classes summed across every `modelUsage` entry
+  (the main model and the side-task model). Both are cumulative for the session. The message's
+  `usage` covers only the turns since the previous result and leaves out the side-task model,
+  so it is read only when `modelUsage` is missing. A call that runs a background subagent emits
+  two result messages, and its last `usage` can be a quarter of the session's tokens (issue #108).
+
+## The `codex-app-server` adapter
+
+`codex-app-server` runs `codex app-server` and answers its approval requests from the kernel's
+gate ([containment profile](harness-containment.md#the-codex-app-server-adapter)).
+
+- It runs the `codex` on `PATH`, resolved to a file. Set `CONDUIT_HARNESS_CODEX_APP_SERVER_COMMAND`
+  to an absolute path to use another. Codex must be logged in (`codex login`) or an
+  `OPENAI_API_KEY` or `CODEX_API_KEY` allowlisted.
+- It supports `_ENV`, `_COMMAND` and `_MODEL`. `_AGENT`, `_PLUGIN_DIRS` and `_ISOLATE_CONFIG`
+  fail registry construction at boot.
+- A station's `tools` list is the gate's allowlist. Codex reads files with shell commands, so
+  list `Bash(cat:*)` style entries for what it may run (`Read`, `Glob` and `Grep` entries have no
+  effect), and `Write` and `Edit` for the files it may patch: a patch that adds a file is a
+  `Write`, one that changes a file is an `Edit`. `unrestricted_tools` and an empty list are
+  refused at load, as for `agent-sdk`.
+- Its usage has tokens and no cost (`cost` is 0). A call the gate holds reports the usage Codex
+  had reported before the hold, so the call in flight is not counted.
+
+`conduit doctor` lists it with `gatesPerCall=yes`. The opt-in live test runs four short calls
+with the operator's login: an allow-all gate, a deny gate, a read-only command (`cat`) that must
+reach the gate, and a hold. The shipped gate never holds a Codex call, so the hold case uses a
+test gate that returns `hold`:
+
+```sh
+CONDUIT_E2E_CODEX_APP_SERVER=1 bun test src/integration/harness-e2e-codex-app-server.test.ts
+```
+
+## The `opencode` adapter
+
+`opencode` runs `opencode serve` and answers its permission asks from the kernel's gate
+([containment profile](harness-containment.md#the-opencode-adapter)).
+
+- It runs the `opencode` on `PATH`, resolved to a file. Set `CONDUIT_HARNESS_OPENCODE_COMMAND`
+  to an absolute path to use another. opencode must be logged in (`opencode auth login`) for
+  the model's provider, or that provider's API key variable allowlisted.
+- The model must be `provider/model`, for example `openai/gpt-4.1-mini`, from the station's
+  `model` or `CONDUIT_HARNESS_OPENCODE_MODEL`. There is no default: a call with none fails
+  before it starts.
+- It supports `_ENV`, `_COMMAND` and `_MODEL`. `_AGENT`, `_PLUGIN_DIRS` and `_ISOLATE_CONFIG`
+  fail registry construction at boot.
+- A station's `tools` list is the gate's allowlist. List `Read`, `Glob`, `Grep`, `Write`,
+  `Edit`, `Bash(cat:*)` style entries and `Agent`. `unrestricted_tools` and an empty list are
+  refused at load. Access outside the project root is always refused, whatever the list says.
+- Its usage has tokens and the cost opencode reports. A call the gate holds reports the usage
+  opencode had reported for the step in flight.
+
+`conduit doctor` lists it with `gatesPerCall=yes`. The opt-in live test runs four short calls
+(allow, write, deny, hold) with the operator's login, and defaults to `openai/gpt-4.1-mini`
+(override with `CONDUIT_E2E_OPENCODE_MODEL`):
+
+```sh
+CONDUIT_E2E_OPENCODE=1 bun test src/integration/harness-e2e-opencode.test.ts
+```
 
 ## See also
 

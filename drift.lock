@@ -3,12 +3,12 @@ version = 1
 [[bindings]]
 doc = "CLAUDE.md"
 target = "SPEC.md#the-rework-loop-and-its-four-bounding-guards"
-sig = "c589b70ef7bb72cd"
+sig = "ad4136a22b151a97"
 
 [[bindings]]
 doc = "CLAUDE.md"
 target = "src/controller/executor.ts#runExecutor"
-sig = "963aca840f24ee89"
+sig = "99332591187853d4"
 
 [[bindings]]
 doc = "CLAUDE.md"
@@ -22,8 +22,28 @@ sig = "c285309b07a9de1d"
 
 [[bindings]]
 doc = "SPEC.md"
+target = "src/checkpoint/checkpoint.ts#computePromptContentAwarePromptTemplateVersion"
+sig = "f266c90d1416d66d"
+
+[[bindings]]
+doc = "SPEC.md"
+target = "src/controller/harness-overlap.ts#OverlapWindows"
+sig = "92ccb841810270de"
+
+[[bindings]]
+doc = "SPEC.md"
+target = "src/controller/harness-overlap.ts#classifyOverlapTouched"
+sig = "f77a500a8734fc9e"
+
+[[bindings]]
+doc = "SPEC.md"
 target = "src/controller/skip-when.ts#evaluateSkipWhen"
 sig = "ab2bcfcf7bc19f36"
+
+[[bindings]]
+doc = "SPEC.md"
+target = "src/flow/load.ts#validateOverlap"
+sig = "628a62f47032a145"
 
 [[bindings]]
 doc = "SPEC.md"
@@ -62,8 +82,23 @@ sig = "42305bed0d797a53"
 
 [[bindings]]
 doc = "SPEC.md"
+target = "src/worker/cgroup-containment.ts#prepareContainedCommand"
+sig = "bf83f0fe33877f0f"
+
+[[bindings]]
+doc = "SPEC.md"
 target = "src/worker/integrity.ts#checkIntegrity"
-sig = "ec86cf6e6cd93960"
+sig = "0ecc19b228398767"
+
+[[bindings]]
+doc = "SPEC.md"
+target = "src/worker/landlock-confinement.ts#confinedWritableSet"
+sig = "04caef8b326c4a8f"
+
+[[bindings]]
+doc = "SPEC.md"
+target = "src/worker/landlock-confinement.ts#detectWriteConfinement"
+sig = "789d8a3c7b448ad9"
 
 [[bindings]]
 doc = "docs/ingress-listener.md"
@@ -73,4 +108,4 @@ sig = "bd240b0922e20e22"
 [[bindings]]
 doc = "docs/installation.md"
 target = "src/cli/main.ts"
-sig = "176a94bb51f868a6"
+sig = "f5a5fd91a8de8abf"

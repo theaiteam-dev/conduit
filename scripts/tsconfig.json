@@ -11,6 +11,8 @@
     "docs-governing.ts",
     "docs-governing.test.ts",
     "docs-check.test.ts",
-    "mutation-check.ts"
+    "mutation-check.ts",
+    "release.ts",
+    "release.test.ts"
   ]
 }

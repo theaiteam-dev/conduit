@@ -122,10 +122,11 @@ meanings:
 | `latest` | Newest stable release. |
 | `1`, `1.0`, `1.0.0` | Stable release aliases at major, minor, and exact-version precision. Pin the exact version for reproducible deployments. |
 
-Release-worthy conventional commits on `main` are verified and processed by
-semantic-release. That workflow creates the Git tag and GitHub Release, then
-publishes the version aliases and advances `latest`. Manually pushing a Git tag
-does not publish a container image.
+A release happens when a maintainer merges a release PR, which sets the
+version in `package.json` (see [Releasing](./docs/releasing.md)). The Release
+workflow then verifies the merged commit, creates the Git tag and GitHub
+Release, publishes the version aliases and advances `latest`. Manually pushing
+a Git tag does not publish a container image.
 
 ```bash
 docker pull ghcr.io/theaiteam-dev/conduit-engine:1.0.0
