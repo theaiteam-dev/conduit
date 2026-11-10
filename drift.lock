@@ -108,4 +108,4 @@ sig = "bd240b0922e20e22"
 [[bindings]]
 doc = "docs/installation.md"
 target = "src/cli/main.ts"
-sig = "6fcd894250891f00"
+sig = "abe4844946aae436"

@@ -220,13 +220,14 @@ takes about three seconds. Two obligations follow:
 The manifest is small on purpose: the five fold sites, plus the line in
 `src/worker/harness-events-claude.ts` (`claudeResultBreakdown`) that makes a
 Claude harness call's token figure the session total from `modelUsage` rather
-than the last result message's `usage` (issue #108), and three lines in
-`src/control/token-weights.ts`: the cache-read term that counts a transform
-call's cache reads in its budget (issues #156 and #125), the cache-read weight
-every harness fold applies, and the remainder that counts a harness total its
-breakdown does not account for, plus the line in `harnessJournalUsage` that
-journals that remainder, the per-adapter weight lookup and the flow override in
-`resolveTokenWeights`, and the critic fold's own adapter (issue #125). Since #125 each fold site passes
+than the last result message's `usage` (issue #108), five lines in
+`src/control/token-weights.ts` (the cache-read term that counts a transform
+call's cache reads in its budget, issues #156 and #125; the cache-read weight
+every harness fold applies; the remainder that counts a harness total its
+breakdown does not account for; and the per-adapter weight lookup and the flow
+override in `resolveTokenWeights`), and two in `src/controller/executor.ts`:
+the line in `harnessJournalUsage` that journals that remainder, and the critic
+fold's own adapter (issue #125). Since #125 each fold site passes
 the call's usage, not its token count, so the weighting happens inside
 `foldHarnessUsage`. Its guard lists were
 found by mutating and seeing what broke, not by guessing. Keep them that way.
