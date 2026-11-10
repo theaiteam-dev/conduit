@@ -14,7 +14,9 @@
  *   - first result's `modelUsage`:      33,484 tokens
  *   - last result's `modelUsage`:       71,856 tokens (the session total)
  * The 60,000-token budget below trips only on the last figure, so each wrong
- * reading leaves the second card free to dispatch.
+ * reading leaves the second card free to dispatch. The figures are raw
+ * totals, so the flow counts cache classes at weight 1 (issue #125); the
+ * weighting itself is pinned in executor-cache-budget.test.ts.
  *
  * Per CLAUDE.md "A green suite does not mean a budget is wired", the assertion
  * reads the accumulator through the consumption andon (a second card that must
@@ -84,6 +86,7 @@ project_root: .
 flow_version: 1
 budgets:
   run: { wall_clock_minutes: 10, max_tokens: ${MAX_TOKENS} }
+  token_weights: { cache_read: 1, cache_creation: 1 }
   per_card: { max_execution_attempts: 3 }
   liveness: { no_progress_minutes: 3 }
 terminal_lanes: [done, scrap, hold]

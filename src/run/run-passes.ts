@@ -17,6 +17,13 @@
  * state.
  */
 import type { ConduitDB } from '../persistence/db';
+import {
+  resolveTokenWeights,
+  weightedUsageTokens,
+  type AdapterUsage,
+  type FlowTokenWeights,
+} from '../control/token-weights';
+import type { UsageBreakdown } from '../worker/harness-adapter';
 import { isFailedLaunch } from './run-state';
 
 /**
@@ -70,9 +77,101 @@ export function nextPassNumber(db: ConduitDB, runId: string): number {
  * takes passes is one ceiling across all of them, so both `--append-pass` and
  * `conduit resume` of such a run cap the invocation at this figure. May be
  * zero or negative; callers clamp.
+ *
+ * Issue #125: earlier spend counts in budget tokens, as the executor counted
+ * it (runBudgetTokens). Rounded down, so the remainder never exceeds what is
+ * left.
  */
-export function remainingRunTokens(db: ConduitDB, runId: string, maxTokens: number): number {
-  return maxTokens - db.getRunUsageTotals(runId).tokens;
+export function remainingRunTokens(
+  db: ConduitDB,
+  runId: string,
+  maxTokens: number,
+  override: FlowTokenWeights | undefined,
+): number {
+  return Math.floor(maxTokens - runBudgetTokens(db, runId, override));
+}
+
+/** A journal span's classes, with the adapter that billed it. */
+type LeafRow = ReturnType<ConduitDB['getSpanBudgetRows']>[number];
+
+function rawTokens(row: LeafRow): number {
+  return row.inputTokens + row.outputTokens + row.cacheReadInputTokens + row.cacheCreationInputTokens;
+}
+
+/**
+ * A run's spans with every `<station>.subflow` span replaced by its child
+ * run's spans, recursively, so each row names the adapter that billed it. A
+ * subflow span whose child run has no spans in the journal stays as it is
+ * (its `subflow:` adapter is unknown, so it weighs 1 per class). When the
+ * child's spans hold less than the subflow span recorded, the difference is
+ * kept as a row of uncached input with no adapter, so it counts at 1 as the
+ * executor's roll-up fold counted it (ADR-0014: missing data never lowers
+ * the count).
+ */
+function leafRows(db: ConduitDB, runId: string, seen: ReadonlySet<string>): LeafRow[] {
+  const out: LeafRow[] = [];
+  for (const row of db.getSpanBudgetRows(runId)) {
+    const child = row.childRunId;
+    if (row.adapter?.startsWith('subflow:') && child !== null && !seen.has(child)) {
+      const childRows = leafRows(db, child, new Set([...seen, child]));
+      if (childRows.length > 0) {
+        out.push(...childRows);
+        const uncovered = rawTokens(row) - childRows.reduce((n, r) => n + rawTokens(r), 0);
+        if (uncovered > 0) {
+          out.push({
+            adapter: null, childRunId: null, inputTokens: uncovered, outputTokens: 0,
+            cacheReadInputTokens: 0, cacheCreationInputTokens: 0, cacheSplit: false,
+          });
+        }
+        continue;
+      }
+    }
+    out.push(row);
+  }
+  return out;
+}
+
+/**
+ * A run's journaled spend in budget tokens (issue #125): each span weighted
+ * for the adapter that billed it, with the flow's `budgets.token_weights`
+ * overriding any class it sets. A span with no adapter weighs 1 per class the
+ * flow does not set. Matches the executor's count, because the executor
+ * journals a harness call's unaccounted remainder in `input_tokens` and a
+ * subflow child's spans are read here rather than its rolled-up span.
+ */
+export function runBudgetTokens(db: ConduitDB, runId: string, override: FlowTokenWeights | undefined): number {
+  let total = 0;
+  for (const row of leafRows(db, runId, new Set([runId]))) {
+    const classes = row.inputTokens + row.outputTokens + row.cacheReadInputTokens + row.cacheCreationInputTokens;
+    total += weightedUsageTokens(classes, row, resolveTokenWeights(override, row.adapter));
+  }
+  return total;
+}
+
+/**
+ * A run's spend grouped by the adapter that billed it, subflow children
+ * included (issue #125). The subflow runner returns this to the parent, which
+ * weights each adapter's share with its own flow's override, so a child's
+ * Claude and codex spend do not collapse into one breakdown. A share is
+ * `cacheSplit: false` when any of its spans recorded no cache columns: the
+ * zeros summed for them are "not reported", not a measured zero.
+ */
+export function runUsageByAdapter(db: ConduitDB, runId: string): AdapterUsage[] {
+  const byAdapter = new Map<string | null, { breakdown: UsageBreakdown; cacheSplit: boolean }>();
+  for (const row of leafRows(db, runId, new Set([runId]))) {
+    const share = byAdapter.get(row.adapter) ?? {
+      breakdown: { inputTokens: 0, outputTokens: 0, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
+      cacheSplit: true,
+    };
+    const sum = share.breakdown;
+    sum.inputTokens += row.inputTokens;
+    sum.outputTokens += row.outputTokens;
+    sum.cacheReadInputTokens += row.cacheReadInputTokens;
+    sum.cacheCreationInputTokens += row.cacheCreationInputTokens;
+    share.cacheSplit &&= row.cacheSplit;
+    byAdapter.set(row.adapter, share);
+  }
+  return [...byAdapter].map(([adapter, share]) => ({ adapter, ...share }));
 }
 
 /** Has runId taken a pass beyond its first (issue #36)? */

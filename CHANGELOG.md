@@ -39,6 +39,20 @@ historical context, not public releases or public repository history.
   cache-reads section for harness and transform spans, and `conduit journal
   inspect` appends the split to each span line that has one.
 
+### Changed
+
+- `budgets.run.max_tokens` and `budgets.per_wave.max_tokens` now count cache
+  reads and cache creation at a weight for the adapter that billed the call,
+  instead of counting every token at 1: `claude-headless` and `agent-sdk`
+  count cache reads at 0.1 and cache creation at 2, `codex-exec` and
+  `codex-app-server` at 0.5 and 1, and other adapters at 1. A cache-heavy run
+  that tripped its budget before may now finish under it. A flow can set
+  `budgets.token_weights.cache_read` (0 to 1) or `.cache_creation` (0 to 2)
+  to override a class for every adapter; `cache_read: 1, cache_creation: 1`
+  restores the old count. `conduit run status` prints the budget figure beside
+  the raw one when they differ. See ADR-0014
+  ([#125](https://github.com/theaiteam-dev/conduit/issues/125)).
+
 ## [2.0.0] - 2026-10-16
 
 ### Breaking

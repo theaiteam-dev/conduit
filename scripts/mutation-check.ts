@@ -29,8 +29,11 @@
  * Not a general mutation-testing run (no operator zoo, no mutation score, no
  * whole-file coverage). The manifest is hand-written and deliberately small:
  * five lines that move money into a budget, plus the one line that decides
- * the figure a Claude harness fold receives (issue #108) and the sum that
- * counts a transform call's cache reads (issue #156). A broad mutation run over this
+ * the figure a Claude harness fold receives (issue #108), the term that
+ * counts a transform call's cache reads (issue #156), and the two lines that
+ * weight a harness call's cache reads and keep its unaccounted remainder,
+ * plus the line that journals that remainder, the per-adapter weight lookup,
+ * the flow override and the critic's own adapter (issue #125). A broad mutation run over this
  * codebase would take a long time and produce mostly equivalent mutants, which
  * is how a check earns a permanent skip. This one runs in seconds and every
  * failure is actionable.
@@ -95,7 +98,7 @@ const MUTANTS: Mutant[] = [
   {
     id: 'gate-critic-fold',
     file: 'src/controller/executor.ts',
-    find: 'foldHarnessUsage(usage.tokens);',
+    find: 'foldHarnessUsage(usage, adapterName);',
     replace: '/* MUTATION-CHECK: gate-critic fold deleted */',
     guards: ['src/controller/executor-harness-gate.test.ts', 'src/controller/executor-harness-gate-hold.test.ts'],
     why:
@@ -106,7 +109,7 @@ const MUTANTS: Mutant[] = [
   {
     id: 'park-throw-fold',
     file: 'src/controller/executor.ts',
-    find: 'foldHarnessUsage(parkedUsage.tokens);',
+    find: 'foldHarnessUsage(parkedUsage, harnessAdapter.name);',
     replace: '/* MUTATION-CHECK: rate-limit-park fold deleted */',
     guards: ['src/controller/executor-harness-journal.test.ts'],
     why:
@@ -117,7 +120,7 @@ const MUTANTS: Mutant[] = [
   {
     id: 'maker-throw-fold',
     file: 'src/controller/executor.ts',
-    find: 'foldHarnessUsage(thrownUsage.tokens);',
+    find: 'foldHarnessUsage(thrownUsage, harnessAdapter.name);',
     replace: '/* MUTATION-CHECK: maker-throw fold deleted */',
     guards: ['src/controller/executor-harness-journal.test.ts', 'src/controller/executor-harness-gate-hold.test.ts'],
     why:
@@ -128,7 +131,7 @@ const MUTANTS: Mutant[] = [
   {
     id: 'maker-success-fold',
     file: 'src/controller/executor.ts',
-    find: 'foldHarnessUsage(reportedTokens);',
+    find: 'foldHarnessUsage(reported, harnessAdapter.name);',
     replace: '/* MUTATION-CHECK: maker-success fold deleted */',
     guards: [
       'src/controller/executor-harness-journal.test.ts',
@@ -145,7 +148,7 @@ const MUTANTS: Mutant[] = [
   {
     id: 'subflow-fold',
     file: 'src/controller/executor.ts',
-    find: 'if (result.tokens !== undefined) foldHarnessUsage(result.tokens);',
+    find: 'if (result.tokens !== undefined) for (const part of subflowFoldParts(result)) foldHarnessUsage(part.usage, part.adapter);',
     replace: '/* MUTATION-CHECK: subflow fold deleted */',
     guards: ['src/controller/executor-subflow.test.ts'],
     why:
@@ -171,19 +174,115 @@ const MUTANTS: Mutant[] = [
       "message's `usage`, which can be a quarter of the session's tokens.",
   },
   {
-    // Not a fold site: the sum trackingAdapter adds to tokensSpent for every
-    // transform call. With a cache split, `inputTokens` is uncached input, so
-    // dropping the cache term breaks no type and no journal row (the span
-    // still records the column) and only the budget comes out low (issue #156).
+    // Not a fold site: the term trackingAdapter adds to tokensSpent for a
+    // transform call's cache reads. With a cache split, `inputTokens` is
+    // uncached input, so dropping the term breaks no type and no journal row
+    // (the span still records the column) and only the budget comes out low
+    // (issues #156 and #125).
     id: 'transform-cache-read-sum',
-    file: 'src/worker/adapter.ts',
-    find: 'return response.inputTokens + (response.cacheReadInputTokens ?? 0) + response.outputTokens;',
+    file: 'src/control/token-weights.ts',
+    find: 'return response.inputTokens + response.outputTokens + weights.cacheRead * cacheRead;',
     replace: 'return response.inputTokens + response.outputTokens; /* MUTATION-CHECK: cache term deleted */',
-    guards: ['src/controller/executor-transform-cache.test.ts'],
+    guards: ['src/controller/executor-transform-cache.test.ts', 'src/control/token-weights.test.ts'],
     why:
       'a transform call against a provider that reports cache reads reaches ' +
       'the run and wave budgets without them, which on a cached prompt is ' +
       'most of its input.',
+  },
+  {
+    // Not a fold site: the weight every harness and subflow fold applies to
+    // cache reads (issue #125). Counting them at 1 breaks no type and no
+    // journal row; the andon trips about ten times early on a cache-heavy run.
+    id: 'harness-cache-read-weight',
+    file: 'src/control/token-weights.ts',
+    find: 'const cacheRead = weights.cacheRead * cacheReadInputTokens;',
+    replace: 'const cacheRead = cacheReadInputTokens; /* MUTATION-CHECK: cache_read weight deleted */',
+    guards: ['src/controller/executor-cache-budget.test.ts', 'src/control/token-weights.test.ts'],
+    why:
+      'harness cache reads count at full weight whatever budgets.token_weights ' +
+      'says, so a multi-turn agent run halts on the tokens andon long before ' +
+      'its spend reaches the limit (issue #125).',
+  },
+  {
+    // Not a fold site: the part of a harness total its breakdown does not
+    // account for, which both foldHarnessUsage and harnessJournalUsage add.
+    // Without it a partial breakdown lowers the count below what the adapter
+    // reported, in memory and in every journal-derived budget (issue #125).
+    id: 'usage-unaccounted-remainder',
+    file: 'src/control/token-weights.ts',
+    find: 'return Math.max(0, tokens - classes);',
+    replace: 'return 0; /* MUTATION-CHECK: remainder deleted */',
+    guards: ['src/controller/executor-cache-budget.test.ts', 'src/control/token-weights.test.ts'],
+    why:
+      'a harness call whose breakdown covers only part of its reported total ' +
+      'counts only that part, in the run and wave budgets and in the remaining ' +
+      'budget of a later pass or resume, so missing data makes the budget ' +
+      'count less than the call spent.',
+  },
+  {
+    // Not a fold site: the line that journals a harness call's unaccounted
+    // remainder in `input_tokens`. Without it the in-memory budget is right
+    // but the journal holds less, so a later pass's or a resume's remaining
+    // budget, read from the journal, comes out high (issue #125).
+    id: 'journal-unaccounted-remainder',
+    file: 'src/controller/executor.ts',
+    find: 'inputTokens: breakdown.inputTokens + unaccountedTokens(reported.tokens, breakdown),',
+    replace: 'inputTokens: breakdown.inputTokens, /* MUTATION-CHECK: journaled remainder deleted */',
+    guards: ['src/controller/executor-cache-budget.test.ts'],
+    why:
+      'a harness call whose breakdown under-covers its total is journaled ' +
+      'without the remainder, so --append-pass and resume of a run with ' +
+      'passes grant budget the run already spent.',
+  },
+  {
+    // Not a fold site: the lookup that gives each call the weights of the
+    // adapter that billed it (issue #125). Without it every call gets one set
+    // of weights, which breaks no type and no journal row; a mixed flow's
+    // Claude and codex calls are then counted alike.
+    id: 'per-adapter-weight-lookup',
+    file: 'src/control/token-weights.ts',
+    find: 'const defaults = adapterCacheWeights(adapterName);',
+    replace: 'const defaults = adapterCacheWeights(null); /* MUTATION-CHECK: per-adapter lookup deleted */',
+    guards: [
+      'src/controller/executor-cache-budget.test.ts',
+      'src/controller/executor-subflow.test.ts',
+      'src/control/token-weights.test.ts',
+      'src/run/run-passes.test.ts',
+    ],
+    why:
+      "every call is weighted as if from one adapter, so a Claude harness call's " +
+      'cache reads count at full weight and the andon trips about ten times early.',
+  },
+  {
+    // Not a fold site: a flow's budgets.token_weights overriding the adapter
+    // default (issue #125). Without it the flow's setting is read, validated
+    // and then ignored.
+    id: 'flow-weight-override',
+    file: 'src/control/token-weights.ts',
+    find: 'cacheRead: override?.cache_read ?? defaults.cacheRead,',
+    replace: 'cacheRead: defaults.cacheRead, /* MUTATION-CHECK: flow override deleted */',
+    guards: [
+      'src/controller/executor-cache-budget.test.ts',
+      'src/controller/executor-subflow.test.ts',
+      'src/control/token-weights.test.ts',
+      'src/run/run-passes.test.ts',
+    ],
+    why:
+      "a flow that sets cache_read (for example 1, to restore the raw count) " +
+      'gets the adapter default instead, so its budget is looser than it declared.',
+  },
+  {
+    // Not a fold site: the gate critic's fold names the critic's adapter, not
+    // the maker's (issue #125). Folding with the maker's adapter breaks no
+    // type and no journal row.
+    id: 'critic-own-adapter',
+    file: 'src/controller/executor.ts',
+    find: 'foldHarnessUsage(usage, adapterName);',
+    replace: "foldHarnessUsage(usage, 'claude-headless'); /* MUTATION-CHECK: critic weighted as the maker */",
+    guards: ['src/controller/executor-cache-budget.test.ts'],
+    why:
+      "a critic on a different adapter than its maker is weighted with the " +
+      "maker's cache discount, so a codex critic behind a Claude maker counts at 0.1.",
   },
 ];
 

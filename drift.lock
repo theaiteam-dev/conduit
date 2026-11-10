@@ -3,12 +3,12 @@ version = 1
 [[bindings]]
 doc = "CLAUDE.md"
 target = "SPEC.md#the-rework-loop-and-its-four-bounding-guards"
-sig = "ad4136a22b151a97"
+sig = "0752ba2f8b5d7a01"
 
 [[bindings]]
 doc = "CLAUDE.md"
 target = "src/controller/executor.ts#runExecutor"
-sig = "99332591187853d4"
+sig = "6df21354b744a204"
 
 [[bindings]]
 doc = "CLAUDE.md"
@@ -108,4 +108,4 @@ sig = "bd240b0922e20e22"
 [[bindings]]
 doc = "docs/installation.md"
 target = "src/cli/main.ts"
-sig = "8aa5d117ed252049"
+sig = "abe4844946aae436"

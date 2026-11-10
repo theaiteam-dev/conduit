@@ -22,7 +22,7 @@
  */
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import { join } from 'node:path';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 
 import type { ModelAdapter } from '../worker/adapter';
@@ -344,5 +344,157 @@ stations:
     expect(invocations).toHaveLength(2);
     expect(invocations[0]!.budgetMaxTokens).toBe(1000);
     expect(invocations[1]!.budgetMaxTokens).toBe(900);
+  });
+
+  // Issue #125: a child reports its spend per adapter, and the parent weights
+  // each share for its own adapter. claude-headless: 100 + 0.1 * 8,000 = 900;
+  // codex-exec: 0.5 * 180 = 90. 8,280 raw tokens count as 990 against 1,000.
+  const CACHE_HEAVY_CHILD = {
+    tokens: 8_280,
+    byAdapter: [
+      { adapter: 'claude-headless', breakdown: { inputTokens: 100, outputTokens: 0, cacheReadInputTokens: 8_000, cacheCreationInputTokens: 0 } },
+      { adapter: 'codex-exec', breakdown: { inputTokens: 0, outputTokens: 0, cacheReadInputTokens: 180, cacheCreationInputTokens: 0 } },
+    ],
+  };
+
+  it("an unknown adapter's share counts at 1: the same child with its codex share unnamed trips 1,000", async () => {
+    // 900 + 180 = 1,080.
+    const flow = setupFlow(1000);
+    seedEntryCard();
+    const { seam } = makeSeam(() => {
+      writeFileSync(join(dir, 'work', 'out.json'), JSON.stringify({ edited: true }));
+      return {
+        outcome: 'done',
+        tokens: CACHE_HEAVY_CHILD.tokens,
+        byAdapter: [CACHE_HEAVY_CHILD.byAdapter[0]!, { ...CACHE_HEAVY_CHILD.byAdapter[1]!, adapter: null }],
+      };
+    });
+
+    await runExecutor({ db, flow, now: () => 1000, adapter: stubAdapter, io, runSubflow: seam });
+
+    expect(ioLines.join('\n')).toContain('andon');
+  });
+
+  it("the parent flow's token_weights overrides the child's adapter defaults", async () => {
+    // cache_read 1 for both shares: 100 + 8,000 + 180 = 8,280 > 1,000.
+    const flow = setupFlow(1000);
+    const path = join(dir, 'flow.yaml');
+    writeFileSync(path, readFileSync(path, 'utf8').replace('  per_card:', '  token_weights: { cache_read: 1 }\n  per_card:'));
+    const reloaded = loadFlow(path);
+    if (!reloaded.ok) throw new Error(JSON.stringify(reloaded.errors));
+    seedEntryCard();
+    const { seam } = makeSeam(() => {
+      writeFileSync(join(dir, 'work', 'out.json'), JSON.stringify({ edited: true }));
+      return { outcome: 'done', ...CACHE_HEAVY_CHILD };
+    });
+
+    await runExecutor({ db, flow: reloaded.flow, now: () => 1000, adapter: stubAdapter, io, runSubflow: seam });
+
+    expect(flow.budgets?.token_weights).toBeUndefined();
+    expect(ioLines.join('\n')).toContain('andon');
+  });
+
+  it("weights a child's cache reads: a cache-heavy child under the weighted budget does not trip it", async () => {
+    const flow = setupFlow(1000);
+    seedEntryCard();
+    const { seam } = makeSeam(() => {
+      writeFileSync(join(dir, 'work', 'out.json'), JSON.stringify({ edited: true }));
+      return { outcome: 'done', ...CACHE_HEAVY_CHILD };
+    });
+
+    await runExecutor({ db, flow, now: () => 1000, adapter: stubAdapter, io, runSubflow: seam });
+
+    expect(ioLines.join('\n')).not.toContain('andon');
+    expect(db.getCard(DEFAULT_RUN_ID, 'card-1')?.lane).toBe('done');
+    // The span keeps the child's summed raw split.
+    const [span] = db.getSpanTokenUsageForRun(DEFAULT_RUN_ID).filter((sp) => sp.name === 'call-child.subflow');
+    expect(span?.inputTokens).toBe(100);
+    expect(span?.cacheReadInputTokens).toBe(8_180);
+  });
+
+  it('a child of the same raw size with no per-adapter split counts at weight 1 and trips the budget', async () => {
+    const flow = setupFlow(1000);
+    seedEntryCard();
+    const { seam } = makeSeam(() => {
+      writeFileSync(join(dir, 'work', 'out.json'), JSON.stringify({ edited: true }));
+      return { outcome: 'done', tokens: 8_280 };
+    });
+
+    await runExecutor({ db, flow, now: () => 1000, adapter: stubAdapter, io, runSubflow: seam });
+
+    expect(ioLines.join('\n')).toContain('andon');
+    expect(db.getCard(DEFAULT_RUN_ID, 'card-1')?.lane).not.toBe('done');
+  });
+
+  it('a cache-heavy child just over the weighted budget still trips it', async () => {
+    const flow = setupFlow(989);
+    seedEntryCard();
+    const { seam } = makeSeam(() => {
+      writeFileSync(join(dir, 'work', 'out.json'), JSON.stringify({ edited: true }));
+      return { outcome: 'done', ...CACHE_HEAVY_CHILD };
+    });
+
+    await runExecutor({ db, flow, now: () => 1000, adapter: stubAdapter, io, runSubflow: seam });
+
+    expect(ioLines.join('\n')).toContain('andon');
+    expect(db.getCard(DEFAULT_RUN_ID, 'card-1')?.lane).not.toBe('done');
+  });
+
+  // A share with a NaN or negative class is unusable (ADR-0014, "missing data
+  // never lowers the count"): the roll-up then counts the child's raw total
+  // at weight 1, as if it reported no shares. A NaN share would otherwise make
+  // tokensSpent NaN, and a negative one would subtract from the run's spend.
+  for (const [label, bad] of [
+    ['NaN', { inputTokens: 0, outputTokens: 0, cacheReadInputTokens: Number.NaN, cacheCreationInputTokens: 0 }],
+    ['negative', { inputTokens: -8_000, outputTokens: 0, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 }],
+  ] as const) {
+    it(`a child share with a ${label} class drops the shares and counts the raw total at 1`, async () => {
+      // Raw 8,280 at weight 1 trips 2,000. Folding the shares instead counts
+      // NaN, or 900 - 8,000 + an 8,180 remainder = 1,080, and trips nothing.
+      const flow = setupFlow(2000);
+      seedEntryCard();
+      const { seam } = makeSeam(() => {
+        writeFileSync(join(dir, 'work', 'out.json'), JSON.stringify({ edited: true }));
+        return {
+          outcome: 'done',
+          tokens: CACHE_HEAVY_CHILD.tokens,
+          byAdapter: [CACHE_HEAVY_CHILD.byAdapter[0]!, { adapter: 'codex-exec', breakdown: { ...bad } }],
+        };
+      });
+
+      await runExecutor({ db, flow, now: () => 1000, adapter: stubAdapter, io, runSubflow: seam });
+
+      expect(ioLines.join('\n')).toContain('andon');
+      // The span records the raw total with no split, like a child with no shares.
+      const [span] = db.getSpanTokenUsageForRun(DEFAULT_RUN_ID).filter((sp) => sp.name === 'call-child.subflow');
+      expect(span?.inputTokens).toBe(8_280);
+      expect(span?.cacheReadInputTokens).toBeNull();
+    });
+  }
+
+  it("records no cache split on the roll-up span when a child share has none", async () => {
+    // A share whose spans recorded no cache columns may hold cached tokens in
+    // its input, so the roll-up span must say "no cache figure", not 0%.
+    const flow = setupFlow(100_000);
+    seedEntryCard();
+    const { seam } = makeSeam(() => {
+      writeFileSync(join(dir, 'work', 'out.json'), JSON.stringify({ edited: true }));
+      return {
+        outcome: 'done',
+        tokens: 500,
+        byAdapter: [{
+          adapter: 'codex-exec',
+          breakdown: { inputTokens: 500, outputTokens: 0, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
+          cacheSplit: false,
+        }],
+      };
+    });
+
+    await runExecutor({ db, flow, now: () => 1000, adapter: stubAdapter, io, runSubflow: seam });
+
+    const [span] = db.getSpanTokenUsageForRun(DEFAULT_RUN_ID).filter((sp) => sp.name === 'call-child.subflow');
+    expect(span?.inputTokens).toBe(500);
+    expect(span?.cacheReadInputTokens).toBeNull();
+    expect(span?.cacheCreationInputTokens).toBeNull();
   });
 });

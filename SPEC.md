@@ -353,6 +353,9 @@ budgets:
   per_wave:                    # subtree andon keyed by parent_id — all children of one parent card (rev-1 H3)
     max_tokens: 400_000
     max_dispatches: 200
+  token_weights:               # optional: overrides every adapter's cache weights (§8, ADR-0014)
+    cache_read: 0.1            # range 0..1; unset = the billing adapter's default
+    cache_creation: 1.25       # range 0..2; unset = the billing adapter's default
   per_card:
     max_execution_attempts: 5  # parse/integrity retries before scrap (rev-1 H5)
   liveness:
@@ -831,7 +834,8 @@ express it (this is why Conduit is a state machine, not Airflow). It is bounded 
    tracked by `parent_id` partition and exceeding the cap scraps that subtree without
    halting the whole run — and the global **andon** (wall-clock + tokens) — *plus* the
    separate **liveness watchdog** (§8) that catches a *stalled* flow the consumption
-   budgets miss.
+   budgets miss. The run and wave token budgets count cache classes at weights for the
+   adapter that billed each call (§8).
 
 ### Fan-in failure policy (rev-1 C4)
 `fan_in: { policy: all | quorum(k) | best_effort }`. Defines what a scrapped or held child
@@ -1093,6 +1097,25 @@ split is harder and needs this in-transaction reservation.)*
 ### Two distinct andons
 1. **Consumption andon** — wall-clock + tokens at run/wave/card scope. Trips on a
    *busy* runaway.
+
+**Budget tokens (issue #125, ADR-0014).** `max_tokens` at run and wave scope compares
+against a weighted total, not raw tokens: uncached input and output count at 1, and cache
+reads and cache creation at weights for the adapter that billed the call. Each adapter
+declares its defaults in one table: `claude-headless` and `agent-sdk` 0.1 and 2 (Anthropic
+cache reads and 1-hour cache writes), `codex-exec` and `codex-app-server` 0.5 and 1 (OpenAI's
+least favourable cached-input discount), `opencode` and the transform adapter 1 and 1 (the
+provider is not known), and 1 and 1 for any adapter not in the table. A flow's
+`budgets.token_weights.cache_read` (range 0 to 1) or `.cache_creation` (range 0 to 2), when
+set, overrides that class for every adapter; the loader rejects anything else with
+`INVALID_TOKEN_WEIGHTS`. Transform calls, every harness fold (the gate critic with its own
+adapter's weights), the subflow roll-up (one share per adapter of the child's spend) and the
+journal-derived remaining budget of a run that takes passes all resolve weights this way.
+Missing data never lowers the count: a call with no cache breakdown counts its whole total
+at 1, a span with no known adapter counts each class the flow does not set at 1, and a
+breakdown that does not account for the whole reported total counts the difference at 1,
+which the journal records as uncached input so a journal-derived budget counts it too. The
+journal keeps raw figures; `conduit run status` prints the budget figure beside the raw one
+when they differ.
 2. **Liveness watchdog** (rev-1 C5) — "no card has changed lane in `no_progress_minutes`
    AND no worker is active" → **immediate** deadlock alert *with the blocking reason*.
    Catches a *stalled* flow (dep scrapped, `hold` with no human, no idle worker) that

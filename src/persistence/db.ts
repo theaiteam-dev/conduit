@@ -1241,6 +1241,23 @@ export interface ConduitDB {
    */
   getRunUsageTotals(runId: string): { tokens: number; costUsd: number };
   /**
+   * Issue #125: one row per journal span of the run, with the adapter that
+   * billed it (null when the span records none), the child run id a
+   * `<station>.subflow` span carries (null otherwise), and its four token
+   * classes (NULL columns as 0), and whether it recorded a cache split
+   * (`cache_read_input_tokens` not NULL). run/run-passes.ts weights each row
+   * by its adapter and recurses into a subflow span's child run.
+   */
+  getSpanBudgetRows(runId: string): Array<{
+    adapter: string | null;
+    childRunId: string | null;
+    inputTokens: number;
+    outputTokens: number;
+    cacheReadInputTokens: number;
+    cacheCreationInputTokens: number;
+    cacheSplit: boolean;
+  }>;
+  /**
    * Issue #30: every harness maker (`<station>.harness`) and harness critic
    * (`<station>.harness-critic`) span of a run, with its duration, its
    * `ready_waiting` sample (null on spans written before that attribute
@@ -1952,6 +1969,48 @@ class ConduitDBImpl implements ConduitDB {
       )
       .get({ $run_id: runId }) as { tokens: number; cost_usd: number };
     return { tokens: row.tokens, costUsd: row.cost_usd };
+  }
+
+  getSpanBudgetRows(runId: string): Array<{
+    adapter: string | null;
+    childRunId: string | null;
+    inputTokens: number;
+    outputTokens: number;
+    cacheReadInputTokens: number;
+    cacheCreationInputTokens: number;
+    cacheSplit: boolean;
+  }> {
+    const rows = this.journalDb
+      .prepare(
+        `SELECT adapter,
+                json_extract(attributes_json, '$.child_run_id') AS child_run_id,
+                COALESCE(input_tokens, 0) AS input_tokens,
+                COALESCE(output_tokens, 0) AS output_tokens,
+                COALESCE(cache_read_input_tokens, 0) AS cache_read,
+                COALESCE(cache_creation_input_tokens, 0) AS cache_creation,
+                cache_read_input_tokens IS NOT NULL AS cache_split
+         FROM journal
+         WHERE run_id = $run_id
+         ORDER BY rowid`,
+      )
+      .all({ $run_id: runId }) as Array<{
+        adapter: string | null;
+        child_run_id: unknown;
+        input_tokens: number;
+        output_tokens: number;
+        cache_read: number;
+        cache_creation: number;
+        cache_split: number;
+      }>;
+    return rows.map((r) => ({
+      adapter: r.adapter,
+      childRunId: typeof r.child_run_id === 'string' ? r.child_run_id : null,
+      inputTokens: r.input_tokens,
+      outputTokens: r.output_tokens,
+      cacheReadInputTokens: r.cache_read,
+      cacheCreationInputTokens: r.cache_creation,
+      cacheSplit: r.cache_split === 1,
+    }));
   }
 
   getHarnessTimingsForRun(runId: string): HarnessTimings {
