@@ -58,22 +58,22 @@ describe("blackbox/ directory layout", () => {
 describe("release workflow runs every PR gate before it publishes", () => {
   // A release is cut from main after a squash merge, so the merged tree is a
   // tree no PR check ran on. The release job must run the same gates the
-  // required PR checks run, in a step before semantic-release, or a merge that
-  // breaks the black-box suite or a budget fold site ships anyway.
+  // required PR checks run, in a step before it creates the release, or a
+  // merge that breaks the black-box suite or a budget fold site ships anyway.
   const wf = parse(readFileSync(join(repoRoot, ".github/workflows/release.yml"), "utf8"));
   const steps: Array<{ name?: string; run?: string; uses?: string; env?: Record<string, string> }> =
     wf.jobs?.release?.steps ?? [];
-  const publishAt = steps.findIndex((s) => s.uses?.startsWith("cycjimmy/semantic-release-action"));
+  const publishAt = steps.findIndex((s) => /\bgh release create\b/.test(s.run ?? ""));
   // Exact script name: `bun run test` must not be satisfied by `bun run test:blackbox`.
   const runIndex = (script: string) =>
     steps.findIndex((s) => new RegExp(`bun run ${script.replace(":", "\\:")}(\\s|$)`, "m").test(s.run ?? ""));
 
-  test("the release job has a semantic-release step", () => {
+  test("the release job has a `gh release create` step", () => {
     expect(publishAt).toBeGreaterThan(-1);
   });
 
   for (const script of ["typecheck", "typecheck:blackbox", "test", "test:blackbox", "test:mutation"]) {
-    test(`runs \`bun run ${script}\` before semantic-release`, () => {
+    test(`runs \`bun run ${script}\` before the release is created`, () => {
       const at = runIndex(script);
       expect(at).toBeGreaterThan(-1);
       expect(at).toBeLessThan(publishAt);

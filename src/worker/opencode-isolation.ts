@@ -24,6 +24,7 @@
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { OPENCODE_PREFIX, taggedTempPrefix } from './stale-temp-dirs';
 
 /** Roots createRunScopedOpenCodeDirs returned and removeRunScopedOpenCodeDirs has not yet removed. */
 const createdRoots = new Set<string>();
@@ -42,7 +43,7 @@ export interface RunScopedOpenCodeDirs {
 
 /** Create an empty HOME and the four empty XDG directories under a fresh temp directory. */
 export function createRunScopedOpenCodeDirs(): RunScopedOpenCodeDirs {
-  const root = mkdtempSync(join(tmpdir(), 'conduit-opencode-'));
+  const root = mkdtempSync(join(tmpdir(), taggedTempPrefix(OPENCODE_PREFIX)));
   try {
     const dir = (name: string): string => {
       const path = join(root, name);

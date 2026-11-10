@@ -217,15 +217,20 @@ export async function handleWebhookRequest(
   // nothing the bounded re-drive is not already doing. A keyed event folded
   // into its run's pending pass (issue #36) is work put in motion too; one the
   // keyed run refused (pass_limit, run_not_appendable) changed nothing.
+  //
+  // A duplicate carries the run id of the run its original delivery started
+  // or joined, when it has one (issue #52): if the first 202 was lost in
+  // transit, the redelivery's answer is the caller's only link to the run.
   const accepted =
     spawnResult.outcome === 'accepted' ||
     spawnResult.outcome === 'queued' ||
     spawnResult.outcome === 'coalesced';
+  const runId = accepted || spawnResult.outcome === 'duplicate' ? spawnResult.runId : undefined;
   return {
     status: accepted ? 202 : 200,
     body: JSON.stringify({
       outcome: spawnResult.outcome,
-      ...(accepted && { run_id: spawnResult.runId }),
+      ...(runId !== undefined && { run_id: runId }),
     }),
   };
 }

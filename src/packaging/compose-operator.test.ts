@@ -195,6 +195,17 @@ describe('docker-compose.operator.yml — topology (static, unconditional)', () 
     expect(commandTokens(listener)).toContain('--port');
   });
 
+  it('binds the listener to 0.0.0.0 so its published port reaches it (#44)', () => {
+    const compose = loadCompose();
+    const [, listener] = engineServiceWithSubcommand(compose, 'listen');
+    // `conduit listen` binds 127.0.0.1 by default, which a published port
+    // cannot reach inside a container.
+    const tokens = commandTokens(listener);
+    const i = tokens.indexOf('--bind');
+    expect(i).toBeGreaterThan(-1);
+    expect(tokens[i + 1]).toBe('0.0.0.0');
+  });
+
   it('declares a per-run kernel service: engine image + the `run` subcommand (AC3, FR-10)', () => {
     const compose = loadCompose();
     const [name, kernel] = engineServiceWithSubcommand(compose, 'run');

@@ -59,7 +59,13 @@ import {
 } from './harness-adapter-claude';
 import { createHarnessEventEmitter } from './harness-events';
 import { mapClaudeStreamMessage, rateLimitWindowsFromInfo, type ClaudeRateLimitInfo } from './harness-events-claude';
-import { HARNESS_GATE_HOLD_CODE, callGateFailClosed, type GateDecision, type GateDenyCode } from './harness-gate';
+import {
+  HARNESS_GATE_HOLD_CODE,
+  callGateFailClosed,
+  gateBuiltinToolNames,
+  type GateDecision,
+  type GateDenyCode,
+} from './harness-gate';
 import { buildHarnessChildEnv } from './harness-runner';
 import { resolveClaudePluginAgent } from './claude-plugin-agents';
 import { createRunScopedClaudeConfigDir, removeRunScopedClaudeConfigDir } from './claude-config-isolation';
@@ -68,6 +74,9 @@ import { prepareContainedCommand, removeCgroup, resolveContainment, type Contain
 import { existsSync, statSync } from 'node:fs';
 import { isDeepStrictEqual } from 'node:util';
 import { resolveExecutable } from './harness-contained-spawn';
+import {
+  callTempDirEnv, createCallTempDir, removeCallTempDir, requireSpawnConfinement, type CallTempDir, type SpawnWriteConfinement,
+} from './landlock-confinement';
 
 /** The part of the SDK's `Query` this adapter uses. */
 export type AgentSdkQuery = AsyncIterable<SDKMessage> & { close?(): void };
@@ -153,6 +162,7 @@ export function createAgentSdkHarnessAdapter(config: AgentSdkHarnessAdapterConfi
     reportsUsage: true,
     canRestrictTools: true,
     canGatePerCall: true,
+    canConfineWrites: true,
     model: config.model,
     agent: config.agent,
 
@@ -179,16 +189,33 @@ export function createAgentSdkHarnessAdapter(config: AgentSdkHarnessAdapterConfi
 
       // Built before the dir exists: nothing between the dir's creation and the try below can throw.
       const baseEnv = buildHarnessChildEnv(config.envAllowlist, sourceEnv);
+      // Issue #122: a write-confined call always gets a run-scoped config dir, since the operator's own
+      // is not in its writable set, and a per-call temp dir that TMPDIR and the XDG cache and state dirs
+      // point at (the CLI writes version locks and logs under them).
+      const confined = call.confinement;
       // Throws before anything is spawned when the child could not authenticate.
       const configDir =
-        config.isolateConfig === true ? createRunScopedClaudeConfigDir(sourceEnv, config.envAllowlist) : undefined;
+        config.isolateConfig === true || confined !== undefined
+          ? createRunScopedClaudeConfigDir(sourceEnv, config.envAllowlist)
+          : undefined;
+      let callTmp: CallTempDir | undefined;
+      try {
+        if (confined !== undefined) callTmp = createCallTempDir();
+      } catch (err) {
+        if (configDir !== undefined) removeRunScopedClaudeConfigDir(configDir);
+        throw err;
+      }
       const env: Record<string, string> = {
         ...baseEnv,
         ...(configDir !== undefined ? { CLAUDE_CONFIG_DIR: configDir } : {}),
+        ...(callTmp !== undefined ? callTempDirEnv(callTmp, { xdg: true }) : {}),
       };
 
-      // Every throw from here on, including one while building the options, must remove the dir.
+      // Every throw from here on, including one while building the options, must remove the dirs.
       try {
+        // Throws before anything is spawned if the confinement cannot be built: never run unconfined.
+        const spawnConfinement: SpawnWriteConfinement | undefined =
+          confined !== undefined ? requireSpawnConfinement(confined, callTmp, [configDir]) : undefined;
         const emit = call.onEvent !== undefined ? createHarnessEventEmitter(call.onEvent) : undefined;
         const abortController = new AbortController();
         // Mutated from callbacks, so held in an object: a bare `let` would be narrowed to its initial value.
@@ -210,10 +237,12 @@ export function createAgentSdkHarnessAdapter(config: AgentSdkHarnessAdapterConfi
         const spawnClaudeCodeProcess = (opts: SpawnOptions): SpawnedProcess => {
           const childEnv: Record<string, string> = {};
           for (const [name, value] of Object.entries(opts.env)) if (value !== undefined) childEnv[name] = value;
-          const contained = prepareContainedCommand(containment, [opts.command, ...opts.args], {
-            ...(opts.cwd !== undefined ? { cwd: opts.cwd } : {}),
-            env: childEnv,
-          });
+          const contained = prepareContainedCommand(
+            containment,
+            [opts.command, ...opts.args],
+            { ...(opts.cwd !== undefined ? { cwd: opts.cwd } : {}), env: childEnv },
+            spawnConfinement,
+          );
           let child: ChildProcess;
           try {
             child = nodeSpawn(contained.argv[0]!, contained.argv.slice(1), {
@@ -390,9 +419,11 @@ export function createAgentSdkHarnessAdapter(config: AgentSdkHarnessAdapterConfi
             PostToolUse: [{ hooks: [postToolUse] }],
             PostToolUseFailure: [{ hooks: [postToolUse] }],
           },
-          // Defence in depth: the gate is the enforcement. Empty tools is the executor's encoding of a
-          // waived `unrestricted_tools` station and passes no narrowing.
-          ...(call.tools.length > 0 ? { allowedTools: call.tools } : {}),
+          // The gate is the enforcement. `tools` sets which built-in tools the model is offered at all
+          // (`allowedTools` only pre-approves, and leaves every other definition in each request), so
+          // the model never sees a built-in the gate would refuse. Empty tools is the executor's
+          // encoding of a waived `unrestricted_tools` station and passes no narrowing.
+          ...(call.tools.length > 0 ? { tools: gateBuiltinToolNames(call.tools), allowedTools: call.tools } : {}),
           ...(model !== undefined ? { model } : {}),
           ...(agent !== undefined ? { agent } : {}),
           ...(pluginDirs.length > 0 ? { plugins: pluginDirs.map((path) => ({ type: 'local' as const, path })) } : {}),
@@ -608,6 +639,7 @@ export function createAgentSdkHarnessAdapter(config: AgentSdkHarnessAdapterConfi
         return { outputs: [], usage };
       } finally {
         if (configDir !== undefined) removeRunScopedClaudeConfigDir(configDir);
+        if (callTmp !== undefined) removeCallTempDir(callTmp);
       }
     },
   };

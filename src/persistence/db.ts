@@ -664,6 +664,25 @@ export interface StoredJournalSpan {
   agentSha256?: string | null;
   /** Invocation id of the harness call (issue #71); null on any other span. */
   invocationId?: string | null;
+  /** Input tokens (uncached when a cache split is present); null on a span with no usage. */
+  inputTokens?: number | null;
+  /** Cache-read input tokens; null when the span records no cache split (issue #156). */
+  cacheReadInputTokens?: number | null;
+  /** Cache-creation input tokens; null when the adapter reported none. */
+  cacheCreationInputTokens?: number | null;
+}
+
+/** One span's token columns, as read by getSpanTokenUsageForRun (issue #156). */
+export interface SpanTokenUsage {
+  cardId: string;
+  station: string;
+  name: string;
+  /** UNCACHED input when either cache column is set (issue #5). */
+  inputTokens: number;
+  outputTokens: number | null;
+  /** NULL when the span records no cache split. */
+  cacheReadInputTokens: number | null;
+  cacheCreationInputTokens: number | null;
 }
 
 /** The harness event kinds the journal keeps (issue #71). Deltas are not among them. */
@@ -747,6 +766,14 @@ export interface HarnessSpanTiming {
   durationMs: number | null;
   /** Other dispatchable cards when the call started; null when not recorded. */
   readyWaiting: number | null;
+  /**
+   * Issue #30, ADR-0012: epoch ms the call started, recorded only on a span
+   * of an overlapped call (`started_at_ms`); null on every serial span and on
+   * older journals, whose calls never overlapped another harness call.
+   */
+  startedAtMs: number | null;
+  /** True when the span records `concurrent: true` (an overlapped call). */
+  concurrent: boolean;
 }
 
 /** A run's harness span timings plus the time of its newest journal row. */
@@ -802,7 +829,11 @@ export type IngressOutcome =
   // 'already_applied': a re-drive found that a pass had already consumed the
   // event (run_pass_events), so it was marked spawned rather than launched a
   // second time.
-  | 'already_applied';
+  | 'already_applied'
+  // Issue #47: a re-drive sweep hit an error, a storage error in practice.
+  // With an event id, that row threw and the sweep moved on; without one, the sweep
+  // could not read its snapshot. Written only when the journal accepts it.
+  | 'sweep_error';
 
 export interface IngressLogInput {
   source: string;
@@ -860,6 +891,7 @@ const VALID_INGRESS_OUTCOMES: ReadonlySet<string> = new Set<IngressOutcome>([
   'run_not_appendable',
   'pass_failed',
   'already_applied',
+  'sweep_error',
 ]);
 
 // ---------------------------------------------------------------------------
@@ -1083,6 +1115,12 @@ export interface ConduitDB {
   getCard(runId: string, id: string): Card | null;
   /** Insert a run record. Throws on duplicate run_id. */
   insertRun(run: RunInput): void;
+  /**
+   * Insert a run record unless a row with its run_id exists. Returns true when
+   * a row was inserted, false when one was already recorded, which is left
+   * unchanged. Same columns as insertRun (issue #48).
+   */
+  insertRunIfAbsent(run: RunInput): boolean;
   /** Return the run record for runId, or null if not found. */
   getRun(runId: string): RunRecord | null;
   /**
@@ -1210,6 +1248,11 @@ export interface ConduitDB {
    * kind (null when the run has none). Read by run/harness-occupancy.ts.
    */
   getHarnessTimingsForRun(runId: string): HarnessTimings;
+  /**
+   * Issue #156: the token columns of every span of a run that carries usage
+   * (`input_tokens` not NULL), in insertion order. Read by run/cache-usage.ts.
+   */
+  getSpanTokenUsageForRun(runId: string): SpanTokenUsage[];
   /**
    * Issue #71: append one durable harness event. INSERT OR IGNORE on the
    * (run, card, station, attempt, invocation_id, seq) key, so a replay is a
@@ -1390,12 +1433,21 @@ class ConduitDBImpl implements ConduitDB {
   }
 
   insertRun(run: RunInput): void {
-    this.stateDb
+    this.runInsert(run, '');
+  }
+
+  insertRunIfAbsent(run: RunInput): boolean {
+    return this.runInsert(run, ' ON CONFLICT(run_id) DO NOTHING') === 1;
+  }
+
+  /** The one runs INSERT, shared by insertRun and insertRunIfAbsent. Returns the rows changed. */
+  private runInsert(run: RunInput, conflictClause: '' | ' ON CONFLICT(run_id) DO NOTHING'): number {
+    return this.stateDb
       .prepare(
         `INSERT INTO runs (run_id, flow, project_root, input_fingerprint, status, outcome,
                            holder_pid, lease_acquired_at, holder_start_time)
          VALUES ($run_id, $flow, $project_root, $input_fingerprint, $status, $outcome,
-                 $holder_pid, $lease_acquired_at, $holder_start_time)`,
+                 $holder_pid, $lease_acquired_at, $holder_start_time)${conflictClause}`,
       )
       .run({
         $run_id: run.run_id,
@@ -1407,7 +1459,7 @@ class ConduitDBImpl implements ConduitDB {
         $holder_pid: run.holder_pid ?? null,
         $lease_acquired_at: run.lease_acquired_at ?? null,
         $holder_start_time: run.holder_start_time ?? null,
-      });
+      }).changes;
   }
 
   getRun(runId: string): RunRecord | null {
@@ -1906,7 +1958,9 @@ class ConduitDBImpl implements ConduitDB {
     const rows = this.journalDb
       .prepare(
         `SELECT station, name, duration_ms,
-                json_extract(attributes_json, '$.ready_waiting') AS ready_waiting
+                json_extract(attributes_json, '$.ready_waiting') AS ready_waiting,
+                json_extract(attributes_json, '$.started_at_ms') AS started_at_ms,
+                json_extract(attributes_json, '$.concurrent') AS concurrent
          FROM journal
          WHERE run_id = $run_id
            AND (name = station || '.harness' OR name = station || '.harness-critic')
@@ -1917,6 +1971,8 @@ class ConduitDBImpl implements ConduitDB {
         name: string;
         duration_ms: number | null;
         ready_waiting: number | null;
+        started_at_ms: number | null;
+        concurrent: number | null;
       }[];
     const last = this.journalDb
       .prepare('SELECT MAX(created_at) AS last FROM journal WHERE run_id = $run_id')
@@ -1927,9 +1983,41 @@ class ConduitDBImpl implements ConduitDB {
         role: row.name.endsWith('.harness-critic') ? ('critic' as const) : ('maker' as const),
         durationMs: row.duration_ms,
         readyWaiting: typeof row.ready_waiting === 'number' ? row.ready_waiting : null,
+        startedAtMs: typeof row.started_at_ms === 'number' ? row.started_at_ms : null,
+        // json_extract returns SQLite's 1 for a JSON true.
+        concurrent: row.concurrent === 1,
       })),
       lastSpanAt: last.last,
     };
+  }
+
+  getSpanTokenUsageForRun(runId: string): SpanTokenUsage[] {
+    const rows = this.journalDb
+      .prepare(
+        `SELECT card_id, station, name, input_tokens, output_tokens,
+                cache_read_input_tokens, cache_creation_input_tokens
+         FROM journal
+         WHERE run_id = $run_id AND input_tokens IS NOT NULL
+         ORDER BY id ASC`,
+      )
+      .all({ $run_id: runId }) as {
+        card_id: string;
+        station: string;
+        name: string;
+        input_tokens: number;
+        output_tokens: number | null;
+        cache_read_input_tokens: number | null;
+        cache_creation_input_tokens: number | null;
+      }[];
+    return rows.map((row) => ({
+      cardId: row.card_id,
+      station: row.station,
+      name: row.name,
+      inputTokens: row.input_tokens,
+      outputTokens: row.output_tokens,
+      cacheReadInputTokens: row.cache_read_input_tokens,
+      cacheCreationInputTokens: row.cache_creation_input_tokens,
+    }));
   }
 
   getJournalSpansForRun(runId: string, cardId: string): StoredJournalSpan[] {
@@ -1937,7 +2025,8 @@ class ConduitDBImpl implements ConduitDB {
       .prepare(
         `SELECT card_id, station, attempt, name, attributes_json,
                 adapter, duration_ms, usage_unknown,
-                binding_stamp, prompt_template_version, agent, agent_sha256, invocation_id
+                binding_stamp, prompt_template_version, agent, agent_sha256, invocation_id,
+                input_tokens, cache_read_input_tokens, cache_creation_input_tokens
          FROM journal
          WHERE run_id = $run_id AND card_id = $card_id
          ORDER BY id ASC`,
@@ -1956,6 +2045,9 @@ class ConduitDBImpl implements ConduitDB {
         agent: string | null;
         agent_sha256: string | null;
         invocation_id: string | null;
+        input_tokens: number | null;
+        cache_read_input_tokens: number | null;
+        cache_creation_input_tokens: number | null;
       }[];
 
     return rows.map((row) => ({
@@ -1976,6 +2068,9 @@ class ConduitDBImpl implements ConduitDB {
       agent: row.agent,
       agentSha256: row.agent_sha256,
       invocationId: row.invocation_id,
+      inputTokens: row.input_tokens,
+      cacheReadInputTokens: row.cache_read_input_tokens,
+      cacheCreationInputTokens: row.cache_creation_input_tokens,
     }));
   }
 
@@ -2485,16 +2580,46 @@ const COLD_START_RETRY: Parameters<typeof withBusyRetry>[1] = {
   maxDelayMs: 150,
 };
 
+/** The oldest state DB version the migration ladder in openConduitDB accepts. */
+const OLDEST_MIGRATABLE_SCHEMA_VERSION = 2;
+
+/**
+ * The error for a state DB this binary cannot open (issue #50). It names which
+ * side is newer and what to do. The path is deliberately unquoted: the CLI's
+ * buildProductionDeps appends a bare-metal CONDUIT_STATE_DB hint to any open
+ * error containing the path in single quotes, which is wrong for this case.
+ */
+function stateSchemaMismatchMessage(stateDbPath: string, found: number): string {
+  const head = `conduit state DB schema mismatch: the state DB at ${stateDbPath} is at schema version ${found}, `;
+  if (found > SCHEMA_VERSION) {
+    return (
+      head +
+      `and this conduit binary supports up to version ${SCHEMA_VERSION}. ` +
+      `The DB was written by a newer Conduit: upgrade the conduit binary or engine image ` +
+      `to that version or later. Migrations run forward only, so rolling back past a ` +
+      `schema migration is not supported. The DB's version was left unchanged.`
+    );
+  }
+  return (
+    head +
+    `and this conduit binary migrates versions ${OLDEST_MIGRATABLE_SCHEMA_VERSION} through ` +
+    `${SCHEMA_VERSION - 1} to ${SCHEMA_VERSION} automatically on open. Version ${found} is ` +
+    `older than the oldest version this binary can migrate, so no migration ran. ` +
+    `Point conduit at a new file to start a new state DB; the old DB's version was left unchanged.`
+  );
+}
+
 /**
  * Open (or create) the split Conduit persistence layer.
  *
  * Fresh state DB (user_version = 0): initialise schema and stamp SCHEMA_VERSION.
  * Existing state DB (user_version = SCHEMA_VERSION): connect as-is.
- * Migratable state DBs (user_version = 2..6): apply the migration ladder and
- * stamp SCHEMA_VERSION. Additive ALTER TABLE steps are safe to re-run when
- * guarded against "duplicate column" errors.
- * Incompatible state DB (user_version < 2 or > SCHEMA_VERSION): throw —
- *   version left untouched so the caller can inspect and recover manually.
+ * Migratable state DBs (user_version = 2..SCHEMA_VERSION - 1): apply the
+ * migration ladder and stamp SCHEMA_VERSION. Additive ALTER TABLE steps are
+ * safe to re-run when guarded against "duplicate column" errors.
+ * Incompatible state DB (user_version < 2 or > SCHEMA_VERSION): throw the
+ *   stateSchemaMismatchMessage error, which says which side is newer; the
+ *   version is left untouched.
  *
  * Journal DB: JOURNAL_DDL is always executed — every statement uses
  * CREATE TABLE/INDEX IF NOT EXISTS so it is fully idempotent and self-heals
@@ -2640,10 +2765,7 @@ export function openConduitDB({
     needsV11ToV12Migration = true;
   } else if (user_version !== SCHEMA_VERSION) {
     stateDb.close();
-    throw new Error(
-      `conduit state DB schema mismatch: found version ${user_version}, ` +
-        `expected ${SCHEMA_VERSION}. Manual migration required.`,
-    );
+    throw new Error(stateSchemaMismatchMessage(stateDbPath, user_version));
   }
 
   if (needsV3ToV4Migration) {

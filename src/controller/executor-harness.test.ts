@@ -31,7 +31,7 @@
  *      wrote its declared output files during invoke; the executor reads them,
  *      coercive-parses (transform.ts coerciveParse), and validates against
  *      buildOutputSchema (schema.ts). "validated present" == the declared output
- *      file exists on disk (findMissingDeclaredOutputs, executor.ts ~1335).
+ *      file exists on disk at the path flow/resolve-output.ts resolves.
  *
  * 2. W4 HARD NON-ADVANCE == escalateToHold (lane 'hold'). This mirrors the
  *    deterministic path's existing `deterministic-output-missing → escalateToHold`

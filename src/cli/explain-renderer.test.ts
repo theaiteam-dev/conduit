@@ -448,6 +448,22 @@ describe('renderFlow — adaptive legend (WI-444 AC4, AC5, AC6)', () => {
     expect(renderFlow(flow)).toContain('effectful');
   });
 
+  it('notes a harness station that declares overlap: true (issue #30)', () => {
+    const flow = makeFlow({
+      stations: {
+        walk: makeStation({ kind: 'harness', harness: 'agent-sdk', overlap: true, next: 'done' }),
+        solo: makeStation({ kind: 'harness', harness: 'agent-sdk', next: 'done' }),
+      },
+      happyPathNext: { walk: 'done', solo: 'done' },
+    });
+    for (const rendered of [renderFlow(flow), renderFlow(flow, { rich: true })]) {
+      const lines = rendered.split('\n');
+      expect(lines.find((l) => l.includes('walk') && l.includes('overlap'))).toBeDefined();
+      expect(lines.find((l) => l.includes('solo') && l.includes('overlap'))).toBeUndefined();
+    }
+    expect(renderFlow(flow)).toContain('(overlap) = harness station');
+  });
+
   it('includes the back-edge marker in the legend when a back-edge exists (AC5)', () => {
     expect(renderFlow(loadOk(TIKTOK)).toLowerCase()).toContain('back-edge');
   });

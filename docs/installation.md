@@ -59,7 +59,9 @@ docker build -t conduit-engine:1.0.0 .
 >
 > | Step | Purpose |
 > |------|---------|
-> | `FROM oven/bun:1.3.11-slim` | Pinned Bun runtime — see [§7](#7-bump-the-bun-version) to change it |
+> | `FROM alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc AS llexec` + `gcc -static` | Build stage: compiles the Landlock write-confinement helper (`native/llexec/llexec.c`) as a static binary. The base is pinned by the digest of the `alpine:3.20` multi-arch index, so every build uses the same toolchain; the Dockerfile comment above the `FROM` says how to move it. Nothing else from this stage reaches the image |
+> | `FROM oven/bun:1.3.11-slim` | Pinned Bun runtime, the image's base — see [§7](#7-bump-the-bun-version) to change it |
+> | `COPY --from=llexec /llexec /usr/local/bin/llexec` | The helper overlapped harness calls run under (reported by the `write-confinement` doctor probe) |
 > | Create `conduit` user/group | Least-privilege execution — the container never runs as root |
 > | `WORKDIR /app` | Relative paths such as `examples/branching/flow.yaml` resolve here |
 > | `COPY package.json bun.lock ./` + `bun install --omit=optional` | Dependency layer cached independently of source changes. Optional dependencies are skipped: they are the Agent SDK's bundled platform binaries, which the `agent-sdk` adapter does not use |
@@ -166,6 +168,44 @@ ephemeral container filesystem is wiped on `docker rm`.
 docker volume create conduit_data
 ```
 
+### State DB schema and the image pin
+
+The state DB records its schema version in `PRAGMA user_version`, and each
+binary carries the version it writes (`SCHEMA_VERSION` in
+`src/persistence/db.ts`). On open, a binary migrates an older state DB forward
+to its own version automatically and stamps the new version. Migrations run
+forward only. Once a newer image has migrated the DB on `/data`, an older image
+cannot open it, so the image pin and the state DB are coupled. Before you
+change the pin, and especially before you roll it back, compare the two
+versions:
+
+```bash
+# The DB's version. This opens the DB read-only; stop the engine first.
+docker run --rm -v conduit_data:/data --entrypoint bun conduit-engine \
+  -e 'const { Database } = require("bun:sqlite");
+      const db = new Database("/data/conduit.sqlite", { readonly: true });
+      console.log(db.query("PRAGMA user_version").get().user_version);'
+
+# The version the image you are about to run writes.
+docker run --rm --entrypoint grep conduit-engine \
+  -m1 'export const SCHEMA_VERSION' /app/src/persistence/db.ts
+```
+
+If the DB's version is higher than the image's, run an image at least as new
+as the one that wrote the DB.
+
+A binary that cannot open the state DB exits nonzero and leaves the version
+stamp unchanged. The error says which side is newer:
+
+```
+fatal: conduit state DB schema mismatch: the state DB at /data/conduit.sqlite is at schema version 13, and this conduit binary supports up to version 12. The DB was written by a newer Conduit: upgrade the conduit binary or engine image to that version or later. Migrations run forward only, so rolling back past a schema migration is not supported. The DB's version was left unchanged.
+```
+
+The other direction, a DB older than the oldest version the binary can
+migrate (version 1), says that no migration ran. The binary has no migration
+for that version, so start a new state DB by pointing `CONDUIT_STATE_DB` at a
+new file.
+
 ### Secret injection (FR-5)
 
 Secrets are **never** baked into an image layer. The `.dockerignore` at the
@@ -271,7 +311,7 @@ override the image with `CONDUIT_FLOW_IMAGE`.
 
 | Service | Image | Command | Purpose |
 |---------|-------|---------|---------|
-| `listener` | `${CONDUIT_FLOW_IMAGE:-branching-flow}` | `listen --flows branching=/flow/flow.yaml --port 8080` | Long-lived process; receives webhook events on port `8080`, enqueues cards into the shared state DB |
+| `listener` | `${CONDUIT_FLOW_IMAGE:-branching-flow}` | `listen --flows branching=/flow/flow.yaml --port 8080 --bind 0.0.0.0` | Long-lived process; receives webhook events on port `8080`, enqueues cards into the shared state DB |
 | `kernel` | `${CONDUIT_FLOW_IMAGE:-branching-flow}` | `run /flow/flow.yaml` | Per-run process; executes the baked flow against the shared state DB and exits when the flow completes |
 | `model` | `ollama/ollama` | — | Local model sidecar; both engine services reach it via `CONDUIT_BASE_URL: http://model:11434/v1` |
 
@@ -303,6 +343,15 @@ docker compose -f docker-compose.operator.yml run --rm kernel
 > **Port mapping** — the `listener` service binds `8080:8080`. Put a reverse
 > proxy or cloud load-balancer in front for TLS termination; the container
 > serves plain HTTP.
+>
+> **`--bind 0.0.0.0` is required in a container.** `conduit listen` binds its
+> HTTP server to `127.0.0.1` unless `--bind` names another address, and a
+> published port does not reach a container's loopback. Without the flag the
+> listener starts but `8080:8080` connects to nothing. To keep the port off the
+> network, restrict the host side instead: `"127.0.0.1:8080:8080"`. A flow whose
+> ingress is Slack Socket Mode only starts no HTTP server, so it needs neither
+> `--bind` nor a `ports:` entry. See
+> [HTTP server: when it starts and where it binds](./ingress-listener.md#http-server-when-it-starts-and-where-it-binds---port---bind).
 
 ---
 
@@ -324,6 +373,7 @@ These probes run whether or not a flow argument is given:
 | `state_db_volume` | Writes and deletes a temp file in the state-DB directory. Paths under `/data` must also be backed by an actual Docker mount; no-volume containers report FAIL instead of silently using ephemeral storage |
 | `project-root-present` | Checks `CONDUIT_PROJECT_ROOT` on disk. Reports FAIL only when the env var is set to a non-existent path. Reports ok (no-op) when the env var is unset or empty — the engine image sets it to an empty string so the probe is a no-op there. Per-flow images set `CONDUIT_PROJECT_ROOT=/flow` so the baked-in directory is verified |
 | `process-containment` | Which mechanism kills the processes a station or harness starts: a per-invocation cgroup v2, or the process-group kill alone. Never FAILs. On the fallback the detail starts with `warning:` and names the reason; a command that starts a new session (every command Claude Code's Bash tool runs) can then outlive its invocation. A default Docker or Podman container reports the fallback, because `/sys/fs/cgroup` is read-only there. See [Process-tree termination](harness-containment.md#process-tree-termination) for the requirements and a Podman recipe |
+| `write-confinement` | Whether overlapped harness calls (`overlap: true` stations under `--concurrency`) can run under Landlock write confinement: the `llexec` helper is found, the kernel offers Landlock ABI 3 or later (Linux 6.2), and a real write test through it is refused outside its writable path. Never FAILs. When it is unavailable the detail starts with `warning:` and names the reason, and cards of `overlap: true` stations run one at a time. The engine image ships the helper at `/usr/local/bin/llexec`; a source checkout builds it with `bun run build:llexec`, and `CONDUIT_LLEXEC` names another copy. A default Docker container passes. See [Write confinement of overlapped calls](harness-containment.md#write-confinement-of-overlapped-calls) |
 | `model_api_key` | `CONDUIT_API_KEY` or `OPENAI_API_KEY` is set |
 | `gateway_base_url` | `CONDUIT_BASE_URL` is set |
 
@@ -333,6 +383,7 @@ These probes run whether or not a flow argument is given:
 |------------|---------------|
 | `flow-prereqs-present` | Every package in `flow.prerequisites` is present on PATH; reports all missing packages, not just the first |
 | `model-endpoint-reachable` | HTTP HEAD/GET to `${CONDUIT_BASE_URL}/models` succeeds; FAIL names the configured endpoint |
+| `harness '<adapter>' (station '<id>')` | One line per harness the flow uses: a `kind: harness` maker, and a `check.critic.harness` gate critic on a station of any kind, marked `(station '<id>' critic)`. The adapter's binary is present and executable; FAIL names the probed path. See [Verifying with `conduit doctor`](harness-adapter-registration.md#verifying-with-conduit-doctor) |
 
 ### Example: passing run (no flow arg)
 
@@ -345,6 +396,7 @@ $ docker run --rm -v conduit_data:/data \
   state_db_volume: ok
   project-root-present: ok
   process-containment: ok — warning: process group only (cannot create a cgroup under /sys/fs/cgroup (EROFS)); a command started in a new session can outlive its invocation, see docs/harness-containment.md
+  write-confinement: ok — Landlock ABI 4 via /usr/local/bin/llexec; overlapped harness calls run write-confined
   model_api_key: ok
   gateway_base_url: ok — CONDUIT_BASE_URL is configured
 ```
@@ -360,6 +412,7 @@ $ docker run --rm -v conduit_data:/data \
   state_db_volume: ok
   project-root-present: ok
   process-containment: ok — warning: process group only (cannot create a cgroup under /sys/fs/cgroup (EROFS)); a command started in a new session can outlive its invocation, see docs/harness-containment.md
+  write-confinement: ok — Landlock ABI 4 via /usr/local/bin/llexec; overlapped harness calls run write-confined
   model_api_key: ok
   gateway_base_url: ok — CONDUIT_BASE_URL is configured
   flow-prereqs-present: ok
@@ -384,16 +437,17 @@ If any probe fails, the command aborts before dispatch or boot.
 
 ## 7. Bump the Bun version
 
-The single authoritative Bun pin is the `FROM` line in the engine Dockerfile:
+The single authoritative Bun pin is the runtime stage's `FROM` line in the engine
+Dockerfile, the last `FROM` (the `llexec` build stage comes before it):
 
 ```dockerfile
-# Dockerfile (repo root), line 1
+# Dockerfile (repo root), the runtime stage
 FROM oven/bun:1.3.11-slim
 ```
 
 To upgrade:
 
-1. Edit `Dockerfile` line 1 to the desired `oven/bun:<version>-slim` tag.
+1. Edit that `FROM` line to the desired `oven/bun:<version>-slim` tag.
 2. Rebuild the engine image:
    ```bash
    docker build -t conduit-engine .
@@ -541,8 +595,13 @@ to retry`. There is nothing to resume, so `conduit resume` refuses it; the
 same `conduit run --run-id job-1 ...` command retries it in place, and may
 carry a corrected `--input`, since nothing ran under the first one. For a run with `kind: harness`
 stations, `run status` also prints how much of the run's wall clock each
-harness station held the serial dispatch path
-(see [`concurrency-demo.md`](./concurrency-demo.md#gotcha-harness-stations-run-one-card-at-a-time)).
+harness station was busy, counting overlapped calls once
+(see [`concurrency-demo.md`](./concurrency-demo.md#harness-stations-run-one-card-at-a-time-unless-they-declare-overlap-true)).
+For a run whose harness or transform spans carry token usage, it also prints
+each station's cache reads and their share of input, or `no cache figure` for a
+station whose provider reported no cache split. For a transform station the
+figure comes from the gateway's `usage.prompt_tokens_details.cached_tokens`, or,
+when the body has none, its `fireworks-cached-prompt-tokens` header.
 
 Under the operator stack the listener does this for you — it recognises a
 parked child, tells the channel once, and resumes the run itself when the gate

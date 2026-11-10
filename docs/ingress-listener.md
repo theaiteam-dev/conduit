@@ -59,8 +59,28 @@ The webhook response is produced as soon as the event is accepted and its
 | --- | --- | --- |
 | `accepted` — a run is now executing | `202` | `{"outcome":"accepted","run_id":"…"}` |
 | `queued` — accepted, waiting on a free run slot | `202` | `{"outcome":"queued","run_id":"…"}` |
-| `duplicate` — already handled | `200` | `{"outcome":"duplicate"}` |
+| `duplicate` — already handled | `200` | `{"outcome":"duplicate","run_id":"…"}`, or `{"outcome":"duplicate"}` (see below) |
 | `spawn_failed` — the launch failed; the sweep owns the retry | `200` | `{"outcome":"spawn_failed"}` |
+
+A `duplicate` carries the `run_id` of the run the original delivery started or
+joined, so a caller whose first `202` was lost in transit can still find the
+run. The id is read from the event's stored row, never derived from the
+redelivery's body, and describes the event when the duplicate arrives:
+
+- Unkeyed binding: always present. The run id is written with the accept,
+  before the launch, so a redelivery that arrives while the first delivery is
+  still launching gets it too. The run may not appear in `conduit run status`
+  until that launch completes.
+- Keyed binding (`run_key`): present once the event was launched as a pass,
+  folded into the run's pending pass (`coalesced`), or consumed by a pass.
+  Absent while the first delivery is still being routed or is queued behind
+  busy run slots, since the keyed run may yet refuse it, and absent for an
+  event the run refused (`pass_limit`, `run_not_appendable`), which never
+  joined it. When the run refuses a pending pass (`max_passes` reached, or the
+  run cannot take it), every event folded into that pass is refused with it, so
+  a later duplicate of any of them names no run.
+- An event accepted before ingress attribution existed has no stored run id,
+  so its duplicate carries none.
 
 Before this, the response waited on the child's **exit**, so a multi-hour render
 held the HTTP socket open for hours: every real client timed out and marked
@@ -76,8 +96,9 @@ accepted work as failed. Generic providers (GitHub, Stripe) time out after
   3. Validate all bindings (malformed?, route collision?)
   4. Resolve alert channels per flow (flow.egress || listener-global)
   5. Re-drive recoverable events (bounded by cap)
-  6. Start HTTP server (webhook adapter)
-  7. Register Slack event handler
+  6. Start HTTP server (webhook and Slack Events API adapters), only when a
+     served binding needs one; 127.0.0.1 unless --bind names another address
+  7. Open Socket Mode connections for socket-transport Slack bindings
     ↓
 [Idle]
   - Accept events
@@ -154,6 +175,60 @@ under saturation the true process count can exceed `max_concurrent_runs` by the 
 in-flight resumes. A second concurrent resume for the *same* run is suppressed (logged
 `'duplicate'`) — the double-driver guard; the run lease remains the backstop for resumes
 that bypassed the gate.
+
+### HTTP server: when it starts and where it binds (`--port`, `--bind`)
+
+The listener starts an HTTP server only when a served flow has a binding that
+receives events over inbound HTTP: a `webhook` binding, or a `slack` binding on
+the Events API transport (`transport: events`, the default). When every served
+binding is Slack Socket Mode (`transport: socket`), it opens no port at all:
+Socket Mode is outbound-only. A flow quarantined at boot does not count.
+
+When the server starts, it binds `127.0.0.1` on port 3000 by default. Change
+the port with `--port <n>` and the address with `--bind <addr>`:
+
+```bash
+# Loopback only (the default): reachable from this host, for example by a
+# reverse proxy on the same machine.
+conduit listen --manifest engine.yaml --port 8080
+
+# Every IPv4 interface: needed when another host, or a published Docker port,
+# must reach the listener directly.
+conduit listen --manifest engine.yaml --port 8080 --bind 0.0.0.0
+```
+
+The startup log line states which case applied:
+
+```
+conduit listen: no HTTP listener (every served binding uses Slack Socket Mode)
+conduit listen: serving ingress on http://127.0.0.1:8080 (loopback only by default; pass --bind 0.0.0.0 to accept connections from other hosts)
+conduit listen: serving ingress on http://0.0.0.0:8080 (--bind 0.0.0.0)
+```
+
+When no binding needs HTTP, an explicit `--port` or `--bind` is reported on
+stderr as ignored, in one line naming the flags that were passed. The default
+port never triggers it:
+
+```
+conduit listen: --bind 0.0.0.0 ignored: no served binding needs an inbound HTTP port
+conduit listen: --port 8080 ignored: no served binding needs an inbound HTTP port
+conduit listen: --port 8080 and --bind 0.0.0.0 ignored: no served binding needs an inbound HTTP port
+```
+
+**In a container, the default is not reachable from outside.** On Docker's
+default bridge network, a published port is forwarded to the container's network
+interface, not to its loopback, so a
+listener bound to `127.0.0.1` inside the container cannot be reached through
+`-p 8080:8080` or a compose `ports:` entry. A containerised listener that
+receives webhooks or Slack Events API requests must pass `--bind 0.0.0.0`, and
+the host side of the port mapping then decides who can reach it: publish it on
+the host's loopback (`-p 127.0.0.1:8080:8080`) when a reverse proxy on the same
+host terminates TLS. `docker-compose.operator.yml` passes `--bind 0.0.0.0` for
+this reason. A Socket-Mode-only container needs neither `--bind` nor a published
+port.
+
+Before #44 the server always started and always bound `0.0.0.0`. See the
+CHANGELOG upgrade note.
 
 ### Per-flow binding declaration
 
@@ -513,6 +588,26 @@ On listener startup, `redriveOnBoot`:
    failure is the loudest case: the row is excluded from every future sweep, so
    its alert is the only thing that will surface the event again.
 
+**A sweep error does not stop the listener.** The periodic sweep and the sweep
+a freed run slot kicks run detached from any request, so each has an error
+boundary. A row that throws (for example `incrementSpawnAttempts` failing with
+`database or disk is full`) is logged `'sweep_error'` with its event id, and
+the sweep goes on to the next row; a snapshot that cannot be read is logged
+`'sweep_error'` with no event id. Both log writes are best effort. The first
+failed sweep of a run of failures fires one alert on the listener-global
+channel (`flow=unknown event=redrive-sweep`); later failures do not alert again
+until a sweep succeeds. After a failed sweep that made no progress (its
+snapshot could not be read, or every row it reached threw), slot-release kicks
+are ignored until the next interval tick, which sweeps again, so a full disk is
+retried once per interval rather than on every child exit. A sweep that
+launched or recorded some row despite an errored row does not back off. The boot re-drive has the
+per-row boundary too, but a snapshot that cannot be read at boot still fails
+the boot. A `'sweep_error'` reason, in the log and in the alert, is cut to 500
+characters. Every launch path (the hot path, the sweep and a keyed pass) hands
+a launched child to its exit watcher before it writes `spawned` and the log
+row, so a storage error in those writes leaves the run slot held until the
+child exits, and the watcher still records a non-zero exit.
+
 **Parked runs are resumed, not re-driven.** A run that halted behind a provider
 rate limit exits 1, but its `runs` row reads `status='halted', outcome='parked'`
 and its cards are `ready` behind a future `release_at`. Both exit watchers
@@ -598,6 +693,7 @@ Append-only journal of all event outcomes. Columns:
   - `'run_not_appendable'`: A keyed run stopped with unfinished cards, or crashed mid-pass
   - `'pass_failed'`: A keyed pass ran and concluded unsuccessfully (its cards are in `done` or `scrap`); the event stays `spawned` and the run takes its next pass
   - `'already_applied'`: A re-drive found that a pass already consumed the event (`run_pass_events`); the event is marked `spawned` and not launched again
+  - `'sweep_error'`: A re-drive sweep hit an error, usually a storage error such as `SQLITE_FULL`. With an event id, that row threw and the sweep went on to the next row; with a null event id, the sweep could not read its snapshot. Written only when the journal still accepts the write
 - `reason` (TEXT, nullable): Human-readable reason
 - `attributes_json` (TEXT, nullable): Event attributes (secret-filtered)
 

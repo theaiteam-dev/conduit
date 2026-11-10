@@ -25,6 +25,15 @@ export type RegisterRunResult =
  * a dead holder, which `getRunState` reports as halted. The existing and
  * conflict paths leave the recorded row and its holder untouched.
  *
+ * Two launches of one run id at the same moment register one row (issue #48).
+ * The read and the insert share one `BEGIN IMMEDIATE` transaction, so the
+ * second launch waits for the first to commit and then reads its row. The
+ * insert is also `ON CONFLICT DO NOTHING`: if a row appears between the read
+ * and the insert anyway, the call answers from that row as the existing,
+ * retry and conflict paths below would, instead of throwing on the primary
+ * key. `conduit run` reports a losing launch whose winner is still running as
+ * a lease conflict.
+ *
  * A failed launch (`isFailedLaunch`: no cards, and halted or left 'running'
  * by a dead holder) is retried in place: the row
  * is rewritten as a fresh registration would write it (status 'running', no
@@ -57,9 +66,13 @@ export function registerRun(
   return withBusyRetry(() =>
     stateDb
       .transaction((): RegisterRunResult => {
-        const recorded = db.getRun(runId);
+        let recorded = db.getRun(runId);
         if (recorded === null) {
-          db.insertRun({
+          // insertRunIfAbsent rather than insertRun (issue #48): a row
+          // recorded after the read above is another launch's registration,
+          // and this call answers from that row below instead of throwing on
+          // the primary key.
+          const inserted = db.insertRunIfAbsent({
             run_id: runId,
             flow,
             project_root: normalizedProjectRoot,
@@ -71,7 +84,10 @@ export function registerRun(
               holder_start_time: holder.startTime,
             }),
           });
-          return { kind: 'created', run: db.getRun(runId)!, retried: false };
+          if (inserted) {
+            return { kind: 'created', run: db.getRun(runId)!, retried: false };
+          }
+          recorded = db.getRun(runId)!;
         }
 
         if (isFailedLaunch(db, recorded, liveness)) {

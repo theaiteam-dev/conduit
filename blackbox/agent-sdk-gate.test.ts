@@ -14,7 +14,7 @@
  * Case 1, a mixed turn with `enforce_owned_paths`:
  *   - `cat topic.md` is allowed (allowlisted executable) and runs;
  *   - `curl -s https://example.com` is denied (not allowlisted);
- *   - `cat topic.md > copy.md` is denied (shell metacharacter), copy.md does
+ *   - `cat topic.md > copy.md` is denied (a redirect, code shell_metacharacter), copy.md does
  *     not exist;
  *   - a Write of result.json is allowed, and the file exists;
  *   - a Write outside the project root is denied (path_escape), and the file
@@ -214,7 +214,7 @@ describe("agent-sdk journey: the tool gate decides each call the SDK's hook repo
     // A deny carries the gate's reason back to the model.
     const reason = new Map(entry.answers.map((a) => [a.label, a.reason]));
     expect(reason.get("curl")).toContain('"curl" is not allowlisted');
-    expect(reason.get("redirect")).toContain("shell metacharacter");
+    expect(reason.get("redirect")).toContain('unquoted ">"');
     expect(reason.get("write-outside")).toContain("outside");
     expect(entry.stopped).toBe(false);
   });
@@ -381,7 +381,7 @@ describe("agent-sdk journey: AskUserQuestion holds the card without spending an 
     expect(inspect.exitCode).toBe(0);
     expect(inspect.stdout).toContain(`[${f.cardId}] entered_lane: research → hold (hold)`);
     expect(inspect.stdout).not.toMatch(/→ (scrap|done)/);
-    expect(inspect.stdout.match(/research\.harness$/gm)).toHaveLength(1);
+    expect(inspect.stdout.match(/ research\.harness(?: cache read .*)?$/gm)).toHaveLength(1);
     expect(decisionsIn(harnessRows(inspect.stdout, f.cardId))).toEqual([
       "gate-decision allow Bash",
       "gate-decision hold AskUserQuestion code=needs_human reason=the tool asks a human",
@@ -490,7 +490,7 @@ describe("agent-sdk journey: an input rewrite by another PreToolUse hook holds t
     const inspect = await f.journalInspect();
     expect(inspect.exitCode).toBe(0);
     expect(inspect.stdout).toContain(`[${f.cardId}] entered_lane: research → hold (hold)`);
-    expect(inspect.stdout.match(/research\.harness$/gm)).toHaveLength(1);
+    expect(inspect.stdout.match(/ research\.harness(?: cache read .*)?$/gm)).toHaveLength(1);
     expect(decisionsIn(harnessRows(inspect.stdout, f.cardId))).toEqual([
       "gate-decision allow Bash",
       "gate-decision allow Bash",

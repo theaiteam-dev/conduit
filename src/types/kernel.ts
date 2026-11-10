@@ -114,20 +114,35 @@ export interface StationConfig {
   effectful: boolean;
   /** Maximum concurrent cards allowed in this station (WIP cap). */
   wip: number;
+  /**
+   * Issue #30, ADR-0012: this harness station's cards may run as overlapping
+   * calls under `conduit run --concurrency K>1`, up to `min(K - in-flight,
+   * wip)` at a time, where in-flight counts the workers already running in
+   * the run when the batch is admitted, under the overlap integrity rule (SPEC §7, "Overlapping harness
+   * calls"). Absent unless declared `true`. Validated at load: only on
+   * `kind: harness`, and only when the station has no `check:`, is not
+   * effectful, is not a fan-out station, has no `deliver:`, the flow sets
+   * `defaults.enforce_owned_paths: true`, and (when the adapter registry is
+   * known at load) the adapter has `canGatePerCall`.
+   */
+  overlap?: boolean;
   /** Artifact names this station reads as input. */
   inputs: string[];
   /** Artifact names this station produces as output. */
   outputs: string[];
   /**
-   * Where a transform station's declared outputs are written (v10, fan-out
-   * children). Default 'project_root' — the historical behavior. 'owned_dir'
-   * writes each output into the card's `owned_paths[0]` directory instead (the
+   * Where a station's declared outputs are written and collected (v10 for
+   * transforms, issue #98 for harness stations, fan-out children). Default
+   * 'project_root', the historical behavior. 'owned_dir' resolves every
+   * declared output under the card's `owned_paths[0]` directory instead (the
    * same card-scoped location seed.json lives in), so N homogeneous fan-out
    * children each produce their OWN artifacts rather than clobbering one shared
    * name at project root (SPEC §9: outputs are disjoint across concurrent
-   * cards). Validated at load: transform stations only, outputs declared.
-   * Fail-closed at write: a card whose owned_paths[0] is not an existing
-   * directory is a config violation.
+   * cards). `flow/resolve-output.ts` is the one resolver for every use of the
+   * paths. Validated at load: transform or harness stations, outputs declared,
+   * and for a harness no output that is also a card-scoped input. Fail-closed at
+   * use: a card whose owned_paths[0] is not an existing directory throws on the
+   * transform path and holds the card on the harness path.
    */
   output_scope?: 'project_root' | 'owned_dir';
   /**
@@ -144,9 +159,8 @@ export interface StationConfig {
    * UNION the reserved seed name (WI-468), so pre-existing flows are unchanged.
    *
    * Validated at load: a list of strings, each a member of the station's declared
-   * `inputs`, never the synthetic `feedback`, and — unlike output_scope, which is
-   * transform-only because the engine writes declared outputs only for transforms
-   * — allowed on harness stations too, which read inputs the same way.
+   * `inputs`, never the synthetic `feedback`, and allowed on transform and
+   * harness stations, the same kinds as output_scope.
    */
   input_scope?: { owned_dir: string[] };
   /** Optional id of the QC check station gating this station's output. */
@@ -164,7 +178,8 @@ export interface StationConfig {
    *
    * Either a bare survivor COUNT (e.g. `2`) or a structured policy object.
    * For `quorum`, `k` is a COUNT (integer ≥ 1): the parent proceeds iff at
-   * least `k` children reach a non-scrap terminal lane (see evaluateFanIn).
+   * least `k` children reach a terminal lane other than `scrap` or `hold`
+   * (see evaluateFanIn).
    */
   fan_in?: number | FanInPolicyConfig;
   /** Optional fan-out count for split stations. */

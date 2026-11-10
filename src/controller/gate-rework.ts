@@ -144,8 +144,9 @@ export type GateReworkDecision =
        * 'rework_cap' | 'no_progress' | 'invalid_verdict' are fixed guard names
        * from THIS module. A gate-check 'scrapped' decision instead PROPAGATES
        * whatever named reason the critic call produced (a pre-public engine review, @queso
-       * finding 1) — the transform convention 'model-incompatible', or one of
-       * gate.ts's distinct `harness-critic-*` reasons for an agentic critic —
+       * finding 1) — one of gate.ts's `critic-*` reasons for a transform
+       * critic (issue #42), or one of its distinct `harness-critic-*` reasons
+       * for an agentic critic —
        * rather than collapsing every critic-call failure to one shared label.
        */
       reason: 'rework_cap' | 'no_progress' | 'invalid_verdict' | string;

@@ -8,7 +8,8 @@
  * writes carries:
  *   - binding_stamp: the stamp the checkpoint was (or would be) written under;
  *   - prompt_template_version: the effective value folded into that stamp
- *     (prompt_version with the agent or skills folded in);
+ *     (prompt_version with the skills, the prompt content and the agent
+ *     folded in);
  *   - agent / agent_sha256: the effective named agent and the SHA-256 of its
  *     definition file, or NULL when the station runs none.
  *
@@ -26,7 +27,11 @@ import type { ModelAdapter, ModelCall, ModelResponse } from '../worker/adapter';
 import type { RunEngineArgs } from '../cli/main';
 import type { Card, FlowConfig } from '../types/kernel';
 import { openConduitDB, type ConduitDB, type StoredJournalSpan, DEFAULT_RUN_ID } from '../persistence/db';
-import { ensureCheckpointSchema, computeAgentAwarePromptTemplateVersion } from '../checkpoint/checkpoint';
+import {
+  ensureCheckpointSchema,
+  computeAgentAwarePromptTemplateVersion,
+  computePromptContentAwarePromptTemplateVersion,
+} from '../checkpoint/checkpoint';
 import { loadFlow } from '../flow/load';
 import { runExecutor, type SubflowSeam } from './executor';
 import {
@@ -71,6 +76,15 @@ function agentPath(name: string): string {
 function writeAgent(name: string, body: string): void {
   mkdirSync(join(pluginDir, 'agents'), { recursive: true });
   writeFileSync(agentPath(name), `---\nname: ${name}\ndescription: d\n---\n${body}\n`);
+}
+
+/**
+ * prompt_version with the prompt file's content folded in (issue #131), the
+ * version every transform and harness station stamps before any agent.
+ */
+function promptAware(promptVersion: string, promptFile: string): string {
+  const sha = createHash('sha256').update(readFileSync(join(projectDir, 'prompts', promptFile), 'utf-8')).digest('hex');
+  return computePromptContentAwarePromptTemplateVersion(promptVersion, sha);
 }
 
 /** SHA-256 of the definition file's bytes, computed independently of the resolver. */
@@ -226,7 +240,7 @@ describe('harness maker spans record the provenance of the config that produced 
     expect(spans).toHaveLength(1);
     const sha = fileSha256(agentPath('coder'));
     expect(spans[0]!.bindingStamp).toBe(stampOf(db, 'a'));
-    expect(spans[0]!.promptTemplateVersion).toBe(computeAgentAwarePromptTemplateVersion('7', 'team:coder', sha));
+    expect(spans[0]!.promptTemplateVersion).toBe(computeAgentAwarePromptTemplateVersion(promptAware('7', 'a.md'), 'team:coder', sha));
     expect(spans[0]!.agent).toBe('team:coder');
     expect(spans[0]!.agentSha256).toBe(sha);
   });
@@ -253,14 +267,14 @@ describe('harness maker spans record the provenance of the config that produced 
     const [first, second] = spans as [StoredJournalSpan, StoredJournalSpan];
     expect(first.agentSha256).toBe(firstSha);
     expect(second.agentSha256).toBe(secondSha);
-    expect(second.promptTemplateVersion).toBe(computeAgentAwarePromptTemplateVersion('7', 'team:coder', secondSha));
+    expect(second.promptTemplateVersion).toBe(computeAgentAwarePromptTemplateVersion(promptAware('7', 'a.md'), 'team:coder', secondSha));
     expect(second.promptTemplateVersion).not.toBe(first.promptTemplateVersion);
     expect(second.bindingStamp).not.toBe(first.bindingStamp);
     // The later row matches the checkpoint the re-run wrote.
     expect(second.bindingStamp).toBe(stampOf(db, 'a'));
   });
 
-  it('a station without an agent records NULL agent columns and the bare prompt_version', async () => {
+  it('a station without an agent records NULL agent columns and the prompt-aware version without an agent', async () => {
     db = openDb();
     const harness = makeHarness();
     const registry = createHarnessRegistry([harness.adapter]);
@@ -270,7 +284,7 @@ describe('harness maker spans record the provenance of the config that produced 
     expect(spans).toHaveLength(1);
     expect(spans[0]!.agent).toBeNull();
     expect(spans[0]!.agentSha256).toBeNull();
-    expect(spans[0]!.promptTemplateVersion).toBe('7');
+    expect(spans[0]!.promptTemplateVersion).toBe(promptAware('7', 'a.md'));
     expect(spans[0]!.bindingStamp).toBe(stampOf(db, 'a'));
   });
 
@@ -322,7 +336,7 @@ describe('transform station spans record provenance', () => {
 
     const spans = spansNamed(db, 'b.transform');
     expect(spans).toHaveLength(1);
-    expect(spans[0]!.promptTemplateVersion).toBe('3');
+    expect(spans[0]!.promptTemplateVersion).toBe(promptAware('3', 'b.md'));
     expect(spans[0]!.bindingStamp).toBe(stampOf(db, 'b'));
     expect(spans[0]!.agent).toBeNull();
     expect(spans[0]!.agentSha256).toBeNull();

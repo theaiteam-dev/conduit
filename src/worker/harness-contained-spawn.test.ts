@@ -161,7 +161,11 @@ describe('containedSpawn real children', () => {
     expect(events).toEqual(['line:partial', 'exit']);
   });
 
+  // These two tests close() the process the way every adapter does. Without it the group stays tracked for
+  // the rest of the test process, so the kernel's signal and exit handlers stay installed, and a later file
+  // that measures those handlers sees them already present (issue #162).
   it('reassembles a multi-byte character split across chunks and a final unterminated line', async () => {
+    const before = trackedCount();
     const lines: string[] = [];
     let done!: () => void;
     const exited = new Promise<void>((r) => (done = r));
@@ -173,15 +177,18 @@ describe('containedSpawn real children', () => {
       await w(e.subarray(4));
       await w(Buffer.from('second\\nlast'));
     `;
-    containedSpawn(containment, 'test')(
+    const proc = containedSpawn(containment, 'test')(
       { command: process.execPath, args: ['-e', script], cwd: ROOT, env: ENV },
       { onLine: (l) => lines.push(l), onStderr() {}, onExit: () => done() },
     );
     await exited;
+    await proc.close();
     expect(lines).toEqual(['h\u00e9\u20ac', 'second', 'last']);
+    expect(trackedCount()).toBe(before);
   });
 
   it('reassembles a multi-byte character split across stderr chunks', async () => {
+    const before = trackedCount();
     const chunks: string[] = [];
     let done!: () => void;
     const exited = new Promise<void>((r) => (done = r));
@@ -192,14 +199,16 @@ describe('containedSpawn real children', () => {
       await w(e.subarray(2, 4));
       await w(e.subarray(4));
     `;
-    containedSpawn(containment, 'test')(
+    const proc = containedSpawn(containment, 'test')(
       { command: process.execPath, args: ['-e', script], cwd: ROOT, env: ENV },
       { onLine() {}, onStderr: (s) => chunks.push(s), onExit: () => done() },
     );
     await exited;
+    await proc.close();
     const text = chunks.join('');
     expect(text).toBe('h\u00e9\u20ac!');
     expect(text).not.toContain('\ufffd');
+    expect(trackedCount()).toBe(before);
   });
 });
 

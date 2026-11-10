@@ -10,6 +10,7 @@ import { accessSync, constants, existsSync, statSync } from 'node:fs';
 import { isAbsolute } from 'node:path';
 import { killContained, trackProcessGroup, untrackProcessGroup } from './process-group';
 import { prepareContainedCommand, removeCgroup, type Containment } from './cgroup-containment';
+import type { SpawnWriteConfinement } from './landlock-confinement';
 
 /** Longest wait for the killed process to exit before `close()` gives up on it. */
 const EXIT_WAIT_MS = 5_000;
@@ -46,6 +47,8 @@ export interface ContainedSpawnSpec {
   cwd: string;
   /** The whole child env. Nothing is inherited. */
   env: Record<string, string>;
+  /** Issue #122: run the command under llexec with this writable set. Absent: not write-confined. */
+  confinement?: SpawnWriteConfinement;
 }
 
 /** The three things a running process tells the adapter. */
@@ -81,7 +84,12 @@ export function containedSpawn(
   seams: { exitWaitMs?: number; kill?: (pid: number, cgroup: string | undefined) => void; spawn?: typeof nodeSpawn } = {},
 ): ContainedSpawn {
   return (spec, handlers) => {
-    const contained = prepareContainedCommand(containment, [spec.command, ...spec.args], { cwd: spec.cwd, env: spec.env });
+    const contained = prepareContainedCommand(
+      containment,
+      [spec.command, ...spec.args],
+      { cwd: spec.cwd, env: spec.env },
+      spec.confinement,
+    );
     let child: ChildProcess;
     try {
       child = (seams.spawn ?? nodeSpawn)(contained.argv[0]!, contained.argv.slice(1), {

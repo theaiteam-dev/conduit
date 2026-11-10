@@ -6,10 +6,12 @@
  * requests and notifications and records what the adapter answers. No test
  * here starts codex or calls a model.
  */
-import { describe, it, expect, afterAll } from 'bun:test';
+import { describe, it, expect, afterAll, spyOn } from 'bun:test';
 import { existsSync, lstatSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, mkdirSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import * as landlock from './landlock-confinement';
+import { withFailingCallTempDir } from './harness-call-temp-dir.test-helper';
 import { describeHarnessContainmentConformance } from './harness-containment.conformance';
 import {
   CODEX_APP_SERVER_ARGS,
@@ -40,6 +42,7 @@ describeHarnessContainmentConformance('codex-app-server', (opts) =>
     envAllowlist: ['OPENAI_API_KEY'],
     sourceEnv: { PATH: process.env.PATH, OPENAI_API_KEY: 'sk-conformance' },
   }),
+  { confinedEnv: ['TMPDIR', 'CODEX_HOME', 'XDG_CACHE_HOME', 'XDG_STATE_HOME'] },
 );
 
 const PREEXISTING_HOMES = new Set(readdirSync(tmpdir()).filter((n) => n.startsWith('conduit-codex-home-')));
@@ -555,6 +558,73 @@ describe('codex-app-server adapter: process, env and CODEX_HOME', () => {
     const err = await rejection(adapterWith(server).invoke(invocation()));
     expect(err.message).toContain('spawn boom');
     expect(existsSync(server.state.spec!.env.CODEX_HOME!)).toBe(false);
+  });
+
+  it('removes the codex home when the per-call temp dir cannot be created, before anything is spawned', async () => {
+    const server = fakeServer((p) => p.completeTurn());
+    const { live, leftBehind } = await withFailingCallTempDir('conduit-codex-home-', async () => {
+      const err = await rejection(adapterWith(server).invoke(invocation({ confinement: { helper: '/nonexistent/helper', writable: [ROOT] } })));
+      expect(err.message).toBe('simulated call temp dir failure');
+    });
+    expect(server.state.spec).toBeUndefined();
+    expect(live.length).toBe(1);
+    expect(leftBehind).toEqual([]);
+  });
+
+  describe('per-call temp dir on a confined call', () => {
+    /** Run `body` and return the root of every per-call temp dir createCallTempDir made during it. */
+    async function recordCallTempDirs(body: () => Promise<void>): Promise<string[]> {
+      const roots: string[] = [];
+      const real = landlock.createCallTempDir;
+      const spy = spyOn(landlock, 'createCallTempDir').mockImplementation(() => {
+        const dir = real();
+        roots.push(dir.root);
+        return dir;
+      });
+      try {
+        await body();
+      } finally {
+        spy.mockRestore();
+      }
+      return roots;
+    }
+    const confined = () => invocation({ confinement: { helper: '/nonexistent/helper', writable: [ROOT] } });
+
+    it('is removed when the spawn throws', async () => {
+      const server = fakeServer(() => {}, { throwOnSpawn: true });
+      const roots = await recordCallTempDirs(async () => {
+        const err = await rejection(adapterWith(server).invoke(confined()));
+        expect(err.message).toContain('spawn boom');
+      });
+      expect(roots.length).toBe(1);
+      expect(existsSync(roots[0]!)).toBe(false);
+    });
+
+    it('is removed when the process dies after the handshake', async () => {
+      const server = fakeServer((p) => p.exit(1));
+      const roots = await recordCallTempDirs(async () => {
+        await rejection(adapterWith(server).invoke(confined()));
+      });
+      expect(roots.length).toBe(1);
+      expect(existsSync(roots[0]!)).toBe(false);
+    });
+
+    it('is removed when building the spawn confinement throws', async () => {
+      const server = fakeServer(() => {});
+      const spy = spyOn(landlock, 'requireSpawnConfinement').mockImplementation(() => {
+        throw new Error('simulated confinement failure');
+      });
+      try {
+        const roots = await recordCallTempDirs(async () => {
+          const err = await rejection(adapterWith(server).invoke(confined()));
+          expect(err.message).toBe('simulated confinement failure');
+        });
+        expect(roots.length).toBe(1);
+        expect(existsSync(roots[0]!)).toBe(false);
+      } finally {
+        spy.mockRestore();
+      }
+    });
   });
 
   it('removes the codex home after a timeout kill', async () => {

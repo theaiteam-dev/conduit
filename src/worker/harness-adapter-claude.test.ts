@@ -30,7 +30,7 @@
  *   - a malformed/unexpected/errored/timed-out payload REJECTS with a named
  *     ('claude-headless') error — never a silent zero-usage success.
  *   - outputs is []: the executor collects declared outputs from DISK
- *     (executor.ts findMissingDeclaredOutputs), and the claude JSON carries no
+ *     (at the paths flow/resolve-output.ts resolves), and the claude JSON carries no
  *     file manifest, so the adapter never fabricates output references.
  */
 import { describe, it, expect } from 'bun:test';

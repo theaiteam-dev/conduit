@@ -281,7 +281,8 @@ against the matrix.
 | Card created (parent or child) | Starts as `(lane=intake, status=waiting)`. On the first tick the kernel evaluates deps; if satisfied, transitions to `(lane=<first_station>, status=ready)`; otherwise stays `status=waiting` until deps clear. `intake` is transient — no card lingers there. |
 | `hold` with no human | does **not** consume budget; if `hold_timeout` is set, the kernel applies the card's `on_timeout` action — `scrap`, `proceed_with_findings`, or `escalate` (§4A). If `hold_timeout` is omitted, the card holds indefinitely. `on_timeout` is **required** when `hold_timeout` is set; the kernel rejects the config at load otherwise. |
 | Andon trips mid-flight | new claims blocked; in-flight workers **drain-and-checkpoint** (§8). |
-| Parent fanned-out, child scraps | fan-in policy decides (§6): `all` → parent holds/scraps; `quorum(k)`/`best_effort` → proceed. |
+| Parent fanned-out, child scraps | fan-in policy decides (§6): `all` → parent holds/scraps; `quorum(k)`/`best_effort` → proceed with the child dropped. |
+| Parent fanned-out, child lands in `hold` | the child is not a survivor (§6): the parent holds (`child_held`) under every policy, `quorum(k)` and `best_effort` included. |
 
 ---
 
@@ -424,7 +425,7 @@ directory (`owned_paths[0]`, where `seed.json` already lives):
 | Knob | Governs | Applies to |
 |---|---|---|
 | `input_scope: { owned_dir: [<name>, …] }` | which declared **inputs** are READ from the card's dir | `transform` + `harness` stations |
-| `output_scope: project_root \| owned_dir` | where declared **outputs** are WRITTEN | `transform` stations |
+| `output_scope: project_root \| owned_dir` | where declared **outputs** are WRITTEN and COLLECTED | `transform` + `harness` stations |
 
 Only the names listed in `input_scope.owned_dir` move; every other declared input
 still resolves from the project root, so a child can combine one shared artifact (a
@@ -440,6 +441,42 @@ lexically via `..`, or through a symlink — is rejected on the read side exactl
 already was on the write side, so reads and writes obey one rule. The
 binding stamp (§5) hashes card-scoped inputs from the card's dir too, so sibling
 children get distinct stamps and a changed per-child file re-executes on resume.
+
+Every use of a declared output's location goes through one resolver
+(`src/flow/resolve-output.ts`), so a writer and a reader cannot disagree about where
+a file is. Under `output_scope: owned_dir` that covers the transform writer; for a
+`harness` station, the paths the agent is told, the presence check, the JSON and
+`output_schema` read of `outputs[0]`, and the artifact hashes on its journal span; the
+gate critic, whose scope is the station's inputs plus outputs and which reads those
+outputs from the card's dir; and a `deliver.files` entry that names a card-scoped
+output, which is delivered from the card's dir. A downstream station reads a child's
+output by listing it in its own `input_scope.owned_dir`.
+
+A `harness` station writes its outputs itself, so a card-scoped one has three more rules:
+
+- **Destination.** The kernel appends an "Output files" section to the rendered prompt,
+  listing the absolute path of each declared output, and passes the same list as
+  `HarnessInvocation.declaredOutputs`. The flow's template does not have to know the
+  card's directory.
+- **Checked before execution.** The card's dir must exist, must be inside the project
+  root after symlinks are resolved (the harness integrity check snapshots only the
+  project root, so it could not check writes anywhere else), and no output name may
+  escape it. A card that fails any of these goes to `hold` before the harness runs, as a
+  card-scoped input that cannot be resolved does. The harness owned-paths integrity
+  check still runs on every attempt: for `kind: harness` it is unconditional, unlike the
+  `defaults.enforce_owned_paths` opt-in that governs the transform and deterministic paths.
+- **Freshness.** Before every attempt, including a retry within one dispatch, the kernel
+  removes each card-scoped declared output that exists. A file present after the call
+  was therefore written by that call: a file from a failed attempt or an earlier run
+  is never collected as the new result, and a sibling's file is never at this card's
+  path. An attempt that writes nothing fails as `harness-output-missing` and spends an
+  execution attempt like any other output failure. Because of this removal, the loader
+  rejects a card-scoped harness output that is also one of the station's card-scoped
+  inputs or the reserved `seed.json`. A skip on resume (matching binding stamp) invokes
+  nothing and removes nothing.
+
+With the default `project_root` scope a harness station's outputs are not removed
+before an attempt and the prompt is unchanged, as before this option existed.
 
 Every knob here came from the three flows diverging or from a rev-1 finding. The seam
 is the whole product: *the flow is config; the kernel is the engine.*
@@ -457,7 +494,9 @@ declare a predicate that lets the kernel pass a card straight through to the sta
 ```
 
 - **`source: seed`** reads a top-level field of the card's `seed.json` (in
-  `owned_paths[0]`, written at fan-out, §9).
+  `owned_paths[0]`, written at fan-out, §9). A relative `owned_paths[0]` resolves against
+  the project root, not the kernel's working directory, and a `seed.json` that resolves
+  outside the owned directory (through a symlink) holds the card.
 - **`source: output`** (with `station: <id>`) reads a top-level field of the payload that
   an upstream `transform` station produced for the same card, from that station's latest
   checkpoint (§5). The station must declare the field in its `output_schema`, must reach
@@ -668,7 +707,8 @@ interpret.
 2. **EXECUTION_LOOP** — worker reasons and invokes tools through the Tool-Bridge (§7).
 3. **MARK_DONE** — worker emits a structured Work Summary + the typed station output.
 4. **The Hook Gateway — deterministic only.** Runs the **Summary Hook**: a *pure code*
-   integrity check (files touched ⊆ owned paths, output schema valid, artifacts exist).
+   integrity check (files created, modified or deleted ⊆ owned paths, output schema valid,
+   artifacts exist).
    It does **not** run an LLM. *(Rev-1 H7 fix: the quality critic is a separate **QC
    station**, §6 — not inside this transaction.)*
 5. **ACK_DONE** — Kernel commits the Work Summary, **checkpoints the station output**,
@@ -683,11 +723,16 @@ binding = hash(model_id, prompt_template_version, resolved_input_artifact_hashes
 ```
 
 `prompt_template_version` covers everything that becomes part of the worker's prompt,
-not only the template file. A `worker.uses` station folds the content hash of each
-injected skill into it, in declared order. A `kind: harness` station that runs a named
+not only the declared `prompt_version`. On a `transform` or `kind: harness` station it
+combines `prompt_version`, then the content hash of each `worker.uses` skill in declared
+order, then the SHA-256 of the template the station renders (the skills and the local
+`prompt_file` as composed, or the `prompt_file` alone). Editing a prompt file or a skill
+therefore invalidates the checkpoint without a `prompt_version` bump, and a bump still
+forces a re-run with the files unchanged. A `kind: harness` station that runs a named
 agent folds in the agent's name and the SHA-256 of its definition file, which the kernel
 locates in the adapter's configured plugin dirs. A station whose agent definition cannot be
-located holds rather than stamping on the name alone.
+located holds rather than stamping on the name alone. A gate critic writes no checkpoint and
+is never skipped, so each check renders the critic's current `prompt_file`.
 
 On resume, a completed station is skipped **only if its binding stamp matches the
 current config.** On mismatch the checkpoint is **invalidated and the invalidation
@@ -771,7 +816,12 @@ express it (this is why Conduit is a state machine, not Airflow). It is bounded 
    the API.)*
 2. **Per-execution-attempt cap.** Integrity-fail / parse-fail retries are bounded
    separately from quality rework (rev-1 H5) → on exhaustion, scrap with a
-   `model-incompatible`/`integrity` reason.
+   `model-incompatible`/`integrity` reason. A transform gate critic's failure
+   scraps under a reason naming its class instead: `critic-verdict-invalid:
+   <validator error>` (parsed, failed the verdict schema),
+   `critic-reject-without-findings`, `critic-verdict-unparseable`,
+   `critic-output-truncated` or `critic-vision-unsupported`. A harness critic
+   uses the matching `harness-critic-*` reasons.
 3. **Progress monotonicity — on the *findings*, not the artifact** (rev-1 H2). A
    rejection whose **critic findings hash** matches the previous attempt's = "same
    defect, no progress" → exhausts the cap immediately. Hashing the artifact is wrong:
@@ -784,11 +834,17 @@ express it (this is why Conduit is a state machine, not Airflow). It is bounded 
    budgets miss.
 
 ### Fan-in failure policy (rev-1 C4)
-`fan_in: { policy: all | quorum(k) | best_effort }`. Defines what a scrapped child does
-to the assembler and parent. `all` → one scrap holds/scraps the parent (A(i)-Team:
-don't ship a partial product). `quorum(k)`/`best_effort` → proceed and record the
-dropped children. **`k` is a count (integer, `1 ≤ k ≤ fan_out`):** the minimum number of
-children that must reach a non-scrap terminal lane for the fan-in to proceed. `k: 9` with
+`fan_in: { policy: all | quorum(k) | best_effort }`. Defines what a scrapped or held child
+does to the assembler and parent. A **survivor** is a child in a terminal lane other than
+`scrap` or `hold`. A child in `hold` was escalated to a human, not finished: its output is
+unchecked, and an integrity breach leaves the out-of-bounds write on disk. The kernel has no
+merge step that could filter it out (the resume station reads what is on disk), so **a held
+child holds the parent under every policy**, journaled as `fan-in child_held`. `all` → one
+scrap also holds the parent (A(i)-Team: don't ship a partial product), journaled as
+`fan-in child_scrapped`. `quorum(k)`/`best_effort` tolerate **scrapped** children only: they
+proceed and record the dropped (scrapped) children. Under these two a held child holds the
+parent as soon as it is seen, without waiting for in-flight siblings. **`k` is a count (integer,
+`1 ≤ k ≤ fan_out`):** the minimum number of survivors for the fan-in to proceed. `k: 9` with
 `fan_out: 10` = tolerate one scrapped child. A count, not a ratio — no rounding ambiguity
 on small fan-outs, and the loader validates it against `fan_out` at load time. A child
 that can never complete must not deadlock the parent — the liveness watchdog (§8) is the
@@ -829,10 +885,129 @@ risk and gets the most poka-yoke.
 > pre-execution the way it does here; containment is a documented **profile** at the
 > process boundary (mandatory owned-paths integrity, secrets-by-allowlist, process-tree
 > termination through a per-invocation cgroup where the host allows it and the
-> process-group kill otherwise, the ADR-0003 container wall, and the adversarial gate as
+> process-group kill otherwise, Landlock write confinement of overlapped calls (ADR-0013),
+> the ADR-0003 container wall, and the adversarial gate as
 > the quality control) rather than the Law. `agentic` keeps its Law-grade meaning in this section
 > unchanged. See [`docs/harness-containment.md`](docs/harness-containment.md) for the
 > full profile.
+
+### Overlapping harness calls (ADR-0012, ADR-0013)
+
+Under `--concurrency K` a `kind: harness` station runs one card at a time unless it declares
+`overlap: true`. A harness call on the serial path holds the tick loop until it returns, and
+its integrity check is the serial rule: every path created, modified or deleted under the
+project root between the call's baseline snapshot and its post-invoke snapshot must lie inside
+the card's `owned_paths`, or the card holds. A delete is a write. A deleted path no longer
+resolves, so it is checked at the location it had in the baseline snapshot: the canonical
+project root joined with its path below the root, with no symlink below the root resolved
+(the snapshot walk never descends a symlink), against the owned paths mapped the same way.
+Resolving it after the call would let a call delete a sibling's file and then replace the
+sibling's directory with a symlink into its own owned dir.
+
+A harness station may declare `overlap: true` (station level, beside `wip`; rejected on any
+other `kind`). Its cards then run as overlapping calls, up to `min(K - in-flight, wip)` at a
+time (in-flight: workers already running in the run when the batch is admitted), when
+every admission condition holds:
+
+- **Static, validated at load:** the station has no `check:` block, is not `effectful`, is
+  not a fan-out station (declares neither `fan_out` nor `child_entry`), and has no `deliver` block; the flow sets
+  `defaults.enforce_owned_paths: true`, so the per-call gate confines file-tool writes to the
+  card's `owned_paths`; and its adapter has `canGatePerCall`. The loader checks the adapter
+  when it is given the adapter registry. The executor checks it again at dispatch, since the
+  registry is engine configuration, and runs a card whose adapter cannot gate per call on the
+  serial path, journaling `overlap_fallback` on its spans and warning once per station.
+- **Write confinement, at dispatch (ADR-0013):** the adapter has `canConfineWrites`, and
+  the host's write-confinement probe succeeded (below). When either fails, every candidate
+  runs on the serial path with the reason journaled as `overlap_fallback`; an unavailable
+  probe is also warned once per run. No overlapped call runs unconfined.
+- **Dynamic, at dispatch:** the card declares non-empty `owned_paths`, every one of them exists
+  (a confinement rule names an existing file or directory), and they are disjoint
+  (canonicalized) from those of every member already admitted to the batch. A card that fails
+  any of these runs on the serial path under the serial rule after the batch, with the reason
+  journaled as `overlap_fallback`. A card over the K or `wip` cap stays `ready` for a later
+  pass. A batch of one card runs on the serial path, unconfined, as any serial call does.
+
+Harness members and transform members never overlap each other: a dispatch pass runs the
+transform batch, then the harness batch. Each member runs in its own attribution scope, so
+its spend folds into the run and wave budgets under its own card.
+
+**The overlap integrity rule.** A member's window runs from just before its baseline snapshot
+to just after its post-invoke snapshot, or to the moment its invoke throws, or to the moment
+the attempt exits on any other error. The kernel records
+each window on a logical clock and which other members' windows intersected it. Each path in a
+member's diff is classified as: inside its own `owned_paths` → allowed; inside the
+`owned_paths` of a member whose window intersected its own → attributed to that member, not a
+breach, and journaled on the member's `<station>.harness` span as `overlap_attributed` (each
+sibling card id with its count of paths and the first 20 of those paths, project-root-relative);
+anywhere else → a breach, and the card holds. Paths
+are canonicalized as the integrity check canonicalizes them: a symlink by its target, and a
+path removed since the snapshot (a sibling deleting a temporary file in its own directory) by
+its parent directory. The serial checks apply to every path not attributed: symlink canonicalization, fail-closed on a
+path that does not resolve (a deleted path is checked at its baseline location, as above), and a
+hold, not a retry, on a breach. The disjoint ownership
+invariant (§9) makes the attribution unambiguous. Because a path that no member owns cannot be
+attributed, a breach by one member holds every member whose diff contains it.
+
+An overlapped call takes both snapshots with a walk that yields to the event loop every 10 ms,
+so one member's snapshot stalls the other members' stdout handling, idle timers and gate
+answers for at most one step of the walk. A step reads and hashes one file synchronously, so a
+single large file can still block the event loop for as long as that read takes. The serial
+path's snapshots stay synchronous.
+
+**Write confinement (ADR-0013).** Every member of a harness overlap batch runs its whole
+process tree under Landlock, through the `llexec` helper, which the adapter's spawn chains
+after the cgroup wrapper (the shell joins the invocation's cgroup, execs `llexec`, and
+`llexec` applies the ruleset and execs the CLI). The ruleset handles the write-type file
+rights of the highest Landlock ABI the kernel reports and grants them only beneath the call's
+writable set: the card's canonical `owned_paths`, a per-call temp dir (`TMPDIR` points at it,
+and the XDG cache and state dirs on adapters that do not already run-scope them), the
+adapter's run-scoped config dirs (`CLAUDE_CONFIG_DIR`, which is created for a confined call
+whatever the adapter's isolation setting, `CODEX_HOME`, the opencode `HOME` and XDG root),
+and `/dev`. Reads and executes are not restricted. The ruleset is inherited by every
+descendant and cannot be removed, so a command that calls `setsid()` or double-forks stays
+confined. A write outside the set fails at the syscall with `EACCES`, before anything changes
+on disk: into a sibling's `owned_paths` by an allowlisted executable (`cp`, `tee`, `sed -i`,
+`mv`, a script the agent wrote), through a symlink into them, or to a shared project file.
+`llexec` never runs the command unconfined: any failure to build or apply the ruleset exits
+before the exec, and the call fails as a spawn failure does. Each overlapped span records
+`write_confinement: "landlock"`.
+
+The kernel decides once per process whether confinement is available: it locates the
+helper (`CONDUIT_LLEXEC`, a source-checkout build, or `llexec` on `PATH`), reads the ABI,
+and runs a real write test through it: a write inside the writable path must succeed, and
+creating a file outside it, truncating an existing file outside it, and hardlinking that
+file into the writable path must each be refused. The same commands run unconfined first
+and must all succeed, so a refusal is Landlock's and not an unwritable scratch dir. The ABI must be 3 or higher (Linux 6.2 or later): ABI 1 and 2 do not
+check `truncate(2)`, so a member could empty a sibling's file, and the diff would attribute
+that to the sibling. On a lower ABI the probe reports confinement unavailable, naming the
+kernel minimum, and the cards run serially. `conduit doctor` reports the result.
+
+**The overlap rule with confinement.** The overlap integrity rule above is unchanged and
+stays the backstop. On its own it cannot detect a write by one member into another
+overlapping member's `owned_paths`, because both diffs attribute it to the owner (ADR-0012's
+gap). Confinement closes that gap for file contents: the write is refused before it happens,
+so a path the rule attributes to a sibling was written by that sibling. A write under the
+project root and outside every member's `owned_paths` is refused too, and the diff would still
+hold the card if one appeared. These remain outside confinement:
+
+- metadata changes: `chmod`, `chown`, `utimes` and extended attributes are not write rights
+  in Landlock, so a member can change a sibling's file modes but not its contents;
+- writes made on the call's behalf by a process that is not confined (a daemon reached over
+  a socket);
+- network egress, which Landlock does not filter here.
+
+**Per card, unchanged.** Rate-limit parks, retries and their backoff, idle and wall-clock
+timeouts, `child_stagger_seconds` and the consumption andon act on each member as they do on
+a serial call. The batch waits for its slowest member, retries included, before the next
+dispatch pass. Each member checks the andon after its own call, so a batch can exceed the
+token budget by up to K calls (the soft ceiling of §8).
+
+**Reporting.** Each span of an overlapped call records `concurrent: true` and the call's start
+(`started_at_ms`). `ready_waiting` on such a span counts the dispatchable cards not admitted
+to its batch. `conduit run status` reports busy time per station and in total as the union of
+call intervals, and waited card-time over overlapped calls as, at each moment, the largest
+`ready_waiting` among the calls running then. A span without `started_at_ms`, including every
+span of a journal written before overlap existed, adds its full duration.
 
 ### The atomic claim (rev-1 C6)
 deps + WIP + worker-slot must become true at a **single linearization point**. They live
@@ -864,16 +1039,25 @@ split is harder and needs this in-transaction reservation.)*
   (schema-aligned recovery from fenced/garbled/prose-wrapped responses). A parse miss is
   a *paid re-bill* and happens on frontier models too. **Bounded:** parse retries count
   against `per_card.max_execution_attempts` (rev-1 H5); on exhaustion → scrap with
-  `model-incompatible`. Parse-miss rate is a first-class journal metric (§11).
+  `model-incompatible`, or, for a gate critic, a named `critic-*` reason (§6
+  guard 2). Parse-miss rate is a first-class journal metric (§11).
 - **Per-model adapters.** Native function-calling vs prompted XML/JSON blocks, normalized
   to the kernel tool protocol. A model with no function-calling falls back to the prompted
   adapter or is rejected at the Bench (§14) before it's allowed on a flow.
 - **The Law (permissioning).** Before any tool runs the Kernel checks Hooks:
-  - **Path ownership** — writes ⊆ the card's `owned_paths`, with **symlink + relative-path
-    resolution** (resolve to canonical absolute, reject escapes) (rev-1 H6).
+  - **Path ownership** — writes, deletes included, ⊆ the card's `owned_paths`, with
+    **symlink + relative-path resolution** (resolve to canonical absolute, reject escapes)
+    (rev-1 H6).
   - **Bash positive allowlist** — only listed executables; **no shell metacharacters**
     (no pipes/redirects/`;`/backticks/`$()`) unless explicitly enabled. Denylists are
-    insufficient against a cheap model + untrusted substrate.
+    insufficient against a cheap model + untrusted substrate. The harness tier's per-call
+    gate, which runs commands in a real shell, applies this rule through a fail-closed shell
+    lexer: it accepts literal single quotes, double quotes with no `$`, backtick, `\` or `!`,
+    and `|` between programs that are each on the allowlist, and refuses every other
+    construct, including `;`, `&&`, `||`, `&`, redirects, here-docs, `$`, backticks, globs,
+    braces, `~`, control characters, and an assignment or quoted word in program position
+    (`docs/harness-containment.md`). The approved string is the string that runs, with
+    nothing expanded.
   - **Network egress denied by default** for content-processing workers (injection
     exfiltration defense). For `agentic` workers this is enforced in-process: the kernel
     spawns the worker harness via `unshare --net` (a Linux network namespace with no
@@ -935,9 +1119,34 @@ Conduit unfurls the plan at runtime rather than following a static script.
   `waiting`. **Waves are emergent** — a card unblocks when its deps reach a terminal lane.
 - **Disjoint ownership invariant (rev-1 H4).** Before committing children, the Kernel
   **validates that owned-path sets across concurrently-eligible cards are disjoint** —
-  or forces a `depends_on` serialization edge for a shared path. The Architect (an LLM)
+  or forces a `depends_on` serialization edge for a shared path. Paths are compared in
+  canonical form (the confinement step below resolves them first), so two spellings of
+  one path (`./a` and `a`, a relative and an absolute form, two symlinks to the same
+  directory) are the same path, and a directory overlaps every path inside it (`a` and
+  `a/b` are not disjoint). The Architect (an LLM)
   proposes; the Kernel (deterministic) enforces. This closes the "two cards both own
-  `config.ts`" race that path-ownership alone misses.
+  `config.ts`" race that path-ownership alone misses. The overlap integrity rule for
+  harness calls (§7) depends on this invariant: it attributes a touched path to the one
+  in-flight card that owns it.
+- **Owned paths confined to the project root.** A child's `owned_paths` are model output.
+  The Kernel resolves every entry against the run's project root, never against its own
+  working directory, canonicalizes it with symlinks resolved in its longest existing
+  prefix (the resolver the integrity check uses, §7), and rejects the whole proposal with
+  `owned_path_out_of_bounds` when an entry lands outside the canonical root: an absolute
+  path elsewhere, a `..` escape, or a symlink pointing out. It runs before the
+  disjointness check, which compares the same canonical paths. The rejection writes no
+  `seed.json` and seeds no child, and holds the parent with the child and the path in its
+  reason. This one check covers every later use of the path: the `seed.json` write, the
+  card-scoped input reads, `skip_when` `source: seed`, and the child's own writes.
+- **One seed per directory.** The Kernel writes every child's `seed.json` into its
+  `owned_paths[0]` before any child runs, so two seeded children whose first owned path
+  resolves to the same directory (compared by the realpath the write uses, so `./a` and
+  `a` are one directory) would leave only the second seed. Such a proposal is rejected
+  with `seed_path_conflict` whether or not `depends_on` orders the two children: the
+  disjointness check above serializes overlapping children, and serialization does not
+  delay the seed writes. The parent is held with both child ids and the path in its
+  reason. Nested directories (`a` and `a/b`) hold separate `seed.json` files and do not
+  conflict here.
 - **Two axes of motion, deliberately different:**
   - **Forward-only across waves.** An implementation failure → **hard pause for a human**
     (`hold`), never an automatic "nuclear reversal" to Wave 1 (state rot).

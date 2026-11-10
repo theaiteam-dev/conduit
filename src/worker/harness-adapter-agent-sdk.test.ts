@@ -11,6 +11,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Options, SDKMessage } from '@anthropic-ai/claude-agent-sdk';
 import { describeHarnessContainmentConformance } from './harness-containment.conformance';
+import { withFailingCallTempDir } from './harness-call-temp-dir.test-helper';
 import { createAgentSdkHarnessAdapter, type AgentSdkHarnessAdapterConfig, type AgentSdkQueryFn } from './harness-adapter-agent-sdk';
 import {
   bindHarnessDefinitionsForIntrospection, buildHarnessDefinitionRegistry, shippedHarnessAdapterNames,
@@ -19,8 +20,15 @@ import {
 import type { HarnessEvent } from './harness-events';
 import { HARNESS_GATE_HOLD_CODE, type GateToolCall, type HarnessToolGate } from './harness-gate';
 
+// The API key is a dummy: a write-confined call always builds a run-scoped config dir (issue #122), which
+// needs a credential source, and the stand-in binary never authenticates.
 describeHarnessContainmentConformance('agent-sdk', (opts) =>
-  createAgentSdkHarnessAdapter({ ...opts, envAllowlist: [] }),
+  createAgentSdkHarnessAdapter({
+    ...opts,
+    envAllowlist: ['ANTHROPIC_API_KEY'],
+    sourceEnv: { PATH: process.env.PATH, ANTHROPIC_API_KEY: 'sk-conformance' },
+  }),
+  { confinedEnv: ['TMPDIR', 'CLAUDE_CONFIG_DIR', 'XDG_CACHE_HOME', 'XDG_STATE_HOME'] },
 );
 
 const ROOT = tmpdir();
@@ -279,6 +287,26 @@ describe('agent-sdk adapter: options handed to the SDK', () => {
     const b = ok();
     await makeAdapter(b.query).invoke(invocation({ gate: allowAll, tools: [] }));
     expect(b.seen[0]!.allowedTools).toBeUndefined();
+    expect(b.seen[0]!.tools).toBeUndefined();
+  });
+
+  it('offers the model only the built-in tools the gate allows', async () => {
+    const a = ok();
+    await makeAdapter(a.query).invoke(invocation({ gate: allowAll, tools: ['Bash(curl:*)', 'Read'] }));
+    expect(a.seen[0]!.tools).toEqual(['Bash', 'Read']);
+    // One Bash entry per rule form collapses to one tool; Task is the subagent tool's other name;
+    // an MCP tool is not a built-in, and a form the gate does not recognise is not offered.
+    const b = ok();
+    await makeAdapter(b.query).invoke(
+      invocation({
+        gate: allowAll,
+        tools: ['Bash(git)', 'Bash(jq:*)', 'Bash(git status:*)', 'Task', 'mcp__db__query', 'Read(./x)'],
+      }),
+    );
+    expect(b.seen[0]!.tools).toEqual(['Bash', 'Agent']);
+    const c = ok();
+    await makeAdapter(c.query).invoke(invocation({ gate: allowAll, tools: ['mcp__db__query'] }));
+    expect(c.seen[0]!.tools).toEqual([]);
   });
 
   it('lets the call model win over the adapter default, and omits it when neither is set', async () => {
@@ -363,6 +391,21 @@ describe('agent-sdk adapter: isolateConfig', () => {
       rmSync(scratch, { recursive: true, force: true });
       rmSync(h, { recursive: true, force: true });
     }
+  });
+
+  it('removes the run-scoped config dir when the per-call temp dir cannot be created, before anything is spawned', async () => {
+    const { query, seen } = scripted(async function* () { yield RESULT_OK; });
+    const { live, leftBehind } = await withFailingCallTempDir('conduit-claude-config-', async () => {
+      const err = await rejection(
+        makeAdapter(query, { sourceEnv: { ANTHROPIC_API_KEY: 'sk-test' }, envAllowlist: ['ANTHROPIC_API_KEY'] }).invoke(
+          invocation({ gate: allowAll, confinement: { helper: '/nonexistent/helper', writable: [ROOT] } }),
+        ),
+      );
+      expect(err.message).toBe('simulated call temp dir failure');
+    });
+    expect(seen).toEqual([]);
+    expect(live.length).toBe(1);
+    expect(leftBehind).toEqual([]);
   });
 
   it('fails before spawning when there is nothing to authenticate with', async () => {

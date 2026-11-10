@@ -35,7 +35,7 @@
  *   }
  *
  *   export type SpawnPathResult =
- *     | { outcome: 'accepted'; runId: string } | { outcome: 'duplicate' }
+ *     | { outcome: 'accepted'; runId: string } | { outcome: 'duplicate'; runId?: string }
  *     | { outcome: 'spawn_failed' } | { outcome: 'queued'; runId: string };
  *
  *   export function runSpawnPath(deps: SpawnPathDeps, input: SpawnPathInput): Promise<SpawnPathResult>;
@@ -330,15 +330,43 @@ describe('duplicate suppression (AC2, NFR-2)', () => {
     const second = await runSpawnPath(deps, baseInput()); // same event_id re-delivered
 
     expect(first).toEqual({ outcome: 'accepted', runId: deriveIngressRunId('evt-1') });
-    expect(second).toEqual({ outcome: 'duplicate' });
+    // Issue #52: the duplicate names the run the first delivery started.
+    expect(second).toEqual({ outcome: 'duplicate', runId: deriveIngressRunId('evt-1') });
     expect(spawn.calls).toHaveLength(1); // NOT 2 — the second delivery never spawns
     expect(db.getIngressLog().map((e) => e.outcome)).toEqual(['accepted', 'duplicate']);
     // State is untouched by the duplicate.
     expect(db.getIngressEvent('evt-1')).toMatchObject({ spawn_state: 'spawned', spawn_attempts: 1 });
   });
 
+  it('names the run id on a duplicate that arrives while the first delivery is still launching', async () => {
+    // Issue #52: the run id is written with the accept, before the launch, so
+    // a concurrent redelivery can name it even though the child is not live yet.
+    let releaseLaunch: () => void = () => {};
+    const launchGate = new Promise<void>((resolve) => {
+      releaseLaunch = resolve;
+    });
+    const calls: SpawnInvocation[] = [];
+    const seam: SpawnSeam = async (inv) => {
+      calls.push(inv);
+      await launchGate;
+      return SPAWN_OK;
+    };
+    const deps = { db, spawn: seam, alert: recordingAlert().seam, globalAlertChannel: '#listener', redriveCap: 100 };
+
+    const first = runSpawnPath(deps, baseInput());
+    expect(db.getIngressEvent('evt-1')).toMatchObject({ spawn_state: 'accepted' });
+    const second = await runSpawnPath(deps, baseInput());
+    releaseLaunch();
+
+    expect(second).toEqual({ outcome: 'duplicate', runId: deriveIngressRunId('evt-1') });
+    expect(await first).toEqual({ outcome: 'accepted', runId: deriveIngressRunId('evt-1') });
+    expect(calls).toHaveLength(1);
+  });
+
   it('treats an already-accepted (not yet spawned) event as a duplicate without spawning', async () => {
     // A prior attempt accepted the event but had not yet spawned (e.g. concurrent delivery).
+    // Accepted with no attribution, as a pre-v9 row was: it has no run id, so
+    // the duplicate names none rather than deriving one (issue #52).
     db.acceptIngressEvent('evt-1', 500);
     const spawn = recordingSpawn(SPAWN_OK);
 
@@ -580,7 +608,8 @@ describe('run-slot backpressure (the original listener-backpressure work)', () =
       baseInput(),
     );
 
-    expect(result).toEqual({ outcome: 'duplicate' });
+    // Issue #52: the run the sweep is launching.
+    expect(result).toEqual({ outcome: 'duplicate', runId: deriveIngressRunId('evt-1') });
     expect(spawn.calls).toHaveLength(0);
     // The redelivery must NOT free the sweep's slot.
     expect(slots.inFlight('evt-1')).toBe(true);
@@ -932,5 +961,67 @@ describe('exit watcher × parked run (issue #7)', () => {
     expect(db.getIngressEvent('evt-1')!.spawn_state).toBe('failed');
     expect(db.getIngressLog().map((e) => e.outcome)).toEqual(['accepted', 'spawn_failed']);
     expect(alert.alerts[0]!.reason).toBe('conduit run exited with code 1');
+  });
+});
+
+// ===========================================================================
+// Bookkeeping throw after the launch (issue #47 review)
+// ===========================================================================
+
+describe('a storage error after the child is launched', () => {
+  /** The real DB, except that markIngressSpawned throws SQLITE_FULL. */
+  function markSpawnedFails(): ConduitDB {
+    return new Proxy(db, {
+      get(target, prop, receiver) {
+        if (prop === 'markIngressSpawned') {
+          return () => {
+            throw Object.assign(new Error('database or disk is full'), { code: 'SQLITE_FULL' });
+          };
+        }
+        const value = Reflect.get(target, prop, receiver);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+  }
+
+  it('keeps the slot held for the live child and still records its exit', async () => {
+    const spawn = launchingSpawn();
+    const alert = recordingAlert();
+    const slots = createRunSlots({ capacity: 1 });
+
+    await expect(
+      runSpawnPath(
+        { db: markSpawnedFails(), spawn: spawn.seam, alert: alert.seam, globalAlertChannel: '#l', redriveCap: 3, slots },
+        baseInput(),
+      ),
+    ).rejects.toThrow('database or disk is full');
+
+    // The child is running: a sweep must see its launch in flight, not a free slot.
+    expect(slots.inFlight('evt-1')).toBe(true);
+
+    spawn.exit(9);
+    await settleExitWatcher();
+
+    expect(slots.inFlightCount()).toBe(0);
+    expect(db.getIngressEvent('evt-1')).toMatchObject({ spawn_state: 'failed' });
+    expect(db.getIngressLog().map((e) => e.outcome)).toContain('spawn_failed');
+  });
+
+  it('a child that has already exited when the seam returns is recorded after the launch writes', async () => {
+    const slots = createRunSlots({ capacity: 1 });
+    const spawn: SpawnSeam = async () => ({ ok: true, exited: Promise.resolve({ code: 9 }) });
+
+    const result = await runSpawnPath(
+      { db, spawn, alert: recordingAlert().seam, globalAlertChannel: '#l', redriveCap: 3, slots },
+      baseInput(),
+    );
+    await settleExitWatcher();
+
+    expect(result).toEqual({ outcome: 'accepted', runId: deriveIngressRunId('evt-1') });
+    // Had the watcher written before the launch path, 'spawned' would have
+    // overwritten 'failed' and the log would start with 'spawn_failed'.
+    expect(db.getIngressEvent('evt-1')).toMatchObject({ spawn_state: 'failed' });
+    expect(db.getIngressLog().map((e) => e.outcome)).toEqual(['accepted', 'spawn_failed']);
+    expect(slots.inFlightCount()).toBe(0);
   });
 });

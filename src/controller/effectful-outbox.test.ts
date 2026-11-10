@@ -50,6 +50,7 @@ import {
   writeCheckpoint,
   readCheckpoint,
   computeBindingStamp,
+  computePromptContentAwarePromptTemplateVersion,
 } from '../checkpoint/checkpoint';
 import { loadFlow } from '../flow/load';
 import { runExecutor } from './executor';
@@ -563,14 +564,18 @@ describe('pure transform station — outbox untouched; checkpoint skip-on-resume
     seedCard(db, { id: 'entry', lane: 'ideate', owned_paths: ['context.json', 'idea.json'] });
 
     // Pre-seed a checkpoint whose stamp MATCHES what the executor will compute.
-    // The executor folds: modelId, prompt_version, input artifact hashes, flowVersion.
+    // The executor folds: modelId, prompt_version with the prompt file's content
+    // hash (issue #131), input artifact hashes, flowVersion.
     // No feedback (rework_count=0), single input context.json.
     const ctxHash = createHash('sha256')
       .update(readFileSync(join(projectDir, 'context.json')))
       .digest('hex');
+    const promptHash = createHash('sha256')
+      .update(readFileSync(join(projectDir, 'prompts', 'ideate.md'), 'utf-8'))
+      .digest('hex');
     const matchingStamp = computeBindingStamp({
       modelId: WORKER_MODEL,
-      promptTemplateVersion: '1',
+      promptTemplateVersion: computePromptContentAwarePromptTemplateVersion('1', promptHash),
       inputArtifactHashes: [ctxHash],
       flowVersion: 1,
     });
