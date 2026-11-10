@@ -1,8 +1,8 @@
 /**
  * `conduit listen` HTTP bind journey (#44).
  *
- * Spawns the shipped binary's `listen` subcommand and reads which TCP sockets
- * the process is LISTENING on from /proc (the same data `ss -tlnp` reports):
+ * Spawns the shipped binary's `listen` subcommand and reads from /proc/net/tcp
+ * which TCP sockets went into LISTEN state after the spawn:
  *
  *   1. A Socket-Mode-only flow: no listening socket at all, and the startup
  *      log says no HTTP listener was started.
@@ -17,7 +17,7 @@
  */
 
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, readdirSync, readFileSync, readlinkSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { connect } from "node:net";
 import { networkInterfaces, tmpdir } from "node:os";
 import { join } from "node:path";
@@ -49,18 +49,17 @@ function decodeAddress(field: string, v6: boolean): ListeningSocket {
   return { address: `ipv6:${hex}`, port };
 }
 
-/** Every TCP socket in LISTEN state (st 0A) owned by `pid`. */
-function listeningSockets(pid: number): ListeningSocket[] {
-  const inodes = new Set<string>();
-  for (const fd of readdirSync(`/proc/${pid}/fd`)) {
-    try {
-      const m = /^socket:\[(\d+)\]$/.exec(readlinkSync(`/proc/${pid}/fd/${fd}`));
-      if (m) inodes.add(m[1]!);
-    } catch {
-      /* fd closed between readdir and readlink */
-    }
-  }
-  const out: ListeningSocket[] = [];
+/**
+ * Every TCP socket on this host in LISTEN state (st 0A), keyed by socket inode.
+ *
+ * The listener's own /proc/<pid>/fd would say which of these it owns, but a
+ * Conduit process is non-dumpable (GHSA-r69q-grh3-2r38), so that directory is
+ * unreadable to another process of the same user. /proc/net/tcp is readable by
+ * anyone and has no owner pid, so ownership is inferred from timing instead:
+ * see `Listen.listening`.
+ */
+function allListeningSockets(): Map<string, ListeningSocket> {
+  const out = new Map<string, ListeningSocket>();
   for (const [file, v6] of [["/proc/net/tcp", false], ["/proc/net/tcp6", true]] as const) {
     let text: string;
     try {
@@ -71,7 +70,7 @@ function listeningSockets(pid: number): ListeningSocket[] {
     for (const line of text.split("\n").slice(1)) {
       const cols = line.trim().split(/\s+/);
       if (cols.length < 10) continue;
-      if (cols[3] === "0A" && inodes.has(cols[9]!)) out.push(decodeAddress(cols[1]!, v6));
+      if (cols[3] === "0A") out.set(cols[9]!, decodeAddress(cols[1]!, v6));
     }
   }
   return out;
@@ -139,6 +138,12 @@ const WEBHOOK_INGRESS = `channels:
 
 interface Listen {
   pid: number;
+  /**
+   * TCP sockets in LISTEN state now that were not there just before the spawn.
+   * Any other process that starts listening in that window is counted too, so
+   * this can fail spuriously on a busy host but cannot pass by missing one.
+   */
+  listening(): ListeningSocket[];
   stdout(): string;
   stderr(): string;
   stop(): Promise<void>;
@@ -173,6 +178,7 @@ async function startListen(ingress: string, extraArgs: string[]): Promise<Listen
     CONDUIT_BASE_URL: "http://127.0.0.1:9/v1",
   };
 
+  const before = allListeningSockets();
   const proc = Bun.spawn(
     [process.execPath, CONDUIT_ENTRY, "listen", "--flows", `bind=${flowPath}`, ...extraArgs],
     { env, stdout: "pipe", stderr: "pipe" },
@@ -198,6 +204,7 @@ async function startListen(ingress: string, extraArgs: string[]): Promise<Listen
 
   const listen: Listen = {
     pid: proc.pid,
+    listening: () => [...allListeningSockets()].filter(([inode]) => !before.has(inode)).map(([, sock]) => sock),
     stdout: () => out,
     stderr: () => err,
     stop: async () => {
@@ -266,7 +273,7 @@ describe.skipIf(process.platform !== "linux")("conduit listen HTTP bind (#44)", 
 
       expect(l.stdout()).toContain("conduit listen: no HTTP listener");
       expect(l.stdout()).not.toContain("serving ingress");
-      expect(listeningSockets(l.pid)).toEqual([]);
+      expect(l.listening()).toEqual([]);
       expect(await probeTcp("127.0.0.1", port)).toBe("refused");
     },
     JOURNEY_TIMEOUT_MS,
@@ -280,7 +287,7 @@ describe.skipIf(process.platform !== "linux")("conduit listen HTTP bind (#44)", 
 
       expect(l.stdout()).toContain(`conduit listen: serving ingress on http://127.0.0.1:${port}`);
       expect(l.stdout()).toContain("loopback only");
-      expect(listeningSockets(l.pid)).toEqual([{ address: "127.0.0.1", port }]);
+      expect(l.listening()).toEqual([{ address: "127.0.0.1", port }]);
 
       // It is the ingress: an unsigned POST to the route is refused by auth.
       const res = await fetch(`http://127.0.0.1:${port}/hooks/bind`, {
@@ -304,7 +311,7 @@ describe.skipIf(process.platform !== "linux")("conduit listen HTTP bind (#44)", 
       const l = await startListen(WEBHOOK_INGRESS, ["--port", String(port), "--bind", "0.0.0.0"]);
 
       expect(l.stdout()).toContain(`conduit listen: serving ingress on http://0.0.0.0:${port} (--bind 0.0.0.0)`);
-      expect(listeningSockets(l.pid)).toEqual([{ address: "0.0.0.0", port }]);
+      expect(l.listening()).toEqual([{ address: "0.0.0.0", port }]);
 
       const external = nonLoopbackIPv4();
       if (external !== undefined) {
