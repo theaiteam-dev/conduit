@@ -292,7 +292,7 @@ function footerLine(view: WatchView, inner: number): Line {
   const badge: Segment =
     view.mode === 'live'
       ? { text: ' LIVE ', fg: '#000000', bg: COLORS.working, bold: true }
-      : { text: ' REPLAY ', fg: '#000000', bg: '#00BFFF', bold: true };
+      : { text: ' REPLAY ', fg: '#000000', bg: COLORS.replayBadge, bold: true };
   const left: Line = [{ text: ' ' }, badge, { text: '  ' }, notRecorded('kernel not observed'), { text: '  ' }];
   if (view.ticker !== null) {
     left.push(normal(`${view.ticker.cardId}  ${view.ticker.text}`));

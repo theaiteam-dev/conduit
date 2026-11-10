@@ -56,7 +56,7 @@ export const JOURNAL_SCHEMA_GAPS: readonly SchemaGap[] = [
     id: 'kernel-heartbeat',
     datum: 'whether the kernel driving the run is alive (FR-14)',
     location: 'a run-level heartbeat row in the journal',
-    renders: '"kernel not observed" in the header',
+    renders: '"kernel not observed" in the footer',
   },
   {
     id: 'run-end-time',

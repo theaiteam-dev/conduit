@@ -47,6 +47,7 @@ export const COLORS = {
   selectedBg: '#0F1018',
   statusBg: '#141824',
   wordmark: '#00BFFF',
+  replayBadge: '#00BFFF',
 } as const;
 
 /** The hue for the station at `index` in flow order. */
