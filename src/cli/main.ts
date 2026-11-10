@@ -23,6 +23,7 @@ import type { ConduitDB } from '../persistence/db';
 import type { WorkerMessage } from '../worker/ipc-protocol';
 import { parseWorkerMessage, serializeWorkerMessage } from '../worker/ipc-protocol';
 import { startWorkerMain } from '../worker/worker-entry';
+import { protectProcessEnvironment } from './non-dumpable';
 import { openConduitDB, DEFAULT_RUN_ID } from '../persistence/db';
 import { validateRunId } from '../run/run-id';
 import { registerRun, computeFingerprint } from '../run/run-registry';
@@ -3685,6 +3686,9 @@ function headersToRecord(headers: Headers): Record<string, string> {
 
 // The real binary entrypoint. Without this, `conduit run flow.yaml` was a no-op.
 if (import.meta.main) {
+  // Before anything else, in the kernel and in every worker: harness children run as the same
+  // user, so this process's /proc/<pid>/environ must not be readable to them (non-dumpable.ts).
+  protectProcessEnvironment();
   // Worker subprocess entry — intercepted BEFORE buildProductionDeps so a worker
   // never opens the state DB (NFR-3: workers do no DB I/O). startWorkerMain wires
   // the harness to real process IPC + timers and self-exits after one task.
