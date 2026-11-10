@@ -1,6 +1,6 @@
 {
   "name": "conduit",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "A deterministic quality-control runtime for AI workflows.",
   "private": true,
   "license": "MIT",

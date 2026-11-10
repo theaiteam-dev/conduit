@@ -11,6 +11,8 @@ historical context, not public releases or public repository history.
 
 ## [Unreleased]
 
+## [2.1.0] - 2026-11-10
+
 ### Security
 
 - A harness could read the kernel's full environment
@@ -410,7 +412,8 @@ historical context, not public releases or public repository history.
 - Added a locally verified, model-free README quickstart and a decision guide
   comparing Conduit with Temporal, n8n, and LangGraph.
 
-[Unreleased]: https://github.com/theaiteam-dev/conduit/compare/v2.0.0...HEAD
+[Unreleased]: https://github.com/theaiteam-dev/conduit/compare/v2.1.0...HEAD
+[2.1.0]: https://github.com/theaiteam-dev/conduit/compare/v2.0.0...v2.1.0
 [2.0.0]: https://github.com/theaiteam-dev/conduit/compare/v1.1.2...v2.0.0
 [1.1.2]: https://github.com/theaiteam-dev/conduit/compare/v1.1.1...v1.1.2
 [1.1.1]: https://github.com/theaiteam-dev/conduit/compare/v1.1.0...v1.1.1
