@@ -34,8 +34,10 @@ historical context, not public releases or public repository history.
   ([#156](https://github.com/theaiteam-dev/conduit/issues/156)). The OpenAI
   adapter reads `usage.prompt_tokens_details.cached_tokens`, or the
   `fireworks-cached-prompt-tokens` header when the body has no figure, and
-  `ModelResponse` gains `cacheReadInputTokens`. Budgets are unchanged: a call
-  with a split spends what it did without one. `conduit run status` prints a
+  `ModelResponse` gains `cacheReadInputTokens`. By default a call with a split
+  spends what it did without one; a flow that sets
+  `budgets.token_weights.cache_read` below 1 counts its cache reads at that
+  weight (see the #125 entry below). `conduit run status` prints a
   cache-reads section for harness and transform spans, and `conduit journal
   inspect` appends the split to each span line that has one.
 

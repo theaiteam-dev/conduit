@@ -85,9 +85,11 @@ resolves the weights of the adapter that billed the call:
   cache split, the total as uncached input with no cache columns, so `run status` prints no cache
   figure for it rather than 0%. The child enforces the ceiling the parent passed down with the
   child's own override. When the two flows' overrides differ, the child can stop short of the
-  parent's remaining budget (its weights count the same spend higher) or overshoot it by one
-  roll-up (they count it lower), and the parent trips then. Checking the parent's ceiling with the
-  parent's weights inside the child is issue #165.
+  parent's remaining budget (its weights count the same spend higher) or overshoot it (they count
+  it lower), and the parent trips only when the child returns. The overshoot is not bounded by one
+  call: a child whose override counts cache reads at 0 adds nothing to its own ceiling for them, so
+  only its other limits (wall clock, execution attempts) stop it. Checking the parent's ceiling
+  with the parent's weights inside the child is issue #165.
 - **Journal-derived figures** (`runBudgetTokens`, used by `remainingRunTokens` for
   `--append-pass` and `conduit resume` of a run with passes, and by the `run status` line): each
   span is weighted for the adapter recorded on it. A `<station>.subflow` span is replaced by its
@@ -107,9 +109,11 @@ sets a class, the line names it: `cache weights per adapter, flow sets cache rea
 `flow sets cache read x1, cache creation x1` when it sets both. A mixed run has no single weight,
 so the line does not print one.
 
-### Missing data never lowers the count
+### Missing data never lowers the count below raw
 
-A call must never count less than its true spend would justify because data is missing:
+Missing or unusable data never makes a call count less than its raw token count. It counts the
+unknown part at weight 1, not at the highest class weight, so a total that was in fact all Claude
+cache creation (weight 2) counts at half what a full breakdown would give:
 
 - A harness call whose adapter reports no breakdown (a total only, or a subflow roll-up with no
   per-adapter shares) counts its whole total at weight 1.

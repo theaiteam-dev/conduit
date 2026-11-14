@@ -10,7 +10,8 @@
  * (`tokensSpent`, the per-card wave tokens, and the journal-derived figures in
  * run/run-passes.ts) use this weighting.
  *
- * Missing data never lowers the count. A call whose adapter reports no cache
+ * Missing data never lowers the count below raw: the unknown part counts at
+ * weight 1, not at the highest class weight. A call whose adapter reports no cache
  * breakdown counts its whole total at weight 1, a breakdown whose classes sum
  * to less than the reported total counts the difference at weight 1, and a
  * span whose adapter is unknown gets weight 1 for each class the flow does not

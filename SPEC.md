@@ -1110,7 +1110,8 @@ set, overrides that class for every adapter; the loader rejects anything else wi
 `INVALID_TOKEN_WEIGHTS`. Transform calls, every harness fold (the gate critic with its own
 adapter's weights), the subflow roll-up (one share per adapter of the child's spend) and the
 journal-derived remaining budget of a run that takes passes all resolve weights this way.
-Missing data never lowers the count: a call with no cache breakdown counts its whole total
+Missing data never lowers the count below raw (the unknown part counts at 1, not at the
+highest class weight): a call with no cache breakdown counts its whole total
 at 1, a span with no known adapter counts each class the flow does not set at 1, and a
 breakdown that does not account for the whole reported total counts the difference at 1,
 which the journal records as uncached input so a journal-derived budget counts it too. The
