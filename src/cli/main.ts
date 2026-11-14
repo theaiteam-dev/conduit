@@ -51,6 +51,7 @@ import {
   buildHarnessDefinitionRegistry,
   bindHarnessDefinitions,
   bindHarnessDefinitionsForIntrospection,
+  shippedHarnessAdapterNames,
 } from '../worker/harness-adapter';
 import type {
   HarnessRegistry,
@@ -58,6 +59,7 @@ import type {
   HarnessAdapterDefinition,
 } from '../worker/harness-adapter';
 import { parseHarnessConfig } from '../worker/harness-config';
+import type { HarnessAdapterConfigDef } from '../worker/harness-config';
 import { describeContainment, resolveContainment, type Containment } from '../worker/cgroup-containment';
 import { describeWriteConfinement, resolveWriteConfinement, type WriteConfinement } from '../worker/landlock-confinement';
 import { loadFlow, probeHarnessBinaries } from '../flow/load';
@@ -3396,6 +3398,43 @@ function buildProductionSocketSeam(): SocketSeam {
   };
 }
 
+/**
+ * The load-time registry `explain` validates against. `explain` only draws the
+ * flow, so a shipped adapter the environment has not registered is not an
+ * error there: it resolves to that adapter's own capabilities, so the tools
+ * check and the renderer's usage note still judge the real adapter. A named
+ * agent on such an adapter is not resolved, because plugin dirs are engine
+ * config this environment does not have. A name the engine does not ship
+ * still fails with UNKNOWN_HARNESS_ADAPTER, and `run`, `resume` and `doctor`
+ * still require registration.
+ */
+function buildExplainHarnessRegistry(defs: readonly HarnessAdapterConfigDef[]): HarnessRegistry {
+  const configured = bindHarnessDefinitionsForIntrospection(buildHarnessDefinitionRegistry(defs));
+  const registered = new Set(defs.map((def) => def.name));
+  const shipped = bindHarnessDefinitionsForIntrospection(
+    buildHarnessDefinitionRegistry(
+      shippedHarnessAdapterNames()
+        .filter((name) => !registered.has(name))
+        .map((name) => ({ name, envAllowlist: [] })),
+    ),
+  );
+  return {
+    resolve(name) {
+      const resolved = configured.resolve(name);
+      if (resolved.ok || !shipped.list().includes(name)) return resolved;
+      const fallback = shipped.resolve(name);
+      if (!fallback.ok || fallback.adapter.resolveAgentDefinition === undefined) return fallback;
+      return {
+        ok: true,
+        adapter: { ...fallback.adapter, resolveAgentDefinition: () => ({ ok: true, path: '', sha256: '' }) },
+      };
+    },
+    list() {
+      return [...configured.list(), ...shipped.list()];
+    },
+  };
+}
+
 /** Build minimal production deps for commands that must not open the state DB. */
 export function buildReadOnlyProductionDeps(): CliDeps {
   const io: CliIO = {
@@ -3418,16 +3457,14 @@ export function buildReadOnlyProductionDeps(): CliDeps {
   // driven, load-time-only harness registry from the same config source (the
   // CONDUIT_HARNESS_* env), or a malformed/unshipped harness adapter silently
   // passes explain's validation (loadFlow treats an undefined registry as
-  // "skip harness checks entirely", not fail-closed). Constructs its own
-  // instance the same way buildProductionDeps does; still never opens the
-  // state DB.
+  // "skip harness checks entirely", not fail-closed). Unlike buildProductionDeps,
+  // a shipped adapter the env does not register still resolves here
+  // (buildExplainHarnessRegistry); still never opens the state DB.
   const parsedHarnessConfig = parseHarnessConfig(process.env);
   if (!parsedHarnessConfig.ok) {
     throw new Error(parsedHarnessConfig.error);
   }
-  const harnessRegistry = bindHarnessDefinitionsForIntrospection(
-    buildHarnessDefinitionRegistry(parsedHarnessConfig.defs),
-  );
+  const harnessRegistry = buildExplainHarnessRegistry(parsedHarnessConfig.defs);
 
   return {
     io,

@@ -715,3 +715,40 @@ describe('the real explain deps builder (buildReadOnlyProductionDeps) is registr
     expect(io.errors.some((l) => l.includes('ghost-headless'))).toBe(true);
   });
 });
+
+describe('explain renders a flow whose shipped harness adapter the env does not register', () => {
+  it('passes a claude-headless flow with no CONDUIT_HARNESS_* set', async () => {
+    const io = makeIO();
+    const code = await withHarnessEnvAsync({}, async () =>
+      main(['explain', claudeFlow, '--color', 'never'], { ...buildReadOnlyProductionDeps(), io }),
+    );
+
+    expect(io.errors).toEqual([]);
+    expect(code).toBe(0);
+    expect(io.lines.some((l) => l.includes('coder'))).toBe(true);
+  });
+
+  it('does not resolve a named agent on an unregistered claude-headless adapter', async () => {
+    const flow = writeFlow('claudeagent', harnessYaml('harness: claude-headless\n      agent: kit:writer'));
+    const io = makeIO();
+    const code = await withHarnessEnvAsync({}, async () =>
+      main(['explain', flow, '--color', 'never'], { ...buildReadOnlyProductionDeps(), io }),
+    );
+
+    expect(io.errors).toEqual([]);
+    expect(code).toBe(0);
+  });
+
+  it('still judges the unregistered adapter by its real capabilities', async () => {
+    // codex-exec cannot run a named agent; that is a property of the adapter,
+    // not of the environment, so explain still rejects it.
+    const flow = writeFlow('codexagent', harnessYaml('harness: codex-exec\n      agent: kit:writer'));
+    const io = makeIO();
+    const code = await withHarnessEnvAsync({}, async () =>
+      main(['explain', flow, '--color', 'never'], { ...buildReadOnlyProductionDeps(), io }),
+    );
+
+    expect(code).toBe(1);
+    expect(io.errors.some((l) => l.includes('UNRESOLVED_HARNESS_AGENT'))).toBe(true);
+  });
+});

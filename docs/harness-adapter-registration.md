@@ -16,6 +16,14 @@ packaging model this guide assumes.
 `kind: harness` station fails closed at load** with `UNKNOWN_HARNESS_ADAPTER`
 — an unconfigured engine behaves exactly like today's, on purpose.
 
+`conduit explain` is the exception, because it only draws the flow. A station
+naming an adapter the engine ships renders whether or not this environment
+registers it, and is judged by that adapter's own capabilities (a tools list it
+cannot express, or a named agent on an adapter that cannot run one, still
+fails). A named agent on an unregistered adapter is not resolved, since the
+plugin dirs it would be found in are engine config. An adapter name the engine
+does not ship still fails with `UNKNOWN_HARNESS_ADAPTER`.
+
 ## Quick start
 
 ```sh
