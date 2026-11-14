@@ -43,7 +43,7 @@ export function readFlowBudgetView(flowPath: string): FlowBudgetView | null {
     typeof run === 'object' && run !== null ? (run as Record<string, unknown>)['max_tokens'] : undefined;
   return {
     override: block['token_weights'] as FlowTokenWeights | undefined,
-    ...(typeof maxTokens === 'number' && { maxTokens }),
+    ...(typeof maxTokens === 'number' && Number.isFinite(maxTokens) && maxTokens >= 0 && { maxTokens }),
   };
 }
 

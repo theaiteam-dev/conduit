@@ -76,6 +76,15 @@ describe('formatBudgetTokens', () => {
     expect(formatBudgetTokens(db, 'missing')).toBeNull();
   });
 
+  it('leaves out a run max_tokens that is not a finite non-negative number', () => {
+    for (const bad of ['.nan', '.inf', '-5']) {
+      registerRun(`budgets:\n  run: { max_tokens: ${bad} }`);
+      span({ inputTokens: 10, outputTokens: 0, cacheReadInputTokens: 100 });
+      expect(formatBudgetTokens(db, 'r')).toBe('budget tokens: 20 (raw 110; cache weights per adapter)');
+      db.deleteRun('r');
+    }
+  });
+
   it('prints nothing when the flow file is not valid YAML', () => {
     registerRun('');
     span({ inputTokens: 10, outputTokens: 0, cacheReadInputTokens: 100 });

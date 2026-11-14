@@ -332,6 +332,12 @@ describe('#5 conduit run delete', () => {
     expect(io.errors.join('\n')).toContain('parent-1');
     expect(db.getSpanBudgetRows('child-1')).toHaveLength(1);
 
+    // A run's own span naming its id does not count as a parent.
+    db.appendJournalSpan({
+      runId: 'child-1', cardId: 'c', station: 'self', attempt: 0, name: 'self.subflow',
+      adapter: 'subflow:./self.yaml', attributes: { child_run_id: 'child-1', outcome: 'success' },
+      usage: { model: '', inputTokens: 1, outputTokens: 0, costUsd: 0 },
+    });
     expect(await main(['run', 'delete', '--run', 'parent-1'], makeDeps())).toBe(0);
     expect(await main(['run', 'delete', '--run', 'child-1'], makeDeps())).toBe(0);
     expect(db.getSpanBudgetRows('child-1')).toHaveLength(0);

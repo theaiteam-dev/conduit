@@ -392,7 +392,8 @@ stations:
     await runExecutor({ db, flow: reloaded.flow, now: () => 1000, adapter: stubAdapter, io, runSubflow: seam });
 
     expect(flow.budgets?.token_weights).toBeUndefined();
-    expect(ioLines.join('\n')).toContain('andon');
+    expect(reloaded.flow.budgets?.token_weights).toEqual({ cache_read: 1 });
+    expect(ioLines.some((l) => l.startsWith('andon:'))).toBe(true);
   });
 
   it("weights a child's cache reads: a cache-heavy child under the weighted budget does not trip it", async () => {
@@ -405,7 +406,7 @@ stations:
 
     await runExecutor({ db, flow, now: () => 1000, adapter: stubAdapter, io, runSubflow: seam });
 
-    expect(ioLines.join('\n')).not.toContain('andon');
+    expect(ioLines.some((l) => l.startsWith('andon:'))).toBe(false);
     expect(db.getCard(DEFAULT_RUN_ID, 'card-1')?.lane).toBe('done');
     // The span keeps the child's summed raw split.
     const [span] = db.getSpanTokenUsageForRun(DEFAULT_RUN_ID).filter((sp) => sp.name === 'call-child.subflow');
@@ -423,7 +424,7 @@ stations:
 
     await runExecutor({ db, flow, now: () => 1000, adapter: stubAdapter, io, runSubflow: seam });
 
-    expect(ioLines.join('\n')).toContain('andon');
+    expect(ioLines.some((l) => l.startsWith('andon:'))).toBe(true);
     expect(db.getCard(DEFAULT_RUN_ID, 'card-1')?.lane).not.toBe('done');
   });
 
@@ -437,7 +438,7 @@ stations:
 
     await runExecutor({ db, flow, now: () => 1000, adapter: stubAdapter, io, runSubflow: seam });
 
-    expect(ioLines.join('\n')).toContain('andon');
+    expect(ioLines.some((l) => l.startsWith('andon:'))).toBe(true);
     expect(db.getCard(DEFAULT_RUN_ID, 'card-1')?.lane).not.toBe('done');
   });
 
@@ -465,7 +466,7 @@ stations:
 
       await runExecutor({ db, flow, now: () => 1000, adapter: stubAdapter, io, runSubflow: seam });
 
-      expect(ioLines.join('\n')).toContain('andon');
+      expect(ioLines.some((l) => l.startsWith('andon:'))).toBe(true);
       // The span records the raw total with no split, like a child with no shares.
       const [span] = db.getSpanTokenUsageForRun(DEFAULT_RUN_ID).filter((sp) => sp.name === 'call-child.subflow');
       expect(span?.inputTokens).toBe(8_280);
