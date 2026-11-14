@@ -1356,6 +1356,13 @@ export interface ConduitDB {
    * Callers outside src/dispatch/ should not use this accessor.
    */
   getStateDb(): Database;
+  /**
+   * Issue #125: the ids of other runs whose journal names runId as a subflow
+   * `child_run_id`, sorted. A parent's journal budget reads its child's spans
+   * in place of the roll-up span, so `conduit run delete` refuses a child
+   * that a parent still references.
+   */
+  getRunsReferencingChild(runId: string): string[];
   /** Delete all rows belonging to runId across all per-run tables. Safe no-op for unknown ids. */
   deleteRun(runId: string): void;
   /** Close both database connections. */
@@ -2573,6 +2580,17 @@ class ConduitDBImpl implements ConduitDB {
    * cleans up the remainder. Ordering it the other way would orphan journal rows
    * under a run_id whose authoritative rows are already gone.
    */
+  getRunsReferencingChild(runId: string): string[] {
+    const rows = this.journalDb
+      .prepare(
+        `SELECT DISTINCT run_id FROM journal
+         WHERE run_id != $r AND json_extract(attributes_json, '$.child_run_id') = $r
+         ORDER BY run_id`,
+      )
+      .all({ $r: runId }) as Array<{ run_id: string }>;
+    return rows.map((r) => r.run_id);
+  }
+
   deleteRun(runId: string): void {
     // Journal DB first (append-only, non-authoritative).
     this.journalDb.transaction(() => {

@@ -93,7 +93,10 @@ resolves the weights of the adapter that billed the call:
   span is weighted for the adapter recorded on it. A `<station>.subflow` span is replaced by its
   child run's spans, found through its `child_run_id`, so the child's adapters are weighted as the
   executor weighted them; a subflow span whose child left no spans counts at 1, and any part of
-  a subflow span's total its child's spans do not cover counts at 1. Transform spans
+  a subflow span's total its child's spans do not cover counts at 1. That remainder keeps the
+  raw total, not the weighted one, so a child's journal must not be replaced: `conduit run
+  delete` refuses a run that another run's span names as its `child_run_id`, since a resumed
+  parent would reuse the deleted child's id. Transform spans
   record no adapter and count at the unknown weights, which equal the transform adapter's.
 - **Pooled deterministic workers** report raw tokens with no split; they count at 1.
 

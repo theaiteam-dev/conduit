@@ -2839,6 +2839,18 @@ async function cmdRunManage(argv: string[], deps: CliDeps): Promise<number> {
   }
 
   // sub === 'delete'
+  // Issue #125: a parent's journal budget reads its subflow child's spans in
+  // place of the roll-up span. Deleting a child a parent still references
+  // would let a resumed parent reuse the child id and count the new child's
+  // spans in place of the original spend, so delete the parent first.
+  const parents = deps.db.getRunsReferencingChild(runId);
+  if (parents.length > 0) {
+    deps.io.err(
+      `error: run ${runId} is a subflow child of ${parents.join(', ')}; ` +
+        `delete ${parents.length === 1 ? 'that run' : 'those runs'} first`,
+    );
+    return 1;
+  }
   deps.db.deleteRun(runId);
   deps.io.out(`run ${runId}: deleted`);
   return 0;
