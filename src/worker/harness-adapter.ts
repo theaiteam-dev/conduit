@@ -176,10 +176,12 @@ export interface RateLimitSnapshot {
 /** Structured usage for one call. */
 export interface KnownUsage {
   /**
-   * TOTAL tokens across every class. This is the BUDGET AUTHORITY — run and
-   * wave budgets fold this number, so it must stay a true total even as
-   * `breakdown` splits it. Summing only breakdown.input+output would drop cache
-   * reads and silently stop the budget guards from tripping.
+   * TOTAL tokens across every class, and it must stay a true total even as
+   * `breakdown` splits it. Since issue #125 the run and wave budgets weight
+   * the breakdown's cache classes (control/token-weights.ts), and count any
+   * part of this total the breakdown does not account for at weight 1, so a
+   * total that drops a class still never lowers the budget count. With no
+   * breakdown the budgets count this figure at weight 1.
    */
   tokens: number;
   cost: number;

@@ -14,6 +14,7 @@
  *   6. Numeric config fields: wip ≥ 1, fan_out ≥ 1, rework_cap ≥ 0 (#15)
  *   7. Quorum fan-in k: integer 1 <= k <= fan_out (#4)
  *   8. depends_on references only known stations (#13)
+ *   8a. INVALID_TOKEN_WEIGHTS: budgets.token_weights out of range (#125)
  *
  * WI-351 additions (only for stations with a declared `next` field):
  *   9.  UNKNOWN_NEXT_TARGET — next names a non-station, non-terminal
@@ -46,6 +47,7 @@ import type {
   SkipWhenConfig,
 } from '../types/kernel';
 import { findCycleNodes } from './dag-utils';
+import { validateTokenWeights } from '../control/token-weights';
 import { FEEDBACK_INPUT } from './render';
 import { harnessOutputInputOverlap } from './resolve-output';
 import { flowHarnesses } from './station-harnesses';
@@ -622,6 +624,12 @@ function collectErrors(
         'terminal_lanes is declared but empty — a flow must declare at least one ' +
         'terminal lane (or omit terminal_lanes to default to done/scrap/hold)',
     });
+  }
+
+  // Issue #125 (ADR-0014): budget weights for cache classes. A negative or
+  // non-numeric weight would let a budget count less than the call spent.
+  for (const message of validateTokenWeights((yaml.budgets as { token_weights?: unknown } | undefined)?.token_weights)) {
+    errors.push({ code: 'INVALID_TOKEN_WEIGHTS', message });
   }
 
   // Pre-compute the set of station ids that are targets of at least one back-edge

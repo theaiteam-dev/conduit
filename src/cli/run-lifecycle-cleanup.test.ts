@@ -311,6 +311,38 @@ describe('#5 conduit run delete', () => {
     expect(cards.n).toBe(0);
   });
 
+  it('refuses to delete a child run another run still references, and deletes it once the parent is gone', async () => {
+    // Issue #125: a parent's journal budget reads its subflow child's spans
+    // in place of the roll-up span, so deleting the child and letting a
+    // resumed parent reuse its id would count the new child in place of the
+    // original spend.
+    db.appendJournalSpan({
+      runId: 'child-1', cardId: 'c', station: 'work', attempt: 0, name: 'work.harness',
+      adapter: 'claude-headless',
+      usage: { model: 'm', inputTokens: 100, outputTokens: 0, costUsd: 0 },
+    });
+    db.appendJournalSpan({
+      runId: 'parent-1', cardId: 'p', station: 'call', attempt: 0, name: 'call.subflow',
+      adapter: 'subflow:./child/flow.yaml', attributes: { child_run_id: 'child-1', outcome: 'success' },
+      usage: { model: '', inputTokens: 100, outputTokens: 0, costUsd: 0 },
+    });
+
+    const refused = await main(['run', 'delete', '--run', 'child-1'], makeDeps());
+    expect(refused).toBe(1);
+    expect(io.errors.join('\n')).toContain('parent-1');
+    expect(db.getSpanBudgetRows('child-1')).toHaveLength(1);
+
+    // A run's own span naming its id does not count as a parent.
+    db.appendJournalSpan({
+      runId: 'child-1', cardId: 'c', station: 'self', attempt: 0, name: 'self.subflow',
+      adapter: 'subflow:./self.yaml', attributes: { child_run_id: 'child-1', outcome: 'success' },
+      usage: { model: '', inputTokens: 1, outputTokens: 0, costUsd: 0 },
+    });
+    expect(await main(['run', 'delete', '--run', 'parent-1'], makeDeps())).toBe(0);
+    expect(await main(['run', 'delete', '--run', 'child-1'], makeDeps())).toBe(0);
+    expect(db.getSpanBudgetRows('child-1')).toHaveLength(0);
+  });
+
   it('refuses to delete without an explicit --run', async () => {
     const code = await main(['run', 'delete'], makeDeps());
     expect(code).toBe(1);

@@ -1823,3 +1823,47 @@ describe('loadFlow — gate critic role preservation (WI-442)', () => {
     expect(flow.stations.write!.role).toBe('writer');
   });
 });
+
+// ---------------------------------------------------------------------------
+// Issue #125 (ADR-0014): budgets.token_weights is validated at load.
+// ---------------------------------------------------------------------------
+
+describe('loadFlow — budgets.token_weights (#125)', () => {
+  const withWeights = (weights: string): string => `
+flow: weights
+flow_version: 1
+budgets:
+  run: { max_tokens: 1000 }
+${weights}
+terminal_lanes: [done, scrap, hold]
+stations:
+  - id: a
+    worker: { kind: transform }
+`;
+
+  it('accepts a flow with no token_weights and passes the block through when valid', () => {
+    expect(expectOk(loadInline(withWeights(''))).budgets?.token_weights).toBeUndefined();
+    const flow = expectOk(loadInline(withWeights('  token_weights: { cache_read: 0.25, cache_creation: 1.25 }')));
+    expect(flow.budgets?.token_weights).toEqual({ cache_read: 0.25, cache_creation: 1.25 });
+  });
+
+  it('accepts the bounds: cache_read 0 and 1, cache_creation 0 and 2', () => {
+    expectOk(loadInline(withWeights('  token_weights: { cache_read: 0, cache_creation: 0 }')));
+    expectOk(loadInline(withWeights('  token_weights: { cache_read: 1, cache_creation: 2 }')));
+  });
+
+  it.each([
+    ['a negative cache_read', '  token_weights: { cache_read: -0.1 }', 'cache_read'],
+    ['a string cache_read', '  token_weights: { cache_read: "0.1" }', 'cache_read'],
+    ['cache_read above 1', '  token_weights: { cache_read: 1.5 }', 'cache_read'],
+    ['a negative cache_creation', '  token_weights: { cache_creation: -1 }', 'cache_creation'],
+    ['cache_creation above 2', '  token_weights: { cache_creation: 3 }', 'cache_creation'],
+    ['a null cache_creation', '  token_weights: { cache_creation: null }', 'cache_creation'],
+    ['an unknown key', '  token_weights: { cache_reads: 0.1 }', 'cache_reads'],
+    ['a scalar block', '  token_weights: 0.1', 'token_weights'],
+  ])('rejects %s (INVALID_TOKEN_WEIGHTS)', (_label, weights, named) => {
+    const result = loadInline(withWeights(weights));
+    expect(errorCodes(result)).toContain('INVALID_TOKEN_WEIGHTS');
+    expect(errorText(result)).toContain(named);
+  });
+});
