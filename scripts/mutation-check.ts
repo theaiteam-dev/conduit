@@ -275,6 +275,10 @@ const MUTANTS: Mutant[] = [
     // Not a fold site: the gate critic's fold names the critic's adapter, not
     // the maker's (issue #125). Folding with the maker's adapter breaks no
     // type and no journal row.
+    // The same line as gate-critic-fold, on purpose: there is one critic fold
+    // site. That mutant deletes the fold; this one keeps it and weights it for
+    // the maker's adapter. Each find string must occur exactly once (checked
+    // below), so both always land on that one site.
     id: 'critic-own-adapter',
     file: 'src/controller/executor.ts',
     find: 'foldHarnessUsage(usage, adapterName);',

@@ -372,7 +372,8 @@ stations:
 
     await runExecutor({ db, flow, now: () => 1000, adapter: stubAdapter, io, runSubflow: seam });
 
-    expect(ioLines.join('\n')).toContain('andon');
+    expect(ioLines.some((l) => l.startsWith('andon:'))).toBe(true);
+    expect(db.getCard(DEFAULT_RUN_ID, 'card-1')?.lane).not.toBe('done');
   });
 
   it("the parent flow's token_weights overrides the child's adapter defaults", async () => {

@@ -1360,7 +1360,9 @@ export interface ConduitDB {
    * Issue #125: the ids of other runs whose journal names runId as a subflow
    * `child_run_id`, sorted. A parent's journal budget reads its child's spans
    * in place of the roll-up span, so `conduit run delete` refuses a child
-   * that a parent still references.
+   * that a parent still references. Scans the whole journal (no index covers
+   * a JSON attribute), which is acceptable for `run delete`, a rare
+   * operator command.
    */
   getRunsReferencingChild(runId: string): string[];
   /** Delete all rows belonging to runId across all per-run tables. Safe no-op for unknown ids. */

@@ -125,8 +125,9 @@ export function unaccountedTokens(tokens: number, breakdown: UsageBreakdown): nu
  * - No breakdown, or one with a non-numeric or negative class: the raw total
  *   at weight 1.
  * - Otherwise each class at its weight, plus any part of the total the classes
- *   do not account for at weight 1, so a partial breakdown cannot shrink the
- *   count below what the adapter reported.
+ *   do not account for at weight 1. Only that unaccounted part is guaranteed
+ *   weight 1: the reported classes keep their weights, so a partial breakdown
+ *   with discounted cache reads can count below the reported total.
  */
 export function weightedUsageTokens(
   tokens: number,

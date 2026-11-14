@@ -60,7 +60,10 @@ function weightsText(override: FlowTokenWeights | undefined): string {
 /**
  * "budget tokens: B[ of run max_tokens M] (raw R; cache weights per
  * adapter[, flow sets ...])", or null when the run has no usage, its flow is
- * unreadable, or the budget figure equals the raw one.
+ * unreadable, or the budget figure equals the raw one. The weights come from
+ * the flow file as it is now, which is also what `--append-pass` and
+ * `conduit resume` load, so the figure is what they would subtract; a run
+ * whose flow was edited since may have been counted with other weights.
  */
 export function formatBudgetTokens(db: ConduitDB, runId: string): string | null {
   const run = db.getRun(runId);

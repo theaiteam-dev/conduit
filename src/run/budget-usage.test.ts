@@ -76,6 +76,14 @@ describe('formatBudgetTokens', () => {
     expect(formatBudgetTokens(db, 'missing')).toBeNull();
   });
 
+  it('prints nothing when the flow file is not valid YAML', () => {
+    registerRun('');
+    span({ inputTokens: 10, outputTokens: 0, cacheReadInputTokens: 100 });
+    expect(formatBudgetTokens(db, 'r')).not.toBeNull();
+    writeFileSync(join(dir, 'flow.yaml'), 'budgets: [unclosed\n', 'utf8');
+    expect(formatBudgetTokens(db, 'r')).toBeNull();
+  });
+
   it('prints nothing when the flow file is gone', () => {
     registerRun('');
     span({ inputTokens: 10, outputTokens: 0, cacheReadInputTokens: 100 });
