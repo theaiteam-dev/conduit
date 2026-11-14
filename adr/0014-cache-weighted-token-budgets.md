@@ -109,11 +109,13 @@ sets a class, the line names it: `cache weights per adapter, flow sets cache rea
 `flow sets cache read x1, cache creation x1` when it sets both. A mixed run has no single weight,
 so the line does not print one.
 
-### Missing data never lowers the count below raw
+### Tokens the data does not account for count at 1
 
-Missing or unusable data never makes a call count less than its raw token count. It counts the
-unknown part at weight 1, not at the highest class weight, so a total that was in fact all Claude
-cache creation (weight 2) counts at half what a full breakdown would give:
+The part of a call's total that no usable breakdown accounts for counts at weight 1. The classes
+a breakdown does report keep their weights, so a call with a partial breakdown that includes
+discounted cache reads can still count below its raw total. Weight 1 is not the highest class
+weight either: a total that was in fact all Claude cache creation (weight 2) counts at half what
+a full breakdown would give.
 
 - A harness call whose adapter reports no breakdown (a total only, or a subflow roll-up with no
   per-adapter shares) counts its whole total at weight 1.

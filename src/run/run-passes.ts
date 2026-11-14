@@ -105,8 +105,8 @@ function rawTokens(row: LeafRow): number {
  * (its `subflow:` adapter is unknown, so it weighs 1 per class). When the
  * child's spans hold less than the subflow span recorded, the difference is
  * kept as a row of uncached input with no adapter, so it counts at 1 as the
- * executor's roll-up fold counted it (ADR-0014: missing data never lowers
- * the count below raw).
+ * executor's roll-up fold counted it (ADR-0014: tokens the data does not
+ * account for count at 1).
  */
 function leafRows(db: ConduitDB, runId: string, seen: ReadonlySet<string>): LeafRow[] {
   const out: LeafRow[] = [];
