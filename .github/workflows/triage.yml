@@ -1,7 +1,7 @@
 # Automated issue triage — classify, scan for prompt injection, label.
 #
-# THREAT MODEL. This workflow is the inverse of pr-review.yml. A fork PR arrives
-# with no secrets and a read-only token, so pr-review.yml has to opt IN to
+# THREAT MODEL. This workflow is the inverse of a PR workflow. A fork PR arrives
+# with no secrets and a read-only token, so a PR workflow has to opt IN to
 # privilege. An `issues: opened` run arrives with full secrets and a write token
 # by DEFAULT, and its input is anonymous: no fork, no branch, no approval, no
 # review. There is no contributor code to execute here, so the classic CI
@@ -15,18 +15,11 @@
 # wrong label. The scan is a second, independent signal on top of that.
 #
 # BLAST RADIUS OF A LABEL WRITE = the union of every workflow triggered by
-# `labeled`. That union is NO LONGER EMPTY: pr-review-fork.yml runs the Nitpick
-# reviewer when the `nitpick` label is applied. Anyone adding a label-triggered
-# workflow is handing this model a new capability — check here first, and add
-# it to the list below.
-#
-#   pr-review-fork.yml — label `nitpick`. NOT reachable from this model, twice
-#     over: `nitpick` is outside TYPE_VALUES (apply-triage.ts:57), which is
-#     what bounds `apply`; and that workflow independently requires the
-#     labeller's login to appear in its LABELLERS allowlist, which
-#     github-actions[bot] does not and cannot add itself to. Adding `nitpick`
-#     to TYPE_VALUES would break the first of those; the second would still
-#     hold, which is why it exists.
+# `labeled`. That union is EMPTY: no workflow here triggers on `labeled`.
+# (pr-review-fork.yml ran the Nitpick reviewer on the `nitpick` label until
+# reviews moved to the OKtoMerge GitHub App, queso/nitpick-flow#51.) Anyone
+# adding a label-triggered workflow is handing this model a new capability —
+# check here first, and list it below.
 #
 # (release.yml and docker.yml mention only Docker OCI image labels, which are
 # unrelated to GitHub issue labels.)
@@ -85,10 +78,9 @@ jobs:
     # Issues: every one gets labelled, whoever opened it. A maintainer filing
     # an issue wants it sorted onto the board the same as anyone else.
     #
-    # PRs: fork-authored and non-insider only. This is the exact complement of
-    # pr-review.yml's gate (`head.repo.fork == false`): Nitpick reviews
-    # internal branches, triage labels fork PRs, and neither runs on the
-    # other's input. A maintainer's own branch needs neither.
+    # PRs: fork-authored and non-insider only. A maintainer's own branch needs
+    # no triage. (Reviews are the OKtoMerge App's, outside this repo's
+    # workflows, on every PR; queso/nitpick-flow#51.)
     #
     # author_association is computed by GitHub from the actor's standing in
     # this repo, not from anything the submitter controls.
@@ -209,8 +201,8 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          # create -> cp-in -> start -> cp-out -> rm, the pattern pr-review.yml
-          # documents: the image bakes the flow at /flow, so a project-root bind
+          # create -> cp-in -> start -> cp-out -> rm, the pattern the old Nitpick
+          # workflow used: the image bakes the flow at /flow, so a project-root bind
           # mount would shadow it.
           cid=$(docker create \
             -v conduit_triage_data:/data \
